@@ -1,0 +1,457 @@
+<html>
+<head>
+<title>split.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+split.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Allows building all the variable fonts of a DesignSpace version 5 by 
+splitting the document into interpolable sub-space, then into each VF. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">annotations</span>
+
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">math</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">Any</span><span class="s2">, </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Dict</span><span class="s2">, </span><span class="s1">Iterator</span><span class="s2">, </span><span class="s1">List</span><span class="s2">, </span><span class="s1">Tuple</span><span class="s2">, </span><span class="s1">cast</span>
+
+<span class="s2">from </span><span class="s1">fontTools.designspaceLib </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">AxisDescriptor</span><span class="s2">,</span>
+    <span class="s1">DesignSpaceDocument</span><span class="s2">,</span>
+    <span class="s1">DiscreteAxisDescriptor</span><span class="s2">,</span>
+    <span class="s1">InstanceDescriptor</span><span class="s2">,</span>
+    <span class="s1">RuleDescriptor</span><span class="s2">,</span>
+    <span class="s1">SimpleLocationDict</span><span class="s2">,</span>
+    <span class="s1">SourceDescriptor</span><span class="s2">,</span>
+    <span class="s1">VariableFontDescriptor</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">fontTools.designspaceLib.statNames </span><span class="s2">import </span><span class="s1">StatNames</span><span class="s2">, </span><span class="s1">getStatNames</span>
+<span class="s2">from </span><span class="s1">fontTools.designspaceLib.types </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">ConditionSet</span><span class="s2">,</span>
+    <span class="s1">Range</span><span class="s2">,</span>
+    <span class="s1">Region</span><span class="s2">,</span>
+    <span class="s1">getVFUserRegion</span><span class="s2">,</span>
+    <span class="s1">locationInRegion</span><span class="s2">,</span>
+    <span class="s1">regionInRegion</span><span class="s2">,</span>
+    <span class="s1">userRegionToDesignRegion</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+<span class="s1">LOGGER = logging.getLogger(__name__)</span>
+
+<span class="s1">MakeInstanceFilenameCallable = Callable[</span>
+    <span class="s1">[DesignSpaceDocument</span><span class="s2">, </span><span class="s1">InstanceDescriptor</span><span class="s2">, </span><span class="s1">StatNames]</span><span class="s2">, </span><span class="s1">str</span>
+<span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">defaultMakeInstanceFilename(</span>
+    <span class="s1">doc: DesignSpaceDocument</span><span class="s2">, </span><span class="s1">instance: InstanceDescriptor</span><span class="s2">, </span><span class="s1">statNames: StatNames</span>
+<span class="s1">) -&gt; str:</span>
+    <span class="s0">&quot;&quot;&quot;Default callable to synthesize an instance filename 
+    when makeNames=True, for instances that don't specify an instance name 
+    in the designspace. This part of the name generation can be overriden 
+    because it's not specified by the STAT table. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">familyName = instance.familyName </span><span class="s2">or </span><span class="s1">statNames.familyNames.get(</span><span class="s3">&quot;en&quot;</span><span class="s1">)</span>
+    <span class="s1">styleName = instance.styleName </span><span class="s2">or </span><span class="s1">statNames.styleNames.get(</span><span class="s3">&quot;en&quot;</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">familyName</span><span class="s2">}</span><span class="s3">-</span><span class="s2">{</span><span class="s1">styleName</span><span class="s2">}</span><span class="s3">.ttf&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">splitInterpolable(</span>
+    <span class="s1">doc: DesignSpaceDocument</span><span class="s2">,</span>
+    <span class="s1">makeNames: bool = </span><span class="s2">True,</span>
+    <span class="s1">expandLocations: bool = </span><span class="s2">True,</span>
+    <span class="s1">makeInstanceFilename: MakeInstanceFilenameCallable = defaultMakeInstanceFilename</span><span class="s2">,</span>
+<span class="s1">) -&gt; Iterator[Tuple[SimpleLocationDict</span><span class="s2">, </span><span class="s1">DesignSpaceDocument]]:</span>
+    <span class="s0">&quot;&quot;&quot;Split the given DS5 into several interpolable sub-designspaces. 
+    There are as many interpolable sub-spaces as there are combinations of 
+    discrete axis values. 
+ 
+    E.g. with axes: 
+        - italic (discrete) Upright or Italic 
+        - style (discrete) Sans or Serif 
+        - weight (continuous) 100 to 900 
+ 
+    There are 4 sub-spaces in which the Weight axis should interpolate: 
+    (Upright, Sans), (Upright, Serif), (Italic, Sans) and (Italic, Serif). 
+ 
+    The sub-designspaces still include the full axis definitions and STAT data, 
+    but the rules, sources, variable fonts, instances are trimmed down to only 
+    keep what falls within the interpolable sub-space. 
+ 
+    Args: 
+      - ``makeNames``: Whether to compute the instance family and style 
+        names using the STAT data. 
+      - ``expandLocations``: Whether to turn all locations into &quot;full&quot; 
+        locations, including implicit default axis values where missing. 
+      - ``makeInstanceFilename``: Callable to synthesize an instance filename 
+        when makeNames=True, for instances that don't specify an instance name 
+        in the designspace. This part of the name generation can be overridden 
+        because it's not specified by the STAT table. 
+ 
+    .. versionadded:: 5.0 
+    &quot;&quot;&quot;</span>
+    <span class="s1">discreteAxes = []</span>
+    <span class="s1">interpolableUserRegion: Region = {}</span>
+    <span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">doc.axes:</span>
+        <span class="s2">if </span><span class="s1">hasattr(axis</span><span class="s2">, </span><span class="s3">&quot;values&quot;</span><span class="s1">):</span>
+            <span class="s4"># Mypy doesn't support narrowing union types via hasattr()</span>
+            <span class="s4"># TODO(Python 3.10): use TypeGuard</span>
+            <span class="s4"># https://mypy.readthedocs.io/en/stable/type_narrowing.html</span>
+            <span class="s1">axis = cast(DiscreteAxisDescriptor</span><span class="s2">, </span><span class="s1">axis)</span>
+            <span class="s1">discreteAxes.append(axis)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">axis = cast(AxisDescriptor</span><span class="s2">, </span><span class="s1">axis)</span>
+            <span class="s1">interpolableUserRegion[axis.name] = Range(</span>
+                <span class="s1">axis.minimum</span><span class="s2">,</span>
+                <span class="s1">axis.maximum</span><span class="s2">,</span>
+                <span class="s1">axis.default</span><span class="s2">,</span>
+            <span class="s1">)</span>
+    <span class="s1">valueCombinations = itertools.product(*[axis.values </span><span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">discreteAxes])</span>
+    <span class="s2">for </span><span class="s1">values </span><span class="s2">in </span><span class="s1">valueCombinations:</span>
+        <span class="s1">discreteUserLocation = {</span>
+            <span class="s1">discreteAxis.name: value</span>
+            <span class="s2">for </span><span class="s1">discreteAxis</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">zip(discreteAxes</span><span class="s2">, </span><span class="s1">values)</span>
+        <span class="s1">}</span>
+        <span class="s1">subDoc = _extractSubSpace(</span>
+            <span class="s1">doc</span><span class="s2">,</span>
+            <span class="s1">{**interpolableUserRegion</span><span class="s2">, </span><span class="s1">**discreteUserLocation}</span><span class="s2">,</span>
+            <span class="s1">keepVFs=</span><span class="s2">True,</span>
+            <span class="s1">makeNames=makeNames</span><span class="s2">,</span>
+            <span class="s1">expandLocations=expandLocations</span><span class="s2">,</span>
+            <span class="s1">makeInstanceFilename=makeInstanceFilename</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s2">yield </span><span class="s1">discreteUserLocation</span><span class="s2">, </span><span class="s1">subDoc</span>
+
+
+<span class="s2">def </span><span class="s1">splitVariableFonts(</span>
+    <span class="s1">doc: DesignSpaceDocument</span><span class="s2">,</span>
+    <span class="s1">makeNames: bool = </span><span class="s2">False,</span>
+    <span class="s1">expandLocations: bool = </span><span class="s2">False,</span>
+    <span class="s1">makeInstanceFilename: MakeInstanceFilenameCallable = defaultMakeInstanceFilename</span><span class="s2">,</span>
+<span class="s1">) -&gt; Iterator[Tuple[str</span><span class="s2">, </span><span class="s1">DesignSpaceDocument]]:</span>
+    <span class="s0">&quot;&quot;&quot;Convert each variable font listed in this document into a standalone 
+    designspace. This can be used to compile all the variable fonts from a 
+    format 5 designspace using tools that can only deal with 1 VF at a time. 
+ 
+    Args: 
+      - ``makeNames``: Whether to compute the instance family and style 
+        names using the STAT data. 
+      - ``expandLocations``: Whether to turn all locations into &quot;full&quot; 
+        locations, including implicit default axis values where missing. 
+      - ``makeInstanceFilename``: Callable to synthesize an instance filename 
+        when makeNames=True, for instances that don't specify an instance name 
+        in the designspace. This part of the name generation can be overridden 
+        because it's not specified by the STAT table. 
+ 
+    .. versionadded:: 5.0 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Make one DesignspaceDoc v5 for each variable font</span>
+    <span class="s2">for </span><span class="s1">vf </span><span class="s2">in </span><span class="s1">doc.getVariableFonts():</span>
+        <span class="s1">vfUserRegion = getVFUserRegion(doc</span><span class="s2">, </span><span class="s1">vf)</span>
+        <span class="s1">vfDoc = _extractSubSpace(</span>
+            <span class="s1">doc</span><span class="s2">,</span>
+            <span class="s1">vfUserRegion</span><span class="s2">,</span>
+            <span class="s1">keepVFs=</span><span class="s2">False,</span>
+            <span class="s1">makeNames=makeNames</span><span class="s2">,</span>
+            <span class="s1">expandLocations=expandLocations</span><span class="s2">,</span>
+            <span class="s1">makeInstanceFilename=makeInstanceFilename</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">vfDoc.lib = {**vfDoc.lib</span><span class="s2">, </span><span class="s1">**vf.lib}</span>
+        <span class="s2">yield </span><span class="s1">vf.name</span><span class="s2">, </span><span class="s1">vfDoc</span>
+
+
+<span class="s2">def </span><span class="s1">convert5to4(</span>
+    <span class="s1">doc: DesignSpaceDocument</span><span class="s2">,</span>
+<span class="s1">) -&gt; Dict[str</span><span class="s2">, </span><span class="s1">DesignSpaceDocument]:</span>
+    <span class="s0">&quot;&quot;&quot;Convert each variable font listed in this document into a standalone 
+    format 4 designspace. This can be used to compile all the variable fonts 
+    from a format 5 designspace using tools that only know about format 4. 
+ 
+    .. versionadded:: 5.0 
+    &quot;&quot;&quot;</span>
+    <span class="s1">vfs = {}</span>
+    <span class="s2">for </span><span class="s1">_location</span><span class="s2">, </span><span class="s1">subDoc </span><span class="s2">in </span><span class="s1">splitInterpolable(doc):</span>
+        <span class="s2">for </span><span class="s1">vfName</span><span class="s2">, </span><span class="s1">vfDoc </span><span class="s2">in </span><span class="s1">splitVariableFonts(subDoc):</span>
+            <span class="s1">vfDoc.formatVersion = </span><span class="s3">&quot;4.1&quot;</span>
+            <span class="s1">vfs[vfName] = vfDoc</span>
+    <span class="s2">return </span><span class="s1">vfs</span>
+
+
+<span class="s2">def </span><span class="s1">_extractSubSpace(</span>
+    <span class="s1">doc: DesignSpaceDocument</span><span class="s2">,</span>
+    <span class="s1">userRegion: Region</span><span class="s2">,</span>
+    <span class="s1">*</span><span class="s2">,</span>
+    <span class="s1">keepVFs: bool</span><span class="s2">,</span>
+    <span class="s1">makeNames: bool</span><span class="s2">,</span>
+    <span class="s1">expandLocations: bool</span><span class="s2">,</span>
+    <span class="s1">makeInstanceFilename: MakeInstanceFilenameCallable</span><span class="s2">,</span>
+<span class="s1">) -&gt; DesignSpaceDocument:</span>
+    <span class="s1">subDoc = DesignSpaceDocument()</span>
+    <span class="s4"># Don't include STAT info</span>
+    <span class="s4"># FIXME: (Jany) let's think about it. Not include = OK because the point of</span>
+    <span class="s4"># the splitting is to build VFs and we'll use the STAT data of the full</span>
+    <span class="s4"># document to generate the STAT of the VFs, so &quot;no need&quot; to have STAT data</span>
+    <span class="s4"># in sub-docs. Counterpoint: what if someone wants to split this DS for</span>
+    <span class="s4"># other purposes?  Maybe for that it would be useful to also subset the STAT</span>
+    <span class="s4"># data?</span>
+    <span class="s4"># subDoc.elidedFallbackName = doc.elidedFallbackName</span>
+
+    <span class="s2">def </span><span class="s1">maybeExpandDesignLocation(object):</span>
+        <span class="s2">if </span><span class="s1">expandLocations:</span>
+            <span class="s2">return </span><span class="s1">object.getFullDesignLocation(doc)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">object.designLocation</span>
+
+    <span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">doc.axes:</span>
+        <span class="s1">range = userRegion[axis.name]</span>
+        <span class="s2">if </span><span class="s1">isinstance(range</span><span class="s2">, </span><span class="s1">Range) </span><span class="s2">and </span><span class="s1">hasattr(axis</span><span class="s2">, </span><span class="s3">&quot;minimum&quot;</span><span class="s1">):</span>
+            <span class="s4"># Mypy doesn't support narrowing union types via hasattr()</span>
+            <span class="s4"># TODO(Python 3.10): use TypeGuard</span>
+            <span class="s4"># https://mypy.readthedocs.io/en/stable/type_narrowing.html</span>
+            <span class="s1">axis = cast(AxisDescriptor</span><span class="s2">, </span><span class="s1">axis)</span>
+            <span class="s1">subDoc.addAxis(</span>
+                <span class="s1">AxisDescriptor(</span>
+                    <span class="s4"># Same info</span>
+                    <span class="s1">tag=axis.tag</span><span class="s2">,</span>
+                    <span class="s1">name=axis.name</span><span class="s2">,</span>
+                    <span class="s1">labelNames=axis.labelNames</span><span class="s2">,</span>
+                    <span class="s1">hidden=axis.hidden</span><span class="s2">,</span>
+                    <span class="s4"># Subset range</span>
+                    <span class="s1">minimum=max(range.minimum</span><span class="s2">, </span><span class="s1">axis.minimum)</span><span class="s2">,</span>
+                    <span class="s1">default=range.default </span><span class="s2">or </span><span class="s1">axis.default</span><span class="s2">,</span>
+                    <span class="s1">maximum=min(range.maximum</span><span class="s2">, </span><span class="s1">axis.maximum)</span><span class="s2">,</span>
+                    <span class="s1">map=[</span>
+                        <span class="s1">(user</span><span class="s2">, </span><span class="s1">design)</span>
+                        <span class="s2">for </span><span class="s1">user</span><span class="s2">, </span><span class="s1">design </span><span class="s2">in </span><span class="s1">axis.map</span>
+                        <span class="s2">if </span><span class="s1">range.minimum &lt;= user &lt;= range.maximum</span>
+                    <span class="s1">]</span><span class="s2">,</span>
+                    <span class="s4"># Don't include STAT info</span>
+                    <span class="s1">axisOrdering=</span><span class="s2">None,</span>
+                    <span class="s1">axisLabels=</span><span class="s2">None,</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+
+    <span class="s4"># Don't include STAT info</span>
+    <span class="s4"># subDoc.locationLabels = doc.locationLabels</span>
+
+    <span class="s4"># Rules: subset them based on conditions</span>
+    <span class="s1">designRegion = userRegionToDesignRegion(doc</span><span class="s2">, </span><span class="s1">userRegion)</span>
+    <span class="s1">subDoc.rules = _subsetRulesBasedOnConditions(doc.rules</span><span class="s2">, </span><span class="s1">designRegion)</span>
+    <span class="s1">subDoc.rulesProcessingLast = doc.rulesProcessingLast</span>
+
+    <span class="s4"># Sources: keep only the ones that fall within the kept axis ranges</span>
+    <span class="s2">for </span><span class="s1">source </span><span class="s2">in </span><span class="s1">doc.sources:</span>
+        <span class="s2">if not </span><span class="s1">locationInRegion(doc.map_backward(source.designLocation)</span><span class="s2">, </span><span class="s1">userRegion):</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">subDoc.addSource(</span>
+            <span class="s1">SourceDescriptor(</span>
+                <span class="s1">filename=source.filename</span><span class="s2">,</span>
+                <span class="s1">path=source.path</span><span class="s2">,</span>
+                <span class="s1">font=source.font</span><span class="s2">,</span>
+                <span class="s1">name=source.name</span><span class="s2">,</span>
+                <span class="s1">designLocation=_filterLocation(</span>
+                    <span class="s1">userRegion</span><span class="s2">, </span><span class="s1">maybeExpandDesignLocation(source)</span>
+                <span class="s1">)</span><span class="s2">,</span>
+                <span class="s1">layerName=source.layerName</span><span class="s2">,</span>
+                <span class="s1">familyName=source.familyName</span><span class="s2">,</span>
+                <span class="s1">styleName=source.styleName</span><span class="s2">,</span>
+                <span class="s1">muteKerning=source.muteKerning</span><span class="s2">,</span>
+                <span class="s1">muteInfo=source.muteInfo</span><span class="s2">,</span>
+                <span class="s1">mutedGlyphNames=source.mutedGlyphNames</span><span class="s2">,</span>
+            <span class="s1">)</span>
+        <span class="s1">)</span>
+
+    <span class="s4"># Copy family name translations from the old default source to the new default</span>
+    <span class="s1">vfDefault = subDoc.findDefault()</span>
+    <span class="s1">oldDefault = doc.findDefault()</span>
+    <span class="s2">if </span><span class="s1">vfDefault </span><span class="s2">is not None and </span><span class="s1">oldDefault </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s1">vfDefault.localisedFamilyName = oldDefault.localisedFamilyName</span>
+
+    <span class="s4"># Variable fonts: keep only the ones that fall within the kept axis ranges</span>
+    <span class="s2">if </span><span class="s1">keepVFs:</span>
+        <span class="s4"># Note: call getVariableFont() to make the implicit VFs explicit</span>
+        <span class="s2">for </span><span class="s1">vf </span><span class="s2">in </span><span class="s1">doc.getVariableFonts():</span>
+            <span class="s1">vfUserRegion = getVFUserRegion(doc</span><span class="s2">, </span><span class="s1">vf)</span>
+            <span class="s2">if </span><span class="s1">regionInRegion(vfUserRegion</span><span class="s2">, </span><span class="s1">userRegion):</span>
+                <span class="s1">subDoc.addVariableFont(</span>
+                    <span class="s1">VariableFontDescriptor(</span>
+                        <span class="s1">name=vf.name</span><span class="s2">,</span>
+                        <span class="s1">filename=vf.filename</span><span class="s2">,</span>
+                        <span class="s1">axisSubsets=[</span>
+                            <span class="s1">axisSubset</span>
+                            <span class="s2">for </span><span class="s1">axisSubset </span><span class="s2">in </span><span class="s1">vf.axisSubsets</span>
+                            <span class="s2">if </span><span class="s1">isinstance(userRegion[axisSubset.name]</span><span class="s2">, </span><span class="s1">Range)</span>
+                        <span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">lib=vf.lib</span><span class="s2">,</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+
+    <span class="s4"># Instances: same as Sources + compute missing names</span>
+    <span class="s2">for </span><span class="s1">instance </span><span class="s2">in </span><span class="s1">doc.instances:</span>
+        <span class="s2">if not </span><span class="s1">locationInRegion(instance.getFullUserLocation(doc)</span><span class="s2">, </span><span class="s1">userRegion):</span>
+            <span class="s2">continue</span>
+
+        <span class="s2">if </span><span class="s1">makeNames:</span>
+            <span class="s1">statNames = getStatNames(doc</span><span class="s2">, </span><span class="s1">instance.getFullUserLocation(doc))</span>
+            <span class="s1">familyName = instance.familyName </span><span class="s2">or </span><span class="s1">statNames.familyNames.get(</span><span class="s3">&quot;en&quot;</span><span class="s1">)</span>
+            <span class="s1">styleName = instance.styleName </span><span class="s2">or </span><span class="s1">statNames.styleNames.get(</span><span class="s3">&quot;en&quot;</span><span class="s1">)</span>
+            <span class="s1">subDoc.addInstance(</span>
+                <span class="s1">InstanceDescriptor(</span>
+                    <span class="s1">filename=instance.filename</span>
+                    <span class="s2">or </span><span class="s1">makeInstanceFilename(doc</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">statNames)</span><span class="s2">,</span>
+                    <span class="s1">path=instance.path</span><span class="s2">,</span>
+                    <span class="s1">font=instance.font</span><span class="s2">,</span>
+                    <span class="s1">name=instance.name </span><span class="s2">or </span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">familyName</span><span class="s2">} {</span><span class="s1">styleName</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s2">,</span>
+                    <span class="s1">userLocation={} </span><span class="s2">if </span><span class="s1">expandLocations </span><span class="s2">else </span><span class="s1">instance.userLocation</span><span class="s2">,</span>
+                    <span class="s1">designLocation=_filterLocation(</span>
+                        <span class="s1">userRegion</span><span class="s2">, </span><span class="s1">maybeExpandDesignLocation(instance)</span>
+                    <span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">familyName=familyName</span><span class="s2">,</span>
+                    <span class="s1">styleName=styleName</span><span class="s2">,</span>
+                    <span class="s1">postScriptFontName=instance.postScriptFontName</span>
+                    <span class="s2">or </span><span class="s1">statNames.postScriptFontName</span><span class="s2">,</span>
+                    <span class="s1">styleMapFamilyName=instance.styleMapFamilyName</span>
+                    <span class="s2">or </span><span class="s1">statNames.styleMapFamilyNames.get(</span><span class="s3">&quot;en&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">styleMapStyleName=instance.styleMapStyleName</span>
+                    <span class="s2">or </span><span class="s1">statNames.styleMapStyleName</span><span class="s2">,</span>
+                    <span class="s1">localisedFamilyName=instance.localisedFamilyName</span>
+                    <span class="s2">or </span><span class="s1">statNames.familyNames</span><span class="s2">,</span>
+                    <span class="s1">localisedStyleName=instance.localisedStyleName</span>
+                    <span class="s2">or </span><span class="s1">statNames.styleNames</span><span class="s2">,</span>
+                    <span class="s1">localisedStyleMapFamilyName=instance.localisedStyleMapFamilyName</span>
+                    <span class="s2">or </span><span class="s1">statNames.styleMapFamilyNames</span><span class="s2">,</span>
+                    <span class="s1">localisedStyleMapStyleName=instance.localisedStyleMapStyleName</span>
+                    <span class="s2">or </span><span class="s1">{}</span><span class="s2">,</span>
+                    <span class="s1">lib=instance.lib</span><span class="s2">,</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">subDoc.addInstance(</span>
+                <span class="s1">InstanceDescriptor(</span>
+                    <span class="s1">filename=instance.filename</span><span class="s2">,</span>
+                    <span class="s1">path=instance.path</span><span class="s2">,</span>
+                    <span class="s1">font=instance.font</span><span class="s2">,</span>
+                    <span class="s1">name=instance.name</span><span class="s2">,</span>
+                    <span class="s1">userLocation={} </span><span class="s2">if </span><span class="s1">expandLocations </span><span class="s2">else </span><span class="s1">instance.userLocation</span><span class="s2">,</span>
+                    <span class="s1">designLocation=_filterLocation(</span>
+                        <span class="s1">userRegion</span><span class="s2">, </span><span class="s1">maybeExpandDesignLocation(instance)</span>
+                    <span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">familyName=instance.familyName</span><span class="s2">,</span>
+                    <span class="s1">styleName=instance.styleName</span><span class="s2">,</span>
+                    <span class="s1">postScriptFontName=instance.postScriptFontName</span><span class="s2">,</span>
+                    <span class="s1">styleMapFamilyName=instance.styleMapFamilyName</span><span class="s2">,</span>
+                    <span class="s1">styleMapStyleName=instance.styleMapStyleName</span><span class="s2">,</span>
+                    <span class="s1">localisedFamilyName=instance.localisedFamilyName</span><span class="s2">,</span>
+                    <span class="s1">localisedStyleName=instance.localisedStyleName</span><span class="s2">,</span>
+                    <span class="s1">localisedStyleMapFamilyName=instance.localisedStyleMapFamilyName</span><span class="s2">,</span>
+                    <span class="s1">localisedStyleMapStyleName=instance.localisedStyleMapStyleName</span><span class="s2">,</span>
+                    <span class="s1">lib=instance.lib</span><span class="s2">,</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+
+    <span class="s1">subDoc.lib = doc.lib</span>
+
+    <span class="s2">return </span><span class="s1">subDoc</span>
+
+
+<span class="s2">def </span><span class="s1">_conditionSetFrom(conditionSet: List[Dict[str</span><span class="s2">, </span><span class="s1">Any]]) -&gt; ConditionSet:</span>
+    <span class="s1">c: Dict[str</span><span class="s2">, </span><span class="s1">Range] = {}</span>
+    <span class="s2">for </span><span class="s1">condition </span><span class="s2">in </span><span class="s1">conditionSet:</span>
+        <span class="s1">minimum</span><span class="s2">, </span><span class="s1">maximum = condition.get(</span><span class="s3">&quot;minimum&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">condition.get(</span><span class="s3">&quot;maximum&quot;</span><span class="s1">)</span>
+        <span class="s1">c[condition[</span><span class="s3">&quot;name&quot;</span><span class="s1">]] = Range(</span>
+            <span class="s1">minimum </span><span class="s2">if </span><span class="s1">minimum </span><span class="s2">is not None else </span><span class="s1">-math.inf</span><span class="s2">,</span>
+            <span class="s1">maximum </span><span class="s2">if </span><span class="s1">maximum </span><span class="s2">is not None else </span><span class="s1">math.inf</span><span class="s2">,</span>
+        <span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">c</span>
+
+
+<span class="s2">def </span><span class="s1">_subsetRulesBasedOnConditions(</span>
+    <span class="s1">rules: List[RuleDescriptor]</span><span class="s2">, </span><span class="s1">designRegion: Region</span>
+<span class="s1">) -&gt; List[RuleDescriptor]:</span>
+    <span class="s4"># What rules to keep:</span>
+    <span class="s4">#  - Keep the rule if any conditionset is relevant.</span>
+    <span class="s4">#  - A conditionset is relevant if all conditions are relevant or it is empty.</span>
+    <span class="s4">#  - A condition is relevant if</span>
+    <span class="s4">#    - axis is point (C-AP),</span>
+    <span class="s4">#       - and point in condition's range (C-AP-in)</span>
+    <span class="s4">#            (in this case remove the condition because it's always true)</span>
+    <span class="s4">#       - else (C-AP-out) whole conditionset can be discarded (condition false</span>
+    <span class="s4">#         =&gt; conditionset false)</span>
+    <span class="s4">#    - axis is range (C-AR),</span>
+    <span class="s4">#       - (C-AR-all) and axis range fully contained in condition range: we can</span>
+    <span class="s4">#         scrap the condition because it's always true</span>
+    <span class="s4">#       - (C-AR-inter) and intersection(axis range, condition range) not empty:</span>
+    <span class="s4">#         keep the condition with the smaller range (= intersection)</span>
+    <span class="s4">#       - (C-AR-none) else, whole conditionset can be discarded</span>
+    <span class="s1">newRules: List[RuleDescriptor] = []</span>
+    <span class="s2">for </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">rules:</span>
+        <span class="s1">newRule: RuleDescriptor = RuleDescriptor(</span>
+            <span class="s1">name=rule.name</span><span class="s2">, </span><span class="s1">conditionSets=[]</span><span class="s2">, </span><span class="s1">subs=rule.subs</span>
+        <span class="s1">)</span>
+        <span class="s2">for </span><span class="s1">conditionset </span><span class="s2">in </span><span class="s1">rule.conditionSets:</span>
+            <span class="s1">cs = _conditionSetFrom(conditionset)</span>
+            <span class="s1">newConditionset: List[Dict[str</span><span class="s2">, </span><span class="s1">Any]] = []</span>
+            <span class="s1">discardConditionset = </span><span class="s2">False</span>
+            <span class="s2">for </span><span class="s1">selectionName</span><span class="s2">, </span><span class="s1">selectionValue </span><span class="s2">in </span><span class="s1">designRegion.items():</span>
+                <span class="s4"># TODO: Ensure that all(key in conditionset for key in region.keys())?</span>
+                <span class="s2">if </span><span class="s1">selectionName </span><span class="s2">not in </span><span class="s1">cs:</span>
+                    <span class="s4"># raise Exception(&quot;Selection has different axes than the rules&quot;)</span>
+                    <span class="s2">continue</span>
+                <span class="s2">if </span><span class="s1">isinstance(selectionValue</span><span class="s2">, </span><span class="s1">(float</span><span class="s2">, </span><span class="s1">int)):  </span><span class="s4"># is point</span>
+                    <span class="s4"># Case C-AP-in</span>
+                    <span class="s2">if </span><span class="s1">selectionValue </span><span class="s2">in </span><span class="s1">cs[selectionName]:</span>
+                        <span class="s2">pass  </span><span class="s4"># always matches, conditionset can stay empty for this one.</span>
+                    <span class="s4"># Case C-AP-out</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s1">discardConditionset = </span><span class="s2">True</span>
+                <span class="s2">else</span><span class="s1">:  </span><span class="s4"># is range</span>
+                    <span class="s4"># Case C-AR-all</span>
+                    <span class="s2">if </span><span class="s1">selectionValue </span><span class="s2">in </span><span class="s1">cs[selectionName]:</span>
+                        <span class="s2">pass  </span><span class="s4"># always matches, conditionset can stay empty for this one.</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s1">intersection = cs[selectionName].intersection(selectionValue)</span>
+                        <span class="s4"># Case C-AR-inter</span>
+                        <span class="s2">if </span><span class="s1">intersection </span><span class="s2">is not None</span><span class="s1">:</span>
+                            <span class="s1">newConditionset.append(</span>
+                                <span class="s1">{</span>
+                                    <span class="s3">&quot;name&quot;</span><span class="s1">: selectionName</span><span class="s2">,</span>
+                                    <span class="s3">&quot;minimum&quot;</span><span class="s1">: intersection.minimum</span><span class="s2">,</span>
+                                    <span class="s3">&quot;maximum&quot;</span><span class="s1">: intersection.maximum</span><span class="s2">,</span>
+                                <span class="s1">}</span>
+                            <span class="s1">)</span>
+                        <span class="s4"># Case C-AR-none</span>
+                        <span class="s2">else</span><span class="s1">:</span>
+                            <span class="s1">discardConditionset = </span><span class="s2">True</span>
+            <span class="s2">if not </span><span class="s1">discardConditionset:</span>
+                <span class="s1">newRule.conditionSets.append(newConditionset)</span>
+        <span class="s2">if </span><span class="s1">newRule.conditionSets:</span>
+            <span class="s1">newRules.append(newRule)</span>
+
+    <span class="s2">return </span><span class="s1">newRules</span>
+
+
+<span class="s2">def </span><span class="s1">_filterLocation(</span>
+    <span class="s1">userRegion: Region</span><span class="s2">,</span>
+    <span class="s1">location: Dict[str</span><span class="s2">, </span><span class="s1">float]</span><span class="s2">,</span>
+<span class="s1">) -&gt; Dict[str</span><span class="s2">, </span><span class="s1">float]:</span>
+    <span class="s2">return </span><span class="s1">{</span>
+        <span class="s1">name: value</span>
+        <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">location.items()</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">userRegion </span><span class="s2">and </span><span class="s1">isinstance(userRegion[name]</span><span class="s2">, </span><span class="s1">Range)</span>
+    <span class="s1">}</span>
+</pre>
+</body>
+</html>

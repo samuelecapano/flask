@@ -1,0 +1,1596 @@
+<html>
+<head>
+<title>_triinterpolate.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_triinterpolate.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Interpolation inside triangular grids. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span>
+<span class="s2">from </span><span class="s1">matplotlib.tri </span><span class="s2">import </span><span class="s1">Triangulation</span>
+<span class="s2">from </span><span class="s1">matplotlib.tri._trifinder </span><span class="s2">import </span><span class="s1">TriFinder</span>
+<span class="s2">from </span><span class="s1">matplotlib.tri._tritools </span><span class="s2">import </span><span class="s1">TriAnalyzer</span>
+
+<span class="s1">__all__ = (</span><span class="s3">'TriInterpolator'</span><span class="s2">, </span><span class="s3">'LinearTriInterpolator'</span><span class="s2">, </span><span class="s3">'CubicTriInterpolator'</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TriInterpolator:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Abstract base class for classes used to interpolate on a triangular grid. 
+ 
+    Derived classes implement the following methods: 
+ 
+    - ``__call__(x, y)``, 
+      where x, y are array-like point coordinates of the same shape, and 
+      that returns a masked array of the same shape containing the 
+      interpolated z-values. 
+ 
+    - ``gradient(x, y)``, 
+      where x, y are array-like point coordinates of the same 
+      shape, and that returns a list of 2 masked arrays of the same shape 
+      containing the 2 derivatives of the interpolator (derivatives of 
+      interpolated z values with respect to x and y). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">triangulation</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">trifinder=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">_api.check_isinstance(Triangulation</span><span class="s2">, </span><span class="s1">triangulation=triangulation)</span>
+        <span class="s1">self._triangulation = triangulation</span>
+
+        <span class="s1">self._z = np.asarray(z)</span>
+        <span class="s2">if </span><span class="s1">self._z.shape != self._triangulation.x.shape:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;z array must have same length as triangulation x&quot;</span>
+                             <span class="s3">&quot; and y arrays&quot;</span><span class="s1">)</span>
+
+        <span class="s1">_api.check_isinstance((TriFinder</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">, </span><span class="s1">trifinder=trifinder)</span>
+        <span class="s1">self._trifinder = trifinder </span><span class="s2">or </span><span class="s1">self._triangulation.get_trifinder()</span>
+
+        <span class="s4"># Default scaling factors : 1.0 (= no scaling)</span>
+        <span class="s4"># Scaling may be used for interpolations for which the order of</span>
+        <span class="s4"># magnitude of x, y has an impact on the interpolant definition.</span>
+        <span class="s4"># Please refer to :meth:`_interpolate_multikeys` for details.</span>
+        <span class="s1">self._unit_x = </span><span class="s5">1.0</span>
+        <span class="s1">self._unit_y = </span><span class="s5">1.0</span>
+
+        <span class="s4"># Default triangle renumbering: None (= no renumbering)</span>
+        <span class="s4"># Renumbering may be used to avoid unnecessary computations</span>
+        <span class="s4"># if complex calculations are done inside the Interpolator.</span>
+        <span class="s4"># Please refer to :meth:`_interpolate_multikeys` for details.</span>
+        <span class="s1">self._tri_renum = </span><span class="s2">None</span>
+
+    <span class="s4"># __call__ and gradient docstrings are shared by all subclasses</span>
+    <span class="s4"># (except, if needed, relevant additions).</span>
+    <span class="s4"># However these methods are only implemented in subclasses to avoid</span>
+    <span class="s4"># confusion in the documentation.</span>
+    <span class="s1">_docstring__call__ = </span><span class="s3">&quot;&quot;&quot; 
+        Returns a masked array containing interpolated values at the specified 
+        (x, y) points. 
+ 
+        Parameters 
+        ---------- 
+        x, y : array-like 
+            x and y coordinates of the same shape and any number of 
+            dimensions. 
+ 
+        Returns 
+        ------- 
+        np.ma.array 
+            Masked array of the same shape as *x* and *y*; values corresponding 
+            to (*x*, *y*) points outside of the triangulation are masked out. 
+ 
+        &quot;&quot;&quot;</span>
+
+    <span class="s1">_docstringgradient = </span><span class="s3">r&quot;&quot;&quot; 
+        Returns a list of 2 masked arrays containing interpolated derivatives 
+        at the specified (x, y) points. 
+ 
+        Parameters 
+        ---------- 
+        x, y : array-like 
+            x and y coordinates of the same shape and any number of 
+            dimensions. 
+ 
+        Returns 
+        ------- 
+        dzdx, dzdy : np.ma.array 
+            2 masked arrays of the same shape as *x* and *y*; values 
+            corresponding to (x, y) points outside of the triangulation 
+            are masked out. 
+            The first returned array contains the values of 
+            :math:`\frac{\partial z}{\partial x}` and the second those of 
+            :math:`\frac{\partial z}{\partial y}`. 
+ 
+        &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_interpolate_multikeys(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tri_index=</span><span class="s2">None,</span>
+                               <span class="s1">return_keys=(</span><span class="s3">'z'</span><span class="s2">,</span><span class="s1">)):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Versatile (private) method defined for all TriInterpolators. 
+ 
+        :meth:`_interpolate_multikeys` is a wrapper around method 
+        :meth:`_interpolate_single_key` (to be defined in the child 
+        subclasses). 
+        :meth:`_interpolate_single_key actually performs the interpolation, 
+        but only for 1-dimensional inputs and at valid locations (inside 
+        unmasked triangles of the triangulation). 
+ 
+        The purpose of :meth:`_interpolate_multikeys` is to implement the 
+        following common tasks needed in all subclasses implementations: 
+ 
+        - calculation of containing triangles 
+        - dealing with more than one interpolation request at the same 
+          location (e.g., if the 2 derivatives are requested, it is 
+          unnecessary to compute the containing triangles twice) 
+        - scaling according to self._unit_x, self._unit_y 
+        - dealing with points outside of the grid (with fill value np.nan) 
+        - dealing with multi-dimensional *x*, *y* arrays: flattening for 
+          :meth:`_interpolate_params` call and final reshaping. 
+ 
+        (Note that np.vectorize could do most of those things very well for 
+        you, but it does it by function evaluations over successive tuples of 
+        the input arrays. Therefore, this tends to be more time-consuming than 
+        using optimized numpy functions - e.g., np.dot - which can be used 
+        easily on the flattened inputs, in the child-subclass methods 
+        :meth:`_interpolate_single_key`.) 
+ 
+        It is guaranteed that the calls to :meth:`_interpolate_single_key` 
+        will be done with flattened (1-d) array-like input parameters *x*, *y* 
+        and with flattened, valid `tri_index` arrays (no -1 index allowed). 
+ 
+        Parameters 
+        ---------- 
+        x, y : array-like 
+            x and y coordinates where interpolated values are requested. 
+        tri_index : array-like of int, optional 
+            Array of the containing triangle indices, same shape as 
+            *x* and *y*. Defaults to None. If None, these indices 
+            will be computed by a TriFinder instance. 
+            (Note: For point outside the grid, tri_index[ipt] shall be -1). 
+        return_keys : tuple of keys from {'z', 'dzdx', 'dzdy'} 
+            Defines the interpolation arrays to return, and in which order. 
+ 
+        Returns 
+        ------- 
+        list of arrays 
+            Each array-like contains the expected interpolated values in the 
+            order defined by *return_keys* parameter. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Flattening and rescaling inputs arrays x, y</span>
+        <span class="s4"># (initial shape is stored for output)</span>
+        <span class="s1">x = np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">y = np.asarray(y</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">sh_ret = x.shape</span>
+        <span class="s2">if </span><span class="s1">x.shape != y.shape:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;x and y shall have same shapes.&quot;</span>
+                             <span class="s3">&quot; Given: {0} and {1}&quot;</span><span class="s1">.format(x.shape</span><span class="s2">, </span><span class="s1">y.shape))</span>
+        <span class="s1">x = np.ravel(x)</span>
+        <span class="s1">y = np.ravel(y)</span>
+        <span class="s1">x_scaled = x/self._unit_x</span>
+        <span class="s1">y_scaled = y/self._unit_y</span>
+        <span class="s1">size_ret = np.size(x_scaled)</span>
+
+        <span class="s4"># Computes &amp; ravels the element indexes, extract the valid ones.</span>
+        <span class="s2">if </span><span class="s1">tri_index </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">tri_index = self._trifinder(x</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">tri_index.shape != sh_ret:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;tri_index array is provided and shall&quot;</span>
+                    <span class="s3">&quot; have same shape as x and y. Given: &quot;</span>
+                    <span class="s3">&quot;{0} and {1}&quot;</span><span class="s1">.format(tri_index.shape</span><span class="s2">, </span><span class="s1">sh_ret))</span>
+            <span class="s1">tri_index = np.ravel(tri_index)</span>
+
+        <span class="s1">mask_in = (tri_index != -</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self._tri_renum </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">valid_tri_index = tri_index[mask_in]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">valid_tri_index = self._tri_renum[tri_index[mask_in]]</span>
+        <span class="s1">valid_x = x_scaled[mask_in]</span>
+        <span class="s1">valid_y = y_scaled[mask_in]</span>
+
+        <span class="s1">ret = []</span>
+        <span class="s2">for </span><span class="s1">return_key </span><span class="s2">in </span><span class="s1">return_keys:</span>
+            <span class="s4"># Find the return index associated with the key.</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">return_index = {</span><span class="s3">'z'</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s3">'dzdx'</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s3">'dzdy'</span><span class="s1">: </span><span class="s5">2</span><span class="s1">}[return_key]</span>
+            <span class="s2">except </span><span class="s1">KeyError </span><span class="s2">as </span><span class="s1">err:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;return_keys items shall take values in&quot;</span>
+                                 <span class="s3">&quot; {'z', 'dzdx', 'dzdy'}&quot;</span><span class="s1">) </span><span class="s2">from </span><span class="s1">err</span>
+
+            <span class="s4"># Sets the scale factor for f &amp; df components</span>
+            <span class="s1">scale = [</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">1.</span><span class="s1">/self._unit_x</span><span class="s2">, </span><span class="s5">1.</span><span class="s1">/self._unit_y][return_index]</span>
+
+            <span class="s4"># Computes the interpolation</span>
+            <span class="s1">ret_loc = np.empty(size_ret</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+            <span class="s1">ret_loc[~mask_in] = np.nan</span>
+            <span class="s1">ret_loc[mask_in] = self._interpolate_single_key(</span>
+                <span class="s1">return_key</span><span class="s2">, </span><span class="s1">valid_tri_index</span><span class="s2">, </span><span class="s1">valid_x</span><span class="s2">, </span><span class="s1">valid_y) * scale</span>
+            <span class="s1">ret += [np.ma.masked_invalid(ret_loc.reshape(sh_ret)</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)]</span>
+
+        <span class="s2">return </span><span class="s1">ret</span>
+
+    <span class="s2">def </span><span class="s1">_interpolate_single_key(self</span><span class="s2">, </span><span class="s1">return_key</span><span class="s2">, </span><span class="s1">tri_index</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Interpolate at points belonging to the triangulation 
+        (inside an unmasked triangles). 
+ 
+        Parameters 
+        ---------- 
+        return_key : {'z', 'dzdx', 'dzdy'} 
+            The requested values (z or its derivatives). 
+        tri_index : 1D int array 
+            Valid triangle index (cannot be -1). 
+        x, y : 1D arrays, same shape as `tri_index` 
+            Valid locations where interpolation is requested. 
+ 
+        Returns 
+        ------- 
+        1-d array 
+            Returned array of the same size as *tri_index* 
+        &quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s3">&quot;TriInterpolator subclasses&quot; </span><span class="s1">+</span>
+                                  <span class="s3">&quot;should implement _interpolate_single_key!&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">LinearTriInterpolator(TriInterpolator):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Linear interpolator on a triangular grid. 
+ 
+    Each triangle is represented by a plane so that an interpolated value at 
+    point (x, y) lies on the plane of the triangle containing (x, y). 
+    Interpolated values are therefore continuous across the triangulation, but 
+    their first derivatives are discontinuous at edges between triangles. 
+ 
+    Parameters 
+    ---------- 
+    triangulation : `~matplotlib.tri.Triangulation` 
+        The triangulation to interpolate over. 
+    z : (npoints,) array-like 
+        Array of values, defined at grid points, to interpolate between. 
+    trifinder : `~matplotlib.tri.TriFinder`, optional 
+        If this is not specified, the Triangulation's default TriFinder will 
+        be used by calling `.Triangulation.get_trifinder`. 
+ 
+    Methods 
+    ------- 
+    `__call__` (x, y) : Returns interpolated values at (x, y) points. 
+    `gradient` (x, y) : Returns interpolated derivatives at (x, y) points. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">triangulation</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">trifinder=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">super().__init__(triangulation</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">trifinder)</span>
+
+        <span class="s4"># Store plane coefficients for fast interpolation calculations.</span>
+        <span class="s1">self._plane_coefficients = \</span>
+            <span class="s1">self._triangulation.calculate_plane_coefficients(self._z)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s2">return </span><span class="s1">self._interpolate_multikeys(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tri_index=</span><span class="s2">None,</span>
+                                           <span class="s1">return_keys=(</span><span class="s3">'z'</span><span class="s2">,</span><span class="s1">))[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">__call__.__doc__ = TriInterpolator._docstring__call__</span>
+
+    <span class="s2">def </span><span class="s1">gradient(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s2">return </span><span class="s1">self._interpolate_multikeys(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tri_index=</span><span class="s2">None,</span>
+                                           <span class="s1">return_keys=(</span><span class="s3">'dzdx'</span><span class="s2">, </span><span class="s3">'dzdy'</span><span class="s1">))</span>
+    <span class="s1">gradient.__doc__ = TriInterpolator._docstringgradient</span>
+
+    <span class="s2">def </span><span class="s1">_interpolate_single_key(self</span><span class="s2">, </span><span class="s1">return_key</span><span class="s2">, </span><span class="s1">tri_index</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s1">_api.check_in_list([</span><span class="s3">'z'</span><span class="s2">, </span><span class="s3">'dzdx'</span><span class="s2">, </span><span class="s3">'dzdy'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">return_key=return_key)</span>
+        <span class="s2">if </span><span class="s1">return_key == </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(self._plane_coefficients[tri_index</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*x +</span>
+                    <span class="s1">self._plane_coefficients[tri_index</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*y +</span>
+                    <span class="s1">self._plane_coefficients[tri_index</span><span class="s2">, </span><span class="s5">2</span><span class="s1">])</span>
+        <span class="s2">elif </span><span class="s1">return_key == </span><span class="s3">'dzdx'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._plane_coefficients[tri_index</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s4"># 'dzdy'</span>
+            <span class="s2">return </span><span class="s1">self._plane_coefficients[tri_index</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+
+
+<span class="s2">class </span><span class="s1">CubicTriInterpolator(TriInterpolator):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Cubic interpolator on a triangular grid. 
+ 
+    In one-dimension - on a segment - a cubic interpolating function is 
+    defined by the values of the function and its derivative at both ends. 
+    This is almost the same in 2D inside a triangle, except that the values 
+    of the function and its 2 derivatives have to be defined at each triangle 
+    node. 
+ 
+    The CubicTriInterpolator takes the value of the function at each node - 
+    provided by the user - and internally computes the value of the 
+    derivatives, resulting in a smooth interpolation. 
+    (As a special feature, the user can also impose the value of the 
+    derivatives at each node, but this is not supposed to be the common 
+    usage.) 
+ 
+    Parameters 
+    ---------- 
+    triangulation : `~matplotlib.tri.Triangulation` 
+        The triangulation to interpolate over. 
+    z : (npoints,) array-like 
+        Array of values, defined at grid points, to interpolate between. 
+    kind : {'min_E', 'geom', 'user'}, optional 
+        Choice of the smoothing algorithm, in order to compute 
+        the interpolant derivatives (defaults to 'min_E'): 
+ 
+        - if 'min_E': (default) The derivatives at each node is computed 
+          to minimize a bending energy. 
+        - if 'geom': The derivatives at each node is computed as a 
+          weighted average of relevant triangle normals. To be used for 
+          speed optimization (large grids). 
+        - if 'user': The user provides the argument *dz*, no computation 
+          is hence needed. 
+ 
+    trifinder : `~matplotlib.tri.TriFinder`, optional 
+        If not specified, the Triangulation's default TriFinder will 
+        be used by calling `.Triangulation.get_trifinder`. 
+    dz : tuple of array-likes (dzdx, dzdy), optional 
+        Used only if  *kind* ='user'. In this case *dz* must be provided as 
+        (dzdx, dzdy) where dzdx, dzdy are arrays of the same shape as *z* and 
+        are the interpolant first derivatives at the *triangulation* points. 
+ 
+    Methods 
+    ------- 
+    `__call__` (x, y) : Returns interpolated values at (x, y) points. 
+    `gradient` (x, y) : Returns interpolated derivatives at (x, y) points. 
+ 
+    Notes 
+    ----- 
+    This note is a bit technical and details how the cubic interpolation is 
+    computed. 
+ 
+    The interpolation is based on a Clough-Tocher subdivision scheme of 
+    the *triangulation* mesh (to make it clearer, each triangle of the 
+    grid will be divided in 3 child-triangles, and on each child triangle 
+    the interpolated function is a cubic polynomial of the 2 coordinates). 
+    This technique originates from FEM (Finite Element Method) analysis; 
+    the element used is a reduced Hsieh-Clough-Tocher (HCT) 
+    element. Its shape functions are described in [1]_. 
+    The assembled function is guaranteed to be C1-smooth, i.e. it is 
+    continuous and its first derivatives are also continuous (this 
+    is easy to show inside the triangles but is also true when crossing the 
+    edges). 
+ 
+    In the default case (*kind* ='min_E'), the interpolant minimizes a 
+    curvature energy on the functional space generated by the HCT element 
+    shape functions - with imposed values but arbitrary derivatives at each 
+    node. The minimized functional is the integral of the so-called total 
+    curvature (implementation based on an algorithm from [2]_ - PCG sparse 
+    solver): 
+ 
+        .. math:: 
+ 
+            E(z) = \frac{1}{2} \int_{\Omega} \left( 
+                \left( \frac{\partial^2{z}}{\partial{x}^2} \right)^2 + 
+                \left( \frac{\partial^2{z}}{\partial{y}^2} \right)^2 + 
+                2\left( \frac{\partial^2{z}}{\partial{y}\partial{x}} \right)^2 
+            \right) dx\,dy 
+ 
+    If the case *kind* ='geom' is chosen by the user, a simple geometric 
+    approximation is used (weighted average of the triangle normal 
+    vectors), which could improve speed on very large grids. 
+ 
+    References 
+    ---------- 
+    .. [1] Michel Bernadou, Kamal Hassan, &quot;Basis functions for general 
+        Hsieh-Clough-Tocher triangles, complete or reduced.&quot;, 
+        International Journal for Numerical Methods in Engineering, 
+        17(5):784 - 789. 2.01. 
+    .. [2] C.T. Kelley, &quot;Iterative Methods for Optimization&quot;. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">triangulation</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">kind=</span><span class="s3">'min_E'</span><span class="s2">, </span><span class="s1">trifinder=</span><span class="s2">None,</span>
+                 <span class="s1">dz=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">super().__init__(triangulation</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">trifinder)</span>
+
+        <span class="s4"># Loads the underlying c++ _triangulation.</span>
+        <span class="s4"># (During loading, reordering of triangulation._triangles may occur so</span>
+        <span class="s4"># that all final triangles are now anti-clockwise)</span>
+        <span class="s1">self._triangulation.get_cpp_triangulation()</span>
+
+        <span class="s4"># To build the stiffness matrix and avoid zero-energy spurious modes</span>
+        <span class="s4"># we will only store internally the valid (unmasked) triangles and</span>
+        <span class="s4"># the necessary (used) points coordinates.</span>
+        <span class="s4"># 2 renumbering tables need to be computed and stored:</span>
+        <span class="s4">#  - a triangle renum table in order to translate the result from a</span>
+        <span class="s4">#    TriFinder instance into the internal stored triangle number.</span>
+        <span class="s4">#  - a node renum table to overwrite the self._z values into the new</span>
+        <span class="s4">#    (used) node numbering.</span>
+        <span class="s1">tri_analyzer = TriAnalyzer(self._triangulation)</span>
+        <span class="s1">(compressed_triangles</span><span class="s2">, </span><span class="s1">compressed_x</span><span class="s2">, </span><span class="s1">compressed_y</span><span class="s2">, </span><span class="s1">tri_renum</span><span class="s2">,</span>
+         <span class="s1">node_renum) = tri_analyzer._get_compressed_triangulation()</span>
+        <span class="s1">self._triangles = compressed_triangles</span>
+        <span class="s1">self._tri_renum = tri_renum</span>
+        <span class="s4"># Taking into account the node renumbering in self._z:</span>
+        <span class="s1">valid_node = (node_renum != -</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">self._z[node_renum[valid_node]] = self._z[valid_node]</span>
+
+        <span class="s4"># Computing scale factors</span>
+        <span class="s1">self._unit_x = np.ptp(compressed_x)</span>
+        <span class="s1">self._unit_y = np.ptp(compressed_y)</span>
+        <span class="s1">self._pts = np.column_stack([compressed_x / self._unit_x</span><span class="s2">,</span>
+                                     <span class="s1">compressed_y / self._unit_y])</span>
+        <span class="s4"># Computing triangle points</span>
+        <span class="s1">self._tris_pts = self._pts[self._triangles]</span>
+        <span class="s4"># Computing eccentricities</span>
+        <span class="s1">self._eccs = self._compute_tri_eccentricities(self._tris_pts)</span>
+        <span class="s4"># Computing dof estimations for HCT triangle shape function</span>
+        <span class="s1">_api.check_in_list([</span><span class="s3">'user'</span><span class="s2">, </span><span class="s3">'geom'</span><span class="s2">, </span><span class="s3">'min_E'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">kind=kind)</span>
+        <span class="s1">self._dof = self._compute_dof(kind</span><span class="s2">, </span><span class="s1">dz=dz)</span>
+        <span class="s4"># Loading HCT element</span>
+        <span class="s1">self._ReferenceElement = _ReducedHCT_Element()</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s2">return </span><span class="s1">self._interpolate_multikeys(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tri_index=</span><span class="s2">None,</span>
+                                           <span class="s1">return_keys=(</span><span class="s3">'z'</span><span class="s2">,</span><span class="s1">))[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">__call__.__doc__ = TriInterpolator._docstring__call__</span>
+
+    <span class="s2">def </span><span class="s1">gradient(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s2">return </span><span class="s1">self._interpolate_multikeys(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tri_index=</span><span class="s2">None,</span>
+                                           <span class="s1">return_keys=(</span><span class="s3">'dzdx'</span><span class="s2">, </span><span class="s3">'dzdy'</span><span class="s1">))</span>
+    <span class="s1">gradient.__doc__ = TriInterpolator._docstringgradient</span>
+
+    <span class="s2">def </span><span class="s1">_interpolate_single_key(self</span><span class="s2">, </span><span class="s1">return_key</span><span class="s2">, </span><span class="s1">tri_index</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y):</span>
+        <span class="s1">_api.check_in_list([</span><span class="s3">'z'</span><span class="s2">, </span><span class="s3">'dzdx'</span><span class="s2">, </span><span class="s3">'dzdy'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">return_key=return_key)</span>
+        <span class="s1">tris_pts = self._tris_pts[tri_index]</span>
+        <span class="s1">alpha = self._get_alpha_vec(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tris_pts)</span>
+        <span class="s1">ecc = self._eccs[tri_index]</span>
+        <span class="s1">dof = np.expand_dims(self._dof[tri_index]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">return_key == </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._ReferenceElement.get_function_values(</span>
+                <span class="s1">alpha</span><span class="s2">, </span><span class="s1">ecc</span><span class="s2">, </span><span class="s1">dof)</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s4"># 'dzdx', 'dzdy'</span>
+            <span class="s1">J = self._get_jacobian(tris_pts)</span>
+            <span class="s1">dzdx = self._ReferenceElement.get_function_derivatives(</span>
+                <span class="s1">alpha</span><span class="s2">, </span><span class="s1">J</span><span class="s2">, </span><span class="s1">ecc</span><span class="s2">, </span><span class="s1">dof)</span>
+            <span class="s2">if </span><span class="s1">return_key == </span><span class="s3">'dzdx'</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">dzdx[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">dzdx[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">_compute_dof(self</span><span class="s2">, </span><span class="s1">kind</span><span class="s2">, </span><span class="s1">dz=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute and return nodal dofs according to kind. 
+ 
+        Parameters 
+        ---------- 
+        kind : {'min_E', 'geom', 'user'} 
+            Choice of the _DOF_estimator subclass to estimate the gradient. 
+        dz : tuple of array-likes (dzdx, dzdy), optional 
+            Used only if *kind*=user; in this case passed to the 
+            :class:`_DOF_estimator_user`. 
+ 
+        Returns 
+        ------- 
+        array-like, shape (npts, 2) 
+            Estimation of the gradient at triangulation nodes (stored as 
+            degree of freedoms of reduced-HCT triangle elements). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">kind == </span><span class="s3">'user'</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">dz </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;For a CubicTriInterpolator with &quot;</span>
+                                 <span class="s3">&quot;*kind*='user', a valid *dz* &quot;</span>
+                                 <span class="s3">&quot;argument is expected.&quot;</span><span class="s1">)</span>
+            <span class="s1">TE = _DOF_estimator_user(self</span><span class="s2">, </span><span class="s1">dz=dz)</span>
+        <span class="s2">elif </span><span class="s1">kind == </span><span class="s3">'geom'</span><span class="s1">:</span>
+            <span class="s1">TE = _DOF_estimator_geom(self)</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s4"># 'min_E', checked in __init__</span>
+            <span class="s1">TE = _DOF_estimator_min_E(self)</span>
+        <span class="s2">return </span><span class="s1">TE.compute_dof_from_df()</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_get_alpha_vec(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">tris_pts):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Fast (vectorized) function to compute barycentric coordinates alpha. 
+ 
+        Parameters 
+        ---------- 
+        x, y : array-like of dim 1 (shape (nx,)) 
+            Coordinates of the points whose points barycentric coordinates are 
+            requested. 
+        tris_pts : array like of dim 3 (shape: (nx, 3, 2)) 
+            Coordinates of the containing triangles apexes. 
+ 
+        Returns 
+        ------- 
+        array of dim 2 (shape (nx, 3)) 
+            Barycentric coordinates of the points inside the containing 
+            triangles. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ndim = tris_pts.ndim-</span><span class="s5">2</span>
+
+        <span class="s1">a = tris_pts[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">b = tris_pts[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">abT = np.stack([a</span><span class="s2">, </span><span class="s1">b]</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">ab = _transpose_vectorized(abT)</span>
+        <span class="s1">OM = np.stack([x</span><span class="s2">, </span><span class="s1">y]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">) - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span>
+
+        <span class="s1">metric = ab @ abT</span>
+        <span class="s4"># Here we try to deal with the colinear cases.</span>
+        <span class="s4"># metric_inv is in this case set to the Moore-Penrose pseudo-inverse</span>
+        <span class="s4"># meaning that we will still return a set of valid barycentric</span>
+        <span class="s4"># coordinates.</span>
+        <span class="s1">metric_inv = _pseudo_inv22sym_vectorized(metric)</span>
+        <span class="s1">Covar = ab @ _transpose_vectorized(np.expand_dims(OM</span><span class="s2">, </span><span class="s1">ndim))</span>
+        <span class="s1">ksi = metric_inv @ Covar</span>
+        <span class="s1">alpha = _to_matrix_vectorized([</span>
+            <span class="s1">[</span><span class="s5">1</span><span class="s1">-ksi[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]-ksi[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">[ksi[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">[ksi[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]]])</span>
+        <span class="s2">return </span><span class="s1">alpha</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_get_jacobian(tris_pts):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Fast (vectorized) function to compute triangle jacobian matrix. 
+ 
+        Parameters 
+        ---------- 
+        tris_pts : array like of dim 3 (shape: (nx, 3, 2)) 
+            Coordinates of the containing triangles apexes. 
+ 
+        Returns 
+        ------- 
+        array of dim 3 (shape (nx, 2, 2)) 
+            Barycentric coordinates of the points inside the containing 
+            triangles. 
+            J[itri, :, :] is the jacobian matrix at apex 0 of the triangle 
+            itri, so that the following (matrix) relationship holds: 
+               [dz/dksi] = [J] x [dz/dx] 
+            with x: global coordinates 
+                 ksi: element parametric coordinates in triangle first apex 
+                 local basis. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">a = np.array(tris_pts[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:])</span>
+        <span class="s1">b = np.array(tris_pts[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:])</span>
+        <span class="s1">J = _to_matrix_vectorized([[a[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">a[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]]</span><span class="s2">,</span>
+                                   <span class="s1">[b[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">b[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]]])</span>
+        <span class="s2">return </span><span class="s1">J</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_compute_tri_eccentricities(tris_pts):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute triangle eccentricities. 
+ 
+        Parameters 
+        ---------- 
+        tris_pts : array like of dim 3 (shape: (nx, 3, 2)) 
+            Coordinates of the triangles apexes. 
+ 
+        Returns 
+        ------- 
+        array like of dim 2 (shape: (nx, 3)) 
+            The so-called eccentricity parameters [1] needed for HCT triangular 
+            element. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">a = np.expand_dims(tris_pts[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">b = np.expand_dims(tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">c = np.expand_dims(tris_pts[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s4"># Do not use np.squeeze, this is dangerous if only one triangle</span>
+        <span class="s4"># in the triangulation...</span>
+        <span class="s1">dot_a = (_transpose_vectorized(a) @ a)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">dot_b = (_transpose_vectorized(b) @ b)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">dot_c = (_transpose_vectorized(c) @ c)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s4"># Note that this line will raise a warning for dot_a, dot_b or dot_c</span>
+        <span class="s4"># zeros, but we choose not to support triangles with duplicate points.</span>
+        <span class="s2">return </span><span class="s1">_to_matrix_vectorized([[(dot_c-dot_b) / dot_a]</span><span class="s2">,</span>
+                                      <span class="s1">[(dot_a-dot_c) / dot_b]</span><span class="s2">,</span>
+                                      <span class="s1">[(dot_b-dot_a) / dot_c]])</span>
+
+
+<span class="s4"># FEM element used for interpolation and for solving minimisation</span>
+<span class="s4"># problem (Reduced HCT element)</span>
+<span class="s2">class </span><span class="s1">_ReducedHCT_Element:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implementation of reduced HCT triangular element with explicit shape 
+    functions. 
+ 
+    Computes z, dz, d2z and the element stiffness matrix for bending energy: 
+    E(f) = integral( (d2z/dx2 + d2z/dy2)**2 dA) 
+ 
+    *** Reference for the shape functions: *** 
+    [1] Basis functions for general Hsieh-Clough-Tocher _triangles, complete or 
+        reduced. 
+        Michel Bernadou, Kamal Hassan 
+        International Journal for Numerical Methods in Engineering. 
+        17(5):784 - 789.  2.01 
+ 
+    *** Element description: *** 
+    9 dofs: z and dz given at 3 apex 
+    C1 (conform) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># 1) Loads matrices to generate shape functions as a function of</span>
+    <span class="s4">#    triangle eccentricities - based on [1] p.11 '''</span>
+    <span class="s1">M = np.array([</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">4.50</span><span class="s2">,  </span><span class="s5">4.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.50</span><span class="s2">,  </span><span class="s5">1.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">1.25</span><span class="s2">,  </span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">3.00</span><span class="s2">, </span><span class="s5">3.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">3.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.25</span><span class="s2">,  </span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.50</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.50</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">1.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">1.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">3.00</span><span class="s2">, </span><span class="s5">3.00</span><span class="s2">, </span><span class="s5">3.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">1.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.25</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.50</span><span class="s1">]])</span>
+    <span class="s1">M0 = np.array([</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">1.50</span><span class="s2">,  </span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">3.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.75</span><span class="s2">,  </span><span class="s5">0.75</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">1.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">3.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.75</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.75</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">1.50</span><span class="s1">]])</span>
+    <span class="s1">M1 = np.array([</span>
+        <span class="s1">[-</span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.75</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.75</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]])</span>
+    <span class="s1">M2 = np.array([</span>
+        <span class="s1">[ </span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.75</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">0.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">1.50</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[-</span><span class="s5">0.25</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.75</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s1">[ </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">,  </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s2">, </span><span class="s5">0.00</span><span class="s1">]])</span>
+
+    <span class="s4"># 2) Loads matrices to rotate components of gradient &amp; Hessian</span>
+    <span class="s4">#    vectors in the reference basis of triangle first apex (a0)</span>
+    <span class="s1">rotate_dV = np.array([[ </span><span class="s5">1.</span><span class="s2">,  </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[ </span><span class="s5">0.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">0.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[-</span><span class="s5">1.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[-</span><span class="s5">1.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[ </span><span class="s5">1.</span><span class="s2">,  </span><span class="s5">0.</span><span class="s1">]])</span>
+
+    <span class="s1">rotate_d2V = np.array([[</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0.</span><span class="s2">, </span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[ </span><span class="s5">0.</span><span class="s2">,  </span><span class="s5">0.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">,</span>
+                           <span class="s1">[</span><span class="s5">0.</span><span class="s2">, </span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">1.</span><span class="s2">, </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[ </span><span class="s5">0.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">2.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.</span><span class="s1">]</span><span class="s2">,</span>
+                           <span class="s1">[</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">1.</span><span class="s2">, </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[-</span><span class="s5">2.</span><span class="s2">,  </span><span class="s5">0.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.</span><span class="s1">]])</span>
+
+    <span class="s4"># 3) Loads Gauss points &amp; weights on the 3 sub-_triangles for P2</span>
+    <span class="s4">#    exact integral - 3 points on each subtriangles.</span>
+    <span class="s4"># NOTE: as the 2nd derivative is discontinuous , we really need those 9</span>
+    <span class="s4"># points!</span>
+    <span class="s1">n_gauss = </span><span class="s5">9</span>
+    <span class="s1">gauss_pts = np.array([[</span><span class="s5">13.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">, </span><span class="s5">13.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">7.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">7.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">1.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">, </span><span class="s5">13.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">1.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">, </span><span class="s5">13.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">7.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">7.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">, </span><span class="s5">13.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[</span><span class="s5">13.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]</span><span class="s2">,</span>
+                          <span class="s1">[ </span><span class="s5">7.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">4.</span><span class="s1">/</span><span class="s5">18.</span><span class="s2">,  </span><span class="s5">7.</span><span class="s1">/</span><span class="s5">18.</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+    <span class="s1">gauss_w = np.ones([</span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float64) / </span><span class="s5">9.</span>
+
+    <span class="s4">#  4) Stiffness matrix for curvature energy</span>
+    <span class="s1">E = np.array([[</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0.</span><span class="s2">, </span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">2.</span><span class="s1">]])</span>
+
+    <span class="s4">#  5) Loads the matrix to compute DOF_rot from tri_J at apex 0</span>
+    <span class="s1">J0_to_J1 = np.array([[-</span><span class="s5">1.</span><span class="s2">,  </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[-</span><span class="s5">1.</span><span class="s2">,  </span><span class="s5">0.</span><span class="s1">]])</span>
+    <span class="s1">J0_to_J2 = np.array([[ </span><span class="s5">0.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[ </span><span class="s5">1.</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1.</span><span class="s1">]])</span>
+
+    <span class="s2">def </span><span class="s1">get_function_values(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">ecc</span><span class="s2">, </span><span class="s1">dofs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        alpha : is a (N x 3 x 1) array (array of column-matrices) of 
+        barycentric coordinates, 
+        ecc : is a (N x 3 x 1) array (array of column-matrices) of triangle 
+        eccentricities, 
+        dofs : is a (N x 1 x 9) arrays (arrays of row-matrices) of computed 
+        degrees of freedom. 
+ 
+        Returns 
+        ------- 
+        Returns the N-array of interpolated function values. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">subtri = np.argmin(alpha</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">ksi = _roll_vectorized(alpha</span><span class="s2">, </span><span class="s1">-subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">E = _roll_vectorized(ecc</span><span class="s2">, </span><span class="s1">-subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">x = ksi[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">y = ksi[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">z = ksi[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">x_sq = x*x</span>
+        <span class="s1">y_sq = y*y</span>
+        <span class="s1">z_sq = z*z</span>
+        <span class="s1">V = _to_matrix_vectorized([</span>
+            <span class="s1">[x_sq*x]</span><span class="s2">, </span><span class="s1">[y_sq*y]</span><span class="s2">, </span><span class="s1">[z_sq*z]</span><span class="s2">, </span><span class="s1">[x_sq*z]</span><span class="s2">, </span><span class="s1">[x_sq*y]</span><span class="s2">, </span><span class="s1">[y_sq*x]</span><span class="s2">,</span>
+            <span class="s1">[y_sq*z]</span><span class="s2">, </span><span class="s1">[z_sq*y]</span><span class="s2">, </span><span class="s1">[z_sq*x]</span><span class="s2">, </span><span class="s1">[x*y*z]])</span>
+        <span class="s1">prod = self.M @ V</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M0 @ V)</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M1 @ V)</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M2 @ V)</span>
+        <span class="s1">s = _roll_vectorized(prod</span><span class="s2">, </span><span class="s5">3</span><span class="s1">*subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">(dofs @ s)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_function_derivatives(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">J</span><span class="s2">, </span><span class="s1">ecc</span><span class="s2">, </span><span class="s1">dofs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        *alpha* is a (N x 3 x 1) array (array of column-matrices of 
+        barycentric coordinates) 
+        *J* is a (N x 2 x 2) array of jacobian matrices (jacobian matrix at 
+        triangle first apex) 
+        *ecc* is a (N x 3 x 1) array (array of column-matrices of triangle 
+        eccentricities) 
+        *dofs* is a (N x 1 x 9) arrays (arrays of row-matrices) of computed 
+        degrees of freedom. 
+ 
+        Returns 
+        ------- 
+        Returns the values of interpolated function derivatives [dz/dx, dz/dy] 
+        in global coordinates at locations alpha, as a column-matrices of 
+        shape (N x 2 x 1). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">subtri = np.argmin(alpha</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">ksi = _roll_vectorized(alpha</span><span class="s2">, </span><span class="s1">-subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">E = _roll_vectorized(ecc</span><span class="s2">, </span><span class="s1">-subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">x = ksi[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">y = ksi[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">z = ksi[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">x_sq = x*x</span>
+        <span class="s1">y_sq = y*y</span>
+        <span class="s1">z_sq = z*z</span>
+        <span class="s1">dV = _to_matrix_vectorized([</span>
+            <span class="s1">[    -</span><span class="s5">3.</span><span class="s1">*x_sq</span><span class="s2">,     </span><span class="s1">-</span><span class="s5">3.</span><span class="s1">*x_sq]</span><span class="s2">,</span>
+            <span class="s1">[     </span><span class="s5">3.</span><span class="s1">*y_sq</span><span class="s2">,           </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[          </span><span class="s5">0.</span><span class="s2">,      </span><span class="s5">3.</span><span class="s1">*z_sq]</span><span class="s2">,</span>
+            <span class="s1">[     -</span><span class="s5">2.</span><span class="s1">*x*z</span><span class="s2">, </span><span class="s1">-</span><span class="s5">2.</span><span class="s1">*x*z+x_sq]</span><span class="s2">,</span>
+            <span class="s1">[-</span><span class="s5">2.</span><span class="s1">*x*y+x_sq</span><span class="s2">,      </span><span class="s1">-</span><span class="s5">2.</span><span class="s1">*x*y]</span><span class="s2">,</span>
+            <span class="s1">[ </span><span class="s5">2.</span><span class="s1">*x*y-y_sq</span><span class="s2">,        </span><span class="s1">-y_sq]</span><span class="s2">,</span>
+            <span class="s1">[      </span><span class="s5">2.</span><span class="s1">*y*z</span><span class="s2">,         </span><span class="s1">y_sq]</span><span class="s2">,</span>
+            <span class="s1">[        z_sq</span><span class="s2">,       </span><span class="s5">2.</span><span class="s1">*y*z]</span><span class="s2">,</span>
+            <span class="s1">[       -z_sq</span><span class="s2">,  </span><span class="s5">2.</span><span class="s1">*x*z-z_sq]</span><span class="s2">,</span>
+            <span class="s1">[     x*z-y*z</span><span class="s2">,      </span><span class="s1">x*y-y*z]])</span>
+        <span class="s4"># Puts back dV in first apex basis</span>
+        <span class="s1">dV = dV @ _extract_submatrices(</span>
+            <span class="s1">self.rotate_dV</span><span class="s2">, </span><span class="s1">subtri</span><span class="s2">, </span><span class="s1">block_size=</span><span class="s5">2</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s1">prod = self.M @ dV</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M0 @ dV)</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M1 @ dV)</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M2 @ dV)</span>
+        <span class="s1">dsdksi = _roll_vectorized(prod</span><span class="s2">, </span><span class="s5">3</span><span class="s1">*subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">dfdksi = dofs @ dsdksi</span>
+        <span class="s4"># In global coordinates:</span>
+        <span class="s4"># Here we try to deal with the simplest colinear cases, returning a</span>
+        <span class="s4"># null matrix.</span>
+        <span class="s1">J_inv = _safe_inv22_vectorized(J)</span>
+        <span class="s1">dfdx = J_inv @ _transpose_vectorized(dfdksi)</span>
+        <span class="s2">return </span><span class="s1">dfdx</span>
+
+    <span class="s2">def </span><span class="s1">get_function_hessians(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">J</span><span class="s2">, </span><span class="s1">ecc</span><span class="s2">, </span><span class="s1">dofs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        *alpha* is a (N x 3 x 1) array (array of column-matrices) of 
+        barycentric coordinates 
+        *J* is a (N x 2 x 2) array of jacobian matrices (jacobian matrix at 
+        triangle first apex) 
+        *ecc* is a (N x 3 x 1) array (array of column-matrices) of triangle 
+        eccentricities 
+        *dofs* is a (N x 1 x 9) arrays (arrays of row-matrices) of computed 
+        degrees of freedom. 
+ 
+        Returns 
+        ------- 
+        Returns the values of interpolated function 2nd-derivatives 
+        [d2z/dx2, d2z/dy2, d2z/dxdy] in global coordinates at locations alpha, 
+        as a column-matrices of shape (N x 3 x 1). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">d2sdksi2 = self.get_d2Sidksij2(alpha</span><span class="s2">, </span><span class="s1">ecc)</span>
+        <span class="s1">d2fdksi2 = dofs @ d2sdksi2</span>
+        <span class="s1">H_rot = self.get_Hrot_from_J(J)</span>
+        <span class="s1">d2fdx2 = d2fdksi2 @ H_rot</span>
+        <span class="s2">return </span><span class="s1">_transpose_vectorized(d2fdx2)</span>
+
+    <span class="s2">def </span><span class="s1">get_d2Sidksij2(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">ecc):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        *alpha* is a (N x 3 x 1) array (array of column-matrices) of 
+        barycentric coordinates 
+        *ecc* is a (N x 3 x 1) array (array of column-matrices) of triangle 
+        eccentricities 
+ 
+        Returns 
+        ------- 
+        Returns the arrays d2sdksi2 (N x 3 x 1) Hessian of shape functions 
+        expressed in covariant coordinates in first apex basis. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">subtri = np.argmin(alpha</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">)[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">ksi = _roll_vectorized(alpha</span><span class="s2">, </span><span class="s1">-subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">E = _roll_vectorized(ecc</span><span class="s2">, </span><span class="s1">-subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">x = ksi[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">y = ksi[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">z = ksi[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">d2V = _to_matrix_vectorized([</span>
+            <span class="s1">[     </span><span class="s5">6.</span><span class="s1">*x</span><span class="s2">,      </span><span class="s5">6.</span><span class="s1">*x</span><span class="s2">,      </span><span class="s5">6.</span><span class="s1">*x]</span><span class="s2">,</span>
+            <span class="s1">[     </span><span class="s5">6.</span><span class="s1">*y</span><span class="s2">,        </span><span class="s5">0.</span><span class="s2">,        </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[       </span><span class="s5">0.</span><span class="s2">,      </span><span class="s5">6.</span><span class="s1">*z</span><span class="s2">,        </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[     </span><span class="s5">2.</span><span class="s1">*z</span><span class="s2">, </span><span class="s5">2.</span><span class="s1">*z-</span><span class="s5">4.</span><span class="s1">*x</span><span class="s2">, </span><span class="s5">2.</span><span class="s1">*z-</span><span class="s5">2.</span><span class="s1">*x]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">2.</span><span class="s1">*y-</span><span class="s5">4.</span><span class="s1">*x</span><span class="s2">,      </span><span class="s5">2.</span><span class="s1">*y</span><span class="s2">, </span><span class="s5">2.</span><span class="s1">*y-</span><span class="s5">2.</span><span class="s1">*x]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">2.</span><span class="s1">*x-</span><span class="s5">4.</span><span class="s1">*y</span><span class="s2">,        </span><span class="s5">0.</span><span class="s2">,     </span><span class="s1">-</span><span class="s5">2.</span><span class="s1">*y]</span><span class="s2">,</span>
+            <span class="s1">[     </span><span class="s5">2.</span><span class="s1">*z</span><span class="s2">,        </span><span class="s5">0.</span><span class="s2">,      </span><span class="s5">2.</span><span class="s1">*y]</span><span class="s2">,</span>
+            <span class="s1">[       </span><span class="s5">0.</span><span class="s2">,      </span><span class="s5">2.</span><span class="s1">*y</span><span class="s2">,      </span><span class="s5">2.</span><span class="s1">*z]</span><span class="s2">,</span>
+            <span class="s1">[       </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">2.</span><span class="s1">*x-</span><span class="s5">4.</span><span class="s1">*z</span><span class="s2">,     </span><span class="s1">-</span><span class="s5">2.</span><span class="s1">*z]</span><span class="s2">,</span>
+            <span class="s1">[    -</span><span class="s5">2.</span><span class="s1">*z</span><span class="s2">,     </span><span class="s1">-</span><span class="s5">2.</span><span class="s1">*y</span><span class="s2">,     </span><span class="s1">x-y-z]])</span>
+        <span class="s4"># Puts back d2V in first apex basis</span>
+        <span class="s1">d2V = d2V @ _extract_submatrices(</span>
+            <span class="s1">self.rotate_d2V</span><span class="s2">, </span><span class="s1">subtri</span><span class="s2">, </span><span class="s1">block_size=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">prod = self.M @ d2V</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M0 @ d2V)</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M1 @ d2V)</span>
+        <span class="s1">prod += _scalar_vectorized(E[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.M2 @ d2V)</span>
+        <span class="s1">d2sdksi2 = _roll_vectorized(prod</span><span class="s2">, </span><span class="s5">3</span><span class="s1">*subtri</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">d2sdksi2</span>
+
+    <span class="s2">def </span><span class="s1">get_bending_matrices(self</span><span class="s2">, </span><span class="s1">J</span><span class="s2">, </span><span class="s1">ecc):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        *J* is a (N x 2 x 2) array of jacobian matrices (jacobian matrix at 
+        triangle first apex) 
+        *ecc* is a (N x 3 x 1) array (array of column-matrices) of triangle 
+        eccentricities 
+ 
+        Returns 
+        ------- 
+        Returns the element K matrices for bending energy expressed in 
+        GLOBAL nodal coordinates. 
+        K_ij = integral [ (d2zi/dx2 + d2zi/dy2) * (d2zj/dx2 + d2zj/dy2) dA] 
+        tri_J is needed to rotate dofs from local basis to global basis 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n = np.size(ecc</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s4"># 1) matrix to rotate dofs in global coordinates</span>
+        <span class="s1">J1 = self.J0_to_J1 @ J</span>
+        <span class="s1">J2 = self.J0_to_J2 @ J</span>
+        <span class="s1">DOF_rot = np.zeros([n</span><span class="s2">, </span><span class="s5">9</span><span class="s2">, </span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">DOF_rot[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span>
+        <span class="s1">DOF_rot[:</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s5">3</span><span class="s1">] = </span><span class="s5">1</span>
+        <span class="s1">DOF_rot[:</span><span class="s2">, </span><span class="s5">6</span><span class="s2">, </span><span class="s5">6</span><span class="s1">] = </span><span class="s5">1</span>
+        <span class="s1">DOF_rot[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s5">3</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = J</span>
+        <span class="s1">DOF_rot[:</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s1">] = J1</span>
+        <span class="s1">DOF_rot[:</span><span class="s2">, </span><span class="s5">7</span><span class="s1">:</span><span class="s5">9</span><span class="s2">, </span><span class="s5">7</span><span class="s1">:</span><span class="s5">9</span><span class="s1">] = J2</span>
+
+        <span class="s4"># 2) matrix to rotate Hessian in global coordinates.</span>
+        <span class="s1">H_rot</span><span class="s2">, </span><span class="s1">area = self.get_Hrot_from_J(J</span><span class="s2">, </span><span class="s1">return_area=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s4"># 3) Computes stiffness matrix</span>
+        <span class="s4"># Gauss quadrature.</span>
+        <span class="s1">K = np.zeros([n</span><span class="s2">, </span><span class="s5">9</span><span class="s2">, </span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">weights = self.gauss_w</span>
+        <span class="s1">pts = self.gauss_pts</span>
+        <span class="s2">for </span><span class="s1">igauss </span><span class="s2">in </span><span class="s1">range(self.n_gauss):</span>
+            <span class="s1">alpha = np.tile(pts[igauss</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">n).reshape(n</span><span class="s2">, </span><span class="s5">3</span><span class="s1">)</span>
+            <span class="s1">alpha = np.expand_dims(alpha</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span>
+            <span class="s1">weight = weights[igauss]</span>
+            <span class="s1">d2Skdksi2 = self.get_d2Sidksij2(alpha</span><span class="s2">, </span><span class="s1">ecc)</span>
+            <span class="s1">d2Skdx2 = d2Skdksi2 @ H_rot</span>
+            <span class="s1">K += weight * (d2Skdx2 @ self.E @ _transpose_vectorized(d2Skdx2))</span>
+
+        <span class="s4"># 4) With nodal (not elem) dofs</span>
+        <span class="s1">K = _transpose_vectorized(DOF_rot) @ K @ DOF_rot</span>
+
+        <span class="s4"># 5) Need the area to compute total element energy</span>
+        <span class="s2">return </span><span class="s1">_scalar_vectorized(area</span><span class="s2">, </span><span class="s1">K)</span>
+
+    <span class="s2">def </span><span class="s1">get_Hrot_from_J(self</span><span class="s2">, </span><span class="s1">J</span><span class="s2">, </span><span class="s1">return_area=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        *J* is a (N x 2 x 2) array of jacobian matrices (jacobian matrix at 
+        triangle first apex) 
+ 
+        Returns 
+        ------- 
+        Returns H_rot used to rotate Hessian from local basis of first apex, 
+        to global coordinates. 
+        if *return_area* is True, returns also the triangle area (0.5*det(J)) 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Here we try to deal with the simplest colinear cases; a null</span>
+        <span class="s4"># energy and area is imposed.</span>
+        <span class="s1">J_inv = _safe_inv22_vectorized(J)</span>
+        <span class="s1">Ji00 = J_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">Ji11 = J_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">Ji10 = J_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">Ji01 = J_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">H_rot = _to_matrix_vectorized([</span>
+            <span class="s1">[Ji00*Ji00</span><span class="s2">, </span><span class="s1">Ji10*Ji10</span><span class="s2">, </span><span class="s1">Ji00*Ji10]</span><span class="s2">,</span>
+            <span class="s1">[Ji01*Ji01</span><span class="s2">, </span><span class="s1">Ji11*Ji11</span><span class="s2">, </span><span class="s1">Ji01*Ji11]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">2</span><span class="s1">*Ji00*Ji01</span><span class="s2">, </span><span class="s5">2</span><span class="s1">*Ji11*Ji10</span><span class="s2">, </span><span class="s1">Ji00*Ji11+Ji10*Ji01]])</span>
+        <span class="s2">if not </span><span class="s1">return_area:</span>
+            <span class="s2">return </span><span class="s1">H_rot</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">area = </span><span class="s5">0.5 </span><span class="s1">* (J[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*J[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] - J[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*J[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s2">return </span><span class="s1">H_rot</span><span class="s2">, </span><span class="s1">area</span>
+
+    <span class="s2">def </span><span class="s1">get_Kff_and_Ff(self</span><span class="s2">, </span><span class="s1">J</span><span class="s2">, </span><span class="s1">ecc</span><span class="s2">, </span><span class="s1">triangles</span><span class="s2">, </span><span class="s1">Uc):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Build K and F for the following elliptic formulation: 
+        minimization of curvature energy with value of function at node 
+        imposed and derivatives 'free'. 
+ 
+        Build the global Kff matrix in cco format. 
+        Build the full Ff vec Ff = - Kfc x Uc. 
+ 
+        Parameters 
+        ---------- 
+        *J* is a (N x 2 x 2) array of jacobian matrices (jacobian matrix at 
+        triangle first apex) 
+        *ecc* is a (N x 3 x 1) array (array of column-matrices) of triangle 
+        eccentricities 
+        *triangles* is a (N x 3) array of nodes indexes. 
+        *Uc* is (N x 3) array of imposed displacements at nodes 
+ 
+        Returns 
+        ------- 
+        (Kff_rows, Kff_cols, Kff_vals) Kff matrix in coo format - Duplicate 
+        (row, col) entries must be summed. 
+        Ff: force vector - dim npts * 3 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ntri = np.size(ecc</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">vec_range = np.arange(ntri</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+        <span class="s1">c_indices = np.full(ntri</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">dtype=np.int32)  </span><span class="s4"># for unused dofs, -1</span>
+        <span class="s1">f_dof = [</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, </span><span class="s5">5</span><span class="s2">, </span><span class="s5">7</span><span class="s2">, </span><span class="s5">8</span><span class="s1">]</span>
+        <span class="s1">c_dof = [</span><span class="s5">0</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s5">6</span><span class="s1">]</span>
+
+        <span class="s4"># vals, rows and cols indices in global dof numbering</span>
+        <span class="s1">f_dof_indices = _to_matrix_vectorized([[</span>
+            <span class="s1">c_indices</span><span class="s2">, </span><span class="s1">triangles[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*</span><span class="s5">2</span><span class="s2">, </span><span class="s1">triangles[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*</span><span class="s5">2</span><span class="s1">+</span><span class="s5">1</span><span class="s2">,</span>
+            <span class="s1">c_indices</span><span class="s2">, </span><span class="s1">triangles[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*</span><span class="s5">2</span><span class="s2">, </span><span class="s1">triangles[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*</span><span class="s5">2</span><span class="s1">+</span><span class="s5">1</span><span class="s2">,</span>
+            <span class="s1">c_indices</span><span class="s2">, </span><span class="s1">triangles[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]*</span><span class="s5">2</span><span class="s2">, </span><span class="s1">triangles[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]*</span><span class="s5">2</span><span class="s1">+</span><span class="s5">1</span><span class="s1">]])</span>
+
+        <span class="s1">expand_indices = np.ones([ntri</span><span class="s2">, </span><span class="s5">9</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+        <span class="s1">f_row_indices = _transpose_vectorized(expand_indices @ f_dof_indices)</span>
+        <span class="s1">f_col_indices = expand_indices @ f_dof_indices</span>
+        <span class="s1">K_elem = self.get_bending_matrices(J</span><span class="s2">, </span><span class="s1">ecc)</span>
+
+        <span class="s4"># Extracting sub-matrices</span>
+        <span class="s4"># Explanation &amp; notations:</span>
+        <span class="s4"># * Subscript f denotes 'free' degrees of freedom (i.e. dz/dx, dz/dx)</span>
+        <span class="s4"># * Subscript c denotes 'condensated' (imposed) degrees of freedom</span>
+        <span class="s4">#    (i.e. z at all nodes)</span>
+        <span class="s4"># * F = [Ff, Fc] is the force vector</span>
+        <span class="s4"># * U = [Uf, Uc] is the imposed dof vector</span>
+        <span class="s4">#        [ Kff Kfc ]</span>
+        <span class="s4"># * K =  [         ]  is the laplacian stiffness matrix</span>
+        <span class="s4">#        [ Kcf Kff ]</span>
+        <span class="s4"># * As F = K x U one gets straightforwardly: Ff = - Kfc x Uc</span>
+
+        <span class="s4"># Computing Kff stiffness matrix in sparse coo format</span>
+        <span class="s1">Kff_vals = np.ravel(K_elem[np.ix_(vec_range</span><span class="s2">, </span><span class="s1">f_dof</span><span class="s2">, </span><span class="s1">f_dof)])</span>
+        <span class="s1">Kff_rows = np.ravel(f_row_indices[np.ix_(vec_range</span><span class="s2">, </span><span class="s1">f_dof</span><span class="s2">, </span><span class="s1">f_dof)])</span>
+        <span class="s1">Kff_cols = np.ravel(f_col_indices[np.ix_(vec_range</span><span class="s2">, </span><span class="s1">f_dof</span><span class="s2">, </span><span class="s1">f_dof)])</span>
+
+        <span class="s4"># Computing Ff force vector in sparse coo format</span>
+        <span class="s1">Kfc_elem = K_elem[np.ix_(vec_range</span><span class="s2">, </span><span class="s1">f_dof</span><span class="s2">, </span><span class="s1">c_dof)]</span>
+        <span class="s1">Uc_elem = np.expand_dims(Uc</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">Ff_elem = -(Kfc_elem @ Uc_elem)[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">Ff_indices = f_dof_indices[np.ix_(vec_range</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">f_dof)][:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span>
+
+        <span class="s4"># Extracting Ff force vector in dense format</span>
+        <span class="s4"># We have to sum duplicate indices -  using bincount</span>
+        <span class="s1">Ff = np.bincount(np.ravel(Ff_indices)</span><span class="s2">, </span><span class="s1">weights=np.ravel(Ff_elem))</span>
+        <span class="s2">return </span><span class="s1">Kff_rows</span><span class="s2">, </span><span class="s1">Kff_cols</span><span class="s2">, </span><span class="s1">Kff_vals</span><span class="s2">, </span><span class="s1">Ff</span>
+
+
+<span class="s4"># :class:_DOF_estimator, _DOF_estimator_user, _DOF_estimator_geom,</span>
+<span class="s4"># _DOF_estimator_min_E</span>
+<span class="s4"># Private classes used to compute the degree of freedom of each triangular</span>
+<span class="s4"># element for the TriCubicInterpolator.</span>
+<span class="s2">class </span><span class="s1">_DOF_estimator:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Abstract base class for classes used to estimate a function's first 
+    derivatives, and deduce the dofs for a CubicTriInterpolator using a 
+    reduced HCT element formulation. 
+ 
+    Derived classes implement ``compute_df(self, **kwargs)``, returning 
+    ``np.vstack([dfx, dfy]).T`` where ``dfx, dfy`` are the estimation of the 2 
+    gradient coordinates. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">interpolator</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">_api.check_isinstance(CubicTriInterpolator</span><span class="s2">, </span><span class="s1">interpolator=interpolator)</span>
+        <span class="s1">self._pts = interpolator._pts</span>
+        <span class="s1">self._tris_pts = interpolator._tris_pts</span>
+        <span class="s1">self.z = interpolator._z</span>
+        <span class="s1">self._triangles = interpolator._triangles</span>
+        <span class="s1">(self._unit_x</span><span class="s2">, </span><span class="s1">self._unit_y) = (interpolator._unit_x</span><span class="s2">,</span>
+                                        <span class="s1">interpolator._unit_y)</span>
+        <span class="s1">self.dz = self.compute_dz(**kwargs)</span>
+        <span class="s1">self.compute_dof_from_df()</span>
+
+    <span class="s2">def </span><span class="s1">compute_dz(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s2">def </span><span class="s1">compute_dof_from_df(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute reduced-HCT elements degrees of freedom, from the gradient. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">J = CubicTriInterpolator._get_jacobian(self._tris_pts)</span>
+        <span class="s1">tri_z = self.z[self._triangles]</span>
+        <span class="s1">tri_dz = self.dz[self._triangles]</span>
+        <span class="s1">tri_dof = self.get_dof_vec(tri_z</span><span class="s2">, </span><span class="s1">tri_dz</span><span class="s2">, </span><span class="s1">J)</span>
+        <span class="s2">return </span><span class="s1">tri_dof</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">get_dof_vec(tri_z</span><span class="s2">, </span><span class="s1">tri_dz</span><span class="s2">, </span><span class="s1">J):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute the dof vector of a triangle, from the value of f, df and 
+        of the local Jacobian at each node. 
+ 
+        Parameters 
+        ---------- 
+        tri_z : shape (3,) array 
+            f nodal values. 
+        tri_dz : shape (3, 2) array 
+            df/dx, df/dy nodal values. 
+        J 
+            Jacobian matrix in local basis of apex 0. 
+ 
+        Returns 
+        ------- 
+        dof : shape (9,) array 
+            For each apex ``iapex``:: 
+ 
+                dof[iapex*3+0] = f(Ai) 
+                dof[iapex*3+1] = df(Ai).(AiAi+) 
+                dof[iapex*3+2] = df(Ai).(AiAi-) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">npt = tri_z.shape[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">dof = np.zeros([npt</span><span class="s2">, </span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">J1 = _ReducedHCT_Element.J0_to_J1 @ J</span>
+        <span class="s1">J2 = _ReducedHCT_Element.J0_to_J2 @ J</span>
+
+        <span class="s1">col0 = J @ np.expand_dims(tri_dz[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">col1 = J1 @ np.expand_dims(tri_dz[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">col2 = J2 @ np.expand_dims(tri_dz[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">)</span>
+
+        <span class="s1">dfdksi = _to_matrix_vectorized([</span>
+            <span class="s1">[col0[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">col1[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">col2[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]]</span><span class="s2">,</span>
+            <span class="s1">[col0[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">col1[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">col2[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]]])</span>
+        <span class="s1">dof[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">:</span><span class="s5">7</span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = tri_z</span>
+        <span class="s1">dof[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s5">8</span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = dfdksi[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">dof[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">9</span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = dfdksi[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">dof</span>
+
+
+<span class="s2">class </span><span class="s1">_DOF_estimator_user(_DOF_estimator):</span>
+    <span class="s0">&quot;&quot;&quot;dz is imposed by user; accounts for scaling if any.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">compute_dz(self</span><span class="s2">, </span><span class="s1">dz):</span>
+        <span class="s1">(dzdx</span><span class="s2">, </span><span class="s1">dzdy) = dz</span>
+        <span class="s1">dzdx = dzdx * self._unit_x</span>
+        <span class="s1">dzdy = dzdy * self._unit_y</span>
+        <span class="s2">return </span><span class="s1">np.vstack([dzdx</span><span class="s2">, </span><span class="s1">dzdy]).T</span>
+
+
+<span class="s2">class </span><span class="s1">_DOF_estimator_geom(_DOF_estimator):</span>
+    <span class="s0">&quot;&quot;&quot;Fast 'geometric' approximation, recommended for large arrays.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">compute_dz(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        self.df is computed as weighted average of _triangles sharing a common 
+        node. On each triangle itri f is first assumed linear (= ~f), which 
+        allows to compute d~f[itri] 
+        Then the following approximation of df nodal values is then proposed: 
+            f[ipt] = SUM ( w[itri] x d~f[itri] , for itri sharing apex ipt) 
+        The weighted coeff. w[itri] are proportional to the angle of the 
+        triangle itri at apex ipt 
+        &quot;&quot;&quot;</span>
+        <span class="s1">el_geom_w = self.compute_geom_weights()</span>
+        <span class="s1">el_geom_grad = self.compute_geom_grads()</span>
+
+        <span class="s4"># Sum of weights coeffs</span>
+        <span class="s1">w_node_sum = np.bincount(np.ravel(self._triangles)</span><span class="s2">,</span>
+                                 <span class="s1">weights=np.ravel(el_geom_w))</span>
+
+        <span class="s4"># Sum of weighted df = (dfx, dfy)</span>
+        <span class="s1">dfx_el_w = np.empty_like(el_geom_w)</span>
+        <span class="s1">dfy_el_w = np.empty_like(el_geom_w)</span>
+        <span class="s2">for </span><span class="s1">iapex </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">dfx_el_w[:</span><span class="s2">, </span><span class="s1">iapex] = el_geom_w[:</span><span class="s2">, </span><span class="s1">iapex]*el_geom_grad[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">dfy_el_w[:</span><span class="s2">, </span><span class="s1">iapex] = el_geom_w[:</span><span class="s2">, </span><span class="s1">iapex]*el_geom_grad[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">dfx_node_sum = np.bincount(np.ravel(self._triangles)</span><span class="s2">,</span>
+                                   <span class="s1">weights=np.ravel(dfx_el_w))</span>
+        <span class="s1">dfy_node_sum = np.bincount(np.ravel(self._triangles)</span><span class="s2">,</span>
+                                   <span class="s1">weights=np.ravel(dfy_el_w))</span>
+
+        <span class="s4"># Estimation of df</span>
+        <span class="s1">dfx_estim = dfx_node_sum/w_node_sum</span>
+        <span class="s1">dfy_estim = dfy_node_sum/w_node_sum</span>
+        <span class="s2">return </span><span class="s1">np.vstack([dfx_estim</span><span class="s2">, </span><span class="s1">dfy_estim]).T</span>
+
+    <span class="s2">def </span><span class="s1">compute_geom_weights(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Build the (nelems, 3) weights coeffs of _triangles angles, 
+        renormalized so that np.sum(weights, axis=1) == np.ones(nelems) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">weights = np.zeros([np.size(self._triangles</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s5">3</span><span class="s1">])</span>
+        <span class="s1">tris_pts = self._tris_pts</span>
+        <span class="s2">for </span><span class="s1">ipt </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">p0 = tris_pts[:</span><span class="s2">, </span><span class="s1">ipt % </span><span class="s5">3</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">p1 = tris_pts[:</span><span class="s2">, </span><span class="s1">(ipt+</span><span class="s5">1</span><span class="s1">) % </span><span class="s5">3</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">p2 = tris_pts[:</span><span class="s2">, </span><span class="s1">(ipt-</span><span class="s5">1</span><span class="s1">) % </span><span class="s5">3</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">alpha1 = np.arctan2(p1[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]-p0[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">p1[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]-p0[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s1">alpha2 = np.arctan2(p2[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]-p0[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">p2[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]-p0[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s4"># In the below formula we could take modulo 2. but</span>
+            <span class="s4"># modulo 1. is safer regarding round-off errors (flat triangles).</span>
+            <span class="s1">angle = np.abs(((alpha2-alpha1) / np.pi) % </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s4"># Weight proportional to angle up np.pi/2; null weight for</span>
+            <span class="s4"># degenerated cases 0 and np.pi (note that *angle* is normalized</span>
+            <span class="s4"># by np.pi).</span>
+            <span class="s1">weights[:</span><span class="s2">, </span><span class="s1">ipt] = </span><span class="s5">0.5 </span><span class="s1">- np.abs(angle-</span><span class="s5">0.5</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">weights</span>
+
+    <span class="s2">def </span><span class="s1">compute_geom_grads(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute the (global) gradient component of f assumed linear (~f). 
+        returns array df of shape (nelems, 2) 
+        df[ielem].dM[ielem] = dz[ielem] i.e. df = dz x dM = dM.T^-1 x dz 
+        &quot;&quot;&quot;</span>
+        <span class="s1">tris_pts = self._tris_pts</span>
+        <span class="s1">tris_f = self.z[self._triangles]</span>
+
+        <span class="s1">dM1 = tris_pts[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">dM2 = tris_pts[:</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s1">:] - tris_pts[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">dM = np.dstack([dM1</span><span class="s2">, </span><span class="s1">dM2])</span>
+        <span class="s4"># Here we try to deal with the simplest colinear cases: a null</span>
+        <span class="s4"># gradient is assumed in this case.</span>
+        <span class="s1">dM_inv = _safe_inv22_vectorized(dM)</span>
+
+        <span class="s1">dZ1 = tris_f[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] - tris_f[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">dZ2 = tris_f[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] - tris_f[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">dZ = np.vstack([dZ1</span><span class="s2">, </span><span class="s1">dZ2]).T</span>
+        <span class="s1">df = np.empty_like(dZ)</span>
+
+        <span class="s4"># With np.einsum: could be ej,eji -&gt; ej</span>
+        <span class="s1">df[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = dZ[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*dM_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] + dZ[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*dM_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">df[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = dZ[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*dM_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] + dZ[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*dM_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">df</span>
+
+
+<span class="s2">class </span><span class="s1">_DOF_estimator_min_E(_DOF_estimator_geom):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The 'smoothest' approximation, df is computed through global minimization 
+    of the bending energy: 
+      E(f) = integral[(d2z/dx2 + d2z/dy2 + 2 d2z/dxdy)**2 dA] 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">Interpolator):</span>
+        <span class="s1">self._eccs = Interpolator._eccs</span>
+        <span class="s1">super().__init__(Interpolator)</span>
+
+    <span class="s2">def </span><span class="s1">compute_dz(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Elliptic solver for bending energy minimization. 
+        Uses a dedicated 'toy' sparse Jacobi PCG solver. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Initial guess for iterative PCG solver.</span>
+        <span class="s1">dz_init = super().compute_dz()</span>
+        <span class="s1">Uf0 = np.ravel(dz_init)</span>
+
+        <span class="s1">reference_element = _ReducedHCT_Element()</span>
+        <span class="s1">J = CubicTriInterpolator._get_jacobian(self._tris_pts)</span>
+        <span class="s1">eccs = self._eccs</span>
+        <span class="s1">triangles = self._triangles</span>
+        <span class="s1">Uc = self.z[self._triangles]</span>
+
+        <span class="s4"># Building stiffness matrix and force vector in coo format</span>
+        <span class="s1">Kff_rows</span><span class="s2">, </span><span class="s1">Kff_cols</span><span class="s2">, </span><span class="s1">Kff_vals</span><span class="s2">, </span><span class="s1">Ff = reference_element.get_Kff_and_Ff(</span>
+            <span class="s1">J</span><span class="s2">, </span><span class="s1">eccs</span><span class="s2">, </span><span class="s1">triangles</span><span class="s2">, </span><span class="s1">Uc)</span>
+
+        <span class="s4"># Building sparse matrix and solving minimization problem</span>
+        <span class="s4"># We could use scipy.sparse direct solver; however to avoid this</span>
+        <span class="s4"># external dependency an implementation of a simple PCG solver with</span>
+        <span class="s4"># a simple diagonal Jacobi preconditioner is implemented.</span>
+        <span class="s1">tol = </span><span class="s5">1.e-10</span>
+        <span class="s1">n_dof = Ff.shape[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">Kff_coo = _Sparse_Matrix_coo(Kff_vals</span><span class="s2">, </span><span class="s1">Kff_rows</span><span class="s2">, </span><span class="s1">Kff_cols</span><span class="s2">,</span>
+                                     <span class="s1">shape=(n_dof</span><span class="s2">, </span><span class="s1">n_dof))</span>
+        <span class="s1">Kff_coo.compress_csc()</span>
+        <span class="s1">Uf</span><span class="s2">, </span><span class="s1">err = _cg(A=Kff_coo</span><span class="s2">, </span><span class="s1">b=Ff</span><span class="s2">, </span><span class="s1">x0=Uf0</span><span class="s2">, </span><span class="s1">tol=tol)</span>
+        <span class="s4"># If the PCG did not converge, we return the best guess between Uf0</span>
+        <span class="s4"># and Uf.</span>
+        <span class="s1">err0 = np.linalg.norm(Kff_coo.dot(Uf0) - Ff)</span>
+        <span class="s2">if </span><span class="s1">err0 &lt; err:</span>
+            <span class="s4"># Maybe a good occasion to raise a warning here ?</span>
+            <span class="s1">_api.warn_external(</span><span class="s3">&quot;In TriCubicInterpolator initialization, &quot;</span>
+                               <span class="s3">&quot;PCG sparse solver did not converge after &quot;</span>
+                               <span class="s3">&quot;1000 iterations. `geom` approximation is &quot;</span>
+                               <span class="s3">&quot;used instead of `min_E`&quot;</span><span class="s1">)</span>
+            <span class="s1">Uf = Uf0</span>
+
+        <span class="s4"># Building dz from Uf</span>
+        <span class="s1">dz = np.empty([self._pts.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">dz[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = Uf[::</span><span class="s5">2</span><span class="s1">]</span>
+        <span class="s1">dz[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = Uf[</span><span class="s5">1</span><span class="s1">::</span><span class="s5">2</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">dz</span>
+
+
+<span class="s4"># The following private :class:_Sparse_Matrix_coo and :func:_cg provide</span>
+<span class="s4"># a PCG sparse solver for (symmetric) elliptic problems.</span>
+<span class="s2">class </span><span class="s1">_Sparse_Matrix_coo:</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">vals</span><span class="s2">, </span><span class="s1">rows</span><span class="s2">, </span><span class="s1">cols</span><span class="s2">, </span><span class="s1">shape):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create a sparse matrix in coo format. 
+        *vals*: arrays of values of non-null entries of the matrix 
+        *rows*: int arrays of rows of non-null entries of the matrix 
+        *cols*: int arrays of cols of non-null entries of the matrix 
+        *shape*: 2-tuple (n, m) of matrix shape 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.n</span><span class="s2">, </span><span class="s1">self.m = shape</span>
+        <span class="s1">self.vals = np.asarray(vals</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">self.rows = np.asarray(rows</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+        <span class="s1">self.cols = np.asarray(cols</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+
+    <span class="s2">def </span><span class="s1">dot(self</span><span class="s2">, </span><span class="s1">V):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Dot product of self by a vector *V* in sparse-dense to dense format 
+        *V* dense vector of shape (self.m,). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">V.shape == (self.m</span><span class="s2">,</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">np.bincount(self.rows</span><span class="s2">,</span>
+                           <span class="s1">weights=self.vals*V[self.cols]</span><span class="s2">,</span>
+                           <span class="s1">minlength=self.m)</span>
+
+    <span class="s2">def </span><span class="s1">compress_csc(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compress rows, cols, vals / summing duplicates. Sort for csc format. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_</span><span class="s2">, </span><span class="s1">unique</span><span class="s2">, </span><span class="s1">indices = np.unique(</span>
+            <span class="s1">self.rows + self.n*self.cols</span><span class="s2">,</span>
+            <span class="s1">return_index=</span><span class="s2">True, </span><span class="s1">return_inverse=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.rows = self.rows[unique]</span>
+        <span class="s1">self.cols = self.cols[unique]</span>
+        <span class="s1">self.vals = np.bincount(indices</span><span class="s2">, </span><span class="s1">weights=self.vals)</span>
+
+    <span class="s2">def </span><span class="s1">compress_csr(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compress rows, cols, vals / summing duplicates. Sort for csr format. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_</span><span class="s2">, </span><span class="s1">unique</span><span class="s2">, </span><span class="s1">indices = np.unique(</span>
+            <span class="s1">self.m*self.rows + self.cols</span><span class="s2">,</span>
+            <span class="s1">return_index=</span><span class="s2">True, </span><span class="s1">return_inverse=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.rows = self.rows[unique]</span>
+        <span class="s1">self.cols = self.cols[unique]</span>
+        <span class="s1">self.vals = np.bincount(indices</span><span class="s2">, </span><span class="s1">weights=self.vals)</span>
+
+    <span class="s2">def </span><span class="s1">to_dense(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a dense matrix representing self, mainly for debugging purposes. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ret = np.zeros([self.n</span><span class="s2">, </span><span class="s1">self.m]</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">nvals = self.vals.size</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nvals):</span>
+            <span class="s1">ret[self.rows[i]</span><span class="s2">, </span><span class="s1">self.cols[i]] += self.vals[i]</span>
+        <span class="s2">return </span><span class="s1">ret</span>
+
+    <span class="s2">def </span><span class="s1">__str__(self):</span>
+        <span class="s2">return </span><span class="s1">self.to_dense().__str__()</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">diag(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the (dense) vector of the diagonal elements.&quot;&quot;&quot;</span>
+        <span class="s1">in_diag = (self.rows == self.cols)</span>
+        <span class="s1">diag = np.zeros(min(self.n</span><span class="s2">, </span><span class="s1">self.n)</span><span class="s2">, </span><span class="s1">dtype=np.float64)  </span><span class="s4"># default 0.</span>
+        <span class="s1">diag[self.rows[in_diag]] = self.vals[in_diag]</span>
+        <span class="s2">return </span><span class="s1">diag</span>
+
+
+<span class="s2">def </span><span class="s1">_cg(A</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">x0=</span><span class="s2">None, </span><span class="s1">tol=</span><span class="s5">1.e-10</span><span class="s2">, </span><span class="s1">maxiter=</span><span class="s5">1000</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Use Preconditioned Conjugate Gradient iteration to solve A x = b 
+    A simple Jacobi (diagonal) preconditioner is used. 
+ 
+    Parameters 
+    ---------- 
+    A : _Sparse_Matrix_coo 
+        *A* must have been compressed before by compress_csc or 
+        compress_csr method. 
+    b : array 
+        Right hand side of the linear system. 
+    x0 : array, optional 
+        Starting guess for the solution. Defaults to the zero vector. 
+    tol : float, optional 
+        Tolerance to achieve. The algorithm terminates when the relative 
+        residual is below tol. Default is 1e-10. 
+    maxiter : int, optional 
+        Maximum number of iterations.  Iteration will stop after *maxiter* 
+        steps even if the specified tolerance has not been achieved. Defaults 
+        to 1000. 
+ 
+    Returns 
+    ------- 
+    x : array 
+        The converged solution. 
+    err : float 
+        The absolute error np.linalg.norm(A.dot(x) - b) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n = b.size</span>
+    <span class="s2">assert </span><span class="s1">A.n == n</span>
+    <span class="s2">assert </span><span class="s1">A.m == n</span>
+    <span class="s1">b_norm = np.linalg.norm(b)</span>
+
+    <span class="s4"># Jacobi pre-conditioner</span>
+    <span class="s1">kvec = A.diag</span>
+    <span class="s4"># For diag elem &lt; 1e-6 we keep 1e-6.</span>
+    <span class="s1">kvec = np.maximum(kvec</span><span class="s2">, </span><span class="s5">1e-6</span><span class="s1">)</span>
+
+    <span class="s4"># Initial guess</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">x = np.zeros(n)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">x = x0</span>
+
+    <span class="s1">r = b - A.dot(x)</span>
+    <span class="s1">w = r/kvec</span>
+
+    <span class="s1">p = np.zeros(n)</span>
+    <span class="s1">beta = </span><span class="s5">0.0</span>
+    <span class="s1">rho = np.dot(r</span><span class="s2">, </span><span class="s1">w)</span>
+    <span class="s1">k = </span><span class="s5">0</span>
+
+    <span class="s4"># Following C. T. Kelley</span>
+    <span class="s2">while </span><span class="s1">(np.sqrt(abs(rho)) &gt; tol*b_norm) </span><span class="s2">and </span><span class="s1">(k &lt; maxiter):</span>
+        <span class="s1">p = w + beta*p</span>
+        <span class="s1">z = A.dot(p)</span>
+        <span class="s1">alpha = rho/np.dot(p</span><span class="s2">, </span><span class="s1">z)</span>
+        <span class="s1">r = r - alpha*z</span>
+        <span class="s1">w = r/kvec</span>
+        <span class="s1">rhoold = rho</span>
+        <span class="s1">rho = np.dot(r</span><span class="s2">, </span><span class="s1">w)</span>
+        <span class="s1">x = x + alpha*p</span>
+        <span class="s1">beta = rho/rhoold</span>
+        <span class="s4"># err = np.linalg.norm(A.dot(x) - b)  # absolute accuracy - not used</span>
+        <span class="s1">k += </span><span class="s5">1</span>
+    <span class="s1">err = np.linalg.norm(A.dot(x) - b)</span>
+    <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">err</span>
+
+
+<span class="s4"># The following private functions:</span>
+<span class="s4">#     :func:`_safe_inv22_vectorized`</span>
+<span class="s4">#     :func:`_pseudo_inv22sym_vectorized`</span>
+<span class="s4">#     :func:`_scalar_vectorized`</span>
+<span class="s4">#     :func:`_transpose_vectorized`</span>
+<span class="s4">#     :func:`_roll_vectorized`</span>
+<span class="s4">#     :func:`_to_matrix_vectorized`</span>
+<span class="s4">#     :func:`_extract_submatrices`</span>
+<span class="s4"># provide fast numpy implementation of some standard operations on arrays of</span>
+<span class="s4"># matrices - stored as (:, n_rows, n_cols)-shaped np.arrays.</span>
+
+<span class="s4"># Development note: Dealing with pathologic 'flat' triangles in the</span>
+<span class="s4"># CubicTriInterpolator code and impact on (2, 2)-matrix inversion functions</span>
+<span class="s4"># :func:`_safe_inv22_vectorized` and :func:`_pseudo_inv22sym_vectorized`.</span>
+<span class="s4">#</span>
+<span class="s4"># Goals:</span>
+<span class="s4"># 1) The CubicTriInterpolator should be able to handle flat or almost flat</span>
+<span class="s4">#    triangles without raising an error,</span>
+<span class="s4"># 2) These degenerated triangles should have no impact on the automatic dof</span>
+<span class="s4">#    calculation (associated with null weight for the _DOF_estimator_geom and</span>
+<span class="s4">#    with null energy for the _DOF_estimator_min_E),</span>
+<span class="s4"># 3) Linear patch test should be passed exactly on degenerated meshes,</span>
+<span class="s4"># 4) Interpolation (with :meth:`_interpolate_single_key` or</span>
+<span class="s4">#    :meth:`_interpolate_multi_key`) shall be correctly handled even *inside*</span>
+<span class="s4">#    the pathologic triangles, to interact correctly with a TriRefiner class.</span>
+<span class="s4">#</span>
+<span class="s4"># Difficulties:</span>
+<span class="s4"># Flat triangles have rank-deficient *J* (so-called jacobian matrix) and</span>
+<span class="s4"># *metric* (the metric tensor = J x J.T). Computation of the local</span>
+<span class="s4"># tangent plane is also problematic.</span>
+<span class="s4">#</span>
+<span class="s4"># Implementation:</span>
+<span class="s4"># Most of the time, when computing the inverse of a rank-deficient matrix it</span>
+<span class="s4"># is safe to simply return the null matrix (which is the implementation in</span>
+<span class="s4"># :func:`_safe_inv22_vectorized`). This is because of point 2), itself</span>
+<span class="s4"># enforced by:</span>
+<span class="s4">#    - null area hence null energy in :class:`_DOF_estimator_min_E`</span>
+<span class="s4">#    - angles close or equal to 0 or np.pi hence null weight in</span>
+<span class="s4">#      :class:`_DOF_estimator_geom`.</span>
+<span class="s4">#      Note that the function angle -&gt; weight is continuous and maximum for an</span>
+<span class="s4">#      angle np.pi/2 (refer to :meth:`compute_geom_weights`)</span>
+<span class="s4"># The exception is the computation of barycentric coordinates, which is done</span>
+<span class="s4"># by inversion of the *metric* matrix. In this case, we need to compute a set</span>
+<span class="s4"># of valid coordinates (1 among numerous possibilities), to ensure point 4).</span>
+<span class="s4"># We benefit here from the symmetry of metric = J x J.T, which makes it easier</span>
+<span class="s4"># to compute a pseudo-inverse in :func:`_pseudo_inv22sym_vectorized`</span>
+<span class="s2">def </span><span class="s1">_safe_inv22_vectorized(M):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Inversion of arrays of (2, 2) matrices, returns 0 for rank-deficient 
+    matrices. 
+ 
+    *M* : array of (2, 2) matrices to inverse, shape (n, 2, 2) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_api.check_shape((</span><span class="s2">None, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">M=M)</span>
+    <span class="s1">M_inv = np.empty_like(M)</span>
+    <span class="s1">prod1 = M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s1">delta = prod1 - M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s4"># We set delta_inv to 0. in case of a rank deficient matrix; a</span>
+    <span class="s4"># rank-deficient input matrix *M* will lead to a null matrix in output</span>
+    <span class="s1">rank2 = (np.abs(delta) &gt; </span><span class="s5">1e-8</span><span class="s1">*np.abs(prod1))</span>
+    <span class="s2">if </span><span class="s1">np.all(rank2):</span>
+        <span class="s4"># Normal 'optimized' flow.</span>
+        <span class="s1">delta_inv = </span><span class="s5">1.</span><span class="s1">/delta</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s4"># 'Pathologic' flow.</span>
+        <span class="s1">delta_inv = np.zeros(M.shape[</span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s1">delta_inv[rank2] = </span><span class="s5">1.</span><span class="s1">/delta[rank2]</span>
+
+    <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*delta_inv</span>
+    <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = -M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*delta_inv</span>
+    <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = -M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*delta_inv</span>
+    <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*delta_inv</span>
+    <span class="s2">return </span><span class="s1">M_inv</span>
+
+
+<span class="s2">def </span><span class="s1">_pseudo_inv22sym_vectorized(M):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Inversion of arrays of (2, 2) SYMMETRIC matrices; returns the 
+    (Moore-Penrose) pseudo-inverse for rank-deficient matrices. 
+ 
+    In case M is of rank 1, we have M = trace(M) x P where P is the orthogonal 
+    projection on Im(M), and we return trace(M)^-1 x P == M / trace(M)**2 
+    In case M is of rank 0, we return the null matrix. 
+ 
+    *M* : array of (2, 2) matrices to inverse, shape (n, 2, 2) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_api.check_shape((</span><span class="s2">None, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">M=M)</span>
+    <span class="s1">M_inv = np.empty_like(M)</span>
+    <span class="s1">prod1 = M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]*M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s1">delta = prod1 - M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]*M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">rank2 = (np.abs(delta) &gt; </span><span class="s5">1e-8</span><span class="s1">*np.abs(prod1))</span>
+
+    <span class="s2">if </span><span class="s1">np.all(rank2):</span>
+        <span class="s4"># Normal 'optimized' flow.</span>
+        <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] / delta</span>
+        <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = -M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] / delta</span>
+        <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = -M[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] / delta</span>
+        <span class="s1">M_inv[:</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = M[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] / delta</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s4"># 'Pathologic' flow.</span>
+        <span class="s4"># Here we have to deal with 2 sub-cases</span>
+        <span class="s4"># 1) First sub-case: matrices of rank 2:</span>
+        <span class="s1">delta = delta[rank2]</span>
+        <span class="s1">M_inv[rank2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = M[rank2</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] / delta</span>
+        <span class="s1">M_inv[rank2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = -M[rank2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] / delta</span>
+        <span class="s1">M_inv[rank2</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = -M[rank2</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] / delta</span>
+        <span class="s1">M_inv[rank2</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = M[rank2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] / delta</span>
+        <span class="s4"># 2) Second sub-case: rank-deficient matrices of rank 0 and 1:</span>
+        <span class="s1">rank01 = ~rank2</span>
+        <span class="s1">tr = M[rank01</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] + M[rank01</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">tr_zeros = (np.abs(tr) &lt; </span><span class="s5">1.e-8</span><span class="s1">)</span>
+        <span class="s1">sq_tr_inv = (</span><span class="s5">1.</span><span class="s1">-tr_zeros) / (tr**</span><span class="s5">2</span><span class="s1">+tr_zeros)</span>
+        <span class="s4"># sq_tr_inv = 1. / tr**2</span>
+        <span class="s1">M_inv[rank01</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = M[rank01</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] * sq_tr_inv</span>
+        <span class="s1">M_inv[rank01</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = M[rank01</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] * sq_tr_inv</span>
+        <span class="s1">M_inv[rank01</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = M[rank01</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] * sq_tr_inv</span>
+        <span class="s1">M_inv[rank01</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = M[rank01</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] * sq_tr_inv</span>
+
+    <span class="s2">return </span><span class="s1">M_inv</span>
+
+
+<span class="s2">def </span><span class="s1">_scalar_vectorized(scalar</span><span class="s2">, </span><span class="s1">M):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Scalar product between scalars and matrices. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">scalar[:</span><span class="s2">, </span><span class="s1">np.newaxis</span><span class="s2">, </span><span class="s1">np.newaxis]*M</span>
+
+
+<span class="s2">def </span><span class="s1">_transpose_vectorized(M):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Transposition of an array of matrices *M*. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">np.transpose(M</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">1</span><span class="s1">])</span>
+
+
+<span class="s2">def </span><span class="s1">_roll_vectorized(M</span><span class="s2">, </span><span class="s1">roll_indices</span><span class="s2">, </span><span class="s1">axis):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Roll an array of matrices along *axis* (0: rows, 1: columns) according to 
+    an array of indices *roll_indices*. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">assert </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s1">ndim = M.ndim</span>
+    <span class="s2">assert </span><span class="s1">ndim == </span><span class="s5">3</span>
+    <span class="s1">ndim_roll = roll_indices.ndim</span>
+    <span class="s2">assert </span><span class="s1">ndim_roll == </span><span class="s5">1</span>
+    <span class="s1">sh = M.shape</span>
+    <span class="s1">r</span><span class="s2">, </span><span class="s1">c = sh[-</span><span class="s5">2</span><span class="s1">:]</span>
+    <span class="s2">assert </span><span class="s1">sh[</span><span class="s5">0</span><span class="s1">] == roll_indices.shape[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">vec_indices = np.arange(sh[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+
+    <span class="s4"># Builds the rolled matrix</span>
+    <span class="s1">M_roll = np.empty_like(M)</span>
+    <span class="s2">if </span><span class="s1">axis == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s2">for </span><span class="s1">ir </span><span class="s2">in </span><span class="s1">range(r):</span>
+            <span class="s2">for </span><span class="s1">ic </span><span class="s2">in </span><span class="s1">range(c):</span>
+                <span class="s1">M_roll[:</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">, </span><span class="s1">ic] = M[vec_indices</span><span class="s2">, </span><span class="s1">(-roll_indices+ir) % r</span><span class="s2">, </span><span class="s1">ic]</span>
+    <span class="s2">else</span><span class="s1">:  </span><span class="s4"># 1</span>
+        <span class="s2">for </span><span class="s1">ir </span><span class="s2">in </span><span class="s1">range(r):</span>
+            <span class="s2">for </span><span class="s1">ic </span><span class="s2">in </span><span class="s1">range(c):</span>
+                <span class="s1">M_roll[:</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">, </span><span class="s1">ic] = M[vec_indices</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">, </span><span class="s1">(-roll_indices+ic) % c]</span>
+    <span class="s2">return </span><span class="s1">M_roll</span>
+
+
+<span class="s2">def </span><span class="s1">_to_matrix_vectorized(M):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Build an array of matrices from individuals np.arrays of identical shapes. 
+ 
+    Parameters 
+    ---------- 
+    M 
+        ncols-list of nrows-lists of shape sh. 
+ 
+    Returns 
+    ------- 
+    M_res : np.array of shape (sh, nrow, ncols) 
+        *M_res* satisfies ``M_res[..., i, j] = M[i][j]``. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">assert </span><span class="s1">isinstance(M</span><span class="s2">, </span><span class="s1">(tuple</span><span class="s2">, </span><span class="s1">list))</span>
+    <span class="s2">assert </span><span class="s1">all(isinstance(item</span><span class="s2">, </span><span class="s1">(tuple</span><span class="s2">, </span><span class="s1">list)) </span><span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">M)</span>
+    <span class="s1">c_vec = np.asarray([len(item) </span><span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">M])</span>
+    <span class="s2">assert </span><span class="s1">np.all(c_vec-c_vec[</span><span class="s5">0</span><span class="s1">] == </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">r = len(M)</span>
+    <span class="s1">c = c_vec[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">M00 = np.asarray(M[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s1">dt = M00.dtype</span>
+    <span class="s1">sh = [M00.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">r</span><span class="s2">, </span><span class="s1">c]</span>
+    <span class="s1">M_ret = np.empty(sh</span><span class="s2">, </span><span class="s1">dtype=dt)</span>
+    <span class="s2">for </span><span class="s1">irow </span><span class="s2">in </span><span class="s1">range(r):</span>
+        <span class="s2">for </span><span class="s1">icol </span><span class="s2">in </span><span class="s1">range(c):</span>
+            <span class="s1">M_ret[:</span><span class="s2">, </span><span class="s1">irow</span><span class="s2">, </span><span class="s1">icol] = np.asarray(M[irow][icol])</span>
+    <span class="s2">return </span><span class="s1">M_ret</span>
+
+
+<span class="s2">def </span><span class="s1">_extract_submatrices(M</span><span class="s2">, </span><span class="s1">block_indices</span><span class="s2">, </span><span class="s1">block_size</span><span class="s2">, </span><span class="s1">axis):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Extract selected blocks of a matrices *M* depending on parameters 
+    *block_indices* and *block_size*. 
+ 
+    Returns the array of extracted matrices *Mres* so that :: 
+ 
+        M_res[..., ir, :] = M[(block_indices*block_size+ir), :] 
+    &quot;&quot;&quot;</span>
+    <span class="s2">assert </span><span class="s1">block_indices.ndim == </span><span class="s5">1</span>
+    <span class="s2">assert </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+
+    <span class="s1">r</span><span class="s2">, </span><span class="s1">c = M.shape</span>
+    <span class="s2">if </span><span class="s1">axis == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">sh = [block_indices.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">block_size</span><span class="s2">, </span><span class="s1">c]</span>
+    <span class="s2">else</span><span class="s1">:  </span><span class="s4"># 1</span>
+        <span class="s1">sh = [block_indices.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">r</span><span class="s2">, </span><span class="s1">block_size]</span>
+
+    <span class="s1">dt = M.dtype</span>
+    <span class="s1">M_res = np.empty(sh</span><span class="s2">, </span><span class="s1">dtype=dt)</span>
+    <span class="s2">if </span><span class="s1">axis == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s2">for </span><span class="s1">ir </span><span class="s2">in </span><span class="s1">range(block_size):</span>
+            <span class="s1">M_res[:</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">, </span><span class="s1">:] = M[(block_indices*block_size+ir)</span><span class="s2">, </span><span class="s1">:]</span>
+    <span class="s2">else</span><span class="s1">:  </span><span class="s4"># 1</span>
+        <span class="s2">for </span><span class="s1">ic </span><span class="s2">in </span><span class="s1">range(block_size):</span>
+            <span class="s1">M_res[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">ic] = M[:</span><span class="s2">, </span><span class="s1">(block_indices*block_size+ic)]</span>
+
+    <span class="s2">return </span><span class="s1">M_res</span>
+</pre>
+</body>
+</html>

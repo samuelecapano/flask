@@ -1,0 +1,1412 @@
+<html>
+<head>
+<title>backend_wx.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_wx.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A wxPython backend for matplotlib. 
+ 
+Originally contributed by Jeremy O'Donoghue (jeremy@o-donoghue.com) and John 
+Hunter (jdhunter@ace.bsd.uchicago.edu). 
+ 
+Copyright (C) Jeremy O'Donoghue &amp; John Hunter, 2003-4. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">math</span>
+<span class="s2">import </span><span class="s1">pathlib</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">weakref</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">PIL</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s2">, </span><span class="s1">FigureCanvasBase</span><span class="s2">, </span><span class="s1">FigureManagerBase</span><span class="s2">,</span>
+    <span class="s1">GraphicsContextBase</span><span class="s2">, </span><span class="s1">MouseButton</span><span class="s2">, </span><span class="s1">NavigationToolbar2</span><span class="s2">, </span><span class="s1">RendererBase</span><span class="s2">,</span>
+    <span class="s1">TimerBase</span><span class="s2">, </span><span class="s1">ToolContainerBase</span><span class="s2">, </span><span class="s1">cursors</span><span class="s2">,</span>
+    <span class="s1">CloseEvent</span><span class="s2">, </span><span class="s1">KeyEvent</span><span class="s2">, </span><span class="s1">LocationEvent</span><span class="s2">, </span><span class="s1">MouseEvent</span><span class="s2">, </span><span class="s1">ResizeEvent)</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span><span class="s2">, </span><span class="s1">backend_tools</span>
+<span class="s2">from </span><span class="s1">matplotlib._pylab_helpers </span><span class="s2">import </span><span class="s1">Gcf</span>
+<span class="s2">from </span><span class="s1">matplotlib.path </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">from </span><span class="s1">matplotlib.transforms </span><span class="s2">import </span><span class="s1">Affine2D</span>
+
+<span class="s2">import </span><span class="s1">wx</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+<span class="s3"># the True dots per inch on the screen; should be display dependent; see</span>
+<span class="s3"># http://groups.google.com/d/msg/comp.lang.postscript/-/omHAc9FEuAsJ?hl=en</span>
+<span class="s3"># for some info about screen dpi</span>
+<span class="s1">PIXELS_PER_INCH = </span><span class="s4">75</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">error_msg_wx(msg</span><span class="s2">, </span><span class="s1">parent=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Signal an error condition with a popup error dialog.&quot;&quot;&quot;</span>
+    <span class="s1">dialog = wx.MessageDialog(parent=parent</span><span class="s2">,</span>
+                              <span class="s1">message=msg</span><span class="s2">,</span>
+                              <span class="s1">caption=</span><span class="s5">'Matplotlib backend_wx error'</span><span class="s2">,</span>
+                              <span class="s1">style=wx.OK | wx.CENTRE)</span>
+    <span class="s1">dialog.ShowModal()</span>
+    <span class="s1">dialog.Destroy()</span>
+    <span class="s2">return None</span>
+
+
+<span class="s3"># lru_cache holds a reference to the App and prevents it from being gc'ed.</span>
+<span class="s1">@functools.lru_cache(</span><span class="s4">1</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">_create_wxapp():</span>
+    <span class="s1">wxapp = wx.App(</span><span class="s2">False</span><span class="s1">)</span>
+    <span class="s1">wxapp.SetExitOnFrameDelete(</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">cbook._setup_new_guiapp()</span>
+    <span class="s2">return </span><span class="s1">wxapp</span>
+
+
+<span class="s2">class </span><span class="s1">TimerWx(TimerBase):</span>
+    <span class="s0">&quot;&quot;&quot;Subclass of `.TimerBase` using wx.Timer events.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._timer = wx.Timer()</span>
+        <span class="s1">self._timer.Notify = self._on_timer</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_timer_start(self):</span>
+        <span class="s1">self._timer.Start(self._interval</span><span class="s2">, </span><span class="s1">self._single)</span>
+
+    <span class="s2">def </span><span class="s1">_timer_stop(self):</span>
+        <span class="s1">self._timer.Stop()</span>
+
+    <span class="s2">def </span><span class="s1">_timer_set_interval(self):</span>
+        <span class="s2">if </span><span class="s1">self._timer.IsRunning():</span>
+            <span class="s1">self._timer_start()  </span><span class="s3"># Restart with new interval.</span>
+
+
+<span class="s1">@_api.deprecated(</span>
+    <span class="s5">&quot;2.0&quot;</span><span class="s2">, </span><span class="s1">name=</span><span class="s5">&quot;wx&quot;</span><span class="s2">, </span><span class="s1">obj_type=</span><span class="s5">&quot;backend&quot;</span><span class="s2">, </span><span class="s1">removal=</span><span class="s5">&quot;the future&quot;</span><span class="s2">,</span>
+    <span class="s1">alternative=</span><span class="s5">&quot;wxagg&quot;</span><span class="s2">,</span>
+    <span class="s1">addendum=</span><span class="s5">&quot;See the Matplotlib usage FAQ for more info on backends.&quot;</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">RendererWx(RendererBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The renderer handles all the drawing primitives using a graphics 
+    context instance that controls the colors/styles. It acts as the 
+    'renderer' instance used by many classes in the hierarchy. 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># In wxPython, drawing is performed on a wxDC instance, which will</span>
+    <span class="s3"># generally be mapped to the client area of the window displaying</span>
+    <span class="s3"># the plot. Under wxPython, the wxDC instance has a wx.Pen which</span>
+    <span class="s3"># describes the colour and weight of any lines drawn, and a wxBrush</span>
+    <span class="s3"># which describes the fill colour of any closed polygon.</span>
+
+    <span class="s3"># Font styles, families and weight.</span>
+    <span class="s1">fontweights = {</span>
+        <span class="s4">100</span><span class="s1">: wx.FONTWEIGHT_LIGHT</span><span class="s2">,</span>
+        <span class="s4">200</span><span class="s1">: wx.FONTWEIGHT_LIGHT</span><span class="s2">,</span>
+        <span class="s4">300</span><span class="s1">: wx.FONTWEIGHT_LIGHT</span><span class="s2">,</span>
+        <span class="s4">400</span><span class="s1">: wx.FONTWEIGHT_NORMAL</span><span class="s2">,</span>
+        <span class="s4">500</span><span class="s1">: wx.FONTWEIGHT_NORMAL</span><span class="s2">,</span>
+        <span class="s4">600</span><span class="s1">: wx.FONTWEIGHT_NORMAL</span><span class="s2">,</span>
+        <span class="s4">700</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+        <span class="s4">800</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+        <span class="s4">900</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+        <span class="s5">'ultralight'</span><span class="s1">: wx.FONTWEIGHT_LIGHT</span><span class="s2">,</span>
+        <span class="s5">'light'</span><span class="s1">: wx.FONTWEIGHT_LIGHT</span><span class="s2">,</span>
+        <span class="s5">'normal'</span><span class="s1">: wx.FONTWEIGHT_NORMAL</span><span class="s2">,</span>
+        <span class="s5">'medium'</span><span class="s1">: wx.FONTWEIGHT_NORMAL</span><span class="s2">,</span>
+        <span class="s5">'semibold'</span><span class="s1">: wx.FONTWEIGHT_NORMAL</span><span class="s2">,</span>
+        <span class="s5">'bold'</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+        <span class="s5">'heavy'</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+        <span class="s5">'ultrabold'</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+        <span class="s5">'black'</span><span class="s1">: wx.FONTWEIGHT_BOLD</span><span class="s2">,</span>
+    <span class="s1">}</span>
+    <span class="s1">fontangles = {</span>
+        <span class="s5">'italic'</span><span class="s1">: wx.FONTSTYLE_ITALIC</span><span class="s2">,</span>
+        <span class="s5">'normal'</span><span class="s1">: wx.FONTSTYLE_NORMAL</span><span class="s2">,</span>
+        <span class="s5">'oblique'</span><span class="s1">: wx.FONTSTYLE_SLANT</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3"># wxPython allows for portable font styles, choosing them appropriately for</span>
+    <span class="s3"># the target platform. Map some standard font names to the portable styles.</span>
+    <span class="s3"># QUESTION: Is it wise to agree to standard fontnames across all backends?</span>
+    <span class="s1">fontnames = {</span>
+        <span class="s5">'Sans'</span><span class="s1">: wx.FONTFAMILY_SWISS</span><span class="s2">,</span>
+        <span class="s5">'Roman'</span><span class="s1">: wx.FONTFAMILY_ROMAN</span><span class="s2">,</span>
+        <span class="s5">'Script'</span><span class="s1">: wx.FONTFAMILY_SCRIPT</span><span class="s2">,</span>
+        <span class="s5">'Decorative'</span><span class="s1">: wx.FONTFAMILY_DECORATIVE</span><span class="s2">,</span>
+        <span class="s5">'Modern'</span><span class="s1">: wx.FONTFAMILY_MODERN</span><span class="s2">,</span>
+        <span class="s5">'Courier'</span><span class="s1">: wx.FONTFAMILY_MODERN</span><span class="s2">,</span>
+        <span class="s5">'courier'</span><span class="s1">: wx.FONTFAMILY_MODERN</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">bitmap</span><span class="s2">, </span><span class="s1">dpi):</span>
+        <span class="s0">&quot;&quot;&quot;Initialise a wxWindows renderer instance.&quot;&quot;&quot;</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - __init__()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.width = bitmap.GetWidth()</span>
+        <span class="s1">self.height = bitmap.GetHeight()</span>
+        <span class="s1">self.bitmap = bitmap</span>
+        <span class="s1">self.fontd = {}</span>
+        <span class="s1">self.dpi = dpi</span>
+        <span class="s1">self.gc = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">flipy(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s2">return True</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">offset_text_height(self):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent(self</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath):</span>
+        <span class="s3"># docstring inherited</span>
+
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s1">s = cbook.strip_math(s)</span>
+
+        <span class="s2">if </span><span class="s1">self.gc </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">gc = self.new_gc()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">gc = self.gc</span>
+        <span class="s1">gfx_ctx = gc.gfx_ctx</span>
+        <span class="s1">font = self.get_wx_font(s</span><span class="s2">, </span><span class="s1">prop)</span>
+        <span class="s1">gfx_ctx.SetFont(font</span><span class="s2">, </span><span class="s1">wx.BLACK)</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">descent</span><span class="s2">, </span><span class="s1">leading = gfx_ctx.GetFullTextExtent(s)</span>
+
+        <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">descent</span>
+
+    <span class="s2">def </span><span class="s1">get_canvas_width_height(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">self.width</span><span class="s2">, </span><span class="s1">self.height</span>
+
+    <span class="s2">def </span><span class="s1">handle_clip_rectangle(self</span><span class="s2">, </span><span class="s1">gc):</span>
+        <span class="s1">new_bounds = gc.get_clip_rectangle()</span>
+        <span class="s2">if </span><span class="s1">new_bounds </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">new_bounds = new_bounds.bounds</span>
+        <span class="s1">gfx_ctx = gc.gfx_ctx</span>
+        <span class="s2">if </span><span class="s1">gfx_ctx._lastcliprect != new_bounds:</span>
+            <span class="s1">gfx_ctx._lastcliprect = new_bounds</span>
+            <span class="s2">if </span><span class="s1">new_bounds </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">gfx_ctx.ResetClip()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">gfx_ctx.Clip(new_bounds[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">self.height - new_bounds[</span><span class="s4">1</span><span class="s1">] - new_bounds[</span><span class="s4">3</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">new_bounds[</span><span class="s4">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">new_bounds[</span><span class="s4">3</span><span class="s1">])</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">convert_path(gfx_ctx</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform):</span>
+        <span class="s1">wxpath = gfx_ctx.CreatePath()</span>
+        <span class="s2">for </span><span class="s1">points</span><span class="s2">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">path.iter_segments(transform):</span>
+            <span class="s2">if </span><span class="s1">code == Path.MOVETO:</span>
+                <span class="s1">wxpath.MoveToPoint(*points)</span>
+            <span class="s2">elif </span><span class="s1">code == Path.LINETO:</span>
+                <span class="s1">wxpath.AddLineToPoint(*points)</span>
+            <span class="s2">elif </span><span class="s1">code == Path.CURVE3:</span>
+                <span class="s1">wxpath.AddQuadCurveToPoint(*points)</span>
+            <span class="s2">elif </span><span class="s1">code == Path.CURVE4:</span>
+                <span class="s1">wxpath.AddCurveToPoint(*points)</span>
+            <span class="s2">elif </span><span class="s1">code == Path.CLOSEPOLY:</span>
+                <span class="s1">wxpath.CloseSubpath()</span>
+        <span class="s2">return </span><span class="s1">wxpath</span>
+
+    <span class="s2">def </span><span class="s1">draw_path(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">rgbFace=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">gc.select()</span>
+        <span class="s1">self.handle_clip_rectangle(gc)</span>
+        <span class="s1">gfx_ctx = gc.gfx_ctx</span>
+        <span class="s1">transform = transform + \</span>
+            <span class="s1">Affine2D().scale(</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">).translate(</span><span class="s4">0.0</span><span class="s2">, </span><span class="s1">self.height)</span>
+        <span class="s1">wxpath = self.convert_path(gfx_ctx</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform)</span>
+        <span class="s2">if </span><span class="s1">rgbFace </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">gfx_ctx.SetBrush(wx.Brush(gc.get_wxcolour(rgbFace)))</span>
+            <span class="s1">gfx_ctx.DrawPath(wxpath)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">gfx_ctx.StrokePath(wxpath)</span>
+        <span class="s1">gc.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">draw_image(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">im):</span>
+        <span class="s1">bbox = gc.get_clip_rectangle()</span>
+        <span class="s2">if </span><span class="s1">bbox </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h = bbox.bounds</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">l = </span><span class="s4">0</span>
+            <span class="s1">b = </span><span class="s4">0</span>
+            <span class="s1">w = self.width</span>
+            <span class="s1">h = self.height</span>
+        <span class="s1">rows</span><span class="s2">, </span><span class="s1">cols = im.shape[:</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">bitmap = wx.Bitmap.FromBufferRGBA(cols</span><span class="s2">, </span><span class="s1">rows</span><span class="s2">, </span><span class="s1">im.tobytes())</span>
+        <span class="s1">gc.select()</span>
+        <span class="s1">gc.gfx_ctx.DrawBitmap(bitmap</span><span class="s2">, </span><span class="s1">int(l)</span><span class="s2">, </span><span class="s1">int(self.height - b)</span><span class="s2">,</span>
+                              <span class="s1">int(w)</span><span class="s2">, </span><span class="s1">int(-h))</span>
+        <span class="s1">gc.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">draw_text(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">ismath=</span><span class="s2">False, </span><span class="s1">mtext=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s3"># docstring inherited</span>
+
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s1">s = cbook.strip_math(s)</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - draw_text()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">gc.select()</span>
+        <span class="s1">self.handle_clip_rectangle(gc)</span>
+        <span class="s1">gfx_ctx = gc.gfx_ctx</span>
+
+        <span class="s1">font = self.get_wx_font(s</span><span class="s2">, </span><span class="s1">prop)</span>
+        <span class="s1">color = gc.get_wxcolour(gc.get_rgb())</span>
+        <span class="s1">gfx_ctx.SetFont(font</span><span class="s2">, </span><span class="s1">color)</span>
+
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">d = self.get_text_width_height_descent(s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath)</span>
+        <span class="s1">x = int(x)</span>
+        <span class="s1">y = int(y - h)</span>
+
+        <span class="s2">if </span><span class="s1">angle == </span><span class="s4">0.0</span><span class="s1">:</span>
+            <span class="s1">gfx_ctx.DrawText(s</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">rads = math.radians(angle)</span>
+            <span class="s1">xo = h * math.sin(rads)</span>
+            <span class="s1">yo = h * math.cos(rads)</span>
+            <span class="s1">gfx_ctx.DrawRotatedText(s</span><span class="s2">, </span><span class="s1">x - xo</span><span class="s2">, </span><span class="s1">y - yo</span><span class="s2">, </span><span class="s1">rads)</span>
+
+        <span class="s1">gc.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">new_gc(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - new_gc()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.gc = GraphicsContextWx(self.bitmap</span><span class="s2">, </span><span class="s1">self)</span>
+        <span class="s1">self.gc.select()</span>
+        <span class="s1">self.gc.unselect()</span>
+        <span class="s2">return </span><span class="s1">self.gc</span>
+
+    <span class="s2">def </span><span class="s1">get_wx_font(self</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop):</span>
+        <span class="s0">&quot;&quot;&quot;Return a wx font.  Cache font instances for efficiency.&quot;&quot;&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - get_wx_font()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">key = hash(prop)</span>
+        <span class="s1">font = self.fontd.get(key)</span>
+        <span class="s2">if </span><span class="s1">font </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">font</span>
+        <span class="s1">size = self.points_to_pixels(prop.get_size_in_points())</span>
+        <span class="s3"># Font colour is determined by the active wx.Pen</span>
+        <span class="s3"># TODO: It may be wise to cache font information</span>
+        <span class="s1">self.fontd[key] = font = wx.Font(  </span><span class="s3"># Cache the font and gc.</span>
+            <span class="s1">pointSize=round(size)</span><span class="s2">,</span>
+            <span class="s1">family=self.fontnames.get(prop.get_name()</span><span class="s2">, </span><span class="s1">wx.ROMAN)</span><span class="s2">,</span>
+            <span class="s1">style=self.fontangles[prop.get_style()]</span><span class="s2">,</span>
+            <span class="s1">weight=self.fontweights[prop.get_weight()])</span>
+        <span class="s2">return </span><span class="s1">font</span>
+
+    <span class="s2">def </span><span class="s1">points_to_pixels(self</span><span class="s2">, </span><span class="s1">points):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">points * (PIXELS_PER_INCH / </span><span class="s4">72.0 </span><span class="s1">* self.dpi / </span><span class="s4">72.0</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">GraphicsContextWx(GraphicsContextBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The graphics context provides the color, line styles, etc. 
+ 
+    This class stores a reference to a wxMemoryDC, and a 
+    wxGraphicsContext that draws to it.  Creating a wxGraphicsContext 
+    seems to be fairly heavy, so these objects are cached based on the 
+    bitmap object that is passed in. 
+ 
+    The base GraphicsContext stores colors as an RGB tuple on the unit 
+    interval, e.g., (0.5, 0.0, 1.0).  wxPython uses an int interval, but 
+    since wxPython colour management is rather simple, I have not chosen 
+    to implement a separate colour manager class. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_capd = {</span><span class="s5">'butt'</span><span class="s1">: wx.CAP_BUTT</span><span class="s2">,</span>
+             <span class="s5">'projecting'</span><span class="s1">: wx.CAP_PROJECTING</span><span class="s2">,</span>
+             <span class="s5">'round'</span><span class="s1">: wx.CAP_ROUND}</span>
+
+    <span class="s1">_joind = {</span><span class="s5">'bevel'</span><span class="s1">: wx.JOIN_BEVEL</span><span class="s2">,</span>
+              <span class="s5">'miter'</span><span class="s1">: wx.JOIN_MITER</span><span class="s2">,</span>
+              <span class="s5">'round'</span><span class="s1">: wx.JOIN_ROUND}</span>
+
+    <span class="s1">_cache = weakref.WeakKeyDictionary()</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">bitmap</span><span class="s2">, </span><span class="s1">renderer):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s3"># assert self.Ok(), &quot;wxMemoryDC not OK to use&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - __init__(): %s&quot;</span><span class="s2">, </span><span class="s1">type(self)</span><span class="s2">, </span><span class="s1">bitmap)</span>
+
+        <span class="s1">dc</span><span class="s2">, </span><span class="s1">gfx_ctx = self._cache.get(bitmap</span><span class="s2">, </span><span class="s1">(</span><span class="s2">None, None</span><span class="s1">))</span>
+        <span class="s2">if </span><span class="s1">dc </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dc = wx.MemoryDC(bitmap)</span>
+            <span class="s1">gfx_ctx = wx.GraphicsContext.Create(dc)</span>
+            <span class="s1">gfx_ctx._lastcliprect = </span><span class="s2">None</span>
+            <span class="s1">self._cache[bitmap] = dc</span><span class="s2">, </span><span class="s1">gfx_ctx</span>
+
+        <span class="s1">self.bitmap = bitmap</span>
+        <span class="s1">self.dc = dc</span>
+        <span class="s1">self.gfx_ctx = gfx_ctx</span>
+        <span class="s1">self._pen = wx.Pen(</span><span class="s5">'BLACK'</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">wx.SOLID)</span>
+        <span class="s1">gfx_ctx.SetPen(self._pen)</span>
+        <span class="s1">self.renderer = renderer</span>
+
+    <span class="s2">def </span><span class="s1">select(self):</span>
+        <span class="s0">&quot;&quot;&quot;Select the current bitmap into this wxDC instance.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">sys.platform == </span><span class="s5">'win32'</span><span class="s1">:</span>
+            <span class="s1">self.dc.SelectObject(self.bitmap)</span>
+            <span class="s1">self.IsSelected = </span><span class="s2">True</span>
+
+    <span class="s2">def </span><span class="s1">unselect(self):</span>
+        <span class="s0">&quot;&quot;&quot;Select a Null bitmap into this wxDC instance.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">sys.platform == </span><span class="s5">'win32'</span><span class="s1">:</span>
+            <span class="s1">self.dc.SelectObject(wx.NullBitmap)</span>
+            <span class="s1">self.IsSelected = </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">set_foreground(self</span><span class="s2">, </span><span class="s1">fg</span><span class="s2">, </span><span class="s1">isRGBA=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s3"># Implementation note: wxPython has a separate concept of pen and</span>
+        <span class="s3"># brush - the brush fills any outline trace left by the pen.</span>
+        <span class="s3"># Here we set both to the same colour - if a figure is not to be</span>
+        <span class="s3"># filled, the renderer will set the brush to be transparent</span>
+        <span class="s3"># Same goes for text foreground...</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - set_foreground()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.select()</span>
+        <span class="s1">super().set_foreground(fg</span><span class="s2">, </span><span class="s1">isRGBA)</span>
+
+        <span class="s1">self._pen.SetColour(self.get_wxcolour(self.get_rgb()))</span>
+        <span class="s1">self.gfx_ctx.SetPen(self._pen)</span>
+        <span class="s1">self.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">set_linewidth(self</span><span class="s2">, </span><span class="s1">w):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">w = float(w)</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - set_linewidth()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.select()</span>
+        <span class="s2">if </span><span class="s4">0 </span><span class="s1">&lt; w &lt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">w = </span><span class="s4">1</span>
+        <span class="s1">super().set_linewidth(w)</span>
+        <span class="s1">lw = int(self.renderer.points_to_pixels(self._linewidth))</span>
+        <span class="s2">if </span><span class="s1">lw == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">lw = </span><span class="s4">1</span>
+        <span class="s1">self._pen.SetWidth(lw)</span>
+        <span class="s1">self.gfx_ctx.SetPen(self._pen)</span>
+        <span class="s1">self.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">set_capstyle(self</span><span class="s2">, </span><span class="s1">cs):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - set_capstyle()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.select()</span>
+        <span class="s1">super().set_capstyle(cs)</span>
+        <span class="s1">self._pen.SetCap(GraphicsContextWx._capd[self._capstyle])</span>
+        <span class="s1">self.gfx_ctx.SetPen(self._pen)</span>
+        <span class="s1">self.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">set_joinstyle(self</span><span class="s2">, </span><span class="s1">js):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - set_joinstyle()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.select()</span>
+        <span class="s1">super().set_joinstyle(js)</span>
+        <span class="s1">self._pen.SetJoin(GraphicsContextWx._joind[self._joinstyle])</span>
+        <span class="s1">self.gfx_ctx.SetPen(self._pen)</span>
+        <span class="s1">self.unselect()</span>
+
+    <span class="s2">def </span><span class="s1">get_wxcolour(self</span><span class="s2">, </span><span class="s1">color):</span>
+        <span class="s0">&quot;&quot;&quot;Convert an RGB(A) color to a wx.Colour.&quot;&quot;&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - get_wx_color()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s2">return </span><span class="s1">wx.Colour(*[int(</span><span class="s4">255 </span><span class="s1">* x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">color])</span>
+
+
+<span class="s2">class </span><span class="s1">_FigureCanvasWxBase(FigureCanvasBase</span><span class="s2">, </span><span class="s1">wx.Panel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The FigureCanvas contains the figure and does event handling. 
+ 
+    In the wxPython backend, it is derived from wxPanel, and (usually) lives 
+    inside a frame instantiated by a FigureManagerWx. The parent window 
+    probably implements a wx.Sizer to control the displayed control size - but 
+    we give a hint as to our preferred minimum size. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">required_interactive_framework = </span><span class="s5">&quot;wx&quot;</span>
+    <span class="s1">_timer_cls = TimerWx</span>
+    <span class="s1">manager_class = _api.classproperty(</span><span class="s2">lambda </span><span class="s1">cls: FigureManagerWx)</span>
+
+    <span class="s1">keyvald = {</span>
+        <span class="s1">wx.WXK_CONTROL: </span><span class="s5">'control'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_SHIFT: </span><span class="s5">'shift'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_ALT: </span><span class="s5">'alt'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_CAPITAL: </span><span class="s5">'caps_lock'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_LEFT: </span><span class="s5">'left'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_UP: </span><span class="s5">'up'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_RIGHT: </span><span class="s5">'right'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_DOWN: </span><span class="s5">'down'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_ESCAPE: </span><span class="s5">'escape'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F1: </span><span class="s5">'f1'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F2: </span><span class="s5">'f2'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F3: </span><span class="s5">'f3'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F4: </span><span class="s5">'f4'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F5: </span><span class="s5">'f5'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F6: </span><span class="s5">'f6'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F7: </span><span class="s5">'f7'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F8: </span><span class="s5">'f8'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F9: </span><span class="s5">'f9'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F10: </span><span class="s5">'f10'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F11: </span><span class="s5">'f11'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_F12: </span><span class="s5">'f12'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_SCROLL: </span><span class="s5">'scroll_lock'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_PAUSE: </span><span class="s5">'break'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_BACK: </span><span class="s5">'backspace'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_RETURN: </span><span class="s5">'enter'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_INSERT: </span><span class="s5">'insert'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_DELETE: </span><span class="s5">'delete'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_HOME: </span><span class="s5">'home'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_END: </span><span class="s5">'end'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_PAGEUP: </span><span class="s5">'pageup'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_PAGEDOWN: </span><span class="s5">'pagedown'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD0: </span><span class="s5">'0'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD1: </span><span class="s5">'1'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD2: </span><span class="s5">'2'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD3: </span><span class="s5">'3'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD4: </span><span class="s5">'4'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD5: </span><span class="s5">'5'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD6: </span><span class="s5">'6'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD7: </span><span class="s5">'7'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD8: </span><span class="s5">'8'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD9: </span><span class="s5">'9'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_ADD: </span><span class="s5">'+'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_SUBTRACT: </span><span class="s5">'-'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_MULTIPLY: </span><span class="s5">'*'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_DIVIDE: </span><span class="s5">'/'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_DECIMAL: </span><span class="s5">'dec'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_ENTER: </span><span class="s5">'enter'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_UP: </span><span class="s5">'up'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_RIGHT: </span><span class="s5">'right'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_DOWN: </span><span class="s5">'down'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_LEFT: </span><span class="s5">'left'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_PAGEUP: </span><span class="s5">'pageup'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_PAGEDOWN: </span><span class="s5">'pagedown'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_HOME: </span><span class="s5">'home'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_END: </span><span class="s5">'end'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_INSERT: </span><span class="s5">'insert'</span><span class="s2">,</span>
+        <span class="s1">wx.WXK_NUMPAD_DELETE: </span><span class="s5">'delete'</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">id</span><span class="s2">, </span><span class="s1">figure=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize a FigureWx instance. 
+ 
+        - Initialize the FigureCanvasBase and wxPanel parents. 
+        - Set event handlers for resize, paint, and keyboard and mouse 
+          interaction. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">FigureCanvasBase.__init__(self</span><span class="s2">, </span><span class="s1">figure)</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h = map(math.ceil</span><span class="s2">, </span><span class="s1">self.figure.bbox.size)</span>
+        <span class="s3"># Set preferred window size hint - helps the sizer, if one is connected</span>
+        <span class="s1">wx.Panel.__init__(self</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">id</span><span class="s2">, </span><span class="s1">size=wx.Size(w</span><span class="s2">, </span><span class="s1">h))</span>
+        <span class="s3"># Create the drawing bitmap</span>
+        <span class="s1">self.bitmap = wx.Bitmap(w</span><span class="s2">, </span><span class="s1">h)</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - __init__() - bitmap w:%d h:%d&quot;</span><span class="s2">, </span><span class="s1">type(self)</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h)</span>
+        <span class="s1">self._isDrawn = </span><span class="s2">False</span>
+        <span class="s1">self._rubberband_rect = </span><span class="s2">None</span>
+        <span class="s1">self._rubberband_pen_black = wx.Pen(</span><span class="s5">'BLACK'</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">wx.PENSTYLE_SHORT_DASH)</span>
+        <span class="s1">self._rubberband_pen_white = wx.Pen(</span><span class="s5">'WHITE'</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">wx.PENSTYLE_SOLID)</span>
+
+        <span class="s1">self.Bind(wx.EVT_SIZE</span><span class="s2">, </span><span class="s1">self._on_size)</span>
+        <span class="s1">self.Bind(wx.EVT_PAINT</span><span class="s2">, </span><span class="s1">self._on_paint)</span>
+        <span class="s1">self.Bind(wx.EVT_CHAR_HOOK</span><span class="s2">, </span><span class="s1">self._on_key_down)</span>
+        <span class="s1">self.Bind(wx.EVT_KEY_UP</span><span class="s2">, </span><span class="s1">self._on_key_up)</span>
+        <span class="s1">self.Bind(wx.EVT_LEFT_DOWN</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_LEFT_DCLICK</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_LEFT_UP</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MIDDLE_DOWN</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MIDDLE_DCLICK</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MIDDLE_UP</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_RIGHT_DOWN</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_RIGHT_DCLICK</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_RIGHT_UP</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_AUX1_DOWN</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_AUX1_UP</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_AUX2_DOWN</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_AUX2_UP</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_AUX1_DCLICK</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_AUX2_DCLICK</span><span class="s2">, </span><span class="s1">self._on_mouse_button)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSEWHEEL</span><span class="s2">, </span><span class="s1">self._on_mouse_wheel)</span>
+        <span class="s1">self.Bind(wx.EVT_MOTION</span><span class="s2">, </span><span class="s1">self._on_motion)</span>
+        <span class="s1">self.Bind(wx.EVT_ENTER_WINDOW</span><span class="s2">, </span><span class="s1">self._on_enter)</span>
+        <span class="s1">self.Bind(wx.EVT_LEAVE_WINDOW</span><span class="s2">, </span><span class="s1">self._on_leave)</span>
+
+        <span class="s1">self.Bind(wx.EVT_MOUSE_CAPTURE_CHANGED</span><span class="s2">, </span><span class="s1">self._on_capture_lost)</span>
+        <span class="s1">self.Bind(wx.EVT_MOUSE_CAPTURE_LOST</span><span class="s2">, </span><span class="s1">self._on_capture_lost)</span>
+
+        <span class="s1">self.SetBackgroundStyle(wx.BG_STYLE_PAINT)  </span><span class="s3"># Reduce flicker.</span>
+        <span class="s1">self.SetBackgroundColour(wx.WHITE)</span>
+
+    <span class="s2">def </span><span class="s1">Copy_to_Clipboard(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Copy bitmap of canvas to system clipboard.&quot;&quot;&quot;</span>
+        <span class="s1">bmp_obj = wx.BitmapDataObject()</span>
+        <span class="s1">bmp_obj.SetBitmap(self.bitmap)</span>
+
+        <span class="s2">if not </span><span class="s1">wx.TheClipboard.IsOpened():</span>
+            <span class="s1">open_success = wx.TheClipboard.Open()</span>
+            <span class="s2">if </span><span class="s1">open_success:</span>
+                <span class="s1">wx.TheClipboard.SetData(bmp_obj)</span>
+                <span class="s1">wx.TheClipboard.Close()</span>
+                <span class="s1">wx.TheClipboard.Flush()</span>
+
+    <span class="s2">def </span><span class="s1">draw_idle(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - draw_idle()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self._isDrawn = </span><span class="s2">False  </span><span class="s3"># Force redraw</span>
+        <span class="s3"># Triggering a paint event is all that is needed to defer drawing</span>
+        <span class="s3"># until later. The platform will send the event when it thinks it is</span>
+        <span class="s3"># a good time (usually as soon as there are no other events pending).</span>
+        <span class="s1">self.Refresh(eraseBackground=</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">flush_events(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">wx.Yield()</span>
+
+    <span class="s2">def </span><span class="s1">start_event_loop(self</span><span class="s2">, </span><span class="s1">timeout=</span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">'_event_loop'</span><span class="s1">):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">&quot;Event loop already running&quot;</span><span class="s1">)</span>
+        <span class="s1">timer = wx.Timer(self</span><span class="s2">, </span><span class="s1">id=wx.ID_ANY)</span>
+        <span class="s2">if </span><span class="s1">timeout &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">timer.Start(int(timeout * </span><span class="s4">1000</span><span class="s1">)</span><span class="s2">, </span><span class="s1">oneShot=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.Bind(wx.EVT_TIMER</span><span class="s2">, </span><span class="s1">self.stop_event_loop</span><span class="s2">, </span><span class="s1">id=timer.GetId())</span>
+        <span class="s3"># Event loop handler for start/stop event loop</span>
+        <span class="s1">self._event_loop = wx.GUIEventLoop()</span>
+        <span class="s1">self._event_loop.Run()</span>
+        <span class="s1">timer.Stop()</span>
+
+    <span class="s2">def </span><span class="s1">stop_event_loop(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">'_event_loop'</span><span class="s1">):</span>
+            <span class="s2">if </span><span class="s1">self._event_loop.IsRunning():</span>
+                <span class="s1">self._event_loop.Exit()</span>
+            <span class="s2">del </span><span class="s1">self._event_loop</span>
+
+    <span class="s2">def </span><span class="s1">_get_imagesave_wildcards(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the wildcard string for the filesave dialog.&quot;&quot;&quot;</span>
+        <span class="s1">default_filetype = self.get_default_filetype()</span>
+        <span class="s1">filetypes = self.get_supported_filetypes_grouped()</span>
+        <span class="s1">sorted_filetypes = sorted(filetypes.items())</span>
+        <span class="s1">wildcards = []</span>
+        <span class="s1">extensions = []</span>
+        <span class="s1">filter_index = </span><span class="s4">0</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(name</span><span class="s2">, </span><span class="s1">exts) </span><span class="s2">in </span><span class="s1">enumerate(sorted_filetypes):</span>
+            <span class="s1">ext_list = </span><span class="s5">';'</span><span class="s1">.join([</span><span class="s5">'*.%s' </span><span class="s1">% ext </span><span class="s2">for </span><span class="s1">ext </span><span class="s2">in </span><span class="s1">exts])</span>
+            <span class="s1">extensions.append(exts[</span><span class="s4">0</span><span class="s1">])</span>
+            <span class="s1">wildcard = </span><span class="s5">'%s (%s)|%s' </span><span class="s1">% (name</span><span class="s2">, </span><span class="s1">ext_list</span><span class="s2">, </span><span class="s1">ext_list)</span>
+            <span class="s2">if </span><span class="s1">default_filetype </span><span class="s2">in </span><span class="s1">exts:</span>
+                <span class="s1">filter_index = i</span>
+            <span class="s1">wildcards.append(wildcard)</span>
+        <span class="s1">wildcards = </span><span class="s5">'|'</span><span class="s1">.join(wildcards)</span>
+        <span class="s2">return </span><span class="s1">wildcards</span><span class="s2">, </span><span class="s1">extensions</span><span class="s2">, </span><span class="s1">filter_index</span>
+
+    <span class="s2">def </span><span class="s1">gui_repaint(self</span><span class="s2">, </span><span class="s1">drawDC=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Update the displayed image on the GUI canvas, using the supplied 
+        wx.PaintDC device context. 
+ 
+        The 'WXAgg' backend sets origin accordingly. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - gui_repaint()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s3"># The &quot;if self&quot; check avoids a &quot;wrapped C/C++ object has been deleted&quot;</span>
+        <span class="s3"># RuntimeError if doing things after window is closed.</span>
+        <span class="s2">if not </span><span class="s1">(self </span><span class="s2">and </span><span class="s1">self.IsShownOnScreen()):</span>
+            <span class="s2">return</span>
+        <span class="s2">if not </span><span class="s1">drawDC:  </span><span class="s3"># not called from OnPaint use a ClientDC</span>
+            <span class="s1">drawDC = wx.ClientDC(self)</span>
+        <span class="s3"># For 'WX' backend on Windows, the bitmap can not be in use by another</span>
+        <span class="s3"># DC (see GraphicsContextWx._cache).</span>
+        <span class="s1">bmp = (self.bitmap.ConvertToImage().ConvertToBitmap()</span>
+               <span class="s2">if </span><span class="s1">wx.Platform == </span><span class="s5">'__WXMSW__'</span>
+                  <span class="s2">and </span><span class="s1">isinstance(self.figure.canvas.get_renderer()</span><span class="s2">, </span><span class="s1">RendererWx)</span>
+               <span class="s2">else </span><span class="s1">self.bitmap)</span>
+        <span class="s1">drawDC.DrawBitmap(bmp</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self._rubberband_rect </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s3"># Some versions of wx+python don't support numpy.float64 here.</span>
+            <span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1 = map(round</span><span class="s2">, </span><span class="s1">self._rubberband_rect)</span>
+            <span class="s1">rect = [(x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y0)</span><span class="s2">, </span><span class="s1">(x1</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1)</span><span class="s2">,</span>
+                    <span class="s1">(x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y1)</span><span class="s2">, </span><span class="s1">(x0</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1)]</span>
+            <span class="s1">drawDC.DrawLineList(rect</span><span class="s2">, </span><span class="s1">self._rubberband_pen_white)</span>
+            <span class="s1">drawDC.DrawLineList(rect</span><span class="s2">, </span><span class="s1">self._rubberband_pen_black)</span>
+
+    <span class="s1">filetypes = {</span>
+        <span class="s1">**FigureCanvasBase.filetypes</span><span class="s2">,</span>
+        <span class="s5">'bmp'</span><span class="s1">: </span><span class="s5">'Windows bitmap'</span><span class="s2">,</span>
+        <span class="s5">'jpeg'</span><span class="s1">: </span><span class="s5">'JPEG'</span><span class="s2">,</span>
+        <span class="s5">'jpg'</span><span class="s1">: </span><span class="s5">'JPEG'</span><span class="s2">,</span>
+        <span class="s5">'pcx'</span><span class="s1">: </span><span class="s5">'PCX'</span><span class="s2">,</span>
+        <span class="s5">'png'</span><span class="s1">: </span><span class="s5">'Portable Network Graphics'</span><span class="s2">,</span>
+        <span class="s5">'tif'</span><span class="s1">: </span><span class="s5">'Tagged Image Format File'</span><span class="s2">,</span>
+        <span class="s5">'tiff'</span><span class="s1">: </span><span class="s5">'Tagged Image Format File'</span><span class="s2">,</span>
+        <span class="s5">'xpm'</span><span class="s1">: </span><span class="s5">'X pixmap'</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">print_figure(self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">super().print_figure(filename</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s3"># Restore the current view; this is needed because the artist contains</span>
+        <span class="s3"># methods rely on particular attributes of the rendered figure for</span>
+        <span class="s3"># determining things like bounding boxes.</span>
+        <span class="s2">if </span><span class="s1">self._isDrawn:</span>
+            <span class="s1">self.draw()</span>
+
+    <span class="s2">def </span><span class="s1">_on_paint(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Called when wxPaintEvt is generated.&quot;&quot;&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - _on_paint()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">drawDC = wx.PaintDC(self)</span>
+        <span class="s2">if not </span><span class="s1">self._isDrawn:</span>
+            <span class="s1">self.draw(drawDC=drawDC)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.gui_repaint(drawDC=drawDC)</span>
+        <span class="s1">drawDC.Destroy()</span>
+
+    <span class="s2">def </span><span class="s1">_on_size(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Called when wxEventSize is generated. 
+ 
+        In this application we attempt to resize to fit the window, so it 
+        is better to take the performance hit and redraw the whole window. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - _on_size()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">sz = self.GetParent().GetSizer()</span>
+        <span class="s2">if </span><span class="s1">sz:</span>
+            <span class="s1">si = sz.GetItem(self)</span>
+        <span class="s2">if </span><span class="s1">sz </span><span class="s2">and </span><span class="s1">si </span><span class="s2">and not </span><span class="s1">si.Proportion </span><span class="s2">and not </span><span class="s1">si.Flag &amp; wx.EXPAND:</span>
+            <span class="s3"># managed by a sizer, but with a fixed size</span>
+            <span class="s1">size = self.GetMinSize()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s3"># variable size</span>
+            <span class="s1">size = self.GetClientSize()</span>
+            <span class="s3"># Do not allow size to become smaller than MinSize</span>
+            <span class="s1">size.IncTo(self.GetMinSize())</span>
+        <span class="s2">if </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s5">&quot;_width&quot;</span><span class="s2">, None</span><span class="s1">):</span>
+            <span class="s2">if </span><span class="s1">size == (self._width</span><span class="s2">, </span><span class="s1">self._height):</span>
+                <span class="s3"># no change in size</span>
+                <span class="s2">return</span>
+        <span class="s1">self._width</span><span class="s2">, </span><span class="s1">self._height = size</span>
+        <span class="s1">self._isDrawn = </span><span class="s2">False</span>
+
+        <span class="s2">if </span><span class="s1">self._width &lt;= </span><span class="s4">1 </span><span class="s2">or </span><span class="s1">self._height &lt;= </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">return  </span><span class="s3"># Empty figure</span>
+
+        <span class="s3"># Create a new, correctly sized bitmap</span>
+        <span class="s1">self.bitmap = wx.Bitmap(self._width</span><span class="s2">, </span><span class="s1">self._height)</span>
+
+        <span class="s1">dpival = self.figure.dpi</span>
+        <span class="s1">winch = self._width / dpival</span>
+        <span class="s1">hinch = self._height / dpival</span>
+        <span class="s1">self.figure.set_size_inches(winch</span><span class="s2">, </span><span class="s1">hinch</span><span class="s2">, </span><span class="s1">forward=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s3"># Rendering will happen on the associated paint event</span>
+        <span class="s3"># so no need to do anything here except to make sure</span>
+        <span class="s3"># the whole background is repainted.</span>
+        <span class="s1">self.Refresh(eraseBackground=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">ResizeEvent(</span><span class="s5">&quot;resize_event&quot;</span><span class="s2">, </span><span class="s1">self)._process()</span>
+        <span class="s1">self.draw_idle()</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_mpl_modifiers(event=</span><span class="s2">None, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">exclude=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">mod_table = [</span>
+            <span class="s1">(</span><span class="s5">&quot;ctrl&quot;</span><span class="s2">, </span><span class="s1">wx.MOD_CONTROL</span><span class="s2">, </span><span class="s1">wx.WXK_CONTROL)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s5">&quot;alt&quot;</span><span class="s2">, </span><span class="s1">wx.MOD_ALT</span><span class="s2">, </span><span class="s1">wx.WXK_ALT)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s5">&quot;shift&quot;</span><span class="s2">, </span><span class="s1">wx.MOD_SHIFT</span><span class="s2">, </span><span class="s1">wx.WXK_SHIFT)</span><span class="s2">,</span>
+        <span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">event </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">modifiers = event.GetModifiers()</span>
+            <span class="s2">return </span><span class="s1">[name </span><span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">key </span><span class="s2">in </span><span class="s1">mod_table</span>
+                    <span class="s2">if </span><span class="s1">modifiers &amp; mod </span><span class="s2">and </span><span class="s1">exclude != key]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">[name </span><span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">key </span><span class="s2">in </span><span class="s1">mod_table</span>
+                    <span class="s2">if </span><span class="s1">wx.GetKeyState(key)]</span>
+
+    <span class="s2">def </span><span class="s1">_get_key(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s1">keyval = event.KeyCode</span>
+        <span class="s2">if </span><span class="s1">keyval </span><span class="s2">in </span><span class="s1">self.keyvald:</span>
+            <span class="s1">key = self.keyvald[keyval]</span>
+        <span class="s2">elif </span><span class="s1">keyval &lt; </span><span class="s4">256</span><span class="s1">:</span>
+            <span class="s1">key = chr(keyval)</span>
+            <span class="s3"># wx always returns an uppercase, so make it lowercase if the shift</span>
+            <span class="s3"># key is not depressed (NOTE: this will not handle Caps Lock)</span>
+            <span class="s2">if not </span><span class="s1">event.ShiftDown():</span>
+                <span class="s1">key = key.lower()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return None</span>
+        <span class="s1">mods = self._mpl_modifiers(event</span><span class="s2">, </span><span class="s1">exclude=keyval)</span>
+        <span class="s2">if </span><span class="s5">&quot;shift&quot; </span><span class="s2">in </span><span class="s1">mods </span><span class="s2">and </span><span class="s1">key.isupper():</span>
+            <span class="s1">mods.remove(</span><span class="s5">&quot;shift&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s5">&quot;+&quot;</span><span class="s1">.join([*mods</span><span class="s2">, </span><span class="s1">key])</span>
+
+    <span class="s2">def </span><span class="s1">_mpl_coords(self</span><span class="s2">, </span><span class="s1">pos=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Convert a wx position, defaulting to the current cursor position, to 
+        Matplotlib coordinates. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">pos </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">pos = wx.GetMouseState()</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = self.ScreenToClient(pos.X</span><span class="s2">, </span><span class="s1">pos.Y)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = pos.X</span><span class="s2">, </span><span class="s1">pos.Y</span>
+        <span class="s3"># flip y so y=0 is bottom of canvas</span>
+        <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">self.figure.bbox.height - y</span>
+
+    <span class="s2">def </span><span class="s1">_on_key_down(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Capture key press.&quot;&quot;&quot;</span>
+        <span class="s1">KeyEvent(</span><span class="s5">&quot;key_press_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">,</span>
+                 <span class="s1">self._get_key(event)</span><span class="s2">, </span><span class="s1">*self._mpl_coords()</span><span class="s2">,</span>
+                 <span class="s1">guiEvent=event)._process()</span>
+        <span class="s2">if </span><span class="s1">self:</span>
+            <span class="s1">event.Skip()</span>
+
+    <span class="s2">def </span><span class="s1">_on_key_up(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Release key.&quot;&quot;&quot;</span>
+        <span class="s1">KeyEvent(</span><span class="s5">&quot;key_release_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">,</span>
+                 <span class="s1">self._get_key(event)</span><span class="s2">, </span><span class="s1">*self._mpl_coords()</span><span class="s2">,</span>
+                 <span class="s1">guiEvent=event)._process()</span>
+        <span class="s2">if </span><span class="s1">self:</span>
+            <span class="s1">event.Skip()</span>
+
+    <span class="s2">def </span><span class="s1">set_cursor(self</span><span class="s2">, </span><span class="s1">cursor):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">cursor = wx.Cursor(_api.check_getitem({</span>
+            <span class="s1">cursors.MOVE: wx.CURSOR_HAND</span><span class="s2">,</span>
+            <span class="s1">cursors.HAND: wx.CURSOR_HAND</span><span class="s2">,</span>
+            <span class="s1">cursors.POINTER: wx.CURSOR_ARROW</span><span class="s2">,</span>
+            <span class="s1">cursors.SELECT_REGION: wx.CURSOR_CROSS</span><span class="s2">,</span>
+            <span class="s1">cursors.WAIT: wx.CURSOR_WAIT</span><span class="s2">,</span>
+            <span class="s1">cursors.RESIZE_HORIZONTAL: wx.CURSOR_SIZEWE</span><span class="s2">,</span>
+            <span class="s1">cursors.RESIZE_VERTICAL: wx.CURSOR_SIZENS</span><span class="s2">,</span>
+        <span class="s1">}</span><span class="s2">, </span><span class="s1">cursor=cursor))</span>
+        <span class="s1">self.SetCursor(cursor)</span>
+        <span class="s1">self.Refresh()</span>
+
+    <span class="s2">def </span><span class="s1">_set_capture(self</span><span class="s2">, </span><span class="s1">capture=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Control wx mouse capture.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.HasCapture():</span>
+            <span class="s1">self.ReleaseMouse()</span>
+        <span class="s2">if </span><span class="s1">capture:</span>
+            <span class="s1">self.CaptureMouse()</span>
+
+    <span class="s2">def </span><span class="s1">_on_capture_lost(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Capture changed or lost&quot;&quot;&quot;</span>
+        <span class="s1">self._set_capture(</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_on_mouse_button(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Start measuring on an axis.&quot;&quot;&quot;</span>
+        <span class="s1">event.Skip()</span>
+        <span class="s1">self._set_capture(event.ButtonDown() </span><span class="s2">or </span><span class="s1">event.ButtonDClick())</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y = self._mpl_coords(event)</span>
+        <span class="s1">button_map = {</span>
+            <span class="s1">wx.MOUSE_BTN_LEFT: MouseButton.LEFT</span><span class="s2">,</span>
+            <span class="s1">wx.MOUSE_BTN_MIDDLE: MouseButton.MIDDLE</span><span class="s2">,</span>
+            <span class="s1">wx.MOUSE_BTN_RIGHT: MouseButton.RIGHT</span><span class="s2">,</span>
+            <span class="s1">wx.MOUSE_BTN_AUX1: MouseButton.BACK</span><span class="s2">,</span>
+            <span class="s1">wx.MOUSE_BTN_AUX2: MouseButton.FORWARD</span><span class="s2">,</span>
+        <span class="s1">}</span>
+        <span class="s1">button = event.GetButton()</span>
+        <span class="s1">button = button_map.get(button</span><span class="s2">, </span><span class="s1">button)</span>
+        <span class="s1">modifiers = self._mpl_modifiers(event)</span>
+        <span class="s2">if </span><span class="s1">event.ButtonDown():</span>
+            <span class="s1">MouseEvent(</span><span class="s5">&quot;button_press_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">button</span><span class="s2">,</span>
+                       <span class="s1">modifiers=modifiers</span><span class="s2">, </span><span class="s1">guiEvent=event)._process()</span>
+        <span class="s2">elif </span><span class="s1">event.ButtonDClick():</span>
+            <span class="s1">MouseEvent(</span><span class="s5">&quot;button_press_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">button</span><span class="s2">,</span>
+                       <span class="s1">dblclick=</span><span class="s2">True, </span><span class="s1">modifiers=modifiers</span><span class="s2">,</span>
+                       <span class="s1">guiEvent=event)._process()</span>
+        <span class="s2">elif </span><span class="s1">event.ButtonUp():</span>
+            <span class="s1">MouseEvent(</span><span class="s5">&quot;button_release_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">button</span><span class="s2">,</span>
+                       <span class="s1">modifiers=modifiers</span><span class="s2">, </span><span class="s1">guiEvent=event)._process()</span>
+
+    <span class="s2">def </span><span class="s1">_on_mouse_wheel(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Translate mouse wheel events into matplotlib events&quot;&quot;&quot;</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y = self._mpl_coords(event)</span>
+        <span class="s3"># Convert delta/rotation/rate into a floating point step size</span>
+        <span class="s1">step = event.LinesPerAction * event.WheelRotation / event.WheelDelta</span>
+        <span class="s3"># Done handling event</span>
+        <span class="s1">event.Skip()</span>
+        <span class="s3"># Mac gives two events for every wheel event; skip every second one.</span>
+        <span class="s2">if </span><span class="s1">wx.Platform == </span><span class="s5">'__WXMAC__'</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">'_skipwheelevent'</span><span class="s1">):</span>
+                <span class="s1">self._skipwheelevent = </span><span class="s2">True</span>
+            <span class="s2">elif </span><span class="s1">self._skipwheelevent:</span>
+                <span class="s1">self._skipwheelevent = </span><span class="s2">False</span>
+                <span class="s2">return  </span><span class="s3"># Return without processing event</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self._skipwheelevent = </span><span class="s2">True</span>
+        <span class="s1">MouseEvent(</span><span class="s5">&quot;scroll_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">step=step</span><span class="s2">,</span>
+                   <span class="s1">modifiers=self._mpl_modifiers(event)</span><span class="s2">,</span>
+                   <span class="s1">guiEvent=event)._process()</span>
+
+    <span class="s2">def </span><span class="s1">_on_motion(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Start measuring on an axis.&quot;&quot;&quot;</span>
+        <span class="s1">event.Skip()</span>
+        <span class="s1">MouseEvent(</span><span class="s5">&quot;motion_notify_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">,</span>
+                   <span class="s1">*self._mpl_coords(event)</span><span class="s2">,</span>
+                   <span class="s1">modifiers=self._mpl_modifiers(event)</span><span class="s2">,</span>
+                   <span class="s1">guiEvent=event)._process()</span>
+
+    <span class="s2">def </span><span class="s1">_on_enter(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Mouse has entered the window.&quot;&quot;&quot;</span>
+        <span class="s1">event.Skip()</span>
+        <span class="s1">LocationEvent(</span><span class="s5">&quot;figure_enter_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">,</span>
+                      <span class="s1">*self._mpl_coords(event)</span><span class="s2">,</span>
+                      <span class="s1">modifiers=self._mpl_modifiers()</span><span class="s2">,</span>
+                      <span class="s1">guiEvent=event)._process()</span>
+
+    <span class="s2">def </span><span class="s1">_on_leave(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Mouse has left the window.&quot;&quot;&quot;</span>
+        <span class="s1">event.Skip()</span>
+        <span class="s1">LocationEvent(</span><span class="s5">&quot;figure_leave_event&quot;</span><span class="s2">, </span><span class="s1">self</span><span class="s2">,</span>
+                      <span class="s1">*self._mpl_coords(event)</span><span class="s2">,</span>
+                      <span class="s1">modifiers=self._mpl_modifiers()</span><span class="s2">,</span>
+                      <span class="s1">guiEvent=event)._process()</span>
+
+
+<span class="s2">class </span><span class="s1">FigureCanvasWx(_FigureCanvasWxBase):</span>
+    <span class="s3"># Rendering to a Wx canvas using the deprecated Wx renderer.</span>
+
+    <span class="s2">def </span><span class="s1">draw(self</span><span class="s2">, </span><span class="s1">drawDC=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Render the figure using RendererWx instance renderer, or using a 
+        previously defined renderer if none is specified. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - draw()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.renderer = RendererWx(self.bitmap</span><span class="s2">, </span><span class="s1">self.figure.dpi)</span>
+        <span class="s1">self.figure.draw(self.renderer)</span>
+        <span class="s1">self._isDrawn = </span><span class="s2">True</span>
+        <span class="s1">self.gui_repaint(drawDC=drawDC)</span>
+
+    <span class="s2">def </span><span class="s1">_print_image(self</span><span class="s2">, </span><span class="s1">filetype</span><span class="s2">, </span><span class="s1">filename):</span>
+        <span class="s1">bitmap = wx.Bitmap(math.ceil(self.figure.bbox.width)</span><span class="s2">,</span>
+                           <span class="s1">math.ceil(self.figure.bbox.height))</span>
+        <span class="s1">self.figure.draw(RendererWx(bitmap</span><span class="s2">, </span><span class="s1">self.figure.dpi))</span>
+        <span class="s1">saved_obj = (bitmap.ConvertToImage()</span>
+                     <span class="s2">if </span><span class="s1">cbook.is_writable_file_like(filename)</span>
+                     <span class="s2">else </span><span class="s1">bitmap)</span>
+        <span class="s2">if not </span><span class="s1">saved_obj.SaveFile(filename</span><span class="s2">, </span><span class="s1">filetype):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">f'Could not save figure to </span><span class="s2">{</span><span class="s1">filename</span><span class="s2">}</span><span class="s5">'</span><span class="s1">)</span>
+        <span class="s3"># draw() is required here since bits of state about the last renderer</span>
+        <span class="s3"># are strewn about the artist draw methods.  Do not remove the draw</span>
+        <span class="s3"># without first verifying that these have been cleaned up.  The artist</span>
+        <span class="s3"># contains() methods will fail otherwise.</span>
+        <span class="s2">if </span><span class="s1">self._isDrawn:</span>
+            <span class="s1">self.draw()</span>
+        <span class="s3"># The &quot;if self&quot; check avoids a &quot;wrapped C/C++ object has been deleted&quot;</span>
+        <span class="s3"># RuntimeError if doing things after window is closed.</span>
+        <span class="s2">if </span><span class="s1">self:</span>
+            <span class="s1">self.Refresh()</span>
+
+    <span class="s1">print_bmp = functools.partialmethod(</span>
+        <span class="s1">_print_image</span><span class="s2">, </span><span class="s1">wx.BITMAP_TYPE_BMP)</span>
+    <span class="s1">print_jpeg = print_jpg = functools.partialmethod(</span>
+        <span class="s1">_print_image</span><span class="s2">, </span><span class="s1">wx.BITMAP_TYPE_JPEG)</span>
+    <span class="s1">print_pcx = functools.partialmethod(</span>
+        <span class="s1">_print_image</span><span class="s2">, </span><span class="s1">wx.BITMAP_TYPE_PCX)</span>
+    <span class="s1">print_png = functools.partialmethod(</span>
+        <span class="s1">_print_image</span><span class="s2">, </span><span class="s1">wx.BITMAP_TYPE_PNG)</span>
+    <span class="s1">print_tiff = print_tif = functools.partialmethod(</span>
+        <span class="s1">_print_image</span><span class="s2">, </span><span class="s1">wx.BITMAP_TYPE_TIF)</span>
+    <span class="s1">print_xpm = functools.partialmethod(</span>
+        <span class="s1">_print_image</span><span class="s2">, </span><span class="s1">wx.BITMAP_TYPE_XPM)</span>
+
+
+<span class="s2">class </span><span class="s1">FigureFrameWx(wx.Frame):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">num</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">canvas_class=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s3"># On non-Windows platform, explicitly set the position - fix</span>
+        <span class="s3"># positioning bug on some Linux platforms</span>
+        <span class="s2">if </span><span class="s1">wx.Platform == </span><span class="s5">'__WXMSW__'</span><span class="s1">:</span>
+            <span class="s1">pos = wx.DefaultPosition</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">pos = wx.Point(</span><span class="s4">20</span><span class="s2">, </span><span class="s4">20</span><span class="s1">)</span>
+        <span class="s1">super().__init__(parent=</span><span class="s2">None, </span><span class="s1">id=-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">pos=pos)</span>
+        <span class="s3"># Frame will be sized later by the Fit method</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - __init__()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">_set_frame_icon(self)</span>
+
+        <span class="s3"># The parameter will become required after the deprecation elapses.</span>
+        <span class="s2">if </span><span class="s1">canvas_class </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.canvas = canvas_class(self</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">fig)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">_api.warn_deprecated(</span>
+                <span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">message=</span><span class="s5">&quot;The canvas_class parameter will become &quot;</span>
+                <span class="s5">&quot;required after the deprecation period starting in Matplotlib &quot;</span>
+                <span class="s5">&quot;%(since)s elapses.&quot;</span><span class="s1">)</span>
+            <span class="s1">self.canvas = self.get_canvas(fig)</span>
+
+        <span class="s3"># Auto-attaches itself to self.canvas.manager</span>
+        <span class="s1">manager = FigureManagerWx(self.canvas</span><span class="s2">, </span><span class="s1">num</span><span class="s2">, </span><span class="s1">self)</span>
+
+        <span class="s1">toolbar = self.canvas.manager.toolbar</span>
+        <span class="s2">if </span><span class="s1">toolbar </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.SetToolBar(toolbar)</span>
+
+        <span class="s3"># On Windows, canvas sizing must occur after toolbar addition;</span>
+        <span class="s3"># otherwise the toolbar further resizes the canvas.</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h = map(math.ceil</span><span class="s2">, </span><span class="s1">fig.bbox.size)</span>
+        <span class="s1">self.canvas.SetInitialSize(wx.Size(w</span><span class="s2">, </span><span class="s1">h))</span>
+        <span class="s1">self.canvas.SetMinSize((</span><span class="s4">2</span><span class="s2">, </span><span class="s4">2</span><span class="s1">))</span>
+        <span class="s1">self.canvas.SetFocus()</span>
+
+        <span class="s1">self.Fit()</span>
+
+        <span class="s1">self.Bind(wx.EVT_CLOSE</span><span class="s2">, </span><span class="s1">self._on_close)</span>
+
+    <span class="s1">sizer = _api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;frame.GetSizer()&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: self.GetSizer()))</span>
+    <span class="s1">figmgr = _api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;frame.canvas.manager&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: self.canvas.manager))</span>
+    <span class="s1">num = _api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;frame.canvas.manager.num&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: self.canvas.manager.num))</span>
+    <span class="s1">toolbar = _api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;frame.GetToolBar()&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: self.GetToolBar()))</span>
+    <span class="s1">toolmanager = _api.deprecated(</span>
+        <span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;frame.canvas.manager.toolmanager&quot;</span><span class="s1">)(</span>
+            <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: self.canvas.manager.toolmanager))</span>
+
+    <span class="s1">@_api.deprecated(</span>
+        <span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;the canvas_class constructor parameter&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">get_canvas(self</span><span class="s2">, </span><span class="s1">fig):</span>
+        <span class="s2">return </span><span class="s1">FigureCanvasWx(self</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">fig)</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;frame.canvas.manager&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">get_figure_manager(self):</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - get_figure_manager()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s2">return </span><span class="s1">self.canvas.manager</span>
+
+    <span class="s2">def </span><span class="s1">_on_close(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - on_close()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">CloseEvent(</span><span class="s5">&quot;close_event&quot;</span><span class="s2">, </span><span class="s1">self.canvas)._process()</span>
+        <span class="s1">self.canvas.stop_event_loop()</span>
+        <span class="s3"># set FigureManagerWx.frame to None to prevent repeated attempts to</span>
+        <span class="s3"># close this frame from FigureManagerWx.destroy()</span>
+        <span class="s1">self.canvas.manager.frame = </span><span class="s2">None</span>
+        <span class="s3"># remove figure manager from Gcf.figs</span>
+        <span class="s1">Gcf.destroy(self.canvas.manager)</span>
+        <span class="s2">try</span><span class="s1">:  </span><span class="s3"># See issue 2941338.</span>
+            <span class="s1">self.canvas.mpl_disconnect(self.canvas.toolbar._id_drag)</span>
+        <span class="s2">except </span><span class="s1">AttributeError:  </span><span class="s3"># If there's no toolbar.</span>
+            <span class="s2">pass</span>
+        <span class="s3"># Carry on with close event propagation, frame &amp; children destruction</span>
+        <span class="s1">event.Skip()</span>
+
+
+<span class="s2">class </span><span class="s1">FigureManagerWx(FigureManagerBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Container/controller for the FigureCanvas and GUI frame. 
+ 
+    It is instantiated by Gcf whenever a new figure is created.  Gcf is 
+    responsible for managing multiple instances of FigureManagerWx. 
+ 
+    Attributes 
+    ---------- 
+    canvas : `FigureCanvas` 
+        a FigureCanvasWx(wx.Panel) instance 
+    window : wxFrame 
+        a wxFrame instance - wxpython.org/Phoenix/docs/html/Frame.html 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">canvas</span><span class="s2">, </span><span class="s1">num</span><span class="s2">, </span><span class="s1">frame):</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - __init__()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">self.frame = self.window = frame</span>
+        <span class="s1">super().__init__(canvas</span><span class="s2">, </span><span class="s1">num)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">create_with_canvas(cls</span><span class="s2">, </span><span class="s1">canvas_class</span><span class="s2">, </span><span class="s1">figure</span><span class="s2">, </span><span class="s1">num):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">wxapp = wx.GetApp() </span><span class="s2">or </span><span class="s1">_create_wxapp()</span>
+        <span class="s1">frame = FigureFrameWx(num</span><span class="s2">, </span><span class="s1">figure</span><span class="s2">, </span><span class="s1">canvas_class=canvas_class)</span>
+        <span class="s1">manager = figure.canvas.manager</span>
+        <span class="s2">if </span><span class="s1">mpl.is_interactive():</span>
+            <span class="s1">manager.frame.Show()</span>
+            <span class="s1">figure.canvas.draw_idle()</span>
+        <span class="s2">return </span><span class="s1">manager</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">start_main_loop(cls):</span>
+        <span class="s2">if not </span><span class="s1">wx.App.IsMainLoopRunning():</span>
+            <span class="s1">wxapp = wx.GetApp()</span>
+            <span class="s2">if </span><span class="s1">wxapp </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">wxapp.MainLoop()</span>
+
+    <span class="s2">def </span><span class="s1">show(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">self.frame.Show()</span>
+        <span class="s1">self.canvas.draw()</span>
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s5">'figure.raise_window'</span><span class="s1">]:</span>
+            <span class="s1">self.frame.Raise()</span>
+
+    <span class="s2">def </span><span class="s1">destroy(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">_log.debug(</span><span class="s5">&quot;%s - destroy()&quot;</span><span class="s2">, </span><span class="s1">type(self))</span>
+        <span class="s1">frame = self.frame</span>
+        <span class="s2">if </span><span class="s1">frame:  </span><span class="s3"># Else, may have been already deleted, e.g. when closing.</span>
+            <span class="s3"># As this can be called from non-GUI thread from plt.close use</span>
+            <span class="s3"># wx.CallAfter to ensure thread safety.</span>
+            <span class="s1">wx.CallAfter(frame.Close)</span>
+
+    <span class="s2">def </span><span class="s1">full_screen_toggle(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">self.frame.ShowFullScreen(</span><span class="s2">not </span><span class="s1">self.frame.IsFullScreen())</span>
+
+    <span class="s2">def </span><span class="s1">get_window_title(self):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">self.window.GetTitle()</span>
+
+    <span class="s2">def </span><span class="s1">set_window_title(self</span><span class="s2">, </span><span class="s1">title):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s1">self.window.SetTitle(title)</span>
+
+    <span class="s2">def </span><span class="s1">resize(self</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height):</span>
+        <span class="s3"># docstring inherited</span>
+        <span class="s3"># Directly using SetClientSize doesn't handle the toolbar on Windows.</span>
+        <span class="s1">self.window.SetSize(self.window.ClientToWindowSize(wx.Size(</span>
+            <span class="s1">math.ceil(width)</span><span class="s2">, </span><span class="s1">math.ceil(height))))</span>
+
+
+<span class="s2">def </span><span class="s1">_load_bitmap(filename):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Load a wx.Bitmap from a file in the &quot;images&quot; directory of the Matplotlib 
+    data. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">wx.Bitmap(str(cbook._get_data_path(</span><span class="s5">'images'</span><span class="s2">, </span><span class="s1">filename)))</span>
+
+
+<span class="s2">def </span><span class="s1">_set_frame_icon(frame):</span>
+    <span class="s1">bundle = wx.IconBundle()</span>
+    <span class="s2">for </span><span class="s1">image </span><span class="s2">in </span><span class="s1">(</span><span class="s5">'matplotlib.png'</span><span class="s2">, </span><span class="s5">'matplotlib_large.png'</span><span class="s1">):</span>
+        <span class="s1">icon = wx.Icon(_load_bitmap(image))</span>
+        <span class="s2">if not </span><span class="s1">icon.IsOk():</span>
+            <span class="s2">return</span>
+        <span class="s1">bundle.AddIcon(icon)</span>
+    <span class="s1">frame.SetIcons(bundle)</span>
+
+
+<span class="s2">class </span><span class="s1">NavigationToolbar2Wx(NavigationToolbar2</span><span class="s2">, </span><span class="s1">wx.ToolBar):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">canvas</span><span class="s2">, </span><span class="s1">coordinates=</span><span class="s2">True, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">style=wx.TB_BOTTOM):</span>
+        <span class="s1">wx.ToolBar.__init__(self</span><span class="s2">, </span><span class="s1">canvas.GetParent()</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">style=style)</span>
+
+        <span class="s2">if </span><span class="s5">'wxMac' </span><span class="s2">in </span><span class="s1">wx.PlatformInfo:</span>
+            <span class="s1">self.SetToolBitmapSize((</span><span class="s4">24</span><span class="s2">, </span><span class="s4">24</span><span class="s1">))</span>
+        <span class="s1">self.wx_ids = {}</span>
+        <span class="s2">for </span><span class="s1">text</span><span class="s2">, </span><span class="s1">tooltip_text</span><span class="s2">, </span><span class="s1">image_file</span><span class="s2">, </span><span class="s1">callback </span><span class="s2">in </span><span class="s1">self.toolitems:</span>
+            <span class="s2">if </span><span class="s1">text </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">self.AddSeparator()</span>
+                <span class="s2">continue</span>
+            <span class="s1">self.wx_ids[text] = (</span>
+                <span class="s1">self.AddTool(</span>
+                    <span class="s1">-</span><span class="s4">1</span><span class="s2">,</span>
+                    <span class="s1">bitmap=self._icon(</span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">image_file</span><span class="s2">}</span><span class="s5">.png&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">bmpDisabled=wx.NullBitmap</span><span class="s2">,</span>
+                    <span class="s1">label=text</span><span class="s2">, </span><span class="s1">shortHelp=tooltip_text</span><span class="s2">,</span>
+                    <span class="s1">kind=(wx.ITEM_CHECK </span><span class="s2">if </span><span class="s1">text </span><span class="s2">in </span><span class="s1">[</span><span class="s5">&quot;Pan&quot;</span><span class="s2">, </span><span class="s5">&quot;Zoom&quot;</span><span class="s1">]</span>
+                          <span class="s2">else </span><span class="s1">wx.ITEM_NORMAL))</span>
+                <span class="s1">.Id)</span>
+            <span class="s1">self.Bind(wx.EVT_TOOL</span><span class="s2">, </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">callback)</span><span class="s2">,</span>
+                      <span class="s1">id=self.wx_ids[text])</span>
+
+        <span class="s1">self._coordinates = coordinates</span>
+        <span class="s2">if </span><span class="s1">self._coordinates:</span>
+            <span class="s1">self.AddStretchableSpace()</span>
+            <span class="s1">self._label_text = wx.StaticText(self</span><span class="s2">, </span><span class="s1">style=wx.ALIGN_RIGHT)</span>
+            <span class="s1">self.AddControl(self._label_text)</span>
+
+        <span class="s1">self.Realize()</span>
+
+        <span class="s1">NavigationToolbar2.__init__(self</span><span class="s2">, </span><span class="s1">canvas)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_icon(name):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Construct a `wx.Bitmap` suitable for use as icon from an image file 
+        *name*, including the extension and relative to Matplotlib's &quot;images&quot; 
+        data directory. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">pilimg = PIL.Image.open(cbook._get_data_path(</span><span class="s5">&quot;images&quot;</span><span class="s2">, </span><span class="s1">name))</span>
+        <span class="s3"># ensure RGBA as wx BitMap expects RGBA format</span>
+        <span class="s1">image = np.array(pilimg.convert(</span><span class="s5">&quot;RGBA&quot;</span><span class="s1">))</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">dark = wx.SystemSettings.GetAppearance().IsDark()</span>
+        <span class="s2">except </span><span class="s1">AttributeError:  </span><span class="s3"># wxpython &lt; 4.1</span>
+            <span class="s3"># copied from wx's IsUsingDarkBackground / GetLuminance.</span>
+            <span class="s1">bg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)</span>
+            <span class="s1">fg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOWTEXT)</span>
+            <span class="s3"># See wx.Colour.GetLuminance.</span>
+            <span class="s1">bg_lum = (</span><span class="s4">.299 </span><span class="s1">* bg.red + </span><span class="s4">.587 </span><span class="s1">* bg.green + </span><span class="s4">.114 </span><span class="s1">* bg.blue) / </span><span class="s4">255</span>
+            <span class="s1">fg_lum = (</span><span class="s4">.299 </span><span class="s1">* fg.red + </span><span class="s4">.587 </span><span class="s1">* fg.green + </span><span class="s4">.114 </span><span class="s1">* fg.blue) / </span><span class="s4">255</span>
+            <span class="s1">dark = fg_lum - bg_lum &gt; </span><span class="s4">.2</span>
+        <span class="s2">if </span><span class="s1">dark:</span>
+            <span class="s1">fg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOWTEXT)</span>
+            <span class="s1">black_mask = (image[...</span><span class="s2">, </span><span class="s1">:</span><span class="s4">3</span><span class="s1">] == </span><span class="s4">0</span><span class="s1">).all(axis=-</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">image[black_mask</span><span class="s2">, </span><span class="s1">:</span><span class="s4">3</span><span class="s1">] = (fg.Red()</span><span class="s2">, </span><span class="s1">fg.Green()</span><span class="s2">, </span><span class="s1">fg.Blue())</span>
+        <span class="s2">return </span><span class="s1">wx.Bitmap.FromBufferRGBA(</span>
+            <span class="s1">image.shape[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">image.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">image.tobytes())</span>
+
+    <span class="s2">def </span><span class="s1">_update_buttons_checked(self):</span>
+        <span class="s2">if </span><span class="s5">&quot;Pan&quot; </span><span class="s2">in </span><span class="s1">self.wx_ids:</span>
+            <span class="s1">self.ToggleTool(self.wx_ids[</span><span class="s5">&quot;Pan&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.mode.name == </span><span class="s5">&quot;PAN&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s5">&quot;Zoom&quot; </span><span class="s2">in </span><span class="s1">self.wx_ids:</span>
+            <span class="s1">self.ToggleTool(self.wx_ids[</span><span class="s5">&quot;Zoom&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.mode.name == </span><span class="s5">&quot;ZOOM&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">zoom(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().zoom(*args)</span>
+        <span class="s1">self._update_buttons_checked()</span>
+
+    <span class="s2">def </span><span class="s1">pan(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().pan(*args)</span>
+        <span class="s1">self._update_buttons_checked()</span>
+
+    <span class="s2">def </span><span class="s1">save_figure(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s3"># Fetch the required filename and file type.</span>
+        <span class="s1">filetypes</span><span class="s2">, </span><span class="s1">exts</span><span class="s2">, </span><span class="s1">filter_index = self.canvas._get_imagesave_wildcards()</span>
+        <span class="s1">default_file = self.canvas.get_default_filename()</span>
+        <span class="s1">dialog = wx.FileDialog(</span>
+            <span class="s1">self.canvas.GetParent()</span><span class="s2">, </span><span class="s5">&quot;Save to file&quot;</span><span class="s2">,</span>
+            <span class="s1">mpl.rcParams[</span><span class="s5">&quot;savefig.directory&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">default_file</span><span class="s2">, </span><span class="s1">filetypes</span><span class="s2">,</span>
+            <span class="s1">wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)</span>
+        <span class="s1">dialog.SetFilterIndex(filter_index)</span>
+        <span class="s2">if </span><span class="s1">dialog.ShowModal() == wx.ID_OK:</span>
+            <span class="s1">path = pathlib.Path(dialog.GetPath())</span>
+            <span class="s1">_log.debug(</span><span class="s5">'%s - Save file path: %s'</span><span class="s2">, </span><span class="s1">type(self)</span><span class="s2">, </span><span class="s1">path)</span>
+            <span class="s1">fmt = exts[dialog.GetFilterIndex()]</span>
+            <span class="s1">ext = path.suffix[</span><span class="s4">1</span><span class="s1">:]</span>
+            <span class="s2">if </span><span class="s1">ext </span><span class="s2">in </span><span class="s1">self.canvas.get_supported_filetypes() </span><span class="s2">and </span><span class="s1">fmt != ext:</span>
+                <span class="s3"># looks like they forgot to set the image type drop</span>
+                <span class="s3"># down, going with the extension.</span>
+                <span class="s1">_log.warning(</span><span class="s5">'extension %s did not match the selected '</span>
+                             <span class="s5">'image type %s; going with %s'</span><span class="s2">,</span>
+                             <span class="s1">ext</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, </span><span class="s1">ext)</span>
+                <span class="s1">fmt = ext</span>
+            <span class="s3"># Save dir for next time, unless empty str (which means use cwd).</span>
+            <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s5">&quot;savefig.directory&quot;</span><span class="s1">]:</span>
+                <span class="s1">mpl.rcParams[</span><span class="s5">&quot;savefig.directory&quot;</span><span class="s1">] = str(path.parent)</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">self.canvas.figure.savefig(path</span><span class="s2">, </span><span class="s1">format=fmt)</span>
+            <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e:</span>
+                <span class="s1">dialog = wx.MessageDialog(</span>
+                    <span class="s1">parent=self.canvas.GetParent()</span><span class="s2">, </span><span class="s1">message=str(e)</span><span class="s2">,</span>
+                    <span class="s1">caption=</span><span class="s5">'Matplotlib error'</span><span class="s1">)</span>
+                <span class="s1">dialog.ShowModal()</span>
+                <span class="s1">dialog.Destroy()</span>
+
+    <span class="s2">def </span><span class="s1">draw_rubberband(self</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1):</span>
+        <span class="s1">height = self.canvas.figure.bbox.height</span>
+        <span class="s1">self.canvas._rubberband_rect = (x0</span><span class="s2">, </span><span class="s1">height - y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">height - y1)</span>
+        <span class="s1">self.canvas.Refresh()</span>
+
+    <span class="s2">def </span><span class="s1">remove_rubberband(self):</span>
+        <span class="s1">self.canvas._rubberband_rect = </span><span class="s2">None</span>
+        <span class="s1">self.canvas.Refresh()</span>
+
+    <span class="s2">def </span><span class="s1">set_message(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s2">if </span><span class="s1">self._coordinates:</span>
+            <span class="s1">self._label_text.SetLabel(s)</span>
+
+    <span class="s2">def </span><span class="s1">set_history_buttons(self):</span>
+        <span class="s1">can_backward = self._nav_stack._pos &gt; </span><span class="s4">0</span>
+        <span class="s1">can_forward = self._nav_stack._pos &lt; len(self._nav_stack._elements) - </span><span class="s4">1</span>
+        <span class="s2">if </span><span class="s5">'Back' </span><span class="s2">in </span><span class="s1">self.wx_ids:</span>
+            <span class="s1">self.EnableTool(self.wx_ids[</span><span class="s5">'Back'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">can_backward)</span>
+        <span class="s2">if </span><span class="s5">'Forward' </span><span class="s2">in </span><span class="s1">self.wx_ids:</span>
+            <span class="s1">self.EnableTool(self.wx_ids[</span><span class="s5">'Forward'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">can_forward)</span>
+
+
+<span class="s3"># tools for matplotlib.backend_managers.ToolManager:</span>
+
+<span class="s2">class </span><span class="s1">ToolbarWx(ToolContainerBase</span><span class="s2">, </span><span class="s1">wx.ToolBar):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">toolmanager</span><span class="s2">, </span><span class="s1">parent=</span><span class="s2">None, </span><span class="s1">style=wx.TB_BOTTOM):</span>
+        <span class="s2">if </span><span class="s1">parent </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">parent = toolmanager.canvas.GetParent()</span>
+        <span class="s1">ToolContainerBase.__init__(self</span><span class="s2">, </span><span class="s1">toolmanager)</span>
+        <span class="s1">wx.ToolBar.__init__(self</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">style=style)</span>
+        <span class="s1">self._space = self.AddStretchableSpace()</span>
+        <span class="s1">self._label_text = wx.StaticText(self</span><span class="s2">, </span><span class="s1">style=wx.ALIGN_RIGHT)</span>
+        <span class="s1">self.AddControl(self._label_text)</span>
+        <span class="s1">self._toolitems = {}</span>
+        <span class="s1">self._groups = {}  </span><span class="s3"># Mapping of groups to the separator after them.</span>
+
+    <span class="s2">def </span><span class="s1">_get_tool_pos(self</span><span class="s2">, </span><span class="s1">tool):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find the position (index) of a wx.ToolBarToolBase in a ToolBar. 
+ 
+        ``ToolBar.GetToolPos`` is not useful because wx assigns the same Id to 
+        all Separators and StretchableSpaces. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">pos</span><span class="s2">, </span><span class="s1">= [pos </span><span class="s2">for </span><span class="s1">pos </span><span class="s2">in </span><span class="s1">range(self.ToolsCount)</span>
+                <span class="s2">if </span><span class="s1">self.GetToolByPos(pos) == tool]</span>
+        <span class="s2">return </span><span class="s1">pos</span>
+
+    <span class="s2">def </span><span class="s1">add_toolitem(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">group</span><span class="s2">, </span><span class="s1">position</span><span class="s2">, </span><span class="s1">image_file</span><span class="s2">, </span><span class="s1">description</span><span class="s2">,</span>
+                     <span class="s1">toggle):</span>
+        <span class="s3"># Find or create the separator that follows this group.</span>
+        <span class="s2">if </span><span class="s1">group </span><span class="s2">not in </span><span class="s1">self._groups:</span>
+            <span class="s1">self._groups[group] = self.InsertSeparator(</span>
+                <span class="s1">self._get_tool_pos(self._space))</span>
+        <span class="s1">sep = self._groups[group]</span>
+        <span class="s3"># List all separators.</span>
+        <span class="s1">seps = [t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">map(self.GetToolByPos</span><span class="s2">, </span><span class="s1">range(self.ToolsCount))</span>
+                <span class="s2">if </span><span class="s1">t.IsSeparator() </span><span class="s2">and not </span><span class="s1">t.IsStretchableSpace()]</span>
+        <span class="s3"># Find where to insert the tool.</span>
+        <span class="s2">if </span><span class="s1">position &gt;= </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3"># Find the start of the group by looking for the separator</span>
+            <span class="s3"># preceding this one; then move forward from it.</span>
+            <span class="s1">start = (</span><span class="s4">0 </span><span class="s2">if </span><span class="s1">sep == seps[</span><span class="s4">0</span><span class="s1">]</span>
+                     <span class="s2">else </span><span class="s1">self._get_tool_pos(seps[seps.index(sep) - </span><span class="s4">1</span><span class="s1">]) + </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s3"># Move backwards from this separator.</span>
+            <span class="s1">start = self._get_tool_pos(sep) + </span><span class="s4">1</span>
+        <span class="s1">idx = start + position</span>
+        <span class="s2">if </span><span class="s1">image_file:</span>
+            <span class="s1">bmp = NavigationToolbar2Wx._icon(image_file)</span>
+            <span class="s1">kind = wx.ITEM_NORMAL </span><span class="s2">if not </span><span class="s1">toggle </span><span class="s2">else </span><span class="s1">wx.ITEM_CHECK</span>
+            <span class="s1">tool = self.InsertTool(idx</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">bmp</span><span class="s2">, </span><span class="s1">wx.NullBitmap</span><span class="s2">, </span><span class="s1">kind</span><span class="s2">,</span>
+                                   <span class="s1">description </span><span class="s2">or </span><span class="s5">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">size = (self.GetTextExtent(name)[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">10</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">toggle:</span>
+                <span class="s1">control = wx.ToggleButton(self</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">size=size)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">control = wx.Button(self</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">size=size)</span>
+            <span class="s1">tool = self.InsertControl(idx</span><span class="s2">, </span><span class="s1">control</span><span class="s2">, </span><span class="s1">label=name)</span>
+        <span class="s1">self.Realize()</span>
+
+        <span class="s2">def </span><span class="s1">handler(event):</span>
+            <span class="s1">self.trigger_tool(name)</span>
+
+        <span class="s2">if </span><span class="s1">image_file:</span>
+            <span class="s1">self.Bind(wx.EVT_TOOL</span><span class="s2">, </span><span class="s1">handler</span><span class="s2">, </span><span class="s1">tool)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">control.Bind(wx.EVT_LEFT_DOWN</span><span class="s2">, </span><span class="s1">handler)</span>
+
+        <span class="s1">self._toolitems.setdefault(name</span><span class="s2">, </span><span class="s1">[])</span>
+        <span class="s1">self._toolitems[name].append((tool</span><span class="s2">, </span><span class="s1">handler))</span>
+
+    <span class="s2">def </span><span class="s1">toggle_toolitem(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">toggled):</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">self._toolitems:</span>
+            <span class="s2">return</span>
+        <span class="s2">for </span><span class="s1">tool</span><span class="s2">, </span><span class="s1">handler </span><span class="s2">in </span><span class="s1">self._toolitems[name]:</span>
+            <span class="s2">if not </span><span class="s1">tool.IsControl():</span>
+                <span class="s1">self.ToggleTool(tool.Id</span><span class="s2">, </span><span class="s1">toggled)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">tool.GetControl().SetValue(toggled)</span>
+        <span class="s1">self.Refresh()</span>
+
+    <span class="s2">def </span><span class="s1">remove_toolitem(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s2">for </span><span class="s1">tool</span><span class="s2">, </span><span class="s1">handler </span><span class="s2">in </span><span class="s1">self._toolitems[name]:</span>
+            <span class="s1">self.DeleteTool(tool.Id)</span>
+        <span class="s2">del </span><span class="s1">self._toolitems[name]</span>
+
+    <span class="s2">def </span><span class="s1">set_message(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s1">self._label_text.SetLabel(s)</span>
+
+
+<span class="s1">@backend_tools._register_tool_class(_FigureCanvasWxBase)</span>
+<span class="s2">class </span><span class="s1">ConfigureSubplotsWx(backend_tools.ConfigureSubplotsBase):</span>
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">NavigationToolbar2Wx.configure_subplots(self)</span>
+
+
+<span class="s1">@backend_tools._register_tool_class(_FigureCanvasWxBase)</span>
+<span class="s2">class </span><span class="s1">SaveFigureWx(backend_tools.SaveFigureBase):</span>
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">NavigationToolbar2Wx.save_figure(</span>
+            <span class="s1">self._make_classic_style_pseudo_toolbar())</span>
+
+
+<span class="s1">@backend_tools._register_tool_class(_FigureCanvasWxBase)</span>
+<span class="s2">class </span><span class="s1">RubberbandWx(backend_tools.RubberbandBase):</span>
+    <span class="s2">def </span><span class="s1">draw_rubberband(self</span><span class="s2">, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1):</span>
+        <span class="s1">NavigationToolbar2Wx.draw_rubberband(</span>
+            <span class="s1">self._make_classic_style_pseudo_toolbar()</span><span class="s2">, None, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1)</span>
+
+    <span class="s2">def </span><span class="s1">remove_rubberband(self):</span>
+        <span class="s1">NavigationToolbar2Wx.remove_rubberband(</span>
+            <span class="s1">self._make_classic_style_pseudo_toolbar())</span>
+
+
+<span class="s2">class </span><span class="s1">_HelpDialog(wx.Dialog):</span>
+    <span class="s1">_instance = </span><span class="s2">None  </span><span class="s3"># a reference to an open dialog singleton</span>
+    <span class="s1">headers = [(</span><span class="s5">&quot;Action&quot;</span><span class="s2">, </span><span class="s5">&quot;Shortcuts&quot;</span><span class="s2">, </span><span class="s5">&quot;Description&quot;</span><span class="s1">)]</span>
+    <span class="s1">widths = [</span><span class="s4">100</span><span class="s2">, </span><span class="s4">140</span><span class="s2">, </span><span class="s4">300</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">help_entries):</span>
+        <span class="s1">super().__init__(parent</span><span class="s2">, </span><span class="s1">title=</span><span class="s5">&quot;Help&quot;</span><span class="s2">,</span>
+                         <span class="s1">style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)</span>
+
+        <span class="s1">sizer = wx.BoxSizer(wx.VERTICAL)</span>
+        <span class="s1">grid_sizer = wx.FlexGridSizer(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">3</span><span class="s2">, </span><span class="s4">8</span><span class="s2">, </span><span class="s4">6</span><span class="s1">)</span>
+        <span class="s3"># create and add the entries</span>
+        <span class="s1">bold = self.GetFont().MakeBold()</span>
+        <span class="s2">for </span><span class="s1">r</span><span class="s2">, </span><span class="s1">row </span><span class="s2">in </span><span class="s1">enumerate(self.headers + help_entries):</span>
+            <span class="s2">for </span><span class="s1">(col</span><span class="s2">, </span><span class="s1">width) </span><span class="s2">in </span><span class="s1">zip(row</span><span class="s2">, </span><span class="s1">self.widths):</span>
+                <span class="s1">label = wx.StaticText(self</span><span class="s2">, </span><span class="s1">label=col)</span>
+                <span class="s2">if </span><span class="s1">r == </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">label.SetFont(bold)</span>
+                <span class="s1">label.Wrap(width)</span>
+                <span class="s1">grid_sizer.Add(label</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s3"># finalize layout, create button</span>
+        <span class="s1">sizer.Add(grid_sizer</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">wx.ALL</span><span class="s2">, </span><span class="s4">6</span><span class="s1">)</span>
+        <span class="s1">ok = wx.Button(self</span><span class="s2">, </span><span class="s1">wx.ID_OK)</span>
+        <span class="s1">sizer.Add(ok</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">wx.ALIGN_CENTER_HORIZONTAL | wx.ALL</span><span class="s2">, </span><span class="s4">8</span><span class="s1">)</span>
+        <span class="s1">self.SetSizer(sizer)</span>
+        <span class="s1">sizer.Fit(self)</span>
+        <span class="s1">self.Layout()</span>
+        <span class="s1">self.Bind(wx.EVT_CLOSE</span><span class="s2">, </span><span class="s1">self._on_close)</span>
+        <span class="s1">ok.Bind(wx.EVT_BUTTON</span><span class="s2">, </span><span class="s1">self._on_close)</span>
+
+    <span class="s2">def </span><span class="s1">_on_close(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s1">_HelpDialog._instance = </span><span class="s2">None  </span><span class="s3"># remove global reference</span>
+        <span class="s1">self.DestroyLater()</span>
+        <span class="s1">event.Skip()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">show(cls</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">help_entries):</span>
+        <span class="s3"># if no dialog is shown, create one; otherwise just re-raise it</span>
+        <span class="s2">if </span><span class="s1">cls._instance:</span>
+            <span class="s1">cls._instance.Raise()</span>
+            <span class="s2">return</span>
+        <span class="s1">cls._instance = cls(parent</span><span class="s2">, </span><span class="s1">help_entries)</span>
+        <span class="s1">cls._instance.Show()</span>
+
+
+<span class="s1">@backend_tools._register_tool_class(_FigureCanvasWxBase)</span>
+<span class="s2">class </span><span class="s1">HelpWx(backend_tools.ToolHelpBase):</span>
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">_HelpDialog.show(self.figure.canvas.GetTopLevelParent()</span><span class="s2">,</span>
+                         <span class="s1">self._get_help_entries())</span>
+
+
+<span class="s1">@backend_tools._register_tool_class(_FigureCanvasWxBase)</span>
+<span class="s2">class </span><span class="s1">ToolCopyToClipboardWx(backend_tools.ToolCopyToClipboardBase):</span>
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if not </span><span class="s1">self.canvas._isDrawn:</span>
+            <span class="s1">self.canvas.draw()</span>
+        <span class="s2">if not </span><span class="s1">self.canvas.bitmap.IsOk() </span><span class="s2">or not </span><span class="s1">wx.TheClipboard.Open():</span>
+            <span class="s2">return</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">wx.TheClipboard.SetData(wx.BitmapDataObject(self.canvas.bitmap))</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s1">wx.TheClipboard.Close()</span>
+
+
+<span class="s1">FigureManagerWx._toolbar2_class = NavigationToolbar2Wx</span>
+<span class="s1">FigureManagerWx._toolmanager_toolbar_class = ToolbarWx</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s2">class </span><span class="s1">_BackendWx(_Backend):</span>
+    <span class="s1">FigureCanvas = FigureCanvasWx</span>
+    <span class="s1">FigureManager = FigureManagerWx</span>
+    <span class="s1">mainloop = FigureManagerWx.start_main_loop</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,272 @@
+<html>
+<head>
+<title>svg.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+svg.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">lru_cache</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">chain</span><span class="s0">, </span><span class="s1">count</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Dict</span><span class="s0">, </span><span class="s1">Iterable</span><span class="s0">, </span><span class="s1">Iterator</span><span class="s0">, </span><span class="s1">List</span><span class="s0">, </span><span class="s1">Optional</span><span class="s0">, </span><span class="s1">Set</span><span class="s0">, </span><span class="s1">Tuple</span>
+
+<span class="s0">try</span><span class="s1">:</span>
+    <span class="s0">from </span><span class="s1">lxml </span><span class="s0">import </span><span class="s1">etree</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+    <span class="s2"># lxml is required for subsetting SVG, but we prefer to delay the import error</span>
+    <span class="s2"># until subset_glyphs() is called (i.e. if font to subset has an 'SVG ' table)</span>
+    <span class="s1">etree = </span><span class="s0">None</span>
+
+<span class="s0">from </span><span class="s1">fontTools </span><span class="s0">import </span><span class="s1">ttLib</span>
+<span class="s0">from </span><span class="s1">fontTools.subset.util </span><span class="s0">import </span><span class="s1">_add_method</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.tables.S_V_G_ </span><span class="s0">import </span><span class="s1">SVGDocument</span>
+
+
+<span class="s1">__all__ = [</span><span class="s3">&quot;subset_glyphs&quot;</span><span class="s1">]</span>
+
+
+<span class="s1">GID_RE = re.compile(</span><span class="s3">r&quot;^glyph(\d+)$&quot;</span><span class="s1">)</span>
+
+<span class="s1">NAMESPACES = {</span>
+    <span class="s3">&quot;svg&quot;</span><span class="s1">: </span><span class="s3">&quot;http://www.w3.org/2000/svg&quot;</span><span class="s0">,</span>
+    <span class="s3">&quot;xlink&quot;</span><span class="s1">: </span><span class="s3">&quot;http://www.w3.org/1999/xlink&quot;</span><span class="s0">,</span>
+<span class="s1">}</span>
+<span class="s1">XLINK_HREF = </span><span class="s3">f'</span><span class="s0">{{{</span><span class="s1">NAMESPACES[</span><span class="s3">&quot;xlink&quot;</span><span class="s1">]</span><span class="s0">}}}</span><span class="s3">href'</span>
+
+
+<span class="s2"># TODO(antrotype): Replace with functools.cache once we are 3.9+</span>
+<span class="s1">@lru_cache(maxsize=</span><span class="s0">None</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">xpath(path):</span>
+    <span class="s2"># compile XPath upfront, caching result to reuse on multiple elements</span>
+    <span class="s0">return </span><span class="s1">etree.XPath(path</span><span class="s0">, </span><span class="s1">namespaces=NAMESPACES)</span>
+
+
+<span class="s0">def </span><span class="s1">group_elements_by_id(tree: etree.Element) -&gt; Dict[str</span><span class="s0">, </span><span class="s1">etree.Element]:</span>
+    <span class="s2"># select all svg elements with 'id' attribute no matter where they are</span>
+    <span class="s2"># including the root element itself:</span>
+    <span class="s2"># https://github.com/fonttools/fonttools/issues/2548</span>
+    <span class="s0">return </span><span class="s1">{el.attrib[</span><span class="s3">&quot;id&quot;</span><span class="s1">]: el </span><span class="s0">for </span><span class="s1">el </span><span class="s0">in </span><span class="s1">xpath(</span><span class="s3">&quot;//svg:*[@id]&quot;</span><span class="s1">)(tree)}</span>
+
+
+<span class="s0">def </span><span class="s1">parse_css_declarations(style_attr: str) -&gt; Dict[str</span><span class="s0">, </span><span class="s1">str]:</span>
+    <span class="s2"># https://developer.mozilla.org/en-US/docs/Web/SVG/Attribute/style</span>
+    <span class="s2"># https://developer.mozilla.org/en-US/docs/Web/CSS/Syntax#css_declarations</span>
+    <span class="s1">result = {}</span>
+    <span class="s0">for </span><span class="s1">declaration </span><span class="s0">in </span><span class="s1">style_attr.split(</span><span class="s3">&quot;;&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">declaration.count(</span><span class="s3">&quot;:&quot;</span><span class="s1">) == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">property_name</span><span class="s0">, </span><span class="s1">value = declaration.split(</span><span class="s3">&quot;:&quot;</span><span class="s1">)</span>
+            <span class="s1">property_name = property_name.strip()</span>
+            <span class="s1">result[property_name] = value.strip()</span>
+        <span class="s0">elif </span><span class="s1">declaration.strip():</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">f&quot;Invalid CSS declaration syntax: </span><span class="s0">{</span><span class="s1">declaration</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s0">def </span><span class="s1">iter_referenced_ids(tree: etree.Element) -&gt; Iterator[str]:</span>
+    <span class="s2"># Yield all the ids that can be reached via references from this element tree.</span>
+    <span class="s2"># We currently support xlink:href (as used by &lt;use&gt; and gradient templates),</span>
+    <span class="s2"># and local url(#...) links found in fill or clip-path attributes</span>
+    <span class="s2"># TODO(anthrotype): Check we aren't missing other supported kinds of reference</span>
+    <span class="s1">find_svg_elements_with_references = xpath(</span>
+        <span class="s3">&quot;.//svg:*[ &quot;</span>
+        <span class="s3">&quot;starts-with(@xlink:href, '#') &quot;</span>
+        <span class="s3">&quot;or starts-with(@fill, 'url(#') &quot;</span>
+        <span class="s3">&quot;or starts-with(@clip-path, 'url(#') &quot;</span>
+        <span class="s3">&quot;or contains(@style, ':url(#') &quot;</span>
+        <span class="s3">&quot;]&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s0">for </span><span class="s1">el </span><span class="s0">in </span><span class="s1">chain([tree]</span><span class="s0">, </span><span class="s1">find_svg_elements_with_references(tree)):</span>
+        <span class="s1">ref_id = href_local_target(el)</span>
+        <span class="s0">if </span><span class="s1">ref_id </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">yield </span><span class="s1">ref_id</span>
+
+        <span class="s1">attrs = el.attrib</span>
+        <span class="s0">if </span><span class="s3">&quot;style&quot; </span><span class="s0">in </span><span class="s1">attrs:</span>
+            <span class="s1">attrs = {**attrs</span><span class="s0">, </span><span class="s1">**parse_css_declarations(el.attrib[</span><span class="s3">&quot;style&quot;</span><span class="s1">])}</span>
+        <span class="s0">for </span><span class="s1">attr </span><span class="s0">in </span><span class="s1">(</span><span class="s3">&quot;fill&quot;</span><span class="s0">, </span><span class="s3">&quot;clip-path&quot;</span><span class="s1">):</span>
+            <span class="s0">if </span><span class="s1">attr </span><span class="s0">in </span><span class="s1">attrs:</span>
+                <span class="s1">value = attrs[attr]</span>
+                <span class="s0">if </span><span class="s1">value.startswith(</span><span class="s3">&quot;url(#&quot;</span><span class="s1">) </span><span class="s0">and </span><span class="s1">value.endswith(</span><span class="s3">&quot;)&quot;</span><span class="s1">):</span>
+                    <span class="s1">ref_id = value[</span><span class="s4">5</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+                    <span class="s0">assert </span><span class="s1">ref_id</span>
+                    <span class="s0">yield </span><span class="s1">ref_id</span>
+
+
+<span class="s0">def </span><span class="s1">closure_element_ids(</span>
+    <span class="s1">elements: Dict[str</span><span class="s0">, </span><span class="s1">etree.Element]</span><span class="s0">, </span><span class="s1">element_ids: Set[str]</span>
+<span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+    <span class="s2"># Expand the initial subset of element ids to include ids that can be reached</span>
+    <span class="s2"># via references from the initial set.</span>
+    <span class="s1">unvisited = element_ids</span>
+    <span class="s0">while </span><span class="s1">unvisited:</span>
+        <span class="s1">referenced: Set[str] = set()</span>
+        <span class="s0">for </span><span class="s1">el_id </span><span class="s0">in </span><span class="s1">unvisited:</span>
+            <span class="s0">if </span><span class="s1">el_id </span><span class="s0">not in </span><span class="s1">elements:</span>
+                <span class="s2"># ignore dangling reference; not our job to validate svg</span>
+                <span class="s0">continue</span>
+            <span class="s1">referenced.update(iter_referenced_ids(elements[el_id]))</span>
+        <span class="s1">referenced -= element_ids</span>
+        <span class="s1">element_ids.update(referenced)</span>
+        <span class="s1">unvisited = referenced</span>
+
+
+<span class="s0">def </span><span class="s1">subset_elements(el: etree.Element</span><span class="s0">, </span><span class="s1">retained_ids: Set[str]) -&gt; bool:</span>
+    <span class="s2"># Keep elements if their id is in the subset, or any of their children's id is.</span>
+    <span class="s2"># Drop elements whose id is not in the subset, and either have no children,</span>
+    <span class="s2"># or all their children are being dropped.</span>
+    <span class="s0">if </span><span class="s1">el.attrib.get(</span><span class="s3">&quot;id&quot;</span><span class="s1">) </span><span class="s0">in </span><span class="s1">retained_ids:</span>
+        <span class="s2"># if id is in the set, don't recurse; keep whole subtree</span>
+        <span class="s0">return True</span>
+    <span class="s2"># recursively subset all the children; we use a list comprehension instead</span>
+    <span class="s2"># of a parentheses-less generator expression because we don't want any() to</span>
+    <span class="s2"># short-circuit, as our function has a side effect of dropping empty elements.</span>
+    <span class="s0">if </span><span class="s1">any([subset_elements(e</span><span class="s0">, </span><span class="s1">retained_ids) </span><span class="s0">for </span><span class="s1">e </span><span class="s0">in </span><span class="s1">el]):</span>
+        <span class="s0">return True</span>
+    <span class="s0">assert </span><span class="s1">len(el) == </span><span class="s4">0</span>
+    <span class="s1">parent = el.getparent()</span>
+    <span class="s0">if </span><span class="s1">parent </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">parent.remove(el)</span>
+    <span class="s0">return False</span>
+
+
+<span class="s0">def </span><span class="s1">remap_glyph_ids(</span>
+    <span class="s1">svg: etree.Element</span><span class="s0">, </span><span class="s1">glyph_index_map: Dict[int</span><span class="s0">, </span><span class="s1">int]</span>
+<span class="s1">) -&gt; Dict[str</span><span class="s0">, </span><span class="s1">str]:</span>
+    <span class="s2"># Given {old_gid: new_gid} map, rename all elements containing id=&quot;glyph{gid}&quot;</span>
+    <span class="s2"># special attributes</span>
+    <span class="s1">elements = group_elements_by_id(svg)</span>
+    <span class="s1">id_map = {}</span>
+    <span class="s0">for </span><span class="s1">el_id</span><span class="s0">, </span><span class="s1">el </span><span class="s0">in </span><span class="s1">elements.items():</span>
+        <span class="s1">m = GID_RE.match(el_id)</span>
+        <span class="s0">if not </span><span class="s1">m:</span>
+            <span class="s0">continue</span>
+        <span class="s1">old_index = int(m.group(</span><span class="s4">1</span><span class="s1">))</span>
+        <span class="s1">new_index = glyph_index_map.get(old_index)</span>
+        <span class="s0">if </span><span class="s1">new_index </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">old_index == new_index:</span>
+                <span class="s0">continue</span>
+            <span class="s1">new_id = </span><span class="s3">f&quot;glyph</span><span class="s0">{</span><span class="s1">new_index</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># If the old index is missing, the element correspond to a glyph that was</span>
+            <span class="s2"># excluded from the font's subset.</span>
+            <span class="s2"># We rename it to avoid clashes with the new GIDs or other element ids.</span>
+            <span class="s1">new_id = </span><span class="s3">f&quot;.</span><span class="s0">{</span><span class="s1">el_id</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s1">n = count(</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s0">while </span><span class="s1">new_id </span><span class="s0">in </span><span class="s1">elements:</span>
+                <span class="s1">new_id = </span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">new_id</span><span class="s0">}</span><span class="s3">.</span><span class="s0">{</span><span class="s1">next(n)</span><span class="s0">}</span><span class="s3">&quot;</span>
+
+        <span class="s1">id_map[el_id] = new_id</span>
+        <span class="s1">el.attrib[</span><span class="s3">&quot;id&quot;</span><span class="s1">] = new_id</span>
+
+    <span class="s0">return </span><span class="s1">id_map</span>
+
+
+<span class="s0">def </span><span class="s1">href_local_target(el: etree.Element) -&gt; Optional[str]:</span>
+    <span class="s0">if </span><span class="s1">XLINK_HREF </span><span class="s0">in </span><span class="s1">el.attrib:</span>
+        <span class="s1">href = el.attrib[XLINK_HREF]</span>
+        <span class="s0">if </span><span class="s1">href.startswith(</span><span class="s3">&quot;#&quot;</span><span class="s1">) </span><span class="s0">and </span><span class="s1">len(href) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">href[</span><span class="s4">1</span><span class="s1">:]  </span><span class="s2"># drop the leading #</span>
+    <span class="s0">return None</span>
+
+
+<span class="s0">def </span><span class="s1">update_glyph_href_links(svg: etree.Element</span><span class="s0">, </span><span class="s1">id_map: Dict[str</span><span class="s0">, </span><span class="s1">str]) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+    <span class="s2"># update all xlink:href=&quot;#glyph...&quot; attributes to point to the new glyph ids</span>
+    <span class="s0">for </span><span class="s1">el </span><span class="s0">in </span><span class="s1">xpath(</span><span class="s3">&quot;.//svg:*[starts-with(@xlink:href, '#glyph')]&quot;</span><span class="s1">)(svg):</span>
+        <span class="s1">old_id = href_local_target(el)</span>
+        <span class="s0">assert </span><span class="s1">old_id </span><span class="s0">is not None</span>
+        <span class="s0">if </span><span class="s1">old_id </span><span class="s0">in </span><span class="s1">id_map:</span>
+            <span class="s1">new_id = id_map[old_id]</span>
+            <span class="s1">el.attrib[XLINK_HREF] = </span><span class="s3">f&quot;#</span><span class="s0">{</span><span class="s1">new_id</span><span class="s0">}</span><span class="s3">&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">ranges(ints: Iterable[int]) -&gt; Iterator[Tuple[int</span><span class="s0">, </span><span class="s1">int]]:</span>
+    <span class="s2"># Yield sorted, non-overlapping (min, max) ranges of consecutive integers</span>
+    <span class="s1">sorted_ints = iter(sorted(set(ints)))</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">start = end = next(sorted_ints)</span>
+    <span class="s0">except </span><span class="s1">StopIteration:</span>
+        <span class="s0">return</span>
+    <span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">sorted_ints:</span>
+        <span class="s0">if </span><span class="s1">v - </span><span class="s4">1 </span><span class="s1">== end:</span>
+            <span class="s1">end = v</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">yield </span><span class="s1">(start</span><span class="s0">, </span><span class="s1">end)</span>
+            <span class="s1">start = end = v</span>
+    <span class="s0">yield </span><span class="s1">(start</span><span class="s0">, </span><span class="s1">end)</span>
+
+
+<span class="s1">@_add_method(ttLib.getTableClass(</span><span class="s3">&quot;SVG &quot;</span><span class="s1">))</span>
+<span class="s0">def </span><span class="s1">subset_glyphs(self</span><span class="s0">, </span><span class="s1">s) -&gt; bool:</span>
+    <span class="s0">if </span><span class="s1">etree </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ImportError(</span><span class="s3">&quot;No module named 'lxml', required to subset SVG&quot;</span><span class="s1">)</span>
+
+    <span class="s2"># glyph names (before subsetting)</span>
+    <span class="s1">glyph_order: List[str] = s.orig_glyph_order</span>
+    <span class="s2"># map from glyph names to original glyph indices</span>
+    <span class="s1">rev_orig_glyph_map: Dict[str</span><span class="s0">, </span><span class="s1">int] = s.reverseOrigGlyphMap</span>
+    <span class="s2"># map from original to new glyph indices (after subsetting)</span>
+    <span class="s1">glyph_index_map: Dict[int</span><span class="s0">, </span><span class="s1">int] = s.glyph_index_map</span>
+
+    <span class="s1">new_docs: List[SVGDocument] = []</span>
+    <span class="s0">for </span><span class="s1">doc </span><span class="s0">in </span><span class="s1">self.docList:</span>
+
+        <span class="s1">glyphs = {</span>
+            <span class="s1">glyph_order[i] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(doc.startGlyphID</span><span class="s0">, </span><span class="s1">doc.endGlyphID + </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">}.intersection(s.glyphs)</span>
+        <span class="s0">if not </span><span class="s1">glyphs:</span>
+            <span class="s2"># no intersection: we can drop the whole record</span>
+            <span class="s0">continue</span>
+
+        <span class="s1">svg = etree.fromstring(</span>
+            <span class="s2"># encode because fromstring dislikes xml encoding decl if input is str.</span>
+            <span class="s2"># SVG xml encoding must be utf-8 as per OT spec.</span>
+            <span class="s1">doc.data.encode(</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">parser=etree.XMLParser(</span>
+                <span class="s2"># Disable libxml2 security restrictions to support very deep trees.</span>
+                <span class="s2"># Without this we would get an error like this:</span>
+                <span class="s2"># `lxml.etree.XMLSyntaxError: internal error: Huge input lookup`</span>
+                <span class="s2"># when parsing big fonts e.g. noto-emoji-picosvg.ttf.</span>
+                <span class="s1">huge_tree=</span><span class="s0">True,</span>
+                <span class="s2"># ignore blank text as it's not meaningful in OT-SVG; it also prevents</span>
+                <span class="s2"># dangling tail text after removing an element when pretty_print=True</span>
+                <span class="s1">remove_blank_text=</span><span class="s0">True,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s1">elements = group_elements_by_id(svg)</span>
+        <span class="s1">gids = {rev_orig_glyph_map[g] </span><span class="s0">for </span><span class="s1">g </span><span class="s0">in </span><span class="s1">glyphs}</span>
+        <span class="s1">element_ids = {</span><span class="s3">f&quot;glyph</span><span class="s0">{</span><span class="s1">i</span><span class="s0">}</span><span class="s3">&quot; </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">gids}</span>
+        <span class="s1">closure_element_ids(elements</span><span class="s0">, </span><span class="s1">element_ids)</span>
+
+        <span class="s0">if not </span><span class="s1">subset_elements(svg</span><span class="s0">, </span><span class="s1">element_ids):</span>
+            <span class="s0">continue</span>
+
+        <span class="s0">if not </span><span class="s1">s.options.retain_gids:</span>
+            <span class="s1">id_map = remap_glyph_ids(svg</span><span class="s0">, </span><span class="s1">glyph_index_map)</span>
+            <span class="s1">update_glyph_href_links(svg</span><span class="s0">, </span><span class="s1">id_map)</span>
+
+        <span class="s1">new_doc = etree.tostring(svg</span><span class="s0">, </span><span class="s1">pretty_print=s.options.pretty_svg).decode(</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">)</span>
+
+        <span class="s1">new_gids = (glyph_index_map[i] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">gids)</span>
+        <span class="s0">for </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end </span><span class="s0">in </span><span class="s1">ranges(new_gids):</span>
+            <span class="s1">new_docs.append(SVGDocument(new_doc</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end</span><span class="s0">, </span><span class="s1">doc.compressed))</span>
+
+    <span class="s1">self.docList = new_docs</span>
+
+    <span class="s0">return </span><span class="s1">bool(self.docList)</span>
+</pre>
+</body>
+</html>

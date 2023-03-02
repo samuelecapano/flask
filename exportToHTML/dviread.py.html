@@ -1,0 +1,1188 @@
+<html>
+<head>
+<title>dviread.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+dviread.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A module for reading dvi files output by TeX. Several limitations make 
+this not (currently) useful as a general-purpose dvi preprocessor, but 
+it is currently used by the pdf backend for processing usetex text. 
+ 
+Interface:: 
+ 
+  with Dvi(filename, 72) as dvi: 
+      # iterate over pages: 
+      for page in dvi: 
+          w, h, d = page.width, page.height, page.descent 
+          for x, y, font, glyph, width in page.text: 
+              fontname = font.texname 
+              pointsize = font.size 
+              ... 
+          for x, y, height, width in page.boxes: 
+              ... 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+<span class="s2">import </span><span class="s1">enum</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">lru_cache</span><span class="s2">, </span><span class="s1">partial</span><span class="s2">, </span><span class="s1">wraps</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">struct</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+<span class="s3"># Many dvi related files are looked for by external processes, require</span>
+<span class="s3"># additional parsing, and are used many times per rendering, which is why they</span>
+<span class="s3"># are cached using lru_cache().</span>
+
+<span class="s3"># Dvi is a bytecode format documented in</span>
+<span class="s3"># https://ctan.org/pkg/dvitype</span>
+<span class="s3"># https://texdoc.org/serve/dvitype.pdf/0</span>
+<span class="s3">#</span>
+<span class="s3"># The file consists of a preamble, some number of pages, a postamble,</span>
+<span class="s3"># and a finale. Different opcodes are allowed in different contexts,</span>
+<span class="s3"># so the Dvi object has a parser state:</span>
+<span class="s3">#</span>
+<span class="s3">#   pre:       expecting the preamble</span>
+<span class="s3">#   outer:     between pages (followed by a page or the postamble,</span>
+<span class="s3">#              also e.g. font definitions are allowed)</span>
+<span class="s3">#   page:      processing a page</span>
+<span class="s3">#   post_post: state after the postamble (our current implementation</span>
+<span class="s3">#              just stops reading)</span>
+<span class="s3">#   finale:    the finale (unimplemented in our current implementation)</span>
+
+<span class="s1">_dvistate = enum.Enum(</span><span class="s4">'DviState'</span><span class="s2">, </span><span class="s4">'pre outer inpage post_post finale'</span><span class="s1">)</span>
+
+<span class="s3"># The marks on a page consist of text and boxes. A page also has dimensions.</span>
+<span class="s1">Page = namedtuple(</span><span class="s4">'Page'</span><span class="s2">, </span><span class="s4">'text boxes height width descent'</span><span class="s1">)</span>
+<span class="s1">Box = namedtuple(</span><span class="s4">'Box'</span><span class="s2">, </span><span class="s4">'x y height width'</span><span class="s1">)</span>
+
+
+<span class="s3"># Also a namedtuple, for backcompat.</span>
+<span class="s2">class </span><span class="s1">Text(namedtuple(</span><span class="s4">'Text'</span><span class="s2">, </span><span class="s4">'x y font glyph width'</span><span class="s1">)):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A glyph in the dvi file. 
+ 
+    The *x* and *y* attributes directly position the glyph.  The *font*, 
+    *glyph*, and *width* attributes are kept public for back-compatibility, 
+    but users wanting to draw the glyph themselves are encouraged to instead 
+    load the font specified by `font_path` at `font_size`, warp it with the 
+    effects specified by `font_effects`, and load the glyph specified by 
+    `glyph_name_or_index`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_get_pdftexmap_entry(self):</span>
+        <span class="s2">return </span><span class="s1">PsfontsMap(find_tex_file(</span><span class="s4">&quot;pdftex.map&quot;</span><span class="s1">))[self.font.texname]</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">font_path(self):</span>
+        <span class="s0">&quot;&quot;&quot;The `~pathlib.Path` to the font for this glyph.&quot;&quot;&quot;</span>
+        <span class="s1">psfont = self._get_pdftexmap_entry()</span>
+        <span class="s2">if </span><span class="s1">psfont.filename </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;No usable font file found for {} ({}); &quot;</span>
+                             <span class="s4">&quot;the font may lack a Type-1 version&quot;</span>
+                             <span class="s1">.format(psfont.psname.decode(</span><span class="s4">&quot;ascii&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                                     <span class="s1">psfont.texname.decode(</span><span class="s4">&quot;ascii&quot;</span><span class="s1">)))</span>
+        <span class="s2">return </span><span class="s1">Path(psfont.filename)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">font_size(self):</span>
+        <span class="s0">&quot;&quot;&quot;The font size.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.font.size</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">font_effects(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The &quot;font effects&quot; dict for this glyph. 
+ 
+        This dict contains the values for this glyph of SlantFont and 
+        ExtendFont (if any), read off :file:`pdftex.map`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._get_pdftexmap_entry().effects</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">glyph_name_or_index(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Either the glyph name or the native charmap glyph index. 
+ 
+        If :file:`pdftex.map` specifies an encoding for this glyph's font, that 
+        is a mapping of glyph indices to Adobe glyph names; use it to convert 
+        dvi indices to glyph names.  Callers can then convert glyph names to 
+        glyph indices (with FT_Get_Name_Index/get_name_index), and load the 
+        glyph using FT_Load_Glyph/load_glyph. 
+ 
+        If :file:`pdftex.map` specifies no encoding, the indices directly map 
+        to the font's &quot;native&quot; charmap; glyphs should directly load using 
+        FT_Load_Char/load_char after selecting the native charmap. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">entry = self._get_pdftexmap_entry()</span>
+        <span class="s2">return </span><span class="s1">(_parse_enc(entry.encoding)[self.glyph]</span>
+                <span class="s2">if </span><span class="s1">entry.encoding </span><span class="s2">is not None else </span><span class="s1">self.glyph)</span>
+
+
+<span class="s3"># Opcode argument parsing</span>
+<span class="s3">#</span>
+<span class="s3"># Each of the following functions takes a Dvi object and delta,</span>
+<span class="s3"># which is the difference between the opcode and the minimum opcode</span>
+<span class="s3"># with the same meaning. Dvi opcodes often encode the number of</span>
+<span class="s3"># argument bytes in this delta.</span>
+
+<span class="s2">def </span><span class="s1">_arg_raw(dvi</span><span class="s2">, </span><span class="s1">delta):</span>
+    <span class="s0">&quot;&quot;&quot;Return *delta* without reading anything more from the dvi file.&quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">delta</span>
+
+
+<span class="s2">def </span><span class="s1">_arg(nbytes</span><span class="s2">, </span><span class="s1">signed</span><span class="s2">, </span><span class="s1">dvi</span><span class="s2">, </span><span class="s1">_):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Read *nbytes* bytes, returning the bytes interpreted as a signed integer 
+    if *signed* is true, unsigned otherwise. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">dvi._arg(nbytes</span><span class="s2">, </span><span class="s1">signed)</span>
+
+
+<span class="s2">def </span><span class="s1">_arg_slen(dvi</span><span class="s2">, </span><span class="s1">delta):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Read *delta* bytes, returning None if *delta* is zero, and the bytes 
+    interpreted as a signed integer otherwise. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">delta == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s2">return None</span>
+    <span class="s2">return </span><span class="s1">dvi._arg(delta</span><span class="s2">, True</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_arg_slen1(dvi</span><span class="s2">, </span><span class="s1">delta):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Read *delta*+1 bytes, returning the bytes interpreted as signed. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">dvi._arg(delta + </span><span class="s5">1</span><span class="s2">, True</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_arg_ulen1(dvi</span><span class="s2">, </span><span class="s1">delta):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Read *delta*+1 bytes, returning the bytes interpreted as unsigned. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">dvi._arg(delta + </span><span class="s5">1</span><span class="s2">, False</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_arg_olen1(dvi</span><span class="s2">, </span><span class="s1">delta):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Read *delta*+1 bytes, returning the bytes interpreted as 
+    unsigned integer for 0&lt;=*delta*&lt;3 and signed if *delta*==3. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">dvi._arg(delta + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">delta == </span><span class="s5">3</span><span class="s1">)</span>
+
+
+<span class="s1">_arg_mapping = dict(raw=_arg_raw</span><span class="s2">,</span>
+                    <span class="s1">u1=partial(_arg</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, False</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">u4=partial(_arg</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, False</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">s4=partial(_arg</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, True</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">slen=_arg_slen</span><span class="s2">,</span>
+                    <span class="s1">olen1=_arg_olen1</span><span class="s2">,</span>
+                    <span class="s1">slen1=_arg_slen1</span><span class="s2">,</span>
+                    <span class="s1">ulen1=_arg_ulen1)</span>
+
+
+<span class="s2">def </span><span class="s1">_dispatch(table</span><span class="s2">, </span><span class="s1">min</span><span class="s2">, </span><span class="s1">max=</span><span class="s2">None, </span><span class="s1">state=</span><span class="s2">None, </span><span class="s1">args=(</span><span class="s4">'raw'</span><span class="s2">,</span><span class="s1">)):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Decorator for dispatch by opcode. Sets the values in *table* 
+    from *min* to *max* to this method, adds a check that the Dvi state 
+    matches *state* if not None, reads arguments from the file according 
+    to *args*. 
+ 
+    Parameters 
+    ---------- 
+    table : dict[int, callable] 
+        The dispatch table to be filled in. 
+ 
+    min, max : int 
+        Range of opcodes that calls the registered function; *max* defaults to 
+        *min*. 
+ 
+    state : _dvistate, optional 
+        State of the Dvi object in which these opcodes are allowed. 
+ 
+    args : list[str], default: ['raw'] 
+        Sequence of argument specifications: 
+ 
+        - 'raw': opcode minus minimum 
+        - 'u1': read one unsigned byte 
+        - 'u4': read four bytes, treat as an unsigned number 
+        - 's4': read four bytes, treat as a signed number 
+        - 'slen': read (opcode - minimum) bytes, treat as signed 
+        - 'slen1': read (opcode - minimum + 1) bytes, treat as signed 
+        - 'ulen1': read (opcode - minimum + 1) bytes, treat as unsigned 
+        - 'olen1': read (opcode - minimum + 1) bytes, treat as unsigned 
+          if under four bytes, signed if four bytes 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">decorate(method):</span>
+        <span class="s1">get_args = [_arg_mapping[x] </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">args]</span>
+
+        <span class="s1">@wraps(method)</span>
+        <span class="s2">def </span><span class="s1">wrapper(self</span><span class="s2">, </span><span class="s1">byte):</span>
+            <span class="s2">if </span><span class="s1">state </span><span class="s2">is not None and </span><span class="s1">self.state != state:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;state precondition failed&quot;</span><span class="s1">)</span>
+            <span class="s2">return </span><span class="s1">method(self</span><span class="s2">, </span><span class="s1">*[f(self</span><span class="s2">, </span><span class="s1">byte-min) </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">get_args])</span>
+        <span class="s2">if </span><span class="s1">max </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">table[min] = wrapper</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(min</span><span class="s2">, </span><span class="s1">max+</span><span class="s5">1</span><span class="s1">):</span>
+                <span class="s2">assert </span><span class="s1">table[i] </span><span class="s2">is None</span>
+                <span class="s1">table[i] = wrapper</span>
+        <span class="s2">return </span><span class="s1">wrapper</span>
+    <span class="s2">return </span><span class="s1">decorate</span>
+
+
+<span class="s2">class </span><span class="s1">Dvi:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A reader for a dvi (&quot;device-independent&quot;) file, as produced by TeX. 
+ 
+    The current implementation can only iterate through pages in order, 
+    and does not even attempt to verify the postamble. 
+ 
+    This class can be used as a context manager to close the underlying 
+    file upon exit. Pages can be read via iteration. Here is an overly 
+    simple way to extract text without trying to detect whitespace:: 
+ 
+        &gt;&gt;&gt; with matplotlib.dviread.Dvi('input.dvi', 72) as dvi: 
+        ...     for page in dvi: 
+        ...         print(''.join(chr(t.glyph) for t in page.text)) 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># dispatch table</span>
+    <span class="s1">_dtable = [</span><span class="s2">None</span><span class="s1">] * </span><span class="s5">256</span>
+    <span class="s1">_dispatch = partial(_dispatch</span><span class="s2">, </span><span class="s1">_dtable)</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">dpi):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read the data from the file named *filename* and convert 
+        TeX's internal units to units of *dpi* per inch. 
+        *dpi* only sets the units and does not limit the resolution. 
+        Use None to return TeX's internal units. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_log.debug(</span><span class="s4">'Dvi: %s'</span><span class="s2">, </span><span class="s1">filename)</span>
+        <span class="s1">self.file = open(filename</span><span class="s2">, </span><span class="s4">'rb'</span><span class="s1">)</span>
+        <span class="s1">self.dpi = dpi</span>
+        <span class="s1">self.fonts = {}</span>
+        <span class="s1">self.state = _dvistate.pre</span>
+
+    <span class="s2">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">&quot;&quot;&quot;Context manager enter method, does nothing.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">__exit__(self</span><span class="s2">, </span><span class="s1">etype</span><span class="s2">, </span><span class="s1">evalue</span><span class="s2">, </span><span class="s1">etrace):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Context manager exit method, closes the underlying file if it is open. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.close()</span>
+
+    <span class="s2">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Iterate through the pages of the file. 
+ 
+        Yields 
+        ------ 
+        Page 
+            Details of all the text and box objects on the page. 
+            The Page tuple contains lists of Text and Box tuples and 
+            the page dimensions, and the Text and Box tuples contain 
+            coordinates transformed into a standard Cartesian 
+            coordinate system at the dpi value given when initializing. 
+            The coordinates are floating point numbers, but otherwise 
+            precision is not lost and coordinate values are not clipped to 
+            integers. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while </span><span class="s1">self._read():</span>
+            <span class="s2">yield </span><span class="s1">self._output()</span>
+
+    <span class="s2">def </span><span class="s1">close(self):</span>
+        <span class="s0">&quot;&quot;&quot;Close the underlying file if it is open.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">self.file.closed:</span>
+            <span class="s1">self.file.close()</span>
+
+    <span class="s2">def </span><span class="s1">_output(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Output the text and boxes belonging to the most recent page. 
+        page = dvi._output() 
+        &quot;&quot;&quot;</span>
+        <span class="s1">minx</span><span class="s2">, </span><span class="s1">miny</span><span class="s2">, </span><span class="s1">maxx</span><span class="s2">, </span><span class="s1">maxy = np.inf</span><span class="s2">, </span><span class="s1">np.inf</span><span class="s2">, </span><span class="s1">-np.inf</span><span class="s2">, </span><span class="s1">-np.inf</span>
+        <span class="s1">maxy_pure = -np.inf</span>
+        <span class="s2">for </span><span class="s1">elt </span><span class="s2">in </span><span class="s1">self.text + self.boxes:</span>
+            <span class="s2">if </span><span class="s1">isinstance(elt</span><span class="s2">, </span><span class="s1">Box):</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">w = elt</span>
+                <span class="s1">e = </span><span class="s5">0  </span><span class="s3"># zero depth</span>
+            <span class="s2">else</span><span class="s1">:  </span><span class="s3"># glyph</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">w = elt</span>
+                <span class="s1">h</span><span class="s2">, </span><span class="s1">e = font._height_depth_of(g)</span>
+            <span class="s1">minx = min(minx</span><span class="s2">, </span><span class="s1">x)</span>
+            <span class="s1">miny = min(miny</span><span class="s2">, </span><span class="s1">y - h)</span>
+            <span class="s1">maxx = max(maxx</span><span class="s2">, </span><span class="s1">x + w)</span>
+            <span class="s1">maxy = max(maxy</span><span class="s2">, </span><span class="s1">y + e)</span>
+            <span class="s1">maxy_pure = max(maxy_pure</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s2">if </span><span class="s1">self._baseline_v </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">maxy_pure = self._baseline_v  </span><span class="s3"># This should normally be the case.</span>
+            <span class="s1">self._baseline_v = </span><span class="s2">None</span>
+
+        <span class="s2">if not </span><span class="s1">self.text </span><span class="s2">and not </span><span class="s1">self.boxes:  </span><span class="s3"># Avoid infs/nans from inf+/-inf.</span>
+            <span class="s2">return </span><span class="s1">Page(text=[]</span><span class="s2">, </span><span class="s1">boxes=[]</span><span class="s2">, </span><span class="s1">width=</span><span class="s5">0</span><span class="s2">, </span><span class="s1">height=</span><span class="s5">0</span><span class="s2">, </span><span class="s1">descent=</span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.dpi </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s3"># special case for ease of debugging: output raw dvi coordinates</span>
+            <span class="s2">return </span><span class="s1">Page(text=self.text</span><span class="s2">, </span><span class="s1">boxes=self.boxes</span><span class="s2">,</span>
+                        <span class="s1">width=maxx-minx</span><span class="s2">, </span><span class="s1">height=maxy_pure-miny</span><span class="s2">,</span>
+                        <span class="s1">descent=maxy-maxy_pure)</span>
+
+        <span class="s3"># convert from TeX's &quot;scaled points&quot; to dpi units</span>
+        <span class="s1">d = self.dpi / (</span><span class="s5">72.27 </span><span class="s1">* </span><span class="s5">2</span><span class="s1">**</span><span class="s5">16</span><span class="s1">)</span>
+        <span class="s1">descent = (maxy - maxy_pure) * d</span>
+
+        <span class="s1">text = [Text((x-minx)*d</span><span class="s2">, </span><span class="s1">(maxy-y)*d - descent</span><span class="s2">, </span><span class="s1">f</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">w*d)</span>
+                <span class="s2">for </span><span class="s1">(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">f</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">w) </span><span class="s2">in </span><span class="s1">self.text]</span>
+        <span class="s1">boxes = [Box((x-minx)*d</span><span class="s2">, </span><span class="s1">(maxy-y)*d - descent</span><span class="s2">, </span><span class="s1">h*d</span><span class="s2">, </span><span class="s1">w*d)</span>
+                 <span class="s2">for </span><span class="s1">(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">w) </span><span class="s2">in </span><span class="s1">self.boxes]</span>
+
+        <span class="s2">return </span><span class="s1">Page(text=text</span><span class="s2">, </span><span class="s1">boxes=boxes</span><span class="s2">, </span><span class="s1">width=(maxx-minx)*d</span><span class="s2">,</span>
+                    <span class="s1">height=(maxy_pure-miny)*d</span><span class="s2">, </span><span class="s1">descent=descent)</span>
+
+    <span class="s2">def </span><span class="s1">_read(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read one page from the file. Return True if successful, 
+        False if there were no more pages. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Pages appear to start with the sequence</span>
+        <span class="s3">#   bop (begin of page)</span>
+        <span class="s3">#   xxx comment</span>
+        <span class="s3">#   &lt;push, ..., pop&gt;  # if using chemformula</span>
+        <span class="s3">#   down</span>
+        <span class="s3">#   push</span>
+        <span class="s3">#     down</span>
+        <span class="s3">#     &lt;push, push, xxx, right, xxx, pop, pop&gt;  # if using xcolor</span>
+        <span class="s3">#     down</span>
+        <span class="s3">#     push</span>
+        <span class="s3">#       down (possibly multiple)</span>
+        <span class="s3">#       push  &lt;=  here, v is the baseline position.</span>
+        <span class="s3">#         etc.</span>
+        <span class="s3"># (dviasm is useful to explore this structure.)</span>
+        <span class="s3"># Thus, we use the vertical position at the first time the stack depth</span>
+        <span class="s3"># reaches 3, while at least three &quot;downs&quot; have been executed (excluding</span>
+        <span class="s3"># those popped out (corresponding to the chemformula preamble)), as the</span>
+        <span class="s3"># baseline (the &quot;down&quot; count is necessary to handle xcolor).</span>
+        <span class="s1">down_stack = [</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">self._baseline_v = </span><span class="s2">None</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">byte = self.file.read(</span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">self._dtable[byte](self</span><span class="s2">, </span><span class="s1">byte)</span>
+            <span class="s1">name = self._dtable[byte].__name__</span>
+            <span class="s2">if </span><span class="s1">name == </span><span class="s4">&quot;_push&quot;</span><span class="s1">:</span>
+                <span class="s1">down_stack.append(down_stack[-</span><span class="s5">1</span><span class="s1">])</span>
+            <span class="s2">elif </span><span class="s1">name == </span><span class="s4">&quot;_pop&quot;</span><span class="s1">:</span>
+                <span class="s1">down_stack.pop()</span>
+            <span class="s2">elif </span><span class="s1">name == </span><span class="s4">&quot;_down&quot;</span><span class="s1">:</span>
+                <span class="s1">down_stack[-</span><span class="s5">1</span><span class="s1">] += </span><span class="s5">1</span>
+            <span class="s2">if </span><span class="s1">(self._baseline_v </span><span class="s2">is None</span>
+                    <span class="s2">and </span><span class="s1">len(getattr(self</span><span class="s2">, </span><span class="s4">&quot;stack&quot;</span><span class="s2">, </span><span class="s1">[])) == </span><span class="s5">3</span>
+                    <span class="s2">and </span><span class="s1">down_stack[-</span><span class="s5">1</span><span class="s1">] &gt;= </span><span class="s5">4</span><span class="s1">):</span>
+                <span class="s1">self._baseline_v = self.v</span>
+            <span class="s2">if </span><span class="s1">byte == </span><span class="s5">140</span><span class="s1">:                         </span><span class="s3"># end of page</span>
+                <span class="s2">return True</span>
+            <span class="s2">if </span><span class="s1">self.state </span><span class="s2">is </span><span class="s1">_dvistate.post_post:   </span><span class="s3"># end of file</span>
+                <span class="s1">self.close()</span>
+                <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">_arg(self</span><span class="s2">, </span><span class="s1">nbytes</span><span class="s2">, </span><span class="s1">signed=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read and return an integer argument *nbytes* long. 
+        Signedness is determined by the *signed* keyword. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">buf = self.file.read(nbytes)</span>
+        <span class="s1">value = buf[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">signed </span><span class="s2">and </span><span class="s1">value &gt;= </span><span class="s5">0x80</span><span class="s1">:</span>
+            <span class="s1">value = value - </span><span class="s5">0x100</span>
+        <span class="s2">for </span><span class="s1">b </span><span class="s2">in </span><span class="s1">buf[</span><span class="s5">1</span><span class="s1">:]:</span>
+            <span class="s1">value = </span><span class="s5">0x100</span><span class="s1">*value + b</span>
+        <span class="s2">return </span><span class="s1">value</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">0</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">127</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage)</span>
+    <span class="s2">def </span><span class="s1">_set_char_immediate(self</span><span class="s2">, </span><span class="s1">char):</span>
+        <span class="s1">self._put_char_real(char)</span>
+        <span class="s1">self.h += self.fonts[self.f]._width_of(char)</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">128</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">131</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'olen1'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_set_char(self</span><span class="s2">, </span><span class="s1">char):</span>
+        <span class="s1">self._put_char_real(char)</span>
+        <span class="s1">self.h += self.fonts[self.f]._width_of(char)</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">132</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'s4'</span><span class="s2">, </span><span class="s4">'s4'</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_set_rule(self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b):</span>
+        <span class="s1">self._put_rule_real(a</span><span class="s2">, </span><span class="s1">b)</span>
+        <span class="s1">self.h += b</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">133</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">136</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'olen1'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_put_char(self</span><span class="s2">, </span><span class="s1">char):</span>
+        <span class="s1">self._put_char_real(char)</span>
+
+    <span class="s2">def </span><span class="s1">_put_char_real(self</span><span class="s2">, </span><span class="s1">char):</span>
+        <span class="s1">font = self.fonts[self.f]</span>
+        <span class="s2">if </span><span class="s1">font._vf </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.text.append(Text(self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">char</span><span class="s2">,</span>
+                                  <span class="s1">font._width_of(char)))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">scale = font._scale</span>
+            <span class="s2">for </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">f</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">w </span><span class="s2">in </span><span class="s1">font._vf[char].text:</span>
+                <span class="s1">newf = DviFont(scale=_mul2012(scale</span><span class="s2">, </span><span class="s1">f._scale)</span><span class="s2">,</span>
+                               <span class="s1">tfm=f._tfm</span><span class="s2">, </span><span class="s1">texname=f.texname</span><span class="s2">, </span><span class="s1">vf=f._vf)</span>
+                <span class="s1">self.text.append(Text(self.h + _mul2012(x</span><span class="s2">, </span><span class="s1">scale)</span><span class="s2">,</span>
+                                      <span class="s1">self.v + _mul2012(y</span><span class="s2">, </span><span class="s1">scale)</span><span class="s2">,</span>
+                                      <span class="s1">newf</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">newf._width_of(g)))</span>
+            <span class="s1">self.boxes.extend([Box(self.h + _mul2012(x</span><span class="s2">, </span><span class="s1">scale)</span><span class="s2">,</span>
+                                   <span class="s1">self.v + _mul2012(y</span><span class="s2">, </span><span class="s1">scale)</span><span class="s2">,</span>
+                                   <span class="s1">_mul2012(a</span><span class="s2">, </span><span class="s1">scale)</span><span class="s2">, </span><span class="s1">_mul2012(b</span><span class="s2">, </span><span class="s1">scale))</span>
+                               <span class="s2">for </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b </span><span class="s2">in </span><span class="s1">font._vf[char].boxes])</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">137</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'s4'</span><span class="s2">, </span><span class="s4">'s4'</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_put_rule(self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b):</span>
+        <span class="s1">self._put_rule_real(a</span><span class="s2">, </span><span class="s1">b)</span>
+
+    <span class="s2">def </span><span class="s1">_put_rule_real(self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b):</span>
+        <span class="s2">if </span><span class="s1">a &gt; </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">b &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">self.boxes.append(Box(self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b))</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">138</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">_nop(self</span><span class="s2">, </span><span class="s1">_):</span>
+        <span class="s2">pass</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">139</span><span class="s2">, </span><span class="s1">state=_dvistate.outer</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'s4'</span><span class="s2">,</span><span class="s1">)*</span><span class="s5">11</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">_bop(self</span><span class="s2">, </span><span class="s1">c0</span><span class="s2">, </span><span class="s1">c1</span><span class="s2">, </span><span class="s1">c2</span><span class="s2">, </span><span class="s1">c3</span><span class="s2">, </span><span class="s1">c4</span><span class="s2">, </span><span class="s1">c5</span><span class="s2">, </span><span class="s1">c6</span><span class="s2">, </span><span class="s1">c7</span><span class="s2">, </span><span class="s1">c8</span><span class="s2">, </span><span class="s1">c9</span><span class="s2">, </span><span class="s1">p):</span>
+        <span class="s1">self.state = _dvistate.inpage</span>
+        <span class="s1">self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">self.w</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y</span><span class="s2">, </span><span class="s1">self.z = </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span>
+        <span class="s1">self.stack = []</span>
+        <span class="s1">self.text = []          </span><span class="s3"># list of Text objects</span>
+        <span class="s1">self.boxes = []         </span><span class="s3"># list of Box objects</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">140</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage)</span>
+    <span class="s2">def </span><span class="s1">_eop(self</span><span class="s2">, </span><span class="s1">_):</span>
+        <span class="s1">self.state = _dvistate.outer</span>
+        <span class="s2">del </span><span class="s1">self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">self.w</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y</span><span class="s2">, </span><span class="s1">self.z</span><span class="s2">, </span><span class="s1">self.stack</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">141</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage)</span>
+    <span class="s2">def </span><span class="s1">_push(self</span><span class="s2">, </span><span class="s1">_):</span>
+        <span class="s1">self.stack.append((self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">self.w</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y</span><span class="s2">, </span><span class="s1">self.z))</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">142</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage)</span>
+    <span class="s2">def </span><span class="s1">_pop(self</span><span class="s2">, </span><span class="s1">_):</span>
+        <span class="s1">self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">self.w</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y</span><span class="s2">, </span><span class="s1">self.z = self.stack.pop()</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">143</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">146</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'slen1'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_right(self</span><span class="s2">, </span><span class="s1">b):</span>
+        <span class="s1">self.h += b</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">147</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">151</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'slen'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_right_w(self</span><span class="s2">, </span><span class="s1">new_w):</span>
+        <span class="s2">if </span><span class="s1">new_w </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.w = new_w</span>
+        <span class="s1">self.h += self.w</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">152</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">156</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'slen'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_right_x(self</span><span class="s2">, </span><span class="s1">new_x):</span>
+        <span class="s2">if </span><span class="s1">new_x </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.x = new_x</span>
+        <span class="s1">self.h += self.x</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">157</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">160</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'slen1'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_down(self</span><span class="s2">, </span><span class="s1">a):</span>
+        <span class="s1">self.v += a</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">161</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">165</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'slen'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_down_y(self</span><span class="s2">, </span><span class="s1">new_y):</span>
+        <span class="s2">if </span><span class="s1">new_y </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.y = new_y</span>
+        <span class="s1">self.v += self.y</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">166</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">170</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'slen'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_down_z(self</span><span class="s2">, </span><span class="s1">new_z):</span>
+        <span class="s2">if </span><span class="s1">new_z </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.z = new_z</span>
+        <span class="s1">self.v += self.z</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">171</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">234</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage)</span>
+    <span class="s2">def </span><span class="s1">_fnt_num_immediate(self</span><span class="s2">, </span><span class="s1">k):</span>
+        <span class="s1">self.f = k</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">235</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">238</span><span class="s2">, </span><span class="s1">state=_dvistate.inpage</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'olen1'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_fnt_num(self</span><span class="s2">, </span><span class="s1">new_f):</span>
+        <span class="s1">self.f = new_f</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">239</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">242</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'ulen1'</span><span class="s2">,</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_xxx(self</span><span class="s2">, </span><span class="s1">datalen):</span>
+        <span class="s1">special = self.file.read(datalen)</span>
+        <span class="s1">_log.debug(</span>
+            <span class="s4">'Dvi._xxx: encountered special: %s'</span><span class="s2">,</span>
+            <span class="s4">''</span><span class="s1">.join([chr(ch) </span><span class="s2">if </span><span class="s5">32 </span><span class="s1">&lt;= ch &lt; </span><span class="s5">127 </span><span class="s2">else </span><span class="s4">'&lt;%02x&gt;' </span><span class="s1">% ch</span>
+                     <span class="s2">for </span><span class="s1">ch </span><span class="s2">in </span><span class="s1">special]))</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">243</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">246</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'olen1'</span><span class="s2">, </span><span class="s4">'u4'</span><span class="s2">, </span><span class="s4">'u4'</span><span class="s2">, </span><span class="s4">'u4'</span><span class="s2">, </span><span class="s4">'u1'</span><span class="s2">, </span><span class="s4">'u1'</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_fnt_def(self</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">l):</span>
+        <span class="s1">self._fnt_def_real(k</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">l)</span>
+
+    <span class="s2">def </span><span class="s1">_fnt_def_real(self</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">l):</span>
+        <span class="s1">n = self.file.read(a + l)</span>
+        <span class="s1">fontname = n[-l:].decode(</span><span class="s4">'ascii'</span><span class="s1">)</span>
+        <span class="s1">tfm = _tfmfile(fontname)</span>
+        <span class="s2">if </span><span class="s1">c != </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">tfm.checksum != </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">c != tfm.checksum:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'tfm checksum mismatch: %s' </span><span class="s1">% n)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">vf = _vffile(fontname)</span>
+        <span class="s2">except </span><span class="s1">FileNotFoundError:</span>
+            <span class="s1">vf = </span><span class="s2">None</span>
+        <span class="s1">self.fonts[k] = DviFont(scale=s</span><span class="s2">, </span><span class="s1">tfm=tfm</span><span class="s2">, </span><span class="s1">texname=n</span><span class="s2">, </span><span class="s1">vf=vf)</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">247</span><span class="s2">, </span><span class="s1">state=_dvistate.pre</span><span class="s2">, </span><span class="s1">args=(</span><span class="s4">'u1'</span><span class="s2">, </span><span class="s4">'u4'</span><span class="s2">, </span><span class="s4">'u4'</span><span class="s2">, </span><span class="s4">'u4'</span><span class="s2">, </span><span class="s4">'u1'</span><span class="s1">))</span>
+    <span class="s2">def </span><span class="s1">_pre(self</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">num</span><span class="s2">, </span><span class="s1">den</span><span class="s2">, </span><span class="s1">mag</span><span class="s2">, </span><span class="s1">k):</span>
+        <span class="s1">self.file.read(k)  </span><span class="s3"># comment in the dvi file</span>
+        <span class="s2">if </span><span class="s1">i != </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unknown dvi format %d&quot; </span><span class="s1">% i)</span>
+        <span class="s2">if </span><span class="s1">num != </span><span class="s5">25400000 </span><span class="s2">or </span><span class="s1">den != </span><span class="s5">7227 </span><span class="s1">* </span><span class="s5">2</span><span class="s1">**</span><span class="s5">16</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Nonstandard units in dvi file&quot;</span><span class="s1">)</span>
+            <span class="s3"># meaning: TeX always uses those exact values, so it</span>
+            <span class="s3"># should be enough for us to support those</span>
+            <span class="s3"># (There are 72.27 pt to an inch so 7227 pt =</span>
+            <span class="s3"># 7227 * 2**16 sp to 100 in. The numerator is multiplied</span>
+            <span class="s3"># by 10^5 to get units of 10**-7 meters.)</span>
+        <span class="s2">if </span><span class="s1">mag != </span><span class="s5">1000</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Nonstandard magnification in dvi file&quot;</span><span class="s1">)</span>
+            <span class="s3"># meaning: LaTeX seems to frown on setting \mag, so</span>
+            <span class="s3"># I think we can assume this is constant</span>
+        <span class="s1">self.state = _dvistate.outer</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">248</span><span class="s2">, </span><span class="s1">state=_dvistate.outer)</span>
+    <span class="s2">def </span><span class="s1">_post(self</span><span class="s2">, </span><span class="s1">_):</span>
+        <span class="s1">self.state = _dvistate.post_post</span>
+        <span class="s3"># TODO: actually read the postamble and finale?</span>
+        <span class="s3"># currently post_post just triggers closing the file</span>
+
+    <span class="s1">@_dispatch(</span><span class="s5">249</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">_post_post(self</span><span class="s2">, </span><span class="s1">_):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s1">@_dispatch(min=</span><span class="s5">250</span><span class="s2">, </span><span class="s1">max=</span><span class="s5">255</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">_malformed(self</span><span class="s2">, </span><span class="s1">offset):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;unknown command: byte </span><span class="s2">{</span><span class="s5">250 </span><span class="s1">+ offset</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">DviFont:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Encapsulation of a font that a DVI file can refer to. 
+ 
+    This class holds a font's texname and size, supports comparison, 
+    and knows the widths of glyphs in the same units as the AFM file. 
+    There are also internal attributes (for use by dviread.py) that 
+    are *not* used for comparison. 
+ 
+    The size is in Adobe points (converted from TeX points). 
+ 
+    Parameters 
+    ---------- 
+    scale : float 
+        Factor by which the font is scaled from its natural size. 
+    tfm : Tfm 
+        TeX font metrics for this font 
+    texname : bytes 
+       Name of the font as used internally by TeX and friends, as an ASCII 
+       bytestring.  This is usually very different from any external font 
+       names; `PsfontsMap` can be used to find the external name of the font. 
+    vf : Vf 
+       A TeX &quot;virtual font&quot; file, or None if this font is not virtual. 
+ 
+    Attributes 
+    ---------- 
+    texname : bytes 
+    size : float 
+       Size of the font in Adobe points, converted from the slightly 
+       smaller TeX points. 
+    widths : list 
+       Widths of glyphs in glyph-space units, typically 1/1000ths of 
+       the point size. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ = (</span><span class="s4">'texname'</span><span class="s2">, </span><span class="s4">'size'</span><span class="s2">, </span><span class="s4">'widths'</span><span class="s2">, </span><span class="s4">'_scale'</span><span class="s2">, </span><span class="s4">'_vf'</span><span class="s2">, </span><span class="s4">'_tfm'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">scale</span><span class="s2">, </span><span class="s1">tfm</span><span class="s2">, </span><span class="s1">texname</span><span class="s2">, </span><span class="s1">vf):</span>
+        <span class="s1">_api.check_isinstance(bytes</span><span class="s2">, </span><span class="s1">texname=texname)</span>
+        <span class="s1">self._scale = scale</span>
+        <span class="s1">self._tfm = tfm</span>
+        <span class="s1">self.texname = texname</span>
+        <span class="s1">self._vf = vf</span>
+        <span class="s1">self.size = scale * (</span><span class="s5">72.0 </span><span class="s1">/ (</span><span class="s5">72.27 </span><span class="s1">* </span><span class="s5">2</span><span class="s1">**</span><span class="s5">16</span><span class="s1">))</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">nchars = max(tfm.width) + </span><span class="s5">1</span>
+        <span class="s2">except </span><span class="s1">ValueError:</span>
+            <span class="s1">nchars = </span><span class="s5">0</span>
+        <span class="s1">self.widths = [(</span><span class="s5">1000</span><span class="s1">*tfm.width.get(char</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)) &gt;&gt; </span><span class="s5">20</span>
+                       <span class="s2">for </span><span class="s1">char </span><span class="s2">in </span><span class="s1">range(nchars)]</span>
+
+    <span class="s2">def </span><span class="s1">__eq__(self</span><span class="s2">, </span><span class="s1">other):</span>
+        <span class="s2">return </span><span class="s1">(type(self) == type(other)</span>
+                <span class="s2">and </span><span class="s1">self.texname == other.texname </span><span class="s2">and </span><span class="s1">self.size == other.size)</span>
+
+    <span class="s2">def </span><span class="s1">__ne__(self</span><span class="s2">, </span><span class="s1">other):</span>
+        <span class="s2">return not </span><span class="s1">self.__eq__(other)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__(self):</span>
+        <span class="s2">return </span><span class="s4">&quot;&lt;{}: {}&gt;&quot;</span><span class="s1">.format(type(self).__name__</span><span class="s2">, </span><span class="s1">self.texname)</span>
+
+    <span class="s2">def </span><span class="s1">_width_of(self</span><span class="s2">, </span><span class="s1">char):</span>
+        <span class="s0">&quot;&quot;&quot;Width of char in dvi units.&quot;&quot;&quot;</span>
+        <span class="s1">width = self._tfm.width.get(char</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">width </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">_mul2012(width</span><span class="s2">, </span><span class="s1">self._scale)</span>
+        <span class="s1">_log.debug(</span><span class="s4">'No width for char %d in font %s.'</span><span class="s2">, </span><span class="s1">char</span><span class="s2">, </span><span class="s1">self.texname)</span>
+        <span class="s2">return </span><span class="s5">0</span>
+
+    <span class="s2">def </span><span class="s1">_height_depth_of(self</span><span class="s2">, </span><span class="s1">char):</span>
+        <span class="s0">&quot;&quot;&quot;Height and depth of char in dvi units.&quot;&quot;&quot;</span>
+        <span class="s1">result = []</span>
+        <span class="s2">for </span><span class="s1">metric</span><span class="s2">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">((self._tfm.height</span><span class="s2">, </span><span class="s4">&quot;height&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                             <span class="s1">(self._tfm.depth</span><span class="s2">, </span><span class="s4">&quot;depth&quot;</span><span class="s1">)):</span>
+            <span class="s1">value = metric.get(char</span><span class="s2">, None</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">value </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">_log.debug(</span><span class="s4">'No %s for char %d in font %s'</span><span class="s2">,</span>
+                           <span class="s1">name</span><span class="s2">, </span><span class="s1">char</span><span class="s2">, </span><span class="s1">self.texname)</span>
+                <span class="s1">result.append(</span><span class="s5">0</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">result.append(_mul2012(value</span><span class="s2">, </span><span class="s1">self._scale))</span>
+        <span class="s3"># cmsyXX (symbols font) glyph 0 (&quot;minus&quot;) has a nonzero descent</span>
+        <span class="s3"># so that TeX aligns equations properly</span>
+        <span class="s3"># (https://tex.stackexchange.com/q/526103/)</span>
+        <span class="s3"># but we actually care about the rasterization depth to align</span>
+        <span class="s3"># the dvipng-generated images.</span>
+        <span class="s2">if </span><span class="s1">re.match(</span><span class="s6">br'^cmsy\d+$'</span><span class="s2">, </span><span class="s1">self.texname) </span><span class="s2">and </span><span class="s1">char == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">result[-</span><span class="s5">1</span><span class="s1">] = </span><span class="s5">0</span>
+        <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">class </span><span class="s1">Vf(Dvi):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    A virtual font (\*.vf file) containing subroutines for dvi files. 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Notes 
+    ----- 
+    The virtual font format is a derivative of dvi: 
+    http://mirrors.ctan.org/info/knuth/virtual-fonts 
+    This class reuses some of the machinery of `Dvi` 
+    but replaces the `_read` loop and dispatch mechanism. 
+ 
+    Examples 
+    -------- 
+    :: 
+ 
+        vf = Vf(filename) 
+        glyph = vf[code] 
+        glyph.text, glyph.boxes, glyph.width 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">filename):</span>
+        <span class="s1">super().__init__(filename</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">self._first_font = </span><span class="s2">None</span>
+            <span class="s1">self._chars = {}</span>
+            <span class="s1">self._read()</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s1">self.close()</span>
+
+    <span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">code):</span>
+        <span class="s2">return </span><span class="s1">self._chars[code]</span>
+
+    <span class="s2">def </span><span class="s1">_read(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read one page from the file. Return True if successful, 
+        False if there were no more pages. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">packet_char</span><span class="s2">, </span><span class="s1">packet_ends = </span><span class="s2">None, None</span>
+        <span class="s1">packet_len</span><span class="s2">, </span><span class="s1">packet_width = </span><span class="s2">None, None</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">byte = self.file.read(</span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s3"># If we are in a packet, execute the dvi instructions</span>
+            <span class="s2">if </span><span class="s1">self.state </span><span class="s2">is </span><span class="s1">_dvistate.inpage:</span>
+                <span class="s1">byte_at = self.file.tell()-</span><span class="s5">1</span>
+                <span class="s2">if </span><span class="s1">byte_at == packet_ends:</span>
+                    <span class="s1">self._finalize_packet(packet_char</span><span class="s2">, </span><span class="s1">packet_width)</span>
+                    <span class="s1">packet_len</span><span class="s2">, </span><span class="s1">packet_char</span><span class="s2">, </span><span class="s1">packet_width = </span><span class="s2">None, None, None</span>
+                    <span class="s3"># fall through to out-of-packet code</span>
+                <span class="s2">elif </span><span class="s1">byte_at &gt; packet_ends:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Packet length mismatch in vf file&quot;</span><span class="s1">)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">if </span><span class="s1">byte </span><span class="s2">in </span><span class="s1">(</span><span class="s5">139</span><span class="s2">, </span><span class="s5">140</span><span class="s1">) </span><span class="s2">or </span><span class="s1">byte &gt;= </span><span class="s5">243</span><span class="s1">:</span>
+                        <span class="s2">raise </span><span class="s1">ValueError(</span>
+                            <span class="s4">&quot;Inappropriate opcode %d in vf file&quot; </span><span class="s1">% byte)</span>
+                    <span class="s1">Dvi._dtable[byte](self</span><span class="s2">, </span><span class="s1">byte)</span>
+                    <span class="s2">continue</span>
+
+            <span class="s3"># We are outside a packet</span>
+            <span class="s2">if </span><span class="s1">byte &lt; </span><span class="s5">242</span><span class="s1">:          </span><span class="s3"># a short packet (length given by byte)</span>
+                <span class="s1">packet_len = byte</span>
+                <span class="s1">packet_char</span><span class="s2">, </span><span class="s1">packet_width = self._arg(</span><span class="s5">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">self._arg(</span><span class="s5">3</span><span class="s1">)</span>
+                <span class="s1">packet_ends = self._init_packet(byte)</span>
+                <span class="s1">self.state = _dvistate.inpage</span>
+            <span class="s2">elif </span><span class="s1">byte == </span><span class="s5">242</span><span class="s1">:       </span><span class="s3"># a long packet</span>
+                <span class="s1">packet_len</span><span class="s2">, </span><span class="s1">packet_char</span><span class="s2">, </span><span class="s1">packet_width = \</span>
+                            <span class="s1">[self._arg(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">(</span><span class="s5">4</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, </span><span class="s5">4</span><span class="s1">)]</span>
+                <span class="s1">self._init_packet(packet_len)</span>
+            <span class="s2">elif </span><span class="s5">243 </span><span class="s1">&lt;= byte &lt;= </span><span class="s5">246</span><span class="s1">:</span>
+                <span class="s1">k = self._arg(byte - </span><span class="s5">242</span><span class="s2">, </span><span class="s1">byte == </span><span class="s5">246</span><span class="s1">)</span>
+                <span class="s1">c</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">l = [self._arg(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">(</span><span class="s5">4</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)]</span>
+                <span class="s1">self._fnt_def_real(k</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">l)</span>
+                <span class="s2">if </span><span class="s1">self._first_font </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s1">self._first_font = k</span>
+            <span class="s2">elif </span><span class="s1">byte == </span><span class="s5">247</span><span class="s1">:       </span><span class="s3"># preamble</span>
+                <span class="s1">i</span><span class="s2">, </span><span class="s1">k = self._arg(</span><span class="s5">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">self._arg(</span><span class="s5">1</span><span class="s1">)</span>
+                <span class="s1">x = self.file.read(k)</span>
+                <span class="s1">cs</span><span class="s2">, </span><span class="s1">ds = self._arg(</span><span class="s5">4</span><span class="s1">)</span><span class="s2">, </span><span class="s1">self._arg(</span><span class="s5">4</span><span class="s1">)</span>
+                <span class="s1">self._pre(i</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">cs</span><span class="s2">, </span><span class="s1">ds)</span>
+            <span class="s2">elif </span><span class="s1">byte == </span><span class="s5">248</span><span class="s1">:       </span><span class="s3"># postamble (just some number of 248s)</span>
+                <span class="s2">break</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unknown vf opcode %d&quot; </span><span class="s1">% byte)</span>
+
+    <span class="s2">def </span><span class="s1">_init_packet(self</span><span class="s2">, </span><span class="s1">pl):</span>
+        <span class="s2">if </span><span class="s1">self.state != _dvistate.outer:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Misplaced packet in vf file&quot;</span><span class="s1">)</span>
+        <span class="s1">self.h</span><span class="s2">, </span><span class="s1">self.v</span><span class="s2">, </span><span class="s1">self.w</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y</span><span class="s2">, </span><span class="s1">self.z = </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span>
+        <span class="s1">self.stack</span><span class="s2">, </span><span class="s1">self.text</span><span class="s2">, </span><span class="s1">self.boxes = []</span><span class="s2">, </span><span class="s1">[]</span><span class="s2">, </span><span class="s1">[]</span>
+        <span class="s1">self.f = self._first_font</span>
+        <span class="s2">return </span><span class="s1">self.file.tell() + pl</span>
+
+    <span class="s2">def </span><span class="s1">_finalize_packet(self</span><span class="s2">, </span><span class="s1">packet_char</span><span class="s2">, </span><span class="s1">packet_width):</span>
+        <span class="s1">self._chars[packet_char] = Page(</span>
+            <span class="s1">text=self.text</span><span class="s2">, </span><span class="s1">boxes=self.boxes</span><span class="s2">, </span><span class="s1">width=packet_width</span><span class="s2">,</span>
+            <span class="s1">height=</span><span class="s2">None, </span><span class="s1">descent=</span><span class="s2">None</span><span class="s1">)</span>
+        <span class="s1">self.state = _dvistate.outer</span>
+
+    <span class="s2">def </span><span class="s1">_pre(self</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">cs</span><span class="s2">, </span><span class="s1">ds):</span>
+        <span class="s2">if </span><span class="s1">self.state </span><span class="s2">is not </span><span class="s1">_dvistate.pre:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;pre command in middle of vf file&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">i != </span><span class="s5">202</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unknown vf format %d&quot; </span><span class="s1">% i)</span>
+        <span class="s2">if </span><span class="s1">len(x):</span>
+            <span class="s1">_log.debug(</span><span class="s4">'vf file comment: %s'</span><span class="s2">, </span><span class="s1">x)</span>
+        <span class="s1">self.state = _dvistate.outer</span>
+        <span class="s3"># cs = checksum, ds = design size</span>
+
+
+<span class="s2">def </span><span class="s1">_mul2012(num1</span><span class="s2">, </span><span class="s1">num2):</span>
+    <span class="s0">&quot;&quot;&quot;Multiply two numbers in 20.12 fixed point format.&quot;&quot;&quot;</span>
+    <span class="s3"># Separated into a function because &gt;&gt; has surprising precedence</span>
+    <span class="s2">return </span><span class="s1">(num1*num2) &gt;&gt; </span><span class="s5">20</span>
+
+
+<span class="s2">class </span><span class="s1">Tfm:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A TeX Font Metric file. 
+ 
+    This implementation covers only the bare minimum needed by the Dvi class. 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Attributes 
+    ---------- 
+    checksum : int 
+       Used for verifying against the dvi file. 
+    design_size : int 
+       Design size of the font (unknown units) 
+    width, height, depth : dict 
+       Dimensions of each character, need to be scaled by the factor 
+       specified in the dvi file. These are dicts because indexing may 
+       not start from 0. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ = (</span><span class="s4">'checksum'</span><span class="s2">, </span><span class="s4">'design_size'</span><span class="s2">, </span><span class="s4">'width'</span><span class="s2">, </span><span class="s4">'height'</span><span class="s2">, </span><span class="s4">'depth'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">filename):</span>
+        <span class="s1">_log.debug(</span><span class="s4">'opening tfm file %s'</span><span class="s2">, </span><span class="s1">filename)</span>
+        <span class="s2">with </span><span class="s1">open(filename</span><span class="s2">, </span><span class="s4">'rb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">file:</span>
+            <span class="s1">header1 = file.read(</span><span class="s5">24</span><span class="s1">)</span>
+            <span class="s1">lh</span><span class="s2">, </span><span class="s1">bc</span><span class="s2">, </span><span class="s1">ec</span><span class="s2">, </span><span class="s1">nw</span><span class="s2">, </span><span class="s1">nh</span><span class="s2">, </span><span class="s1">nd = struct.unpack(</span><span class="s4">'!6H'</span><span class="s2">, </span><span class="s1">header1[</span><span class="s5">2</span><span class="s1">:</span><span class="s5">14</span><span class="s1">])</span>
+            <span class="s1">_log.debug(</span><span class="s4">'lh=%d, bc=%d, ec=%d, nw=%d, nh=%d, nd=%d'</span><span class="s2">,</span>
+                       <span class="s1">lh</span><span class="s2">, </span><span class="s1">bc</span><span class="s2">, </span><span class="s1">ec</span><span class="s2">, </span><span class="s1">nw</span><span class="s2">, </span><span class="s1">nh</span><span class="s2">, </span><span class="s1">nd)</span>
+            <span class="s1">header2 = file.read(</span><span class="s5">4</span><span class="s1">*lh)</span>
+            <span class="s1">self.checksum</span><span class="s2">, </span><span class="s1">self.design_size = struct.unpack(</span><span class="s4">'!2I'</span><span class="s2">, </span><span class="s1">header2[:</span><span class="s5">8</span><span class="s1">])</span>
+            <span class="s3"># there is also encoding information etc.</span>
+            <span class="s1">char_info = file.read(</span><span class="s5">4</span><span class="s1">*(ec-bc+</span><span class="s5">1</span><span class="s1">))</span>
+            <span class="s1">widths = struct.unpack(</span><span class="s4">f'!</span><span class="s2">{</span><span class="s1">nw</span><span class="s2">}</span><span class="s4">i'</span><span class="s2">, </span><span class="s1">file.read(</span><span class="s5">4</span><span class="s1">*nw))</span>
+            <span class="s1">heights = struct.unpack(</span><span class="s4">f'!</span><span class="s2">{</span><span class="s1">nh</span><span class="s2">}</span><span class="s4">i'</span><span class="s2">, </span><span class="s1">file.read(</span><span class="s5">4</span><span class="s1">*nh))</span>
+            <span class="s1">depths = struct.unpack(</span><span class="s4">f'!</span><span class="s2">{</span><span class="s1">nd</span><span class="s2">}</span><span class="s4">i'</span><span class="s2">, </span><span class="s1">file.read(</span><span class="s5">4</span><span class="s1">*nd))</span>
+        <span class="s1">self.width</span><span class="s2">, </span><span class="s1">self.height</span><span class="s2">, </span><span class="s1">self.depth = {}</span><span class="s2">, </span><span class="s1">{}</span><span class="s2">, </span><span class="s1">{}</span>
+        <span class="s2">for </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">char </span><span class="s2">in </span><span class="s1">enumerate(range(bc</span><span class="s2">, </span><span class="s1">ec+</span><span class="s5">1</span><span class="s1">)):</span>
+            <span class="s1">byte0 = char_info[</span><span class="s5">4</span><span class="s1">*idx]</span>
+            <span class="s1">byte1 = char_info[</span><span class="s5">4</span><span class="s1">*idx+</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">self.width[char] = widths[byte0]</span>
+            <span class="s1">self.height[char] = heights[byte1 &gt;&gt; </span><span class="s5">4</span><span class="s1">]</span>
+            <span class="s1">self.depth[char] = depths[byte1 &amp; </span><span class="s5">0xf</span><span class="s1">]</span>
+
+
+<span class="s1">PsFont = namedtuple(</span><span class="s4">'PsFont'</span><span class="s2">, </span><span class="s4">'texname psname effects encoding filename'</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">PsfontsMap:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A psfonts.map formatted file, mapping TeX fonts to PS fonts. 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Notes 
+    ----- 
+    For historical reasons, TeX knows many Type-1 fonts by different 
+    names than the outside world. (For one thing, the names have to 
+    fit in eight characters.) Also, TeX's native fonts are not Type-1 
+    but Metafont, which is nontrivial to convert to PostScript except 
+    as a bitmap. While high-quality conversions to Type-1 format exist 
+    and are shipped with modern TeX distributions, we need to know 
+    which Type-1 fonts are the counterparts of which native fonts. For 
+    these reasons a mapping is needed from internal font names to font 
+    file names. 
+ 
+    A texmf tree typically includes mapping files called e.g. 
+    :file:`psfonts.map`, :file:`pdftex.map`, or :file:`dvipdfm.map`. 
+    The file :file:`psfonts.map` is used by :program:`dvips`, 
+    :file:`pdftex.map` by :program:`pdfTeX`, and :file:`dvipdfm.map` 
+    by :program:`dvipdfm`. :file:`psfonts.map` might avoid embedding 
+    the 35 PostScript fonts (i.e., have no filename for them, as in 
+    the Times-Bold example above), while the pdf-related files perhaps 
+    only avoid the &quot;Base 14&quot; pdf fonts. But the user may have 
+    configured these files differently. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; map = PsfontsMap(find_tex_file('pdftex.map')) 
+    &gt;&gt;&gt; entry = map[b'ptmbo8r'] 
+    &gt;&gt;&gt; entry.texname 
+    b'ptmbo8r' 
+    &gt;&gt;&gt; entry.psname 
+    b'Times-Bold' 
+    &gt;&gt;&gt; entry.encoding 
+    '/usr/local/texlive/2008/texmf-dist/fonts/enc/dvips/base/8r.enc' 
+    &gt;&gt;&gt; entry.effects 
+    {'slant': 0.16700000000000001} 
+    &gt;&gt;&gt; entry.filename 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ = (</span><span class="s4">'_filename'</span><span class="s2">, </span><span class="s4">'_unparsed'</span><span class="s2">, </span><span class="s4">'_parsed'</span><span class="s1">)</span>
+
+    <span class="s3"># Create a filename -&gt; PsfontsMap cache, so that calling</span>
+    <span class="s3"># `PsfontsMap(filename)` with the same filename a second time immediately</span>
+    <span class="s3"># returns the same object.</span>
+    <span class="s1">@lru_cache()</span>
+    <span class="s2">def </span><span class="s1">__new__(cls</span><span class="s2">, </span><span class="s1">filename):</span>
+        <span class="s1">self = object.__new__(cls)</span>
+        <span class="s1">self._filename = os.fsdecode(filename)</span>
+        <span class="s3"># Some TeX distributions have enormous pdftex.map files which would</span>
+        <span class="s3"># take hundreds of milliseconds to parse, but it is easy enough to just</span>
+        <span class="s3"># store the unparsed lines (keyed by the first word, which is the</span>
+        <span class="s3"># texname) and parse them on-demand.</span>
+        <span class="s2">with </span><span class="s1">open(filename</span><span class="s2">, </span><span class="s4">'rb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">file:</span>
+            <span class="s1">self._unparsed = {}</span>
+            <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">file:</span>
+                <span class="s1">tfmname = line.split(</span><span class="s6">b' '</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+                <span class="s1">self._unparsed.setdefault(tfmname</span><span class="s2">, </span><span class="s1">[]).append(line)</span>
+        <span class="s1">self._parsed = {}</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">texname):</span>
+        <span class="s2">assert </span><span class="s1">isinstance(texname</span><span class="s2">, </span><span class="s1">bytes)</span>
+        <span class="s2">if </span><span class="s1">texname </span><span class="s2">in </span><span class="s1">self._unparsed:</span>
+            <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">self._unparsed.pop(texname):</span>
+                <span class="s2">if </span><span class="s1">self._parse_and_cache_line(line):</span>
+                    <span class="s2">break</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._parsed[texname]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s2">raise </span><span class="s1">LookupError(</span>
+                <span class="s4">f&quot;An associated PostScript font (required by Matplotlib) &quot;</span>
+                <span class="s4">f&quot;could not be found for TeX font </span><span class="s2">{</span><span class="s1">texname.decode(</span><span class="s4">'ascii'</span><span class="s1">)</span><span class="s2">!r} </span><span class="s4">&quot;</span>
+                <span class="s4">f&quot;in </span><span class="s2">{</span><span class="s1">self._filename</span><span class="s2">!r}</span><span class="s4">; this problem can often be solved by &quot;</span>
+                <span class="s4">f&quot;installing a suitable PostScript font package in your TeX &quot;</span>
+                <span class="s4">f&quot;package manager&quot;</span><span class="s1">) </span><span class="s2">from None</span>
+
+    <span class="s2">def </span><span class="s1">_parse_and_cache_line(self</span><span class="s2">, </span><span class="s1">line):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parse a line in the font mapping file. 
+ 
+        The format is (partially) documented at 
+        http://mirrors.ctan.org/systems/doc/pdftex/manual/pdftex-a.pdf 
+        https://tug.org/texinfohtml/dvips.html#psfonts_002emap 
+        Each line can have the following fields: 
+ 
+        - tfmname (first, only required field), 
+        - psname (defaults to tfmname, must come immediately after tfmname if 
+          present), 
+        - fontflags (integer, must come immediately after psname if present, 
+          ignored by us), 
+        - special (SlantFont and ExtendFont, only field that is double-quoted), 
+        - fontfile, encodingfile (optional, prefixed by &lt;, &lt;&lt;, or &lt;[; &lt;&lt; always 
+          precedes a font, &lt;[ always precedes an encoding, &lt; can precede either 
+          but then an encoding file must have extension .enc; &lt; and &lt;&lt; also 
+          request different font subsetting behaviors but we ignore that; &lt; can 
+          be separated from the filename by whitespace). 
+ 
+        special, fontfile, and encodingfile can appear in any order. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># If the map file specifies multiple encodings for a font, we</span>
+        <span class="s3"># follow pdfTeX in choosing the last one specified. Such</span>
+        <span class="s3"># entries are probably mistakes but they have occurred.</span>
+        <span class="s3"># https://tex.stackexchange.com/q/10826/</span>
+
+        <span class="s2">if not </span><span class="s1">line </span><span class="s2">or </span><span class="s1">line.startswith((</span><span class="s6">b&quot; &quot;</span><span class="s2">, </span><span class="s6">b&quot;%&quot;</span><span class="s2">, </span><span class="s6">b&quot;*&quot;</span><span class="s2">, </span><span class="s6">b&quot;;&quot;</span><span class="s2">, </span><span class="s6">b&quot;#&quot;</span><span class="s1">)):</span>
+            <span class="s2">return</span>
+        <span class="s1">tfmname = basename = special = encodingfile = fontfile = </span><span class="s2">None</span>
+        <span class="s1">is_subsetted = is_t1 = is_truetype = </span><span class="s2">False</span>
+        <span class="s1">matches = re.finditer(</span><span class="s6">br'&quot;([^&quot;]*)(?:&quot;|$)|(\S+)'</span><span class="s2">, </span><span class="s1">line)</span>
+        <span class="s2">for </span><span class="s1">match </span><span class="s2">in </span><span class="s1">matches:</span>
+            <span class="s1">quoted</span><span class="s2">, </span><span class="s1">unquoted = match.groups()</span>
+            <span class="s2">if </span><span class="s1">unquoted:</span>
+                <span class="s2">if </span><span class="s1">unquoted.startswith(</span><span class="s6">b&quot;&lt;&lt;&quot;</span><span class="s1">):  </span><span class="s3"># font</span>
+                    <span class="s1">fontfile = unquoted[</span><span class="s5">2</span><span class="s1">:]</span>
+                <span class="s2">elif </span><span class="s1">unquoted.startswith(</span><span class="s6">b&quot;&lt;[&quot;</span><span class="s1">):  </span><span class="s3"># encoding</span>
+                    <span class="s1">encodingfile = unquoted[</span><span class="s5">2</span><span class="s1">:]</span>
+                <span class="s2">elif </span><span class="s1">unquoted.startswith(</span><span class="s6">b&quot;&lt;&quot;</span><span class="s1">):  </span><span class="s3"># font or encoding</span>
+                    <span class="s1">word = (</span>
+                        <span class="s3"># &lt;foo =&gt; foo</span>
+                        <span class="s1">unquoted[</span><span class="s5">1</span><span class="s1">:]</span>
+                        <span class="s3"># &lt; by itself =&gt; read the next word</span>
+                        <span class="s2">or </span><span class="s1">next(filter(</span><span class="s2">None, </span><span class="s1">next(matches).groups())))</span>
+                    <span class="s2">if </span><span class="s1">word.endswith(</span><span class="s6">b&quot;.enc&quot;</span><span class="s1">):</span>
+                        <span class="s1">encodingfile = word</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s1">fontfile = word</span>
+                        <span class="s1">is_subsetted = </span><span class="s2">True</span>
+                <span class="s2">elif </span><span class="s1">tfmname </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s1">tfmname = unquoted</span>
+                <span class="s2">elif </span><span class="s1">basename </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s1">basename = unquoted</span>
+            <span class="s2">elif </span><span class="s1">quoted:</span>
+                <span class="s1">special = quoted</span>
+        <span class="s1">effects = {}</span>
+        <span class="s2">if </span><span class="s1">special:</span>
+            <span class="s1">words = reversed(special.split())</span>
+            <span class="s2">for </span><span class="s1">word </span><span class="s2">in </span><span class="s1">words:</span>
+                <span class="s2">if </span><span class="s1">word == </span><span class="s6">b&quot;SlantFont&quot;</span><span class="s1">:</span>
+                    <span class="s1">effects[</span><span class="s4">&quot;slant&quot;</span><span class="s1">] = float(next(words))</span>
+                <span class="s2">elif </span><span class="s1">word == </span><span class="s6">b&quot;ExtendFont&quot;</span><span class="s1">:</span>
+                    <span class="s1">effects[</span><span class="s4">&quot;extend&quot;</span><span class="s1">] = float(next(words))</span>
+
+        <span class="s3"># Verify some properties of the line that would cause it to be ignored</span>
+        <span class="s3"># otherwise.</span>
+        <span class="s2">if </span><span class="s1">fontfile </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">fontfile.endswith((</span><span class="s6">b&quot;.ttf&quot;</span><span class="s2">, </span><span class="s6">b&quot;.ttc&quot;</span><span class="s1">)):</span>
+                <span class="s1">is_truetype = </span><span class="s2">True</span>
+            <span class="s2">elif not </span><span class="s1">fontfile.endswith(</span><span class="s6">b&quot;.otf&quot;</span><span class="s1">):</span>
+                <span class="s1">is_t1 = </span><span class="s2">True</span>
+        <span class="s2">elif </span><span class="s1">basename </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">is_t1 = </span><span class="s2">True</span>
+        <span class="s2">if </span><span class="s1">is_truetype </span><span class="s2">and </span><span class="s1">is_subsetted </span><span class="s2">and </span><span class="s1">encodingfile </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+        <span class="s2">if not </span><span class="s1">is_t1 </span><span class="s2">and </span><span class="s1">(</span><span class="s4">&quot;slant&quot; </span><span class="s2">in </span><span class="s1">effects </span><span class="s2">or </span><span class="s4">&quot;extend&quot; </span><span class="s2">in </span><span class="s1">effects):</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">abs(effects.get(</span><span class="s4">&quot;slant&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">abs(effects.get(</span><span class="s4">&quot;extend&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)) &gt; </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">if </span><span class="s1">basename </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">basename = tfmname</span>
+        <span class="s2">if </span><span class="s1">encodingfile </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">encodingfile = _find_tex_file(encodingfile)</span>
+        <span class="s2">if </span><span class="s1">fontfile </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">fontfile = _find_tex_file(fontfile)</span>
+        <span class="s1">self._parsed[tfmname] = PsFont(</span>
+            <span class="s1">texname=tfmname</span><span class="s2">, </span><span class="s1">psname=basename</span><span class="s2">, </span><span class="s1">effects=effects</span><span class="s2">,</span>
+            <span class="s1">encoding=encodingfile</span><span class="s2">, </span><span class="s1">filename=fontfile)</span>
+        <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_enc(path):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Parse a \*.enc file referenced from a psfonts.map style file. 
+ 
+    The format supported by this function is a tiny subset of PostScript. 
+ 
+    Parameters 
+    ---------- 
+    path : `os.PathLike` 
+ 
+    Returns 
+    ------- 
+    list 
+        The nth entry of the list is the PostScript glyph name of the nth 
+        glyph. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">no_comments = re.sub(</span><span class="s4">&quot;%.*&quot;</span><span class="s2">, </span><span class="s4">&quot;&quot;</span><span class="s2">, </span><span class="s1">Path(path).read_text(encoding=</span><span class="s4">&quot;ascii&quot;</span><span class="s1">))</span>
+    <span class="s1">array = re.search(</span><span class="s4">r&quot;(?s)\[(.*)\]&quot;</span><span class="s2">, </span><span class="s1">no_comments).group(</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">lines = [line </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">array.split() </span><span class="s2">if </span><span class="s1">line]</span>
+    <span class="s2">if </span><span class="s1">all(line.startswith(</span><span class="s4">&quot;/&quot;</span><span class="s1">) </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">lines):</span>
+        <span class="s2">return </span><span class="s1">[line[</span><span class="s5">1</span><span class="s1">:] </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">lines]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;Failed to parse {} as Postscript encoding&quot;</span><span class="s1">.format(path))</span>
+
+
+<span class="s2">class </span><span class="s1">_LuatexKpsewhich:</span>
+    <span class="s1">@lru_cache()  </span><span class="s3"># A singleton.</span>
+    <span class="s2">def </span><span class="s1">__new__(cls):</span>
+        <span class="s1">self = object.__new__(cls)</span>
+        <span class="s1">self._proc = self._new_proc()</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">_new_proc(self):</span>
+        <span class="s2">return </span><span class="s1">subprocess.Popen(</span>
+            <span class="s1">[</span><span class="s4">&quot;luatex&quot;</span><span class="s2">, </span><span class="s4">&quot;--luaonly&quot;</span><span class="s2">,</span>
+             <span class="s1">str(cbook._get_data_path(</span><span class="s4">&quot;kpsewhich.lua&quot;</span><span class="s1">))]</span><span class="s2">,</span>
+            <span class="s1">stdin=subprocess.PIPE</span><span class="s2">, </span><span class="s1">stdout=subprocess.PIPE)</span>
+
+    <span class="s2">def </span><span class="s1">search(self</span><span class="s2">, </span><span class="s1">filename):</span>
+        <span class="s2">if </span><span class="s1">self._proc.poll() </span><span class="s2">is not None</span><span class="s1">:  </span><span class="s3"># Dead, restart it.</span>
+            <span class="s1">self._proc = self._new_proc()</span>
+        <span class="s1">self._proc.stdin.write(os.fsencode(filename) + </span><span class="s6">b&quot;</span><span class="s2">\n</span><span class="s6">&quot;</span><span class="s1">)</span>
+        <span class="s1">self._proc.stdin.flush()</span>
+        <span class="s1">out = self._proc.stdout.readline().rstrip()</span>
+        <span class="s2">return None if </span><span class="s1">out == </span><span class="s6">b&quot;nil&quot; </span><span class="s2">else </span><span class="s1">os.fsdecode(out)</span>
+
+
+<span class="s1">@lru_cache()</span>
+<span class="s2">def </span><span class="s1">_find_tex_file(filename):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Find a file in the texmf tree using kpathsea_. 
+ 
+    The kpathsea library, provided by most existing TeX distributions, both 
+    on Unix-like systems and on Windows (MikTeX), is invoked via a long-lived 
+    luatex process if luatex is installed, or via kpsewhich otherwise. 
+ 
+    .. _kpathsea: https://www.tug.org/kpathsea/ 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Raises 
+    ------ 
+    FileNotFoundError 
+        If the file is not found. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3"># we expect these to always be ascii encoded, but use utf-8</span>
+    <span class="s3"># out of caution</span>
+    <span class="s2">if </span><span class="s1">isinstance(filename</span><span class="s2">, </span><span class="s1">bytes):</span>
+        <span class="s1">filename = filename.decode(</span><span class="s4">'utf-8'</span><span class="s2">, </span><span class="s1">errors=</span><span class="s4">'replace'</span><span class="s1">)</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">lk = _LuatexKpsewhich()</span>
+    <span class="s2">except </span><span class="s1">FileNotFoundError:</span>
+        <span class="s1">lk = </span><span class="s2">None  </span><span class="s3"># Fallback to directly calling kpsewhich, as below.</span>
+
+    <span class="s2">if </span><span class="s1">lk:</span>
+        <span class="s1">path = lk.search(filename)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">os.name == </span><span class="s4">'nt'</span><span class="s1">:</span>
+            <span class="s3"># On Windows only, kpathsea can use utf-8 for cmd args and output.</span>
+            <span class="s3"># The `command_line_encoding` environment variable is set to force</span>
+            <span class="s3"># it to always use utf-8 encoding.  See Matplotlib issue #11848.</span>
+            <span class="s1">kwargs = {</span><span class="s4">'env'</span><span class="s1">: {**os.environ</span><span class="s2">, </span><span class="s4">'command_line_encoding'</span><span class="s1">: </span><span class="s4">'utf-8'</span><span class="s1">}</span><span class="s2">,</span>
+                      <span class="s4">'encoding'</span><span class="s1">: </span><span class="s4">'utf-8'</span><span class="s1">}</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s3"># On POSIX, run through the equivalent of os.fsdecode().</span>
+            <span class="s1">kwargs = {</span><span class="s4">'encoding'</span><span class="s1">: sys.getfilesystemencoding()</span><span class="s2">,</span>
+                      <span class="s4">'errors'</span><span class="s1">: </span><span class="s4">'surrogateescape'</span><span class="s1">}</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">path = (cbook._check_and_log_subprocess([</span><span class="s4">'kpsewhich'</span><span class="s2">, </span><span class="s1">filename]</span><span class="s2">,</span>
+                                                    <span class="s1">_log</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+                    <span class="s1">.rstrip(</span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s1">))</span>
+        <span class="s2">except </span><span class="s1">(FileNotFoundError</span><span class="s2">, </span><span class="s1">RuntimeError):</span>
+            <span class="s1">path = </span><span class="s2">None</span>
+
+    <span class="s2">if </span><span class="s1">path:</span>
+        <span class="s2">return </span><span class="s1">path</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">FileNotFoundError(</span>
+            <span class="s4">f&quot;Matplotlib's TeX implementation searched for a file named &quot;</span>
+            <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">filename</span><span class="s2">!r} </span><span class="s4">in your texmf tree, but could not find it&quot;</span><span class="s1">)</span>
+
+
+<span class="s3"># After the deprecation period elapses, delete this shim and rename</span>
+<span class="s3"># _find_tex_file to find_tex_file everywhere.</span>
+<span class="s2">def </span><span class="s1">find_tex_file(filename):</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_find_tex_file(filename)</span>
+    <span class="s2">except </span><span class="s1">FileNotFoundError </span><span class="s2">as </span><span class="s1">exc:</span>
+        <span class="s1">_api.warn_deprecated(</span>
+            <span class="s4">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">message=</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">exc.args[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">}</span><span class="s4">; in the future, this will raise a &quot;</span>
+            <span class="s4">f&quot;FileNotFoundError.&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s4">&quot;&quot;</span>
+
+
+<span class="s1">find_tex_file.__doc__ = _find_tex_file.__doc__</span>
+
+
+<span class="s1">@lru_cache()</span>
+<span class="s2">def </span><span class="s1">_fontfile(cls</span><span class="s2">, </span><span class="s1">suffix</span><span class="s2">, </span><span class="s1">texname):</span>
+    <span class="s2">return </span><span class="s1">cls(_find_tex_file(texname + suffix))</span>
+
+
+<span class="s1">_tfmfile = partial(_fontfile</span><span class="s2">, </span><span class="s1">Tfm</span><span class="s2">, </span><span class="s4">&quot;.tfm&quot;</span><span class="s1">)</span>
+<span class="s1">_vffile = partial(_fontfile</span><span class="s2">, </span><span class="s1">Vf</span><span class="s2">, </span><span class="s4">&quot;.vf&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s4">'__main__'</span><span class="s1">:</span>
+    <span class="s2">from </span><span class="s1">argparse </span><span class="s2">import </span><span class="s1">ArgumentParser</span>
+    <span class="s2">import </span><span class="s1">itertools</span>
+
+    <span class="s1">parser = ArgumentParser()</span>
+    <span class="s1">parser.add_argument(</span><span class="s4">&quot;filename&quot;</span><span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span><span class="s4">&quot;dpi&quot;</span><span class="s2">, </span><span class="s1">nargs=</span><span class="s4">&quot;?&quot;</span><span class="s2">, </span><span class="s1">type=float</span><span class="s2">, </span><span class="s1">default=</span><span class="s2">None</span><span class="s1">)</span>
+    <span class="s1">args = parser.parse_args()</span>
+    <span class="s2">with </span><span class="s1">Dvi(args.filename</span><span class="s2">, </span><span class="s1">args.dpi) </span><span class="s2">as </span><span class="s1">dvi:</span>
+        <span class="s1">fontmap = PsfontsMap(_find_tex_file(</span><span class="s4">'pdftex.map'</span><span class="s1">))</span>
+        <span class="s2">for </span><span class="s1">page </span><span class="s2">in </span><span class="s1">dvi:</span>
+            <span class="s1">print(</span><span class="s4">f&quot;=== new page === &quot;</span>
+                  <span class="s4">f&quot;(w: </span><span class="s2">{</span><span class="s1">page.width</span><span class="s2">}</span><span class="s4">, h: </span><span class="s2">{</span><span class="s1">page.height</span><span class="s2">}</span><span class="s4">, d: </span><span class="s2">{</span><span class="s1">page.descent</span><span class="s2">}</span><span class="s4">)&quot;</span><span class="s1">)</span>
+            <span class="s2">for </span><span class="s1">font</span><span class="s2">, </span><span class="s1">group </span><span class="s2">in </span><span class="s1">itertools.groupby(</span>
+                    <span class="s1">page.text</span><span class="s2">, lambda </span><span class="s1">text: text.font):</span>
+                <span class="s1">print(</span><span class="s4">f&quot;font: </span><span class="s2">{</span><span class="s1">font.texname.decode(</span><span class="s4">'latin-1'</span><span class="s1">)</span><span class="s2">!r}\t</span><span class="s4">&quot;</span>
+                      <span class="s4">f&quot;scale: </span><span class="s2">{</span><span class="s1">font._scale / </span><span class="s5">2 </span><span class="s1">** </span><span class="s5">20</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+                <span class="s1">print(</span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s4">&quot;glyph&quot;</span><span class="s2">, </span><span class="s4">&quot;chr&quot;</span><span class="s2">, </span><span class="s4">&quot;w&quot;</span><span class="s2">, </span><span class="s4">&quot;(glyphs)&quot;</span><span class="s2">, </span><span class="s1">sep=</span><span class="s4">&quot;</span><span class="s2">\t</span><span class="s4">&quot;</span><span class="s1">)</span>
+                <span class="s2">for </span><span class="s1">text </span><span class="s2">in </span><span class="s1">group:</span>
+                    <span class="s1">print(text.x</span><span class="s2">, </span><span class="s1">text.y</span><span class="s2">, </span><span class="s1">text.glyph</span><span class="s2">,</span>
+                          <span class="s1">chr(text.glyph) </span><span class="s2">if </span><span class="s1">chr(text.glyph).isprintable()</span>
+                          <span class="s2">else </span><span class="s4">&quot;.&quot;</span><span class="s2">,</span>
+                          <span class="s1">text.width</span><span class="s2">, </span><span class="s1">sep=</span><span class="s4">&quot;</span><span class="s2">\t</span><span class="s4">&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">page.boxes:</span>
+                <span class="s1">print(</span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s4">&quot;h&quot;</span><span class="s2">, </span><span class="s4">&quot;w&quot;</span><span class="s2">, </span><span class="s4">&quot;&quot;</span><span class="s2">, </span><span class="s4">&quot;(boxes)&quot;</span><span class="s2">, </span><span class="s1">sep=</span><span class="s4">&quot;</span><span class="s2">\t</span><span class="s4">&quot;</span><span class="s1">)</span>
+                <span class="s2">for </span><span class="s1">box </span><span class="s2">in </span><span class="s1">page.boxes:</span>
+                    <span class="s1">print(box.x</span><span class="s2">, </span><span class="s1">box.y</span><span class="s2">, </span><span class="s1">box.height</span><span class="s2">, </span><span class="s1">box.width</span><span class="s2">, </span><span class="s1">sep=</span><span class="s4">&quot;</span><span class="s2">\t</span><span class="s4">&quot;</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,486 @@
+<html>
+<head>
+<title>mutator.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+mutator.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Instantiate a variation font.  Run, eg: 
+ 
+$ fonttools varLib.mutator ./NotoSansArabic-VF.ttf wght=140 wdth=85 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.fixedTools </span><span class="s2">import </span><span class="s1">floatToFixedToFloat</span><span class="s2">, </span><span class="s1">floatToFixed</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s2">import </span><span class="s1">otRound</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.boundsPen </span><span class="s2">import </span><span class="s1">BoundsPen</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">TTFont</span><span class="s2">, </span><span class="s1">newTable</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s2">import </span><span class="s1">ttProgram</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables._g_l_y_f </span><span class="s2">import </span><span class="s1">GlyphCoordinates</span><span class="s2">, </span><span class="s1">flagOverlapSimple</span><span class="s2">, </span><span class="s1">OVERLAP_COMPOUND</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.models </span><span class="s2">import </span><span class="s1">(</span>
+	<span class="s1">supportScalar</span><span class="s2">,</span>
+	<span class="s1">normalizeLocation</span><span class="s2">,</span>
+	<span class="s1">piecewiseLinearMap</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.merger </span><span class="s2">import </span><span class="s1">MutatorMerger</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.varStore </span><span class="s2">import </span><span class="s1">VarStoreInstancer</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.mvar </span><span class="s2">import </span><span class="s1">MVAR_ENTRIES</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.iup </span><span class="s2">import </span><span class="s1">iup_delta</span>
+<span class="s2">import </span><span class="s1">fontTools.subset.cff</span>
+<span class="s2">import </span><span class="s1">os.path</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">BytesIO</span>
+
+
+<span class="s1">log = logging.getLogger(</span><span class="s3">&quot;fontTools.varlib.mutator&quot;</span><span class="s1">)</span>
+
+<span class="s4"># map 'wdth' axis (1..200) to OS/2.usWidthClass (1..9), rounding to closest</span>
+<span class="s1">OS2_WIDTH_CLASS_VALUES = {}</span>
+<span class="s1">percents = [</span><span class="s5">50.0</span><span class="s2">, </span><span class="s5">62.5</span><span class="s2">, </span><span class="s5">75.0</span><span class="s2">, </span><span class="s5">87.5</span><span class="s2">, </span><span class="s5">100.0</span><span class="s2">, </span><span class="s5">112.5</span><span class="s2">, </span><span class="s5">125.0</span><span class="s2">, </span><span class="s5">150.0</span><span class="s2">, </span><span class="s5">200.0</span><span class="s1">]</span>
+<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(prev</span><span class="s2">, </span><span class="s1">curr) </span><span class="s2">in </span><span class="s1">enumerate(zip(percents[:-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">percents[</span><span class="s5">1</span><span class="s1">:])</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">1</span><span class="s1">):</span>
+	<span class="s1">half = (prev + curr) / </span><span class="s5">2</span>
+	<span class="s1">OS2_WIDTH_CLASS_VALUES[half] = i</span>
+
+
+<span class="s2">def </span><span class="s1">interpolate_cff2_PrivateDict(topDict</span><span class="s2">, </span><span class="s1">interpolateFromDeltas):</span>
+	<span class="s1">pd_blend_lists = (</span><span class="s3">&quot;BlueValues&quot;</span><span class="s2">, </span><span class="s3">&quot;OtherBlues&quot;</span><span class="s2">, </span><span class="s3">&quot;FamilyBlues&quot;</span><span class="s2">,</span>
+						<span class="s3">&quot;FamilyOtherBlues&quot;</span><span class="s2">, </span><span class="s3">&quot;StemSnapH&quot;</span><span class="s2">,</span>
+						<span class="s3">&quot;StemSnapV&quot;</span><span class="s1">)</span>
+	<span class="s1">pd_blend_values = (</span><span class="s3">&quot;BlueScale&quot;</span><span class="s2">, </span><span class="s3">&quot;BlueShift&quot;</span><span class="s2">,</span>
+						<span class="s3">&quot;BlueFuzz&quot;</span><span class="s2">, </span><span class="s3">&quot;StdHW&quot;</span><span class="s2">, </span><span class="s3">&quot;StdVW&quot;</span><span class="s1">)</span>
+	<span class="s2">for </span><span class="s1">fontDict </span><span class="s2">in </span><span class="s1">topDict.FDArray:</span>
+		<span class="s1">pd = fontDict.Private</span>
+		<span class="s1">vsindex = pd.vsindex </span><span class="s2">if </span><span class="s1">(hasattr(pd</span><span class="s2">, </span><span class="s3">'vsindex'</span><span class="s1">)) </span><span class="s2">else </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">pd.rawDict.items():</span>
+			<span class="s2">if </span><span class="s1">(key </span><span class="s2">in </span><span class="s1">pd_blend_values) </span><span class="s2">and </span><span class="s1">isinstance(value</span><span class="s2">, </span><span class="s1">list):</span>
+					<span class="s1">delta = interpolateFromDeltas(vsindex</span><span class="s2">, </span><span class="s1">value[</span><span class="s5">1</span><span class="s1">:])</span>
+					<span class="s1">pd.rawDict[key] = otRound(value[</span><span class="s5">0</span><span class="s1">] + delta)</span>
+			<span class="s2">elif </span><span class="s1">(key </span><span class="s2">in </span><span class="s1">pd_blend_lists) </span><span class="s2">and </span><span class="s1">isinstance(value[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">list):</span>
+				<span class="s3">&quot;&quot;&quot;If any argument in a BlueValues list is a blend list, 
+                then they all are. The first value of each list is an 
+                absolute value. The delta tuples are calculated from 
+                relative master values, hence we need to append all the 
+                deltas to date to each successive absolute value.&quot;&quot;&quot;</span>
+				<span class="s1">delta = </span><span class="s5">0</span>
+				<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">val_list </span><span class="s2">in </span><span class="s1">enumerate(value):</span>
+					<span class="s1">delta += otRound(interpolateFromDeltas(vsindex</span><span class="s2">,</span>
+										<span class="s1">val_list[</span><span class="s5">1</span><span class="s1">:]))</span>
+					<span class="s1">value[i] = val_list[</span><span class="s5">0</span><span class="s1">] + delta</span>
+
+
+<span class="s2">def </span><span class="s1">interpolate_cff2_charstrings(topDict</span><span class="s2">, </span><span class="s1">interpolateFromDeltas</span><span class="s2">, </span><span class="s1">glyphOrder):</span>
+	<span class="s1">charstrings = topDict.CharStrings</span>
+	<span class="s2">for </span><span class="s1">gname </span><span class="s2">in </span><span class="s1">glyphOrder:</span>
+		<span class="s4"># Interpolate charstring</span>
+		<span class="s4"># e.g replace blend op args with regular args,</span>
+		<span class="s4"># and use and discard vsindex op.</span>
+		<span class="s1">charstring = charstrings[gname]</span>
+		<span class="s1">new_program = []</span>
+		<span class="s1">vsindex = </span><span class="s5">0</span>
+		<span class="s1">last_i = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">token </span><span class="s2">in </span><span class="s1">enumerate(charstring.program):</span>
+			<span class="s2">if </span><span class="s1">token == </span><span class="s3">'vsindex'</span><span class="s1">:</span>
+				<span class="s1">vsindex = charstring.program[i - </span><span class="s5">1</span><span class="s1">]</span>
+				<span class="s2">if </span><span class="s1">last_i != </span><span class="s5">0</span><span class="s1">:</span>
+					<span class="s1">new_program.extend(charstring.program[last_i:i - </span><span class="s5">1</span><span class="s1">])</span>
+				<span class="s1">last_i = i + </span><span class="s5">1</span>
+			<span class="s2">elif </span><span class="s1">token == </span><span class="s3">'blend'</span><span class="s1">:</span>
+				<span class="s1">num_regions = charstring.getNumRegions(vsindex)</span>
+				<span class="s1">numMasters = </span><span class="s5">1 </span><span class="s1">+ num_regions</span>
+				<span class="s1">num_args = charstring.program[i - </span><span class="s5">1</span><span class="s1">]</span>
+				<span class="s4"># The program list starting at program[i] is now:</span>
+				<span class="s4"># ..args for following operations</span>
+				<span class="s4"># num_args values  from the default font</span>
+				<span class="s4"># num_args tuples, each with numMasters-1 delta values</span>
+				<span class="s4"># num_blend_args</span>
+				<span class="s4"># 'blend'</span>
+				<span class="s1">argi = i - (num_args * numMasters + </span><span class="s5">1</span><span class="s1">)</span>
+				<span class="s1">end_args = tuplei = argi + num_args</span>
+				<span class="s2">while </span><span class="s1">argi &lt; end_args:</span>
+					<span class="s1">next_ti = tuplei + num_regions</span>
+					<span class="s1">deltas = charstring.program[tuplei:next_ti]</span>
+					<span class="s1">delta = interpolateFromDeltas(vsindex</span><span class="s2">, </span><span class="s1">deltas)</span>
+					<span class="s1">charstring.program[argi] += otRound(delta)</span>
+					<span class="s1">tuplei = next_ti</span>
+					<span class="s1">argi += </span><span class="s5">1</span>
+				<span class="s1">new_program.extend(charstring.program[last_i:end_args])</span>
+				<span class="s1">last_i = i + </span><span class="s5">1</span>
+		<span class="s2">if </span><span class="s1">last_i != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">new_program.extend(charstring.program[last_i:])</span>
+			<span class="s1">charstring.program = new_program</span>
+
+
+<span class="s2">def </span><span class="s1">interpolate_cff2_metrics(varfont</span><span class="s2">, </span><span class="s1">topDict</span><span class="s2">, </span><span class="s1">glyphOrder</span><span class="s2">, </span><span class="s1">loc):</span>
+	<span class="s0">&quot;&quot;&quot;Unlike TrueType glyphs, neither advance width nor bounding box 
+    info is stored in a CFF2 charstring. The width data exists only in 
+    the hmtx and HVAR tables. Since LSB data cannot be interpolated 
+    reliably from the master LSB values in the hmtx table, we traverse 
+    the charstring to determine the actual bound box. &quot;&quot;&quot;</span>
+
+	<span class="s1">charstrings = topDict.CharStrings</span>
+	<span class="s1">boundsPen = BoundsPen(glyphOrder)</span>
+	<span class="s1">hmtx = varfont[</span><span class="s3">'hmtx'</span><span class="s1">]</span>
+	<span class="s1">hvar_table = </span><span class="s2">None</span>
+	<span class="s2">if </span><span class="s3">'HVAR' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">hvar_table = varfont[</span><span class="s3">'HVAR'</span><span class="s1">].table</span>
+		<span class="s1">fvar = varfont[</span><span class="s3">'fvar'</span><span class="s1">]</span>
+		<span class="s1">varStoreInstancer = VarStoreInstancer(hvar_table.VarStore</span><span class="s2">, </span><span class="s1">fvar.axes</span><span class="s2">, </span><span class="s1">loc)</span>
+
+	<span class="s2">for </span><span class="s1">gid</span><span class="s2">, </span><span class="s1">gname </span><span class="s2">in </span><span class="s1">enumerate(glyphOrder):</span>
+		<span class="s1">entry = list(hmtx[gname])</span>
+		<span class="s4"># get width delta.</span>
+		<span class="s2">if </span><span class="s1">hvar_table:</span>
+			<span class="s2">if </span><span class="s1">hvar_table.AdvWidthMap:</span>
+				<span class="s1">width_idx = hvar_table.AdvWidthMap.mapping[gname]</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">width_idx = gid</span>
+			<span class="s1">width_delta = otRound(varStoreInstancer[width_idx])</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">width_delta = </span><span class="s5">0</span>
+
+		<span class="s4"># get LSB.</span>
+		<span class="s1">boundsPen.init()</span>
+		<span class="s1">charstring = charstrings[gname]</span>
+		<span class="s1">charstring.draw(boundsPen)</span>
+		<span class="s2">if </span><span class="s1">boundsPen.bounds </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s4"># Happens with non-marking glyphs</span>
+			<span class="s1">lsb_delta = </span><span class="s5">0</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">lsb = otRound(boundsPen.bounds[</span><span class="s5">0</span><span class="s1">])</span>
+			<span class="s1">lsb_delta = entry[</span><span class="s5">1</span><span class="s1">] - lsb</span>
+
+		<span class="s2">if </span><span class="s1">lsb_delta </span><span class="s2">or </span><span class="s1">width_delta:</span>
+			<span class="s2">if </span><span class="s1">width_delta:</span>
+				<span class="s1">entry[</span><span class="s5">0</span><span class="s1">] = max(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">entry[</span><span class="s5">0</span><span class="s1">] + width_delta)</span>
+			<span class="s2">if </span><span class="s1">lsb_delta:</span>
+				<span class="s1">entry[</span><span class="s5">1</span><span class="s1">] = lsb</span>
+			<span class="s1">hmtx[gname] = tuple(entry)</span>
+
+
+<span class="s2">def </span><span class="s1">instantiateVariableFont(varfont</span><span class="s2">, </span><span class="s1">location</span><span class="s2">, </span><span class="s1">inplace=</span><span class="s2">False, </span><span class="s1">overlap=</span><span class="s2">True</span><span class="s1">):</span>
+	<span class="s0">&quot;&quot;&quot; Generate a static instance from a variable TTFont and a dictionary 
+    defining the desired location along the variable font's axes. 
+    The location values must be specified as user-space coordinates, e.g.: 
+ 
+        {'wght': 400, 'wdth': 100} 
+ 
+    By default, a new TTFont object is returned. If ``inplace`` is True, the 
+    input varfont is modified and reduced to a static font. 
+ 
+    When the overlap parameter is defined as True, 
+    OVERLAP_SIMPLE and OVERLAP_COMPOUND bits are set to 1.  See 
+    https://docs.microsoft.com/en-us/typography/opentype/spec/glyf 
+    &quot;&quot;&quot;</span>
+	<span class="s2">if not </span><span class="s1">inplace:</span>
+		<span class="s4"># make a copy to leave input varfont unmodified</span>
+		<span class="s1">stream = BytesIO()</span>
+		<span class="s1">varfont.save(stream)</span>
+		<span class="s1">stream.seek(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">varfont = TTFont(stream)</span>
+
+	<span class="s1">fvar = varfont[</span><span class="s3">'fvar'</span><span class="s1">]</span>
+	<span class="s1">axes = {a.axisTag:(a.minValue</span><span class="s2">,</span><span class="s1">a.defaultValue</span><span class="s2">,</span><span class="s1">a.maxValue) </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">fvar.axes}</span>
+	<span class="s1">loc = normalizeLocation(location</span><span class="s2">, </span><span class="s1">axes)</span>
+	<span class="s2">if </span><span class="s3">'avar' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">maps = varfont[</span><span class="s3">'avar'</span><span class="s1">].segments</span>
+		<span class="s1">loc = {k: piecewiseLinearMap(v</span><span class="s2">, </span><span class="s1">maps[k]) </span><span class="s2">for </span><span class="s1">k</span><span class="s2">,</span><span class="s1">v </span><span class="s2">in </span><span class="s1">loc.items()}</span>
+	<span class="s4"># Quantize to F2Dot14, to avoid surprise interpolations.</span>
+	<span class="s1">loc = {k:floatToFixedToFloat(v</span><span class="s2">, </span><span class="s5">14</span><span class="s1">) </span><span class="s2">for </span><span class="s1">k</span><span class="s2">,</span><span class="s1">v </span><span class="s2">in </span><span class="s1">loc.items()}</span>
+	<span class="s4"># Location is normalized now</span>
+	<span class="s1">log.info(</span><span class="s3">&quot;Normalized location: %s&quot;</span><span class="s2">, </span><span class="s1">loc)</span>
+
+	<span class="s2">if </span><span class="s3">'gvar' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Mutating glyf/gvar tables&quot;</span><span class="s1">)</span>
+		<span class="s1">gvar = varfont[</span><span class="s3">'gvar'</span><span class="s1">]</span>
+		<span class="s1">glyf = varfont[</span><span class="s3">'glyf'</span><span class="s1">]</span>
+		<span class="s1">hMetrics = varfont[</span><span class="s3">'hmtx'</span><span class="s1">].metrics</span>
+		<span class="s1">vMetrics = getattr(varfont.get(</span><span class="s3">'vmtx'</span><span class="s1">)</span><span class="s2">, </span><span class="s3">'metrics'</span><span class="s2">, None</span><span class="s1">)</span>
+		<span class="s4"># get list of glyph names in gvar sorted by component depth</span>
+		<span class="s1">glyphnames = sorted(</span>
+			<span class="s1">gvar.variations.keys()</span><span class="s2">,</span>
+			<span class="s1">key=</span><span class="s2">lambda </span><span class="s1">name: (</span>
+				<span class="s1">glyf[name].getCompositeMaxpValues(glyf).maxComponentDepth</span>
+				<span class="s2">if </span><span class="s1">glyf[name].isComposite() </span><span class="s2">else </span><span class="s5">0</span><span class="s2">,</span>
+				<span class="s1">name))</span>
+		<span class="s2">for </span><span class="s1">glyphname </span><span class="s2">in </span><span class="s1">glyphnames:</span>
+			<span class="s1">variations = gvar.variations[glyphname]</span>
+			<span class="s1">coordinates</span><span class="s2">, </span><span class="s1">_ = glyf._getCoordinatesAndControls(glyphname</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+			<span class="s1">origCoords</span><span class="s2">, </span><span class="s1">endPts = </span><span class="s2">None, None</span>
+			<span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">variations:</span>
+				<span class="s1">scalar = supportScalar(loc</span><span class="s2">, </span><span class="s1">var.axes)</span>
+				<span class="s2">if not </span><span class="s1">scalar: </span><span class="s2">continue</span>
+				<span class="s1">delta = var.coordinates</span>
+				<span class="s2">if None in </span><span class="s1">delta:</span>
+					<span class="s2">if </span><span class="s1">origCoords </span><span class="s2">is None</span><span class="s1">:</span>
+						<span class="s1">origCoords</span><span class="s2">, </span><span class="s1">g = glyf._getCoordinatesAndControls(glyphname</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+					<span class="s1">delta = iup_delta(delta</span><span class="s2">, </span><span class="s1">origCoords</span><span class="s2">, </span><span class="s1">g.endPts)</span>
+				<span class="s1">coordinates += GlyphCoordinates(delta) * scalar</span>
+			<span class="s1">glyf._setCoordinates(glyphname</span><span class="s2">, </span><span class="s1">coordinates</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">glyf = </span><span class="s2">None</span>
+
+	<span class="s2">if </span><span class="s3">'cvar' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Mutating cvt/cvar tables&quot;</span><span class="s1">)</span>
+		<span class="s1">cvar = varfont[</span><span class="s3">'cvar'</span><span class="s1">]</span>
+		<span class="s1">cvt = varfont[</span><span class="s3">'cvt '</span><span class="s1">]</span>
+		<span class="s1">deltas = {}</span>
+		<span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">cvar.variations:</span>
+			<span class="s1">scalar = supportScalar(loc</span><span class="s2">, </span><span class="s1">var.axes)</span>
+			<span class="s2">if not </span><span class="s1">scalar: </span><span class="s2">continue</span>
+			<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">c </span><span class="s2">in </span><span class="s1">enumerate(var.coordinates):</span>
+				<span class="s2">if </span><span class="s1">c </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s1">deltas[i] = deltas.get(i</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) + scalar * c</span>
+		<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">delta </span><span class="s2">in </span><span class="s1">deltas.items():</span>
+			<span class="s1">cvt[i] += otRound(delta)</span>
+
+	<span class="s2">if </span><span class="s3">'CFF2' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Mutating CFF2 table&quot;</span><span class="s1">)</span>
+		<span class="s1">glyphOrder = varfont.getGlyphOrder()</span>
+		<span class="s1">CFF2 = varfont[</span><span class="s3">'CFF2'</span><span class="s1">]</span>
+		<span class="s1">topDict = CFF2.cff.topDictIndex[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">vsInstancer = VarStoreInstancer(topDict.VarStore.otVarStore</span><span class="s2">, </span><span class="s1">fvar.axes</span><span class="s2">, </span><span class="s1">loc)</span>
+		<span class="s1">interpolateFromDeltas = vsInstancer.interpolateFromDeltas</span>
+		<span class="s1">interpolate_cff2_PrivateDict(topDict</span><span class="s2">, </span><span class="s1">interpolateFromDeltas)</span>
+		<span class="s1">CFF2.desubroutinize()</span>
+		<span class="s1">interpolate_cff2_charstrings(topDict</span><span class="s2">, </span><span class="s1">interpolateFromDeltas</span><span class="s2">, </span><span class="s1">glyphOrder)</span>
+		<span class="s1">interpolate_cff2_metrics(varfont</span><span class="s2">, </span><span class="s1">topDict</span><span class="s2">, </span><span class="s1">glyphOrder</span><span class="s2">, </span><span class="s1">loc)</span>
+		<span class="s2">del </span><span class="s1">topDict.rawDict[</span><span class="s3">'VarStore'</span><span class="s1">]</span>
+		<span class="s2">del </span><span class="s1">topDict.VarStore</span>
+
+	<span class="s2">if </span><span class="s3">'MVAR' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Mutating MVAR table&quot;</span><span class="s1">)</span>
+		<span class="s1">mvar = varfont[</span><span class="s3">'MVAR'</span><span class="s1">].table</span>
+		<span class="s1">varStoreInstancer = VarStoreInstancer(mvar.VarStore</span><span class="s2">, </span><span class="s1">fvar.axes</span><span class="s2">, </span><span class="s1">loc)</span>
+		<span class="s1">records = mvar.ValueRecord</span>
+		<span class="s2">for </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">records:</span>
+			<span class="s1">mvarTag = rec.ValueTag</span>
+			<span class="s2">if </span><span class="s1">mvarTag </span><span class="s2">not in </span><span class="s1">MVAR_ENTRIES:</span>
+				<span class="s2">continue</span>
+			<span class="s1">tableTag</span><span class="s2">, </span><span class="s1">itemName = MVAR_ENTRIES[mvarTag]</span>
+			<span class="s1">delta = otRound(varStoreInstancer[rec.VarIdx])</span>
+			<span class="s2">if not </span><span class="s1">delta:</span>
+				<span class="s2">continue</span>
+			<span class="s1">setattr(varfont[tableTag]</span><span class="s2">, </span><span class="s1">itemName</span><span class="s2">,</span>
+				<span class="s1">getattr(varfont[tableTag]</span><span class="s2">, </span><span class="s1">itemName) + delta)</span>
+
+	<span class="s1">log.info(</span><span class="s3">&quot;Mutating FeatureVariations&quot;</span><span class="s1">)</span>
+	<span class="s2">for </span><span class="s1">tableTag </span><span class="s2">in </span><span class="s3">'GSUB'</span><span class="s2">,</span><span class="s3">'GPOS'</span><span class="s1">:</span>
+		<span class="s2">if not </span><span class="s1">tableTag </span><span class="s2">in </span><span class="s1">varfont:</span>
+			<span class="s2">continue</span>
+		<span class="s1">table = varfont[tableTag].table</span>
+		<span class="s2">if not </span><span class="s1">getattr(table</span><span class="s2">, </span><span class="s3">'FeatureVariations'</span><span class="s2">, None</span><span class="s1">):</span>
+			<span class="s2">continue</span>
+		<span class="s1">variations = table.FeatureVariations</span>
+		<span class="s2">for </span><span class="s1">record </span><span class="s2">in </span><span class="s1">variations.FeatureVariationRecord:</span>
+			<span class="s1">applies = </span><span class="s2">True</span>
+			<span class="s2">for </span><span class="s1">condition </span><span class="s2">in </span><span class="s1">record.ConditionSet.ConditionTable:</span>
+				<span class="s2">if </span><span class="s1">condition.Format == </span><span class="s5">1</span><span class="s1">:</span>
+					<span class="s1">axisIdx = condition.AxisIndex</span>
+					<span class="s1">axisTag = fvar.axes[axisIdx].axisTag</span>
+					<span class="s1">Min = condition.FilterRangeMinValue</span>
+					<span class="s1">Max = condition.FilterRangeMaxValue</span>
+					<span class="s1">v = loc[axisTag]</span>
+					<span class="s2">if not </span><span class="s1">(Min &lt;= v &lt;= Max):</span>
+						<span class="s1">applies = </span><span class="s2">False</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">applies = </span><span class="s2">False</span>
+				<span class="s2">if not </span><span class="s1">applies:</span>
+					<span class="s2">break</span>
+
+			<span class="s2">if </span><span class="s1">applies:</span>
+				<span class="s2">assert </span><span class="s1">record.FeatureTableSubstitution.Version == </span><span class="s5">0x00010000</span>
+				<span class="s2">for </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">record.FeatureTableSubstitution.SubstitutionRecord:</span>
+					<span class="s1">table.FeatureList.FeatureRecord[rec.FeatureIndex].Feature = rec.Feature</span>
+				<span class="s2">break</span>
+		<span class="s2">del </span><span class="s1">table.FeatureVariations</span>
+
+	<span class="s2">if </span><span class="s3">'GDEF' </span><span class="s2">in </span><span class="s1">varfont </span><span class="s2">and </span><span class="s1">varfont[</span><span class="s3">'GDEF'</span><span class="s1">].table.Version &gt;= </span><span class="s5">0x00010003</span><span class="s1">:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Mutating GDEF/GPOS/GSUB tables&quot;</span><span class="s1">)</span>
+		<span class="s1">gdef = varfont[</span><span class="s3">'GDEF'</span><span class="s1">].table</span>
+		<span class="s1">instancer = VarStoreInstancer(gdef.VarStore</span><span class="s2">, </span><span class="s1">fvar.axes</span><span class="s2">, </span><span class="s1">loc)</span>
+
+		<span class="s1">merger = MutatorMerger(varfont</span><span class="s2">, </span><span class="s1">instancer)</span>
+		<span class="s1">merger.mergeTables(varfont</span><span class="s2">, </span><span class="s1">[varfont]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">'GDEF'</span><span class="s2">, </span><span class="s3">'GPOS'</span><span class="s1">])</span>
+
+		<span class="s4"># Downgrade GDEF.</span>
+		<span class="s2">del </span><span class="s1">gdef.VarStore</span>
+		<span class="s1">gdef.Version = </span><span class="s5">0x00010002</span>
+		<span class="s2">if </span><span class="s1">gdef.MarkGlyphSetsDef </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">del </span><span class="s1">gdef.MarkGlyphSetsDef</span>
+			<span class="s1">gdef.Version = </span><span class="s5">0x00010000</span>
+
+		<span class="s2">if not </span><span class="s1">(gdef.LigCaretList </span><span class="s2">or</span>
+			<span class="s1">gdef.MarkAttachClassDef </span><span class="s2">or</span>
+			<span class="s1">gdef.GlyphClassDef </span><span class="s2">or</span>
+			<span class="s1">gdef.AttachList </span><span class="s2">or</span>
+			<span class="s1">(gdef.Version &gt;= </span><span class="s5">0x00010002 </span><span class="s2">and </span><span class="s1">gdef.MarkGlyphSetsDef)):</span>
+			<span class="s2">del </span><span class="s1">varfont[</span><span class="s3">'GDEF'</span><span class="s1">]</span>
+
+	<span class="s1">addidef = </span><span class="s2">False</span>
+	<span class="s2">if </span><span class="s1">glyf:</span>
+		<span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">glyf.glyphs.values():</span>
+			<span class="s2">if </span><span class="s1">hasattr(glyph</span><span class="s2">, </span><span class="s3">&quot;program&quot;</span><span class="s1">):</span>
+				<span class="s1">instructions = glyph.program.getAssembly()</span>
+				<span class="s4"># If GETVARIATION opcode is used in bytecode of any glyph add IDEF</span>
+				<span class="s1">addidef = any(op.startswith(</span><span class="s3">&quot;GETVARIATION&quot;</span><span class="s1">) </span><span class="s2">for </span><span class="s1">op </span><span class="s2">in </span><span class="s1">instructions)</span>
+				<span class="s2">if </span><span class="s1">addidef:</span>
+					<span class="s2">break</span>
+		<span class="s2">if </span><span class="s1">overlap:</span>
+			<span class="s2">for </span><span class="s1">glyph_name </span><span class="s2">in </span><span class="s1">glyf.keys():</span>
+				<span class="s1">glyph = glyf[glyph_name]</span>
+				<span class="s4"># Set OVERLAP_COMPOUND bit for compound glyphs</span>
+				<span class="s2">if </span><span class="s1">glyph.isComposite():</span>
+					<span class="s1">glyph.components[</span><span class="s5">0</span><span class="s1">].flags |= OVERLAP_COMPOUND</span>
+				<span class="s4"># Set OVERLAP_SIMPLE bit for simple glyphs</span>
+				<span class="s2">elif </span><span class="s1">glyph.numberOfContours &gt; </span><span class="s5">0</span><span class="s1">:</span>
+					<span class="s1">glyph.flags[</span><span class="s5">0</span><span class="s1">] |= flagOverlapSimple</span>
+	<span class="s2">if </span><span class="s1">addidef:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Adding IDEF to fpgm table for GETVARIATION opcode&quot;</span><span class="s1">)</span>
+		<span class="s1">asm = []</span>
+		<span class="s2">if </span><span class="s3">'fpgm' </span><span class="s2">in </span><span class="s1">varfont:</span>
+			<span class="s1">fpgm = varfont[</span><span class="s3">'fpgm'</span><span class="s1">]</span>
+			<span class="s1">asm = fpgm.program.getAssembly()</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">fpgm = newTable(</span><span class="s3">'fpgm'</span><span class="s1">)</span>
+			<span class="s1">fpgm.program = ttProgram.Program()</span>
+			<span class="s1">varfont[</span><span class="s3">'fpgm'</span><span class="s1">] = fpgm</span>
+		<span class="s1">asm.append(</span><span class="s3">&quot;PUSHB[000] 145&quot;</span><span class="s1">)</span>
+		<span class="s1">asm.append(</span><span class="s3">&quot;IDEF[ ]&quot;</span><span class="s1">)</span>
+		<span class="s1">args = [str(len(loc))]</span>
+		<span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">fvar.axes:</span>
+			<span class="s1">args.append(str(floatToFixed(loc[a.axisTag]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)))</span>
+		<span class="s1">asm.append(</span><span class="s3">&quot;NPUSHW[ ] &quot; </span><span class="s1">+ </span><span class="s3">' '</span><span class="s1">.join(args))</span>
+		<span class="s1">asm.append(</span><span class="s3">&quot;ENDF[ ]&quot;</span><span class="s1">)</span>
+		<span class="s1">fpgm.program.fromAssembly(asm)</span>
+
+		<span class="s4"># Change maxp attributes as IDEF is added</span>
+		<span class="s2">if </span><span class="s3">'maxp' </span><span class="s2">in </span><span class="s1">varfont:</span>
+			<span class="s1">maxp = varfont[</span><span class="s3">'maxp'</span><span class="s1">]</span>
+			<span class="s1">setattr(maxp</span><span class="s2">, </span><span class="s3">&quot;maxInstructionDefs&quot;</span><span class="s2">, </span><span class="s5">1 </span><span class="s1">+ getattr(maxp</span><span class="s2">, </span><span class="s3">&quot;maxInstructionDefs&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+			<span class="s1">setattr(maxp</span><span class="s2">, </span><span class="s3">&quot;maxStackElements&quot;</span><span class="s2">, </span><span class="s1">max(len(loc)</span><span class="s2">, </span><span class="s1">getattr(maxp</span><span class="s2">, </span><span class="s3">&quot;maxStackElements&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)))</span>
+
+	<span class="s2">if </span><span class="s3">'name' </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Pruning name table&quot;</span><span class="s1">)</span>
+		<span class="s1">exclude = {a.axisNameID </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">fvar.axes}</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">fvar.instances:</span>
+			<span class="s1">exclude.add(i.subfamilyNameID)</span>
+			<span class="s1">exclude.add(i.postscriptNameID)</span>
+		<span class="s2">if </span><span class="s3">'ltag' </span><span class="s2">in </span><span class="s1">varfont:</span>
+			<span class="s4"># Drop the whole 'ltag' table if all its language tags are referenced by</span>
+			<span class="s4"># name records to be pruned.</span>
+			<span class="s4"># TODO: prune unused ltag tags and re-enumerate langIDs accordingly</span>
+			<span class="s1">excludedUnicodeLangIDs = [</span>
+				<span class="s1">n.langID </span><span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">varfont[</span><span class="s3">'name'</span><span class="s1">].names</span>
+				<span class="s2">if </span><span class="s1">n.nameID </span><span class="s2">in </span><span class="s1">exclude </span><span class="s2">and </span><span class="s1">n.platformID == </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">n.langID != </span><span class="s5">0xFFFF</span>
+			<span class="s1">]</span>
+			<span class="s2">if </span><span class="s1">set(excludedUnicodeLangIDs) == set(range(len((varfont[</span><span class="s3">'ltag'</span><span class="s1">].tags)))):</span>
+				<span class="s2">del </span><span class="s1">varfont[</span><span class="s3">'ltag'</span><span class="s1">]</span>
+		<span class="s1">varfont[</span><span class="s3">'name'</span><span class="s1">].names[:] = [</span>
+			<span class="s1">n </span><span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">varfont[</span><span class="s3">'name'</span><span class="s1">].names</span>
+			<span class="s2">if </span><span class="s1">n.nameID </span><span class="s2">not in </span><span class="s1">exclude</span>
+		<span class="s1">]</span>
+
+	<span class="s2">if </span><span class="s3">&quot;wght&quot; </span><span class="s2">in </span><span class="s1">location </span><span class="s2">and </span><span class="s3">&quot;OS/2&quot; </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">varfont[</span><span class="s3">&quot;OS/2&quot;</span><span class="s1">].usWeightClass = otRound(</span>
+			<span class="s1">max(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">min(location[</span><span class="s3">&quot;wght&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">1000</span><span class="s1">))</span>
+		<span class="s1">)</span>
+	<span class="s2">if </span><span class="s3">&quot;wdth&quot; </span><span class="s2">in </span><span class="s1">location:</span>
+		<span class="s1">wdth = location[</span><span class="s3">&quot;wdth&quot;</span><span class="s1">]</span>
+		<span class="s2">for </span><span class="s1">percent</span><span class="s2">, </span><span class="s1">widthClass </span><span class="s2">in </span><span class="s1">sorted(OS2_WIDTH_CLASS_VALUES.items()):</span>
+			<span class="s2">if </span><span class="s1">wdth &lt; percent:</span>
+				<span class="s1">varfont[</span><span class="s3">&quot;OS/2&quot;</span><span class="s1">].usWidthClass = widthClass</span>
+				<span class="s2">break</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">varfont[</span><span class="s3">&quot;OS/2&quot;</span><span class="s1">].usWidthClass = </span><span class="s5">9</span>
+	<span class="s2">if </span><span class="s3">&quot;slnt&quot; </span><span class="s2">in </span><span class="s1">location </span><span class="s2">and </span><span class="s3">&quot;post&quot; </span><span class="s2">in </span><span class="s1">varfont:</span>
+		<span class="s1">varfont[</span><span class="s3">&quot;post&quot;</span><span class="s1">].italicAngle = max(-</span><span class="s5">90</span><span class="s2">, </span><span class="s1">min(location[</span><span class="s3">&quot;slnt&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">90</span><span class="s1">))</span>
+
+	<span class="s1">log.info(</span><span class="s3">&quot;Removing variable tables&quot;</span><span class="s1">)</span>
+	<span class="s2">for </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">(</span><span class="s3">'avar'</span><span class="s2">,</span><span class="s3">'cvar'</span><span class="s2">,</span><span class="s3">'fvar'</span><span class="s2">,</span><span class="s3">'gvar'</span><span class="s2">,</span><span class="s3">'HVAR'</span><span class="s2">,</span><span class="s3">'MVAR'</span><span class="s2">,</span><span class="s3">'VVAR'</span><span class="s2">,</span><span class="s3">'STAT'</span><span class="s1">):</span>
+		<span class="s2">if </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">varfont:</span>
+			<span class="s2">del </span><span class="s1">varfont[tag]</span>
+
+	<span class="s2">return </span><span class="s1">varfont</span>
+
+
+<span class="s2">def </span><span class="s1">main(args=</span><span class="s2">None</span><span class="s1">):</span>
+	<span class="s0">&quot;&quot;&quot;Instantiate a variation font&quot;&quot;&quot;</span>
+	<span class="s2">from </span><span class="s1">fontTools </span><span class="s2">import </span><span class="s1">configLogger</span>
+	<span class="s2">import </span><span class="s1">argparse</span>
+
+	<span class="s1">parser = argparse.ArgumentParser(</span>
+		<span class="s3">&quot;fonttools varLib.mutator&quot;</span><span class="s2">, </span><span class="s1">description=</span><span class="s3">&quot;Instantiate a variable font&quot;</span><span class="s1">)</span>
+	<span class="s1">parser.add_argument(</span>
+		<span class="s3">&quot;input&quot;</span><span class="s2">, </span><span class="s1">metavar=</span><span class="s3">&quot;INPUT.ttf&quot;</span><span class="s2">, </span><span class="s1">help=</span><span class="s3">&quot;Input variable TTF file.&quot;</span><span class="s1">)</span>
+	<span class="s1">parser.add_argument(</span>
+		<span class="s3">&quot;locargs&quot;</span><span class="s2">, </span><span class="s1">metavar=</span><span class="s3">&quot;AXIS=LOC&quot;</span><span class="s2">, </span><span class="s1">nargs=</span><span class="s3">&quot;*&quot;</span><span class="s2">,</span>
+		<span class="s1">help=</span><span class="s3">&quot;List of space separated locations. A location consist in &quot;</span>
+		<span class="s3">&quot;the name of a variation axis, followed by '=' and a number. E.g.: &quot;</span>
+		<span class="s3">&quot; wght=700 wdth=80. The default is the location of the base master.&quot;</span><span class="s1">)</span>
+	<span class="s1">parser.add_argument(</span>
+		<span class="s3">&quot;-o&quot;</span><span class="s2">, </span><span class="s3">&quot;--output&quot;</span><span class="s2">, </span><span class="s1">metavar=</span><span class="s3">&quot;OUTPUT.ttf&quot;</span><span class="s2">, </span><span class="s1">default=</span><span class="s2">None,</span>
+		<span class="s1">help=</span><span class="s3">&quot;Output instance TTF file (default: INPUT-instance.ttf).&quot;</span><span class="s1">)</span>
+	<span class="s1">parser.add_argument(</span>
+		<span class="s3">&quot;--no-recalc-timestamp&quot;</span><span class="s2">, </span><span class="s1">dest=</span><span class="s3">&quot;recalc_timestamp&quot;</span><span class="s2">, </span><span class="s1">action=</span><span class="s3">'store_false'</span><span class="s2">,</span>
+		<span class="s1">help=</span><span class="s3">&quot;Don't set the output font's timestamp to the current time.&quot;</span><span class="s1">)</span>
+	<span class="s1">logging_group = parser.add_mutually_exclusive_group(required=</span><span class="s2">False</span><span class="s1">)</span>
+	<span class="s1">logging_group.add_argument(</span>
+		<span class="s3">&quot;-v&quot;</span><span class="s2">, </span><span class="s3">&quot;--verbose&quot;</span><span class="s2">, </span><span class="s1">action=</span><span class="s3">&quot;store_true&quot;</span><span class="s2">, </span><span class="s1">help=</span><span class="s3">&quot;Run more verbosely.&quot;</span><span class="s1">)</span>
+	<span class="s1">logging_group.add_argument(</span>
+		<span class="s3">&quot;-q&quot;</span><span class="s2">, </span><span class="s3">&quot;--quiet&quot;</span><span class="s2">, </span><span class="s1">action=</span><span class="s3">&quot;store_true&quot;</span><span class="s2">, </span><span class="s1">help=</span><span class="s3">&quot;Turn verbosity off.&quot;</span><span class="s1">)</span>
+	<span class="s1">parser.add_argument(</span>
+		<span class="s3">&quot;--no-overlap&quot;</span><span class="s2">,</span>
+		<span class="s1">dest=</span><span class="s3">&quot;overlap&quot;</span><span class="s2">,</span>
+		<span class="s1">action=</span><span class="s3">&quot;store_false&quot;</span><span class="s2">,</span>
+		<span class="s1">help=</span><span class="s3">&quot;Don't set OVERLAP_SIMPLE/OVERLAP_COMPOUND glyf flags.&quot;</span>
+	<span class="s1">)</span>
+	<span class="s1">options = parser.parse_args(args)</span>
+
+	<span class="s1">varfilename = options.input</span>
+	<span class="s1">outfile = (</span>
+		<span class="s1">os.path.splitext(varfilename)[</span><span class="s5">0</span><span class="s1">] + </span><span class="s3">'-instance.ttf'</span>
+		<span class="s2">if not </span><span class="s1">options.output </span><span class="s2">else </span><span class="s1">options.output)</span>
+	<span class="s1">configLogger(level=(</span>
+		<span class="s3">&quot;DEBUG&quot; </span><span class="s2">if </span><span class="s1">options.verbose </span><span class="s2">else</span>
+		<span class="s3">&quot;ERROR&quot; </span><span class="s2">if </span><span class="s1">options.quiet </span><span class="s2">else</span>
+		<span class="s3">&quot;INFO&quot;</span><span class="s1">))</span>
+
+	<span class="s1">loc = {}</span>
+	<span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">options.locargs:</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">tag</span><span class="s2">, </span><span class="s1">val = arg.split(</span><span class="s3">'='</span><span class="s1">)</span>
+			<span class="s2">assert </span><span class="s1">len(tag) &lt;= </span><span class="s5">4</span>
+			<span class="s1">loc[tag.ljust(</span><span class="s5">4</span><span class="s1">)] = float(val)</span>
+		<span class="s2">except </span><span class="s1">(ValueError</span><span class="s2">, </span><span class="s1">AssertionError):</span>
+			<span class="s1">parser.error(</span><span class="s3">&quot;invalid location argument format: %r&quot; </span><span class="s1">% arg)</span>
+	<span class="s1">log.info(</span><span class="s3">&quot;Location: %s&quot;</span><span class="s2">, </span><span class="s1">loc)</span>
+
+	<span class="s1">log.info(</span><span class="s3">&quot;Loading variable font&quot;</span><span class="s1">)</span>
+	<span class="s1">varfont = TTFont(varfilename</span><span class="s2">, </span><span class="s1">recalcTimestamp=options.recalc_timestamp)</span>
+
+	<span class="s1">instantiateVariableFont(varfont</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">inplace=</span><span class="s2">True, </span><span class="s1">overlap=options.overlap)</span>
+
+	<span class="s1">log.info(</span><span class="s3">&quot;Saving instance font %s&quot;</span><span class="s2">, </span><span class="s1">outfile)</span>
+	<span class="s1">varfont.save(outfile)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s2">import </span><span class="s1">sys</span>
+	<span class="s2">if </span><span class="s1">len(sys.argv) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">sys.exit(main())</span>
+	<span class="s2">import </span><span class="s1">doctest</span>
+	<span class="s1">sys.exit(doctest.testmod().failed)</span>
+</pre>
+</body>
+</html>

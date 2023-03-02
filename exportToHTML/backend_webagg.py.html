@@ -1,0 +1,361 @@
+<html>
+<head>
+<title>backend_webagg.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_webagg.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Displays Agg images in the browser, with interactivity 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># The WebAgg backend is divided into two modules:</span>
+<span class="s2">#</span>
+<span class="s2"># - `backend_webagg_core.py` contains code necessary to embed a WebAgg</span>
+<span class="s2">#   plot inside of a web application, and communicate in an abstract</span>
+<span class="s2">#   way over a web socket.</span>
+<span class="s2">#</span>
+<span class="s2"># - `backend_webagg.py` contains a concrete implementation of a basic</span>
+<span class="s2">#   application, implemented with tornado.</span>
+
+<span class="s3">from </span><span class="s1">contextlib </span><span class="s3">import </span><span class="s1">contextmanager</span>
+<span class="s3">import </span><span class="s1">errno</span>
+<span class="s3">from </span><span class="s1">io </span><span class="s3">import </span><span class="s1">BytesIO</span>
+<span class="s3">import </span><span class="s1">json</span>
+<span class="s3">import </span><span class="s1">mimetypes</span>
+<span class="s3">from </span><span class="s1">pathlib </span><span class="s3">import </span><span class="s1">Path</span>
+<span class="s3">import </span><span class="s1">random</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">signal</span>
+<span class="s3">import </span><span class="s1">socket</span>
+<span class="s3">import </span><span class="s1">threading</span>
+
+<span class="s3">try</span><span class="s1">:</span>
+    <span class="s3">import </span><span class="s1">tornado</span>
+<span class="s3">except </span><span class="s1">ImportError </span><span class="s3">as </span><span class="s1">err:</span>
+    <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">&quot;The WebAgg backend requires Tornado.&quot;</span><span class="s1">) </span><span class="s3">from </span><span class="s1">err</span>
+
+<span class="s3">import </span><span class="s1">tornado.web</span>
+<span class="s3">import </span><span class="s1">tornado.ioloop</span>
+<span class="s3">import </span><span class="s1">tornado.websocket</span>
+
+<span class="s3">import </span><span class="s1">matplotlib </span><span class="s3">as </span><span class="s1">mpl</span>
+<span class="s3">from </span><span class="s1">matplotlib.backend_bases </span><span class="s3">import </span><span class="s1">_Backend</span>
+<span class="s3">from </span><span class="s1">matplotlib._pylab_helpers </span><span class="s3">import </span><span class="s1">Gcf</span>
+<span class="s3">from </span><span class="s1">. </span><span class="s3">import </span><span class="s1">backend_webagg_core </span><span class="s3">as </span><span class="s1">core</span>
+<span class="s3">from </span><span class="s1">.backend_webagg_core </span><span class="s3">import </span><span class="s1">(  </span><span class="s2"># noqa: F401 # pylint: disable=W0611</span>
+    <span class="s1">TimerAsyncio</span><span class="s3">, </span><span class="s1">TimerTornado)</span>
+
+
+<span class="s1">@mpl._api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s1">)</span>
+<span class="s3">class </span><span class="s1">ServerThread(threading.Thread):</span>
+    <span class="s3">def </span><span class="s1">run(self):</span>
+        <span class="s1">tornado.ioloop.IOLoop.instance().start()</span>
+
+
+<span class="s1">webagg_server_thread = threading.Thread(</span>
+    <span class="s1">target=</span><span class="s3">lambda</span><span class="s1">: tornado.ioloop.IOLoop.instance().start())</span>
+
+
+<span class="s3">class </span><span class="s1">FigureManagerWebAgg(core.FigureManagerWebAgg):</span>
+    <span class="s1">_toolbar2_class = core.NavigationToolbar2WebAgg</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">pyplot_show(cls</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">block=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">WebAggApplication.initialize()</span>
+
+        <span class="s1">url = </span><span class="s4">&quot;http://{address}:{port}{prefix}&quot;</span><span class="s1">.format(</span>
+            <span class="s1">address=WebAggApplication.address</span><span class="s3">,</span>
+            <span class="s1">port=WebAggApplication.port</span><span class="s3">,</span>
+            <span class="s1">prefix=WebAggApplication.url_prefix)</span>
+
+        <span class="s3">if </span><span class="s1">mpl.rcParams[</span><span class="s4">'webagg.open_in_browser'</span><span class="s1">]:</span>
+            <span class="s3">import </span><span class="s1">webbrowser</span>
+            <span class="s3">if not </span><span class="s1">webbrowser.open(url):</span>
+                <span class="s1">print(</span><span class="s4">&quot;To view figure, visit {0}&quot;</span><span class="s1">.format(url))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">print(</span><span class="s4">&quot;To view figure, visit {0}&quot;</span><span class="s1">.format(url))</span>
+
+        <span class="s1">WebAggApplication.start()</span>
+
+
+<span class="s3">class </span><span class="s1">FigureCanvasWebAgg(core.FigureCanvasWebAggCore):</span>
+    <span class="s1">manager_class = FigureManagerWebAgg</span>
+
+
+<span class="s3">class </span><span class="s1">WebAggApplication(tornado.web.Application):</span>
+    <span class="s1">initialized = </span><span class="s3">False</span>
+    <span class="s1">started = </span><span class="s3">False</span>
+
+    <span class="s3">class </span><span class="s1">FavIcon(tornado.web.RequestHandler):</span>
+        <span class="s3">def </span><span class="s1">get(self):</span>
+            <span class="s1">self.set_header(</span><span class="s4">'Content-Type'</span><span class="s3">, </span><span class="s4">'image/png'</span><span class="s1">)</span>
+            <span class="s1">self.write(Path(mpl.get_data_path()</span><span class="s3">,</span>
+                            <span class="s4">'images/matplotlib.png'</span><span class="s1">).read_bytes())</span>
+
+    <span class="s3">class </span><span class="s1">SingleFigurePage(tornado.web.RequestHandler):</span>
+        <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">application</span><span class="s3">, </span><span class="s1">request</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">url_prefix=</span><span class="s4">''</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+            <span class="s1">self.url_prefix = url_prefix</span>
+            <span class="s1">super().__init__(application</span><span class="s3">, </span><span class="s1">request</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3">def </span><span class="s1">get(self</span><span class="s3">, </span><span class="s1">fignum):</span>
+            <span class="s1">fignum = int(fignum)</span>
+            <span class="s1">manager = Gcf.get_fig_manager(fignum)</span>
+
+            <span class="s1">ws_uri = </span><span class="s4">'ws://{req.host}{prefix}/'</span><span class="s1">.format(req=self.request</span><span class="s3">,</span>
+                                                       <span class="s1">prefix=self.url_prefix)</span>
+            <span class="s1">self.render(</span>
+                <span class="s4">&quot;single_figure.html&quot;</span><span class="s3">,</span>
+                <span class="s1">prefix=self.url_prefix</span><span class="s3">,</span>
+                <span class="s1">ws_uri=ws_uri</span><span class="s3">,</span>
+                <span class="s1">fig_id=fignum</span><span class="s3">,</span>
+                <span class="s1">toolitems=core.NavigationToolbar2WebAgg.toolitems</span><span class="s3">,</span>
+                <span class="s1">canvas=manager.canvas)</span>
+
+    <span class="s3">class </span><span class="s1">AllFiguresPage(tornado.web.RequestHandler):</span>
+        <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">application</span><span class="s3">, </span><span class="s1">request</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">url_prefix=</span><span class="s4">''</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+            <span class="s1">self.url_prefix = url_prefix</span>
+            <span class="s1">super().__init__(application</span><span class="s3">, </span><span class="s1">request</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3">def </span><span class="s1">get(self):</span>
+            <span class="s1">ws_uri = </span><span class="s4">'ws://{req.host}{prefix}/'</span><span class="s1">.format(req=self.request</span><span class="s3">,</span>
+                                                       <span class="s1">prefix=self.url_prefix)</span>
+            <span class="s1">self.render(</span>
+                <span class="s4">&quot;all_figures.html&quot;</span><span class="s3">,</span>
+                <span class="s1">prefix=self.url_prefix</span><span class="s3">,</span>
+                <span class="s1">ws_uri=ws_uri</span><span class="s3">,</span>
+                <span class="s1">figures=sorted(Gcf.figs.items())</span><span class="s3">,</span>
+                <span class="s1">toolitems=core.NavigationToolbar2WebAgg.toolitems)</span>
+
+    <span class="s3">class </span><span class="s1">MplJs(tornado.web.RequestHandler):</span>
+        <span class="s3">def </span><span class="s1">get(self):</span>
+            <span class="s1">self.set_header(</span><span class="s4">'Content-Type'</span><span class="s3">, </span><span class="s4">'application/javascript'</span><span class="s1">)</span>
+
+            <span class="s1">js_content = core.FigureManagerWebAgg.get_javascript()</span>
+
+            <span class="s1">self.write(js_content)</span>
+
+    <span class="s3">class </span><span class="s1">Download(tornado.web.RequestHandler):</span>
+        <span class="s3">def </span><span class="s1">get(self</span><span class="s3">, </span><span class="s1">fignum</span><span class="s3">, </span><span class="s1">fmt):</span>
+            <span class="s1">fignum = int(fignum)</span>
+            <span class="s1">manager = Gcf.get_fig_manager(fignum)</span>
+            <span class="s1">self.set_header(</span>
+                <span class="s4">'Content-Type'</span><span class="s3">, </span><span class="s1">mimetypes.types_map.get(fmt</span><span class="s3">, </span><span class="s4">'binary'</span><span class="s1">))</span>
+            <span class="s1">buff = BytesIO()</span>
+            <span class="s1">manager.canvas.figure.savefig(buff</span><span class="s3">, </span><span class="s1">format=fmt)</span>
+            <span class="s1">self.write(buff.getvalue())</span>
+
+    <span class="s3">class </span><span class="s1">WebSocket(tornado.websocket.WebSocketHandler):</span>
+        <span class="s1">supports_binary = </span><span class="s3">True</span>
+
+        <span class="s3">def </span><span class="s1">open(self</span><span class="s3">, </span><span class="s1">fignum):</span>
+            <span class="s1">self.fignum = int(fignum)</span>
+            <span class="s1">self.manager = Gcf.get_fig_manager(self.fignum)</span>
+            <span class="s1">self.manager.add_web_socket(self)</span>
+            <span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'set_nodelay'</span><span class="s1">):</span>
+                <span class="s1">self.set_nodelay(</span><span class="s3">True</span><span class="s1">)</span>
+
+        <span class="s3">def </span><span class="s1">on_close(self):</span>
+            <span class="s1">self.manager.remove_web_socket(self)</span>
+
+        <span class="s3">def </span><span class="s1">on_message(self</span><span class="s3">, </span><span class="s1">message):</span>
+            <span class="s1">message = json.loads(message)</span>
+            <span class="s2"># The 'supports_binary' message is on a client-by-client</span>
+            <span class="s2"># basis.  The others affect the (shared) canvas as a</span>
+            <span class="s2"># whole.</span>
+            <span class="s3">if </span><span class="s1">message[</span><span class="s4">'type'</span><span class="s1">] == </span><span class="s4">'supports_binary'</span><span class="s1">:</span>
+                <span class="s1">self.supports_binary = message[</span><span class="s4">'value'</span><span class="s1">]</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">manager = Gcf.get_fig_manager(self.fignum)</span>
+                <span class="s2"># It is possible for a figure to be closed,</span>
+                <span class="s2"># but a stale figure UI is still sending messages</span>
+                <span class="s2"># from the browser.</span>
+                <span class="s3">if </span><span class="s1">manager </span><span class="s3">is not None</span><span class="s1">:</span>
+                    <span class="s1">manager.handle_json(message)</span>
+
+        <span class="s3">def </span><span class="s1">send_json(self</span><span class="s3">, </span><span class="s1">content):</span>
+            <span class="s1">self.write_message(json.dumps(content))</span>
+
+        <span class="s3">def </span><span class="s1">send_binary(self</span><span class="s3">, </span><span class="s1">blob):</span>
+            <span class="s3">if </span><span class="s1">self.supports_binary:</span>
+                <span class="s1">self.write_message(blob</span><span class="s3">, </span><span class="s1">binary=</span><span class="s3">True</span><span class="s1">)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">data_uri = </span><span class="s4">&quot;data:image/png;base64,{0}&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">blob.encode(</span><span class="s4">'base64'</span><span class="s1">).replace(</span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s3">, </span><span class="s4">''</span><span class="s1">))</span>
+                <span class="s1">self.write_message(data_uri)</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">url_prefix=</span><span class="s4">''</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">url_prefix:</span>
+            <span class="s3">assert </span><span class="s1">url_prefix[</span><span class="s5">0</span><span class="s1">] == </span><span class="s4">'/' </span><span class="s3">and </span><span class="s1">url_prefix[-</span><span class="s5">1</span><span class="s1">] != </span><span class="s4">'/'</span><span class="s3">, </span><span class="s1">\</span>
+                <span class="s4">'url_prefix must start with a &quot;/&quot; and not end with one.'</span>
+
+        <span class="s1">super().__init__(</span>
+            <span class="s1">[</span>
+                <span class="s2"># Static files for the CSS and JS</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/_static/(.*)'</span><span class="s3">,</span>
+                 <span class="s1">tornado.web.StaticFileHandler</span><span class="s3">,</span>
+                 <span class="s1">{</span><span class="s4">'path'</span><span class="s1">: core.FigureManagerWebAgg.get_static_file_path()})</span><span class="s3">,</span>
+
+                <span class="s2"># Static images for the toolbar</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/_images/(.*)'</span><span class="s3">,</span>
+                 <span class="s1">tornado.web.StaticFileHandler</span><span class="s3">,</span>
+                 <span class="s1">{</span><span class="s4">'path'</span><span class="s1">: Path(mpl.get_data_path()</span><span class="s3">, </span><span class="s4">'images'</span><span class="s1">)})</span><span class="s3">,</span>
+
+                <span class="s2"># A Matplotlib favicon</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/favicon.ico'</span><span class="s3">, </span><span class="s1">self.FavIcon)</span><span class="s3">,</span>
+
+                <span class="s2"># The page that contains all of the pieces</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/([0-9]+)'</span><span class="s3">, </span><span class="s1">self.SingleFigurePage</span><span class="s3">,</span>
+                 <span class="s1">{</span><span class="s4">'url_prefix'</span><span class="s1">: url_prefix})</span><span class="s3">,</span>
+
+                <span class="s2"># The page that contains all of the figures</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/?'</span><span class="s3">, </span><span class="s1">self.AllFiguresPage</span><span class="s3">,</span>
+                 <span class="s1">{</span><span class="s4">'url_prefix'</span><span class="s1">: url_prefix})</span><span class="s3">,</span>
+
+                <span class="s1">(url_prefix + </span><span class="s4">r'/js/mpl.js'</span><span class="s3">, </span><span class="s1">self.MplJs)</span><span class="s3">,</span>
+
+                <span class="s2"># Sends images and events to the browser, and receives</span>
+                <span class="s2"># events from the browser</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/([0-9]+)/ws'</span><span class="s3">, </span><span class="s1">self.WebSocket)</span><span class="s3">,</span>
+
+                <span class="s2"># Handles the downloading (i.e., saving) of static images</span>
+                <span class="s1">(url_prefix + </span><span class="s4">r'/([0-9]+)/download.([a-z0-9.]+)'</span><span class="s3">,</span>
+                 <span class="s1">self.Download)</span><span class="s3">,</span>
+            <span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">template_path=core.FigureManagerWebAgg.get_static_file_path())</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">initialize(cls</span><span class="s3">, </span><span class="s1">url_prefix=</span><span class="s4">''</span><span class="s3">, </span><span class="s1">port=</span><span class="s3">None, </span><span class="s1">address=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">cls.initialized:</span>
+            <span class="s3">return</span>
+
+        <span class="s2"># Create the class instance</span>
+        <span class="s1">app = cls(url_prefix=url_prefix)</span>
+
+        <span class="s1">cls.url_prefix = url_prefix</span>
+
+        <span class="s2"># This port selection algorithm is borrowed, more or less</span>
+        <span class="s2"># verbatim, from IPython.</span>
+        <span class="s3">def </span><span class="s1">random_ports(port</span><span class="s3">, </span><span class="s1">n):</span>
+            <span class="s0">&quot;&quot;&quot; 
+            Generate a list of n random ports near the given port. 
+ 
+            The first 5 ports will be sequential, and the remaining n-5 will be 
+            randomly selected in the range [port-2*n, port+2*n]. 
+            &quot;&quot;&quot;</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(min(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">n)):</span>
+                <span class="s3">yield </span><span class="s1">port + i</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n - </span><span class="s5">5</span><span class="s1">):</span>
+                <span class="s3">yield </span><span class="s1">port + random.randint(-</span><span class="s5">2 </span><span class="s1">* n</span><span class="s3">, </span><span class="s5">2 </span><span class="s1">* n)</span>
+
+        <span class="s3">if </span><span class="s1">address </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">cls.address = mpl.rcParams[</span><span class="s4">'webagg.address'</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">cls.address = address</span>
+        <span class="s1">cls.port = mpl.rcParams[</span><span class="s4">'webagg.port'</span><span class="s1">]</span>
+        <span class="s3">for </span><span class="s1">port </span><span class="s3">in </span><span class="s1">random_ports(cls.port</span><span class="s3">,</span>
+                                 <span class="s1">mpl.rcParams[</span><span class="s4">'webagg.port_retries'</span><span class="s1">]):</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s1">app.listen(port</span><span class="s3">, </span><span class="s1">cls.address)</span>
+            <span class="s3">except </span><span class="s1">socket.error </span><span class="s3">as </span><span class="s1">e:</span>
+                <span class="s3">if </span><span class="s1">e.errno != errno.EADDRINUSE:</span>
+                    <span class="s3">raise</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">cls.port = port</span>
+                <span class="s3">break</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">SystemExit(</span>
+                <span class="s4">&quot;The webagg server could not be started because an available &quot;</span>
+                <span class="s4">&quot;port could not be found&quot;</span><span class="s1">)</span>
+
+        <span class="s1">cls.initialized = </span><span class="s3">True</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">start(cls):</span>
+        <span class="s3">import </span><span class="s1">asyncio</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">asyncio.get_running_loop()</span>
+        <span class="s3">except </span><span class="s1">RuntimeError:</span>
+            <span class="s3">pass</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">cls.started = </span><span class="s3">True</span>
+
+        <span class="s3">if </span><span class="s1">cls.started:</span>
+            <span class="s3">return</span>
+
+        <span class="s4">&quot;&quot;&quot; 
+        IOLoop.running() was removed as of Tornado 2.4; see for example 
+        https://groups.google.com/forum/#!topic/python-tornado/QLMzkpQBGOY 
+        Thus there is no correct way to check if the loop has already been 
+        launched. We may end up with two concurrently running loops in that 
+        unlucky case with all the expected consequences. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ioloop = tornado.ioloop.IOLoop.instance()</span>
+
+        <span class="s3">def </span><span class="s1">shutdown():</span>
+            <span class="s1">ioloop.stop()</span>
+            <span class="s1">print(</span><span class="s4">&quot;Server is stopped&quot;</span><span class="s1">)</span>
+            <span class="s1">sys.stdout.flush()</span>
+            <span class="s1">cls.started = </span><span class="s3">False</span>
+
+        <span class="s1">@contextmanager</span>
+        <span class="s3">def </span><span class="s1">catch_sigint():</span>
+            <span class="s1">old_handler = signal.signal(</span>
+                <span class="s1">signal.SIGINT</span><span class="s3">,</span>
+                <span class="s3">lambda </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">frame: ioloop.add_callback_from_signal(shutdown))</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s3">yield</span>
+            <span class="s3">finally</span><span class="s1">:</span>
+                <span class="s1">signal.signal(signal.SIGINT</span><span class="s3">, </span><span class="s1">old_handler)</span>
+
+        <span class="s2"># Set the flag to True *before* blocking on ioloop.start()</span>
+        <span class="s1">cls.started = </span><span class="s3">True</span>
+
+        <span class="s1">print(</span><span class="s4">&quot;Press Ctrl+C to stop WebAgg server&quot;</span><span class="s1">)</span>
+        <span class="s1">sys.stdout.flush()</span>
+        <span class="s3">with </span><span class="s1">catch_sigint():</span>
+            <span class="s1">ioloop.start()</span>
+
+
+<span class="s3">def </span><span class="s1">ipython_inline_display(figure):</span>
+    <span class="s3">import </span><span class="s1">tornado.template</span>
+
+    <span class="s1">WebAggApplication.initialize()</span>
+    <span class="s3">import </span><span class="s1">asyncio</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">asyncio.get_running_loop()</span>
+    <span class="s3">except </span><span class="s1">RuntimeError:</span>
+        <span class="s3">if not </span><span class="s1">webagg_server_thread.is_alive():</span>
+            <span class="s1">webagg_server_thread.start()</span>
+
+    <span class="s1">fignum = figure.number</span>
+    <span class="s1">tpl = Path(core.FigureManagerWebAgg.get_static_file_path()</span><span class="s3">,</span>
+               <span class="s4">&quot;ipython_inline_figure.html&quot;</span><span class="s1">).read_text()</span>
+    <span class="s1">t = tornado.template.Template(tpl)</span>
+    <span class="s3">return </span><span class="s1">t.generate(</span>
+        <span class="s1">prefix=WebAggApplication.url_prefix</span><span class="s3">,</span>
+        <span class="s1">fig_id=fignum</span><span class="s3">,</span>
+        <span class="s1">toolitems=core.NavigationToolbar2WebAgg.toolitems</span><span class="s3">,</span>
+        <span class="s1">canvas=figure.canvas</span><span class="s3">,</span>
+        <span class="s1">port=WebAggApplication.port).decode(</span><span class="s4">'utf-8'</span><span class="s1">)</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s3">class </span><span class="s1">_BackendWebAgg(_Backend):</span>
+    <span class="s1">FigureCanvas = FigureCanvasWebAgg</span>
+    <span class="s1">FigureManager = FigureManagerWebAgg</span>
+</pre>
+</body>
+</html>

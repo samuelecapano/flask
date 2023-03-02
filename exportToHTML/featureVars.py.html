@@ -1,0 +1,547 @@
+<html>
+<head>
+<title>featureVars.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+featureVars.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Module to build FeatureVariation tables: 
+https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#featurevariations-table 
+ 
+NOTE: The API is experimental and subject to change. 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.dictTools </span><span class="s2">import </span><span class="s1">hashdict</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.intTools </span><span class="s2">import </span><span class="s1">popCount</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">newTable</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s2">import </span><span class="s1">otTables </span><span class="s2">as </span><span class="s1">ot</span>
+<span class="s2">from </span><span class="s1">fontTools.otlLib.builder </span><span class="s2">import </span><span class="s1">buildLookup</span><span class="s2">, </span><span class="s1">buildSingleSubstSubtable</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">OrderedDict</span>
+
+<span class="s2">from </span><span class="s1">.errors </span><span class="s2">import </span><span class="s1">VarLibError</span><span class="s2">, </span><span class="s1">VarLibValidationError</span>
+
+
+<span class="s2">def </span><span class="s1">addFeatureVariations(font</span><span class="s2">, </span><span class="s1">conditionalSubstitutions</span><span class="s2">, </span><span class="s1">featureTag=</span><span class="s3">'rvrn'</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Add conditional substitutions to a Variable Font. 
+ 
+    The `conditionalSubstitutions` argument is a list of (Region, Substitutions) 
+    tuples. 
+ 
+    A Region is a list of Boxes. A Box is a dict mapping axisTags to 
+    (minValue, maxValue) tuples. Irrelevant axes may be omitted and they are 
+    interpretted as extending to end of axis in each direction.  A Box represents 
+    an orthogonal 'rectangular' subset of an N-dimensional design space. 
+    A Region represents a more complex subset of an N-dimensional design space, 
+    ie. the union of all the Boxes in the Region. 
+    For efficiency, Boxes within a Region should ideally not overlap, but 
+    functionality is not compromised if they do. 
+ 
+    The minimum and maximum values are expressed in normalized coordinates. 
+ 
+    A Substitution is a dict mapping source glyph names to substitute glyph names. 
+ 
+    Example: 
+ 
+    # &gt;&gt;&gt; f = TTFont(srcPath) 
+    # &gt;&gt;&gt; condSubst = [ 
+    # ...     # A list of (Region, Substitution) tuples. 
+    # ...     ([{&quot;wdth&quot;: (0.5, 1.0)}], {&quot;cent&quot;: &quot;cent.rvrn&quot;}), 
+    # ...     ([{&quot;wght&quot;: (0.5, 1.0)}], {&quot;dollar&quot;: &quot;dollar.rvrn&quot;}), 
+    # ... ] 
+    # &gt;&gt;&gt; addFeatureVariations(f, condSubst) 
+    # &gt;&gt;&gt; f.save(dstPath) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_checkSubstitutionGlyphsExist(</span>
+        <span class="s1">glyphNames=set(font.getGlyphOrder())</span><span class="s2">,</span>
+        <span class="s1">substitutions=conditionalSubstitutions</span><span class="s2">,</span>
+    <span class="s1">)</span>
+
+    <span class="s1">substitutions = overlayFeatureVariations(conditionalSubstitutions)</span>
+
+    <span class="s4"># turn substitution dicts into tuples of tuples, so they are hashable</span>
+    <span class="s1">conditionalSubstitutions</span><span class="s2">, </span><span class="s1">allSubstitutions = makeSubstitutionsHashable(substitutions)</span>
+    <span class="s2">if </span><span class="s3">&quot;GSUB&quot; </span><span class="s2">not in </span><span class="s1">font:</span>
+        <span class="s1">font[</span><span class="s3">&quot;GSUB&quot;</span><span class="s1">] = buildGSUB()</span>
+
+    <span class="s4"># setup lookups</span>
+    <span class="s1">lookupMap = buildSubstitutionLookups(font[</span><span class="s3">&quot;GSUB&quot;</span><span class="s1">].table</span><span class="s2">, </span><span class="s1">allSubstitutions)</span>
+
+    <span class="s4"># addFeatureVariationsRaw takes a list of</span>
+    <span class="s4">#  ( {condition}, [ lookup indices ] )</span>
+    <span class="s4"># so rearrange our lookups to match</span>
+    <span class="s1">conditionsAndLookups = []</span>
+    <span class="s2">for </span><span class="s1">conditionSet</span><span class="s2">, </span><span class="s1">substitutions </span><span class="s2">in </span><span class="s1">conditionalSubstitutions:</span>
+        <span class="s1">conditionsAndLookups.append((conditionSet</span><span class="s2">, </span><span class="s1">[lookupMap[s] </span><span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">substitutions]))</span>
+
+    <span class="s1">addFeatureVariationsRaw(font</span><span class="s2">, </span><span class="s1">font[</span><span class="s3">&quot;GSUB&quot;</span><span class="s1">].table</span><span class="s2">,</span>
+                            <span class="s1">conditionsAndLookups</span><span class="s2">,</span>
+                            <span class="s1">featureTag)</span>
+
+<span class="s2">def </span><span class="s1">_checkSubstitutionGlyphsExist(glyphNames</span><span class="s2">, </span><span class="s1">substitutions):</span>
+    <span class="s1">referencedGlyphNames = set()</span>
+    <span class="s2">for </span><span class="s1">_</span><span class="s2">, </span><span class="s1">substitution </span><span class="s2">in </span><span class="s1">substitutions:</span>
+        <span class="s1">referencedGlyphNames |=  substitution.keys()</span>
+        <span class="s1">referencedGlyphNames |=  set(substitution.values())</span>
+    <span class="s1">missing = referencedGlyphNames - glyphNames</span>
+    <span class="s2">if </span><span class="s1">missing:</span>
+       <span class="s2">raise </span><span class="s1">VarLibValidationError(</span>
+            <span class="s3">&quot;Missing glyphs are referenced in conditional substitution rules:&quot;</span>
+            <span class="s3">f&quot; </span><span class="s2">{</span><span class="s3">', '</span><span class="s1">.join(missing)</span><span class="s2">}</span><span class="s3">&quot;</span>
+        <span class="s1">)</span>
+
+<span class="s2">def </span><span class="s1">overlayFeatureVariations(conditionalSubstitutions):</span>
+    <span class="s0">&quot;&quot;&quot;Compute overlaps between all conditional substitutions. 
+ 
+    The `conditionalSubstitutions` argument is a list of (Region, Substitutions) 
+    tuples. 
+ 
+    A Region is a list of Boxes. A Box is a dict mapping axisTags to 
+    (minValue, maxValue) tuples. Irrelevant axes may be omitted and they are 
+    interpretted as extending to end of axis in each direction.  A Box represents 
+    an orthogonal 'rectangular' subset of an N-dimensional design space. 
+    A Region represents a more complex subset of an N-dimensional design space, 
+    ie. the union of all the Boxes in the Region. 
+    For efficiency, Boxes within a Region should ideally not overlap, but 
+    functionality is not compromised if they do. 
+ 
+    The minimum and maximum values are expressed in normalized coordinates. 
+ 
+    A Substitution is a dict mapping source glyph names to substitute glyph names. 
+ 
+    Returns data is in similar but different format.  Overlaps of distinct 
+    substitution Boxes (*not* Regions) are explicitly listed as distinct rules, 
+    and rules with the same Box merged.  The more specific rules appear earlier 
+    in the resulting list.  Moreover, instead of just a dictionary of substitutions, 
+    a list of dictionaries is returned for substitutions corresponding to each 
+    unique space, with each dictionary being identical to one of the input 
+    substitution dictionaries.  These dictionaries are not merged to allow data 
+    sharing when they are converted into font tables. 
+ 
+    Example:: 
+ 
+        &gt;&gt;&gt; condSubst = [ 
+        ...     # A list of (Region, Substitution) tuples. 
+        ...     ([{&quot;wght&quot;: (0.5, 1.0)}], {&quot;dollar&quot;: &quot;dollar.rvrn&quot;}), 
+        ...     ([{&quot;wght&quot;: (0.5, 1.0)}], {&quot;dollar&quot;: &quot;dollar.rvrn&quot;}), 
+        ...     ([{&quot;wdth&quot;: (0.5, 1.0)}], {&quot;cent&quot;: &quot;cent.rvrn&quot;}), 
+        ...     ([{&quot;wght&quot;: (0.5, 1.0), &quot;wdth&quot;: (-1, 1.0)}], {&quot;dollar&quot;: &quot;dollar.rvrn&quot;}), 
+        ... ] 
+        &gt;&gt;&gt; from pprint import pprint 
+        &gt;&gt;&gt; pprint(overlayFeatureVariations(condSubst)) 
+        [({'wdth': (0.5, 1.0), 'wght': (0.5, 1.0)}, 
+          [{'dollar': 'dollar.rvrn'}, {'cent': 'cent.rvrn'}]), 
+         ({'wdth': (0.5, 1.0)}, [{'cent': 'cent.rvrn'}]), 
+         ({'wght': (0.5, 1.0)}, [{'dollar': 'dollar.rvrn'}])] 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># Merge same-substitutions rules, as this creates fewer number oflookups.</span>
+    <span class="s1">merged = OrderedDict()</span>
+    <span class="s2">for </span><span class="s1">value</span><span class="s2">,</span><span class="s1">key </span><span class="s2">in </span><span class="s1">conditionalSubstitutions:</span>
+        <span class="s1">key = hashdict(key)</span>
+        <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">merged:</span>
+            <span class="s1">merged[key].extend(value)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">merged[key] = value</span>
+    <span class="s1">conditionalSubstitutions = [(v</span><span class="s2">,</span><span class="s1">dict(k)) </span><span class="s2">for </span><span class="s1">k</span><span class="s2">,</span><span class="s1">v </span><span class="s2">in </span><span class="s1">merged.items()]</span>
+    <span class="s2">del </span><span class="s1">merged</span>
+
+    <span class="s4"># Merge same-region rules, as this is cheaper.</span>
+    <span class="s4"># Also convert boxes to hashdict()</span>
+    <span class="s4">#</span>
+    <span class="s4"># Reversing is such that earlier entries win in case of conflicting substitution</span>
+    <span class="s4"># rules for the same region.</span>
+    <span class="s1">merged = OrderedDict()</span>
+    <span class="s2">for </span><span class="s1">key</span><span class="s2">,</span><span class="s1">value </span><span class="s2">in </span><span class="s1">reversed(conditionalSubstitutions):</span>
+        <span class="s1">key = tuple(sorted((hashdict(cleanupBox(k)) </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">key)</span><span class="s2">,</span>
+                           <span class="s1">key=</span><span class="s2">lambda </span><span class="s1">d: tuple(sorted(d.items()))))</span>
+        <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">merged:</span>
+            <span class="s1">merged[key].update(value)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">merged[key] = dict(value)</span>
+    <span class="s1">conditionalSubstitutions = list(reversed(merged.items()))</span>
+    <span class="s2">del </span><span class="s1">merged</span>
+
+    <span class="s4"># Overlay</span>
+    <span class="s4">#</span>
+    <span class="s4"># Rank is the bit-set of the index of all contributing layers.</span>
+    <span class="s1">initMapInit = ((hashdict()</span><span class="s2">,</span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span><span class="s1">) </span><span class="s4"># Initializer representing the entire space</span>
+    <span class="s1">boxMap = OrderedDict(initMapInit) </span><span class="s4"># Map from Box to Rank</span>
+    <span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">(currRegion</span><span class="s2">,</span><span class="s1">_) </span><span class="s2">in </span><span class="s1">enumerate(conditionalSubstitutions):</span>
+        <span class="s1">newMap = OrderedDict(initMapInit)</span>
+        <span class="s1">currRank = </span><span class="s5">1</span><span class="s1">&lt;&lt;i</span>
+        <span class="s2">for </span><span class="s1">box</span><span class="s2">,</span><span class="s1">rank </span><span class="s2">in </span><span class="s1">boxMap.items():</span>
+            <span class="s2">for </span><span class="s1">currBox </span><span class="s2">in </span><span class="s1">currRegion:</span>
+                <span class="s1">intersection</span><span class="s2">, </span><span class="s1">remainder = overlayBox(currBox</span><span class="s2">, </span><span class="s1">box)</span>
+                <span class="s2">if </span><span class="s1">intersection </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">intersection = hashdict(intersection)</span>
+                    <span class="s1">newMap[intersection] = newMap.get(intersection</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) | rank|currRank</span>
+                <span class="s2">if </span><span class="s1">remainder </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">remainder = hashdict(remainder)</span>
+                    <span class="s1">newMap[remainder] = newMap.get(remainder</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) | rank</span>
+        <span class="s1">boxMap = newMap</span>
+
+    <span class="s4"># Generate output</span>
+    <span class="s1">items = []</span>
+    <span class="s2">for </span><span class="s1">box</span><span class="s2">,</span><span class="s1">rank </span><span class="s2">in </span><span class="s1">sorted(boxMap.items()</span><span class="s2">,</span>
+                           <span class="s1">key=(</span><span class="s2">lambda </span><span class="s1">BoxAndRank: -popCount(BoxAndRank[</span><span class="s5">1</span><span class="s1">]))):</span>
+        <span class="s4"># Skip any box that doesn't have any substitution.</span>
+        <span class="s2">if </span><span class="s1">rank == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s2">continue</span>
+        <span class="s1">substsList = []</span>
+        <span class="s1">i = </span><span class="s5">0</span>
+        <span class="s2">while </span><span class="s1">rank:</span>
+          <span class="s2">if </span><span class="s1">rank &amp; </span><span class="s5">1</span><span class="s1">:</span>
+              <span class="s1">substsList.append(conditionalSubstitutions[i][</span><span class="s5">1</span><span class="s1">])</span>
+          <span class="s1">rank &gt;&gt;= </span><span class="s5">1</span>
+          <span class="s1">i += </span><span class="s5">1</span>
+        <span class="s1">items.append((dict(box)</span><span class="s2">,</span><span class="s1">substsList))</span>
+    <span class="s2">return </span><span class="s1">items</span>
+
+
+<span class="s4">#</span>
+<span class="s4"># Terminology:</span>
+<span class="s4">#</span>
+<span class="s4"># A 'Box' is a dict representing an orthogonal &quot;rectangular&quot; bit of N-dimensional space.</span>
+<span class="s4"># The keys in the dict are axis tags, the values are (minValue, maxValue) tuples.</span>
+<span class="s4"># Missing dimensions (keys) are substituted by the default min and max values</span>
+<span class="s4"># from the corresponding axes.</span>
+<span class="s4">#</span>
+
+<span class="s2">def </span><span class="s1">overlayBox(top</span><span class="s2">, </span><span class="s1">bot):</span>
+    <span class="s0">&quot;&quot;&quot;Overlays ``top`` box on top of ``bot`` box. 
+ 
+    Returns two items: 
+ 
+    * Box for intersection of ``top`` and ``bot``, or None if they don't intersect. 
+    * Box for remainder of ``bot``.  Remainder box might not be exact (since the 
+      remainder might not be a simple box), but is inclusive of the exact 
+      remainder. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># Intersection</span>
+    <span class="s1">intersection = {}</span>
+    <span class="s1">intersection.update(top)</span>
+    <span class="s1">intersection.update(bot)</span>
+    <span class="s2">for </span><span class="s1">axisTag </span><span class="s2">in </span><span class="s1">set(top) &amp; set(bot):</span>
+        <span class="s1">min1</span><span class="s2">, </span><span class="s1">max1 = top[axisTag]</span>
+        <span class="s1">min2</span><span class="s2">, </span><span class="s1">max2 = bot[axisTag]</span>
+        <span class="s1">minimum = max(min1</span><span class="s2">, </span><span class="s1">min2)</span>
+        <span class="s1">maximum = min(max1</span><span class="s2">, </span><span class="s1">max2)</span>
+        <span class="s2">if not </span><span class="s1">minimum &lt; maximum:</span>
+            <span class="s2">return None, </span><span class="s1">bot </span><span class="s4"># Do not intersect</span>
+        <span class="s1">intersection[axisTag] = minimum</span><span class="s2">,</span><span class="s1">maximum</span>
+
+    <span class="s4"># Remainder</span>
+    <span class="s4">#</span>
+    <span class="s4"># Remainder is empty if bot's each axis range lies within that of intersection.</span>
+    <span class="s4">#</span>
+    <span class="s4"># Remainder is shrank if bot's each, except for exactly one, axis range lies</span>
+    <span class="s4"># within that of intersection, and that one axis, it spills out of the</span>
+    <span class="s4"># intersection only on one side.</span>
+    <span class="s4">#</span>
+    <span class="s4"># Bot is returned in full as remainder otherwise, as true remainder is not</span>
+    <span class="s4"># representable as a single box.</span>
+
+    <span class="s1">remainder = dict(bot)</span>
+    <span class="s1">exactlyOne = </span><span class="s2">False</span>
+    <span class="s1">fullyInside = </span><span class="s2">False</span>
+    <span class="s2">for </span><span class="s1">axisTag </span><span class="s2">in </span><span class="s1">bot:</span>
+        <span class="s2">if </span><span class="s1">axisTag </span><span class="s2">not in </span><span class="s1">intersection:</span>
+            <span class="s1">fullyInside = </span><span class="s2">False</span>
+            <span class="s2">continue </span><span class="s4"># Axis range lies fully within</span>
+        <span class="s1">min1</span><span class="s2">, </span><span class="s1">max1 = intersection[axisTag]</span>
+        <span class="s1">min2</span><span class="s2">, </span><span class="s1">max2 = bot[axisTag]</span>
+        <span class="s2">if </span><span class="s1">min1 &lt;= min2 </span><span class="s2">and </span><span class="s1">max2 &lt;= max1:</span>
+            <span class="s2">continue </span><span class="s4"># Axis range lies fully within</span>
+
+        <span class="s4"># Bot's range doesn't fully lie within that of top's for this axis.</span>
+        <span class="s4"># We know they intersect, so it cannot lie fully without either; so they</span>
+        <span class="s4"># overlap.</span>
+
+        <span class="s4"># If we have had an overlapping axis before, remainder is not</span>
+        <span class="s4"># representable as a box, so return full bottom and go home.</span>
+        <span class="s2">if </span><span class="s1">exactlyOne:</span>
+            <span class="s2">return </span><span class="s1">intersection</span><span class="s2">, </span><span class="s1">bot</span>
+        <span class="s1">exactlyOne = </span><span class="s2">True</span>
+        <span class="s1">fullyInside = </span><span class="s2">False</span>
+
+        <span class="s4"># Otherwise, cut remainder on this axis and continue.</span>
+        <span class="s2">if </span><span class="s1">min1 &lt;= min2:</span>
+            <span class="s4"># Right side survives.</span>
+            <span class="s1">minimum = max(max1</span><span class="s2">, </span><span class="s1">min2)</span>
+            <span class="s1">maximum = max2</span>
+        <span class="s2">elif </span><span class="s1">max2 &lt;= max1:</span>
+            <span class="s4"># Left side survives.</span>
+            <span class="s1">minimum = min2</span>
+            <span class="s1">maximum = min(min1</span><span class="s2">, </span><span class="s1">max2)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s4"># Remainder leaks out from both sides.  Can't cut either.</span>
+            <span class="s2">return </span><span class="s1">intersection</span><span class="s2">, </span><span class="s1">bot</span>
+
+        <span class="s1">remainder[axisTag] = minimum</span><span class="s2">,</span><span class="s1">maximum</span>
+
+    <span class="s2">if </span><span class="s1">fullyInside:</span>
+        <span class="s4"># bot is fully within intersection.  Remainder is empty.</span>
+        <span class="s2">return </span><span class="s1">intersection</span><span class="s2">, None</span>
+
+    <span class="s2">return </span><span class="s1">intersection</span><span class="s2">, </span><span class="s1">remainder</span>
+
+<span class="s2">def </span><span class="s1">cleanupBox(box):</span>
+    <span class="s0">&quot;&quot;&quot;Return a sparse copy of `box`, without redundant (default) values. 
+ 
+        &gt;&gt;&gt; cleanupBox({}) 
+        {} 
+        &gt;&gt;&gt; cleanupBox({'wdth': (0.0, 1.0)}) 
+        {'wdth': (0.0, 1.0)} 
+        &gt;&gt;&gt; cleanupBox({'wdth': (-1.0, 1.0)}) 
+        {} 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">{tag: limit </span><span class="s2">for </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">limit </span><span class="s2">in </span><span class="s1">box.items() </span><span class="s2">if </span><span class="s1">limit != (-</span><span class="s5">1.0</span><span class="s2">, </span><span class="s5">1.0</span><span class="s1">)}</span>
+
+
+<span class="s4">#</span>
+<span class="s4"># Low level implementation</span>
+<span class="s4">#</span>
+
+<span class="s2">def </span><span class="s1">addFeatureVariationsRaw(font</span><span class="s2">, </span><span class="s1">table</span><span class="s2">, </span><span class="s1">conditionalSubstitutions</span><span class="s2">, </span><span class="s1">featureTag=</span><span class="s3">'rvrn'</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Low level implementation of addFeatureVariations that directly 
+    models the possibilities of the FeatureVariations table.&quot;&quot;&quot;</span>
+
+    <span class="s4">#</span>
+    <span class="s4"># if there is no &lt;featureTag&gt; feature:</span>
+    <span class="s4">#     make empty &lt;featureTag&gt; feature</span>
+    <span class="s4">#     sort features, get &lt;featureTag&gt; feature index</span>
+    <span class="s4">#     add &lt;featureTag&gt; feature to all scripts</span>
+    <span class="s4"># make lookups</span>
+    <span class="s4"># add feature variations</span>
+    <span class="s4">#</span>
+    <span class="s2">if </span><span class="s1">table.Version &lt; </span><span class="s5">0x00010001</span><span class="s1">:</span>
+        <span class="s1">table.Version = </span><span class="s5">0x00010001  </span><span class="s4"># allow table.FeatureVariations</span>
+
+    <span class="s1">table.FeatureVariations = </span><span class="s2">None  </span><span class="s4"># delete any existing FeatureVariations</span>
+
+    <span class="s1">varFeatureIndices = []</span>
+    <span class="s2">for </span><span class="s1">index</span><span class="s2">, </span><span class="s1">feature </span><span class="s2">in </span><span class="s1">enumerate(table.FeatureList.FeatureRecord):</span>
+        <span class="s2">if </span><span class="s1">feature.FeatureTag == featureTag:</span>
+            <span class="s1">varFeatureIndices.append(index)</span>
+
+    <span class="s2">if not </span><span class="s1">varFeatureIndices:</span>
+        <span class="s1">varFeature = buildFeatureRecord(featureTag</span><span class="s2">, </span><span class="s1">[])</span>
+        <span class="s1">table.FeatureList.FeatureRecord.append(varFeature)</span>
+        <span class="s1">table.FeatureList.FeatureCount = len(table.FeatureList.FeatureRecord)</span>
+
+        <span class="s1">sortFeatureList(table)</span>
+        <span class="s1">varFeatureIndex = table.FeatureList.FeatureRecord.index(varFeature)</span>
+
+        <span class="s2">for </span><span class="s1">scriptRecord </span><span class="s2">in </span><span class="s1">table.ScriptList.ScriptRecord:</span>
+            <span class="s2">if </span><span class="s1">scriptRecord.Script.DefaultLangSys </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">VarLibError(</span>
+                    <span class="s3">&quot;Feature variations require that the script &quot;</span>
+                    <span class="s3">f&quot;'</span><span class="s2">{</span><span class="s1">scriptRecord.ScriptTag</span><span class="s2">}</span><span class="s3">' defines a default language system.&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">langSystems = [lsr.LangSys </span><span class="s2">for </span><span class="s1">lsr </span><span class="s2">in </span><span class="s1">scriptRecord.Script.LangSysRecord]</span>
+            <span class="s2">for </span><span class="s1">langSys </span><span class="s2">in </span><span class="s1">[scriptRecord.Script.DefaultLangSys] + langSystems:</span>
+                <span class="s1">langSys.FeatureIndex.append(varFeatureIndex)</span>
+                <span class="s1">langSys.FeatureCount = len(langSys.FeatureIndex)</span>
+
+        <span class="s1">varFeatureIndices = [varFeatureIndex]</span>
+
+    <span class="s1">axisIndices = {axis.axisTag: axisIndex </span><span class="s2">for </span><span class="s1">axisIndex</span><span class="s2">, </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">enumerate(font[</span><span class="s3">&quot;fvar&quot;</span><span class="s1">].axes)}</span>
+
+    <span class="s1">featureVariationRecords = []</span>
+    <span class="s2">for </span><span class="s1">conditionSet</span><span class="s2">, </span><span class="s1">lookupIndices </span><span class="s2">in </span><span class="s1">conditionalSubstitutions:</span>
+        <span class="s1">conditionTable = []</span>
+        <span class="s2">for </span><span class="s1">axisTag</span><span class="s2">, </span><span class="s1">(minValue</span><span class="s2">, </span><span class="s1">maxValue) </span><span class="s2">in </span><span class="s1">sorted(conditionSet.items()):</span>
+            <span class="s2">if </span><span class="s1">minValue &gt; maxValue:</span>
+                <span class="s2">raise </span><span class="s1">VarLibValidationError(</span>
+                    <span class="s3">&quot;A condition set has a minimum value above the maximum value.&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">ct = buildConditionTable(axisIndices[axisTag]</span><span class="s2">, </span><span class="s1">minValue</span><span class="s2">, </span><span class="s1">maxValue)</span>
+            <span class="s1">conditionTable.append(ct)</span>
+        <span class="s1">records = []</span>
+        <span class="s2">for </span><span class="s1">varFeatureIndex </span><span class="s2">in </span><span class="s1">varFeatureIndices:</span>
+            <span class="s1">existingLookupIndices = table.FeatureList.FeatureRecord[varFeatureIndex].Feature.LookupListIndex</span>
+            <span class="s1">records.append(buildFeatureTableSubstitutionRecord(varFeatureIndex</span><span class="s2">, </span><span class="s1">existingLookupIndices + lookupIndices))</span>
+        <span class="s1">featureVariationRecords.append(buildFeatureVariationRecord(conditionTable</span><span class="s2">, </span><span class="s1">records))</span>
+
+    <span class="s1">table.FeatureVariations = buildFeatureVariations(featureVariationRecords)</span>
+
+
+<span class="s4">#</span>
+<span class="s4"># Building GSUB/FeatureVariations internals</span>
+<span class="s4">#</span>
+
+<span class="s2">def </span><span class="s1">buildGSUB():</span>
+    <span class="s0">&quot;&quot;&quot;Build a GSUB table from scratch.&quot;&quot;&quot;</span>
+    <span class="s1">fontTable = newTable(</span><span class="s3">&quot;GSUB&quot;</span><span class="s1">)</span>
+    <span class="s1">gsub = fontTable.table = ot.GSUB()</span>
+    <span class="s1">gsub.Version = </span><span class="s5">0x00010001  </span><span class="s4"># allow gsub.FeatureVariations</span>
+
+    <span class="s1">gsub.ScriptList = ot.ScriptList()</span>
+    <span class="s1">gsub.ScriptList.ScriptRecord = []</span>
+    <span class="s1">gsub.FeatureList = ot.FeatureList()</span>
+    <span class="s1">gsub.FeatureList.FeatureRecord = []</span>
+    <span class="s1">gsub.LookupList = ot.LookupList()</span>
+    <span class="s1">gsub.LookupList.Lookup = []</span>
+
+    <span class="s1">srec = ot.ScriptRecord()</span>
+    <span class="s1">srec.ScriptTag = </span><span class="s3">'DFLT'</span>
+    <span class="s1">srec.Script = ot.Script()</span>
+    <span class="s1">srec.Script.DefaultLangSys = </span><span class="s2">None</span>
+    <span class="s1">srec.Script.LangSysRecord = []</span>
+    <span class="s1">srec.Script.LangSysCount = </span><span class="s5">0</span>
+
+    <span class="s1">langrec = ot.LangSysRecord()</span>
+    <span class="s1">langrec.LangSys = ot.LangSys()</span>
+    <span class="s1">langrec.LangSys.ReqFeatureIndex = </span><span class="s5">0xFFFF</span>
+    <span class="s1">langrec.LangSys.FeatureIndex = []</span>
+    <span class="s1">srec.Script.DefaultLangSys = langrec.LangSys</span>
+
+    <span class="s1">gsub.ScriptList.ScriptRecord.append(srec)</span>
+    <span class="s1">gsub.ScriptList.ScriptCount = </span><span class="s5">1</span>
+    <span class="s1">gsub.FeatureVariations = </span><span class="s2">None</span>
+
+    <span class="s2">return </span><span class="s1">fontTable</span>
+
+
+<span class="s2">def </span><span class="s1">makeSubstitutionsHashable(conditionalSubstitutions):</span>
+    <span class="s0">&quot;&quot;&quot;Turn all the substitution dictionaries in sorted tuples of tuples so 
+    they are hashable, to detect duplicates so we don't write out redundant 
+    data.&quot;&quot;&quot;</span>
+    <span class="s1">allSubstitutions = set()</span>
+    <span class="s1">condSubst = []</span>
+    <span class="s2">for </span><span class="s1">conditionSet</span><span class="s2">, </span><span class="s1">substitutionMaps </span><span class="s2">in </span><span class="s1">conditionalSubstitutions:</span>
+        <span class="s1">substitutions = []</span>
+        <span class="s2">for </span><span class="s1">substitutionMap </span><span class="s2">in </span><span class="s1">substitutionMaps:</span>
+            <span class="s1">subst = tuple(sorted(substitutionMap.items()))</span>
+            <span class="s1">substitutions.append(subst)</span>
+            <span class="s1">allSubstitutions.add(subst)</span>
+        <span class="s1">condSubst.append((conditionSet</span><span class="s2">, </span><span class="s1">substitutions))</span>
+    <span class="s2">return </span><span class="s1">condSubst</span><span class="s2">, </span><span class="s1">sorted(allSubstitutions)</span>
+
+
+<span class="s2">def </span><span class="s1">buildSubstitutionLookups(gsub</span><span class="s2">, </span><span class="s1">allSubstitutions):</span>
+    <span class="s0">&quot;&quot;&quot;Build the lookups for the glyph substitutions, return a dict mapping 
+    the substitution to lookup indices.&quot;&quot;&quot;</span>
+    <span class="s1">firstIndex = len(gsub.LookupList.Lookup)</span>
+    <span class="s1">lookupMap = {}</span>
+    <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">substitutionMap </span><span class="s2">in </span><span class="s1">enumerate(allSubstitutions):</span>
+        <span class="s1">lookupMap[substitutionMap] = i + firstIndex</span>
+
+    <span class="s2">for </span><span class="s1">subst </span><span class="s2">in </span><span class="s1">allSubstitutions:</span>
+        <span class="s1">substMap = dict(subst)</span>
+        <span class="s1">lookup = buildLookup([buildSingleSubstSubtable(substMap)])</span>
+        <span class="s1">gsub.LookupList.Lookup.append(lookup)</span>
+        <span class="s2">assert </span><span class="s1">gsub.LookupList.Lookup[lookupMap[subst]] </span><span class="s2">is </span><span class="s1">lookup</span>
+    <span class="s1">gsub.LookupList.LookupCount = len(gsub.LookupList.Lookup)</span>
+    <span class="s2">return </span><span class="s1">lookupMap</span>
+
+
+<span class="s2">def </span><span class="s1">buildFeatureVariations(featureVariationRecords):</span>
+    <span class="s0">&quot;&quot;&quot;Build the FeatureVariations subtable.&quot;&quot;&quot;</span>
+    <span class="s1">fv = ot.FeatureVariations()</span>
+    <span class="s1">fv.Version = </span><span class="s5">0x00010000</span>
+    <span class="s1">fv.FeatureVariationRecord = featureVariationRecords</span>
+    <span class="s1">fv.FeatureVariationCount = len(featureVariationRecords)</span>
+    <span class="s2">return </span><span class="s1">fv</span>
+
+
+<span class="s2">def </span><span class="s1">buildFeatureRecord(featureTag</span><span class="s2">, </span><span class="s1">lookupListIndices):</span>
+    <span class="s0">&quot;&quot;&quot;Build a FeatureRecord.&quot;&quot;&quot;</span>
+    <span class="s1">fr = ot.FeatureRecord()</span>
+    <span class="s1">fr.FeatureTag = featureTag</span>
+    <span class="s1">fr.Feature = ot.Feature()</span>
+    <span class="s1">fr.Feature.LookupListIndex = lookupListIndices</span>
+    <span class="s1">fr.Feature.populateDefaults()</span>
+    <span class="s2">return </span><span class="s1">fr</span>
+
+
+<span class="s2">def </span><span class="s1">buildFeatureVariationRecord(conditionTable</span><span class="s2">, </span><span class="s1">substitutionRecords):</span>
+    <span class="s0">&quot;&quot;&quot;Build a FeatureVariationRecord.&quot;&quot;&quot;</span>
+    <span class="s1">fvr = ot.FeatureVariationRecord()</span>
+    <span class="s1">fvr.ConditionSet = ot.ConditionSet()</span>
+    <span class="s1">fvr.ConditionSet.ConditionTable = conditionTable</span>
+    <span class="s1">fvr.ConditionSet.ConditionCount = len(conditionTable)</span>
+    <span class="s1">fvr.FeatureTableSubstitution = ot.FeatureTableSubstitution()</span>
+    <span class="s1">fvr.FeatureTableSubstitution.Version = </span><span class="s5">0x00010000</span>
+    <span class="s1">fvr.FeatureTableSubstitution.SubstitutionRecord = substitutionRecords</span>
+    <span class="s1">fvr.FeatureTableSubstitution.SubstitutionCount = len(substitutionRecords)</span>
+    <span class="s2">return </span><span class="s1">fvr</span>
+
+
+<span class="s2">def </span><span class="s1">buildFeatureTableSubstitutionRecord(featureIndex</span><span class="s2">, </span><span class="s1">lookupListIndices):</span>
+    <span class="s0">&quot;&quot;&quot;Build a FeatureTableSubstitutionRecord.&quot;&quot;&quot;</span>
+    <span class="s1">ftsr = ot.FeatureTableSubstitutionRecord()</span>
+    <span class="s1">ftsr.FeatureIndex = featureIndex</span>
+    <span class="s1">ftsr.Feature = ot.Feature()</span>
+    <span class="s1">ftsr.Feature.LookupListIndex = lookupListIndices</span>
+    <span class="s1">ftsr.Feature.LookupCount = len(lookupListIndices)</span>
+    <span class="s2">return </span><span class="s1">ftsr</span>
+
+
+<span class="s2">def </span><span class="s1">buildConditionTable(axisIndex</span><span class="s2">, </span><span class="s1">filterRangeMinValue</span><span class="s2">, </span><span class="s1">filterRangeMaxValue):</span>
+    <span class="s0">&quot;&quot;&quot;Build a ConditionTable.&quot;&quot;&quot;</span>
+    <span class="s1">ct = ot.ConditionTable()</span>
+    <span class="s1">ct.Format = </span><span class="s5">1</span>
+    <span class="s1">ct.AxisIndex = axisIndex</span>
+    <span class="s1">ct.FilterRangeMinValue = filterRangeMinValue</span>
+    <span class="s1">ct.FilterRangeMaxValue = filterRangeMaxValue</span>
+    <span class="s2">return </span><span class="s1">ct</span>
+
+
+<span class="s2">def </span><span class="s1">sortFeatureList(table):</span>
+    <span class="s0">&quot;&quot;&quot;Sort the feature list by feature tag, and remap the feature indices 
+    elsewhere. This is needed after the feature list has been modified. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># decorate, sort, undecorate, because we need to make an index remapping table</span>
+    <span class="s1">tagIndexFea = [(fea.FeatureTag</span><span class="s2">, </span><span class="s1">index</span><span class="s2">, </span><span class="s1">fea) </span><span class="s2">for </span><span class="s1">index</span><span class="s2">, </span><span class="s1">fea </span><span class="s2">in </span><span class="s1">enumerate(table.FeatureList.FeatureRecord)]</span>
+    <span class="s1">tagIndexFea.sort()</span>
+    <span class="s1">table.FeatureList.FeatureRecord = [fea </span><span class="s2">for </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">index</span><span class="s2">, </span><span class="s1">fea </span><span class="s2">in </span><span class="s1">tagIndexFea]</span>
+    <span class="s1">featureRemap = dict(zip([index </span><span class="s2">for </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">index</span><span class="s2">, </span><span class="s1">fea </span><span class="s2">in </span><span class="s1">tagIndexFea]</span><span class="s2">, </span><span class="s1">range(len(tagIndexFea))))</span>
+
+    <span class="s4"># Remap the feature indices</span>
+    <span class="s1">remapFeatures(table</span><span class="s2">, </span><span class="s1">featureRemap)</span>
+
+
+<span class="s2">def </span><span class="s1">remapFeatures(table</span><span class="s2">, </span><span class="s1">featureRemap):</span>
+    <span class="s0">&quot;&quot;&quot;Go through the scripts list, and remap feature indices.&quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">scriptIndex</span><span class="s2">, </span><span class="s1">script </span><span class="s2">in </span><span class="s1">enumerate(table.ScriptList.ScriptRecord):</span>
+        <span class="s1">defaultLangSys = script.Script.DefaultLangSys</span>
+        <span class="s2">if </span><span class="s1">defaultLangSys </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">_remapLangSys(defaultLangSys</span><span class="s2">, </span><span class="s1">featureRemap)</span>
+        <span class="s2">for </span><span class="s1">langSysRecordIndex</span><span class="s2">, </span><span class="s1">langSysRec </span><span class="s2">in </span><span class="s1">enumerate(script.Script.LangSysRecord):</span>
+            <span class="s1">langSys = langSysRec.LangSys</span>
+            <span class="s1">_remapLangSys(langSys</span><span class="s2">, </span><span class="s1">featureRemap)</span>
+
+    <span class="s2">if </span><span class="s1">hasattr(table</span><span class="s2">, </span><span class="s3">&quot;FeatureVariations&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">table.FeatureVariations </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s2">for </span><span class="s1">fvr </span><span class="s2">in </span><span class="s1">table.FeatureVariations.FeatureVariationRecord:</span>
+            <span class="s2">for </span><span class="s1">ftsr </span><span class="s2">in </span><span class="s1">fvr.FeatureTableSubstitution.SubstitutionRecord:</span>
+                <span class="s1">ftsr.FeatureIndex = featureRemap[ftsr.FeatureIndex]</span>
+
+
+<span class="s2">def </span><span class="s1">_remapLangSys(langSys</span><span class="s2">, </span><span class="s1">featureRemap):</span>
+    <span class="s2">if </span><span class="s1">langSys.ReqFeatureIndex != </span><span class="s5">0xffff</span><span class="s1">:</span>
+        <span class="s1">langSys.ReqFeatureIndex = featureRemap[langSys.ReqFeatureIndex]</span>
+    <span class="s1">langSys.FeatureIndex = [featureRemap[index] </span><span class="s2">for </span><span class="s1">index </span><span class="s2">in </span><span class="s1">langSys.FeatureIndex]</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+    <span class="s2">import </span><span class="s1">doctest</span><span class="s2">, </span><span class="s1">sys</span>
+    <span class="s1">sys.exit(doctest.testmod().failed)</span>
+</pre>
+</body>
+</html>

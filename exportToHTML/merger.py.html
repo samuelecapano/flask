@@ -1,0 +1,1564 @@
+<html>
+<head>
+<title>merger.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+merger.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Merge OpenType Layout tables (GDEF / GPOS / GSUB). 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">copy</span>
+<span class="s2">import </span><span class="s1">enum</span>
+<span class="s2">from </span><span class="s1">operator </span><span class="s2">import </span><span class="s1">ior</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">from </span><span class="s1">fontTools.colorLib.builder </span><span class="s2">import </span><span class="s1">MAX_PAINT_COLR_LAYER_COUNT</span><span class="s2">, </span><span class="s1">LayerReuseCache</span>
+<span class="s2">from </span><span class="s1">fontTools.misc </span><span class="s2">import </span><span class="s1">classifyTools</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s2">import </span><span class="s1">otRound</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.treeTools </span><span class="s2">import </span><span class="s1">build_n_ary_tree</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s2">import </span><span class="s1">otTables </span><span class="s2">as </span><span class="s1">ot</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s2">import </span><span class="s1">otBase </span><span class="s2">as </span><span class="s1">otBase</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables.otConverters </span><span class="s2">import </span><span class="s1">BaseFixedValue</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables.otTraverse </span><span class="s2">import </span><span class="s1">dfs_base_table</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables.DefaultTable </span><span class="s2">import </span><span class="s1">DefaultTable</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib </span><span class="s2">import </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">models</span><span class="s2">, </span><span class="s1">varStore</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.models </span><span class="s2">import </span><span class="s1">nonNone</span><span class="s2">, </span><span class="s1">allNone</span><span class="s2">, </span><span class="s1">allEqual</span><span class="s2">, </span><span class="s1">allEqualTo</span><span class="s2">, </span><span class="s1">subList</span>
+<span class="s2">from </span><span class="s1">fontTools.varLib.varStore </span><span class="s2">import </span><span class="s1">VarStoreInstancer</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">reduce</span>
+<span class="s2">from </span><span class="s1">fontTools.otlLib.builder </span><span class="s2">import </span><span class="s1">buildSinglePos</span>
+<span class="s2">from </span><span class="s1">fontTools.otlLib.optimize.gpos </span><span class="s2">import </span><span class="s1">(</span>
+	<span class="s1">_compression_level_from_env</span><span class="s2">,</span>
+	<span class="s1">compact_pair_pos</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+<span class="s1">log = logging.getLogger(</span><span class="s3">&quot;fontTools.varLib.merger&quot;</span><span class="s1">)</span>
+
+<span class="s2">from </span><span class="s1">.errors </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">ShouldBeConstant</span><span class="s2">,</span>
+    <span class="s1">FoundANone</span><span class="s2">,</span>
+    <span class="s1">MismatchedTypes</span><span class="s2">,</span>
+    <span class="s1">NotANone</span><span class="s2">,</span>
+    <span class="s1">LengthsDiffer</span><span class="s2">,</span>
+    <span class="s1">KeysDiffer</span><span class="s2">,</span>
+    <span class="s1">InconsistentGlyphOrder</span><span class="s2">,</span>
+    <span class="s1">InconsistentExtensions</span><span class="s2">,</span>
+    <span class="s1">InconsistentFormats</span><span class="s2">,</span>
+    <span class="s1">UnsupportedFormat</span><span class="s2">,</span>
+    <span class="s1">VarLibMergeError</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+<span class="s2">class </span><span class="s1">Merger(object):</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">font=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s1">self.font = font</span>
+		<span class="s4"># mergeTables populates this from the parent's master ttfs</span>
+		<span class="s1">self.ttfs = </span><span class="s2">None</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s2">def </span><span class="s1">merger(celf</span><span class="s2">, </span><span class="s1">clazzes</span><span class="s2">, </span><span class="s1">attrs=(</span><span class="s2">None,</span><span class="s1">)):</span>
+		<span class="s2">assert </span><span class="s1">celf != Merger</span><span class="s2">, </span><span class="s3">'Subclass Merger instead.'</span>
+		<span class="s2">if </span><span class="s3">'mergers' </span><span class="s2">not in </span><span class="s1">celf.__dict__:</span>
+			<span class="s1">celf.mergers = {}</span>
+		<span class="s2">if </span><span class="s1">type(clazzes) </span><span class="s2">in </span><span class="s1">(type</span><span class="s2">, </span><span class="s1">enum.EnumMeta):</span>
+			<span class="s1">clazzes = (clazzes</span><span class="s2">,</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">type(attrs) == str:</span>
+			<span class="s1">attrs = (attrs</span><span class="s2">,</span><span class="s1">)</span>
+		<span class="s2">def </span><span class="s1">wrapper(method):</span>
+			<span class="s2">assert </span><span class="s1">method.__name__ == </span><span class="s3">'merge'</span>
+			<span class="s1">done = []</span>
+			<span class="s2">for </span><span class="s1">clazz </span><span class="s2">in </span><span class="s1">clazzes:</span>
+				<span class="s2">if </span><span class="s1">clazz </span><span class="s2">in </span><span class="s1">done: </span><span class="s2">continue </span><span class="s4"># Support multiple names of a clazz</span>
+				<span class="s1">done.append(clazz)</span>
+				<span class="s1">mergers = celf.mergers.setdefault(clazz</span><span class="s2">, </span><span class="s1">{})</span>
+				<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">attrs:</span>
+					<span class="s2">assert </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">mergers</span><span class="s2">, </span><span class="s1">\</span>
+						<span class="s3">&quot;Oops, class '%s' has merge function for '%s' defined already.&quot; </span><span class="s1">% (clazz.__name__</span><span class="s2">, </span><span class="s1">attr)</span>
+					<span class="s1">mergers[attr] = method</span>
+			<span class="s2">return None</span>
+		<span class="s2">return </span><span class="s1">wrapper</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s2">def </span><span class="s1">mergersFor(celf</span><span class="s2">, </span><span class="s1">thing</span><span class="s2">, </span><span class="s1">_default={}):</span>
+		<span class="s1">typ = type(thing)</span>
+
+		<span class="s2">for </span><span class="s1">celf </span><span class="s2">in </span><span class="s1">celf.mro():</span>
+
+			<span class="s1">mergers = getattr(celf</span><span class="s2">, </span><span class="s3">'mergers'</span><span class="s2">, None</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">mergers </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s2">break</span><span class="s1">;</span>
+
+			<span class="s1">m = celf.mergers.get(typ</span><span class="s2">, None</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">m </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s2">return </span><span class="s1">m</span>
+
+		<span class="s2">return </span><span class="s1">_default</span>
+
+	<span class="s2">def </span><span class="s1">mergeObjects(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">exclude=()):</span>
+		<span class="s2">if </span><span class="s1">hasattr(out</span><span class="s2">, </span><span class="s3">&quot;ensureDecompiled&quot;</span><span class="s1">):</span>
+			<span class="s1">out.ensureDecompiled(recurse=</span><span class="s2">False</span><span class="s1">)</span>
+		<span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">lst:</span>
+			<span class="s2">if </span><span class="s1">hasattr(item</span><span class="s2">, </span><span class="s3">&quot;ensureDecompiled&quot;</span><span class="s1">):</span>
+				<span class="s1">item.ensureDecompiled(recurse=</span><span class="s2">False</span><span class="s1">)</span>
+		<span class="s1">keys = sorted(vars(out).keys())</span>
+		<span class="s2">if not </span><span class="s1">all(keys == sorted(vars(v).keys()) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst):</span>
+			<span class="s2">raise </span><span class="s1">KeysDiffer(self</span><span class="s2">, </span><span class="s1">expected=keys</span><span class="s2">,</span>
+				<span class="s1">got=[sorted(vars(v).keys()) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span>
+			<span class="s1">)</span>
+		<span class="s1">mergers = self.mergersFor(out)</span>
+		<span class="s1">defaultMerger = mergers.get(</span><span class="s3">'*'</span><span class="s2">, </span><span class="s1">self.__class__.mergeThings)</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys:</span>
+				<span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">exclude: </span><span class="s2">continue</span>
+				<span class="s1">value = getattr(out</span><span class="s2">, </span><span class="s1">key)</span>
+				<span class="s1">values = [getattr(table</span><span class="s2">, </span><span class="s1">key) </span><span class="s2">for </span><span class="s1">table </span><span class="s2">in </span><span class="s1">lst]</span>
+				<span class="s1">mergerFunc = mergers.get(key</span><span class="s2">, </span><span class="s1">defaultMerger)</span>
+				<span class="s1">mergerFunc(self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">values)</span>
+		<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+			<span class="s1">e.stack.append(</span><span class="s3">'.'</span><span class="s1">+key)</span>
+			<span class="s2">raise</span>
+
+	<span class="s2">def </span><span class="s1">mergeLists(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst):</span>
+		<span class="s2">if not </span><span class="s1">allEqualTo(out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">len):</span>
+			<span class="s2">raise </span><span class="s1">LengthsDiffer(self</span><span class="s2">, </span><span class="s1">expected=len(out)</span><span class="s2">, </span><span class="s1">got=[len(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">lst])</span>
+		<span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">(value</span><span class="s2">,</span><span class="s1">values) </span><span class="s2">in </span><span class="s1">enumerate(zip(out</span><span class="s2">, </span><span class="s1">zip(*lst))):</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">self.mergeThings(value</span><span class="s2">, </span><span class="s1">values)</span>
+			<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+				<span class="s1">e.stack.append(</span><span class="s3">'[%d]' </span><span class="s1">% i)</span>
+				<span class="s2">raise</span>
+
+	<span class="s2">def </span><span class="s1">mergeThings(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst):</span>
+		<span class="s2">if not </span><span class="s1">allEqualTo(out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">type):</span>
+			<span class="s2">raise </span><span class="s1">MismatchedTypes(self</span><span class="s2">,</span>
+					<span class="s1">expected=type(out).__name__</span><span class="s2">,</span>
+					<span class="s1">got=[type(x).__name__ </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">lst]</span>
+			<span class="s1">)</span>
+		<span class="s1">mergerFunc = self.mergersFor(out).get(</span><span class="s2">None, None</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">mergerFunc </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">mergerFunc(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst)</span>
+		<span class="s2">elif </span><span class="s1">isinstance(out</span><span class="s2">, </span><span class="s1">enum.Enum):</span>
+			<span class="s4"># need to special-case Enums as have __dict__ but are not regular 'objects',</span>
+			<span class="s4"># otherwise mergeObjects/mergeThings get trapped in a RecursionError</span>
+			<span class="s2">if not </span><span class="s1">allEqualTo(out</span><span class="s2">, </span><span class="s1">lst):</span>
+				<span class="s2">raise </span><span class="s1">ShouldBeConstant(self</span><span class="s2">, </span><span class="s1">expected=out</span><span class="s2">, </span><span class="s1">got=lst)</span>
+		<span class="s2">elif </span><span class="s1">hasattr(out</span><span class="s2">, </span><span class="s3">'__dict__'</span><span class="s1">):</span>
+			<span class="s1">self.mergeObjects(out</span><span class="s2">, </span><span class="s1">lst)</span>
+		<span class="s2">elif </span><span class="s1">isinstance(out</span><span class="s2">, </span><span class="s1">list):</span>
+			<span class="s1">self.mergeLists(out</span><span class="s2">, </span><span class="s1">lst)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">if not </span><span class="s1">allEqualTo(out</span><span class="s2">, </span><span class="s1">lst):</span>
+				<span class="s2">raise </span><span class="s1">ShouldBeConstant(self</span><span class="s2">, </span><span class="s1">expected=out</span><span class="s2">, </span><span class="s1">got=lst)</span>
+
+	<span class="s2">def </span><span class="s1">mergeTables(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">master_ttfs</span><span class="s2">, </span><span class="s1">tableTags):</span>
+		<span class="s2">for </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">tableTags:</span>
+			<span class="s2">if </span><span class="s1">tag </span><span class="s2">not in </span><span class="s1">font: </span><span class="s2">continue</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">self.ttfs = master_ttfs</span>
+				<span class="s1">self.mergeThings(font[tag]</span><span class="s2">, </span><span class="s1">[m.get(tag) </span><span class="s2">for </span><span class="s1">m </span><span class="s2">in </span><span class="s1">master_ttfs])</span>
+			<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+				<span class="s1">e.stack.append(tag)</span>
+				<span class="s2">raise</span>
+
+<span class="s4">#</span>
+<span class="s4"># Aligning merger</span>
+<span class="s4">#</span>
+<span class="s2">class </span><span class="s1">AligningMerger(Merger):</span>
+	<span class="s2">pass</span>
+
+<span class="s1">@AligningMerger.merger(ot.GDEF</span><span class="s2">, </span><span class="s3">&quot;GlyphClassDef&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">if </span><span class="s1">self </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">if not </span><span class="s1">allNone(lst):</span>
+			<span class="s2">raise </span><span class="s1">NotANone(merger</span><span class="s2">, </span><span class="s1">expected=</span><span class="s2">None, </span><span class="s1">got=lst)</span>
+		<span class="s2">return</span>
+
+	<span class="s1">lst = [l.classDefs </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span>
+	<span class="s1">self.classDefs = {}</span>
+	<span class="s4"># We only care about the .classDefs</span>
+	<span class="s1">self = self.classDefs</span>
+
+	<span class="s1">allKeys = set()</span>
+	<span class="s1">allKeys.update(*[l.keys() </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">allKeys:</span>
+		<span class="s1">allValues = nonNone(l.get(k) </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst)</span>
+		<span class="s2">if not </span><span class="s1">allEqual(allValues):</span>
+			<span class="s2">raise </span><span class="s1">ShouldBeConstant(merger</span><span class="s2">, </span><span class="s1">expected=allValues[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">got=lst</span><span class="s2">, </span><span class="s1">stack=[</span><span class="s3">&quot;.&quot; </span><span class="s1">+ k])</span>
+		<span class="s2">if not </span><span class="s1">allValues:</span>
+			<span class="s1">self[k] = </span><span class="s2">None</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">self[k] = allValues[</span><span class="s5">0</span><span class="s1">]</span>
+
+<span class="s2">def </span><span class="s1">_SinglePosUpgradeToFormat2(self):</span>
+	<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">: </span><span class="s2">return </span><span class="s1">self</span>
+
+	<span class="s1">ret = ot.SinglePos()</span>
+	<span class="s1">ret.Format = </span><span class="s5">2</span>
+	<span class="s1">ret.Coverage = self.Coverage</span>
+	<span class="s1">ret.ValueFormat = self.ValueFormat</span>
+	<span class="s1">ret.Value = [self.Value </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">ret.Coverage.glyphs]</span>
+	<span class="s1">ret.ValueCount = len(ret.Value)</span>
+
+	<span class="s2">return </span><span class="s1">ret</span>
+
+<span class="s2">def </span><span class="s1">_merge_GlyphOrders(font</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">values_lst=</span><span class="s2">None, </span><span class="s1">default=</span><span class="s2">None</span><span class="s1">):</span>
+	<span class="s0">&quot;&quot;&quot;Takes font and list of glyph lists (must be sorted by glyph id), and returns 
+    two things: 
+    - Combined glyph list, 
+    - If values_lst is None, return input glyph lists, but padded with None when a glyph 
+      was missing in a list.  Otherwise, return values_lst list-of-list, padded with None 
+      to match combined glyph lists. 
+    &quot;&quot;&quot;</span>
+	<span class="s2">if </span><span class="s1">values_lst </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s1">dict_sets = [set(l) </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">dict_sets = [{g:v </span><span class="s2">for </span><span class="s1">g</span><span class="s2">,</span><span class="s1">v </span><span class="s2">in </span><span class="s1">zip(l</span><span class="s2">,</span><span class="s1">vs)} </span><span class="s2">for </span><span class="s1">l</span><span class="s2">,</span><span class="s1">vs </span><span class="s2">in </span><span class="s1">zip(lst</span><span class="s2">,</span><span class="s1">values_lst)]</span>
+	<span class="s1">combined = set()</span>
+	<span class="s1">combined.update(*dict_sets)</span>
+
+	<span class="s1">sortKey = font.getReverseGlyphMap().__getitem__</span>
+	<span class="s1">order = sorted(combined</span><span class="s2">, </span><span class="s1">key=sortKey)</span>
+	<span class="s4"># Make sure all input glyphsets were in proper order</span>
+	<span class="s2">if not </span><span class="s1">all(sorted(vs</span><span class="s2">, </span><span class="s1">key=sortKey) == vs </span><span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">lst):</span>
+		<span class="s2">raise </span><span class="s1">InconsistentGlyphOrder()</span>
+	<span class="s2">del </span><span class="s1">combined</span>
+
+	<span class="s1">paddedValues = </span><span class="s2">None</span>
+	<span class="s2">if </span><span class="s1">values_lst </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s1">padded = [[glyph </span><span class="s2">if </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">dict_set </span><span class="s2">else </span><span class="s1">default</span>
+			   <span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">order]</span>
+			  <span class="s2">for </span><span class="s1">dict_set </span><span class="s2">in </span><span class="s1">dict_sets]</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s2">assert </span><span class="s1">len(lst) == len(values_lst)</span>
+		<span class="s1">padded = [[dict_set[glyph] </span><span class="s2">if </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">dict_set </span><span class="s2">else </span><span class="s1">default</span>
+			   <span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">order]</span>
+			  <span class="s2">for </span><span class="s1">dict_set </span><span class="s2">in </span><span class="s1">dict_sets]</span>
+	<span class="s2">return </span><span class="s1">order</span><span class="s2">, </span><span class="s1">padded</span>
+
+<span class="s1">@AligningMerger.merger(otBase.ValueRecord)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># Code below sometimes calls us with self being</span>
+	<span class="s4"># a new object. Copy it from lst and recurse.</span>
+	<span class="s1">self.__dict__ = lst[</span><span class="s5">0</span><span class="s1">].__dict__.copy()</span>
+	<span class="s1">merger.mergeObjects(self</span><span class="s2">, </span><span class="s1">lst)</span>
+
+<span class="s1">@AligningMerger.merger(ot.Anchor)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># Code below sometimes calls us with self being</span>
+	<span class="s4"># a new object. Copy it from lst and recurse.</span>
+	<span class="s1">self.__dict__ = lst[</span><span class="s5">0</span><span class="s1">].__dict__.copy()</span>
+	<span class="s1">merger.mergeObjects(self</span><span class="s2">, </span><span class="s1">lst)</span>
+
+<span class="s2">def </span><span class="s1">_Lookup_SinglePos_get_effective_value(merger</span><span class="s2">, </span><span class="s1">subtables</span><span class="s2">, </span><span class="s1">glyph):</span>
+	<span class="s2">for </span><span class="s1">self </span><span class="s2">in </span><span class="s1">subtables:</span>
+		<span class="s2">if </span><span class="s1">self </span><span class="s2">is None or </span><span class="s1">\</span>
+		   <span class="s1">type(self) != ot.SinglePos </span><span class="s2">or </span><span class="s1">\</span>
+		   <span class="s1">self.Coverage </span><span class="s2">is None or </span><span class="s1">\</span>
+		   <span class="s1">glyph </span><span class="s2">not in </span><span class="s1">self.Coverage.glyphs:</span>
+			<span class="s2">continue</span>
+		<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">self.Value</span>
+		<span class="s2">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">self.Value[self.Coverage.glyphs.index(glyph)]</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;single positioning lookup&quot;</span><span class="s1">)</span>
+	<span class="s2">return None</span>
+
+<span class="s2">def </span><span class="s1">_Lookup_PairPos_get_effective_value_pair(merger</span><span class="s2">, </span><span class="s1">subtables</span><span class="s2">, </span><span class="s1">firstGlyph</span><span class="s2">, </span><span class="s1">secondGlyph):</span>
+	<span class="s2">for </span><span class="s1">self </span><span class="s2">in </span><span class="s1">subtables:</span>
+		<span class="s2">if </span><span class="s1">self </span><span class="s2">is None or </span><span class="s1">\</span>
+		   <span class="s1">type(self) != ot.PairPos </span><span class="s2">or </span><span class="s1">\</span>
+		   <span class="s1">self.Coverage </span><span class="s2">is None or </span><span class="s1">\</span>
+		   <span class="s1">firstGlyph </span><span class="s2">not in </span><span class="s1">self.Coverage.glyphs:</span>
+			<span class="s2">continue</span>
+		<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">ps = self.PairSet[self.Coverage.glyphs.index(firstGlyph)]</span>
+			<span class="s1">pvr = ps.PairValueRecord</span>
+			<span class="s2">for </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">pvr: </span><span class="s4"># TODO Speed up</span>
+				<span class="s2">if </span><span class="s1">rec.SecondGlyph == secondGlyph:</span>
+					<span class="s2">return </span><span class="s1">rec</span>
+			<span class="s2">continue</span>
+		<span class="s2">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s1">klass1 = self.ClassDef1.classDefs.get(firstGlyph</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">klass2 = self.ClassDef2.classDefs.get(secondGlyph</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s2">return </span><span class="s1">self.Class1Record[klass1].Class2Record[klass2]</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;pair positioning lookup&quot;</span><span class="s1">)</span>
+	<span class="s2">return None</span>
+
+<span class="s1">@AligningMerger.merger(ot.SinglePos)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">self.ValueFormat = valueFormat = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+	<span class="s2">if not </span><span class="s1">(len(lst) == </span><span class="s5">1 </span><span class="s2">or </span><span class="s1">(valueFormat &amp; ~</span><span class="s5">0xF </span><span class="s1">== </span><span class="s5">0</span><span class="s1">)):</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;single positioning lookup&quot;</span><span class="s1">)</span>
+
+	<span class="s4"># If all have same coverage table and all are format 1,</span>
+	<span class="s1">coverageGlyphs = self.Coverage.glyphs</span>
+	<span class="s2">if </span><span class="s1">all(v.Format == </span><span class="s5">1 </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst) </span><span class="s2">and </span><span class="s1">all(coverageGlyphs == v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst):</span>
+		<span class="s1">self.Value = otBase.ValueRecord(valueFormat</span><span class="s2">, </span><span class="s1">self.Value)</span>
+		<span class="s2">if </span><span class="s1">valueFormat != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">merger.mergeThings(self.Value</span><span class="s2">, </span><span class="s1">[v.Value </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst])</span>
+		<span class="s1">self.ValueFormat = self.Value.getFormat()</span>
+		<span class="s2">return</span>
+
+	<span class="s4"># Upgrade everything to Format=2</span>
+	<span class="s1">self.Format = </span><span class="s5">2</span>
+	<span class="s1">lst = [_SinglePosUpgradeToFormat2(v) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span>
+
+	<span class="s4"># Align them</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">padded = _merge_GlyphOrders(merger.font</span><span class="s2">,</span>
+					    <span class="s1">[v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+					    <span class="s1">[v.Value </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst])</span>
+
+	<span class="s1">self.Coverage.glyphs = glyphs</span>
+	<span class="s1">self.Value = [otBase.ValueRecord(valueFormat) </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">glyphs]</span>
+	<span class="s1">self.ValueCount = len(self.Value)</span>
+
+	<span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">values </span><span class="s2">in </span><span class="s1">enumerate(padded):</span>
+		<span class="s2">for </span><span class="s1">j</span><span class="s2">,</span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">enumerate(glyphs):</span>
+			<span class="s2">if </span><span class="s1">values[j] </span><span class="s2">is not None</span><span class="s1">: </span><span class="s2">continue</span>
+			<span class="s4"># Fill in value from other subtables</span>
+			<span class="s4"># Note!!! This *might* result in behavior change if ValueFormat2-zeroedness</span>
+			<span class="s4"># is different between used subtable and current subtable!</span>
+			<span class="s4"># TODO(behdad) Check and warn if that happens?</span>
+			<span class="s1">v = _Lookup_SinglePos_get_effective_value(merger</span><span class="s2">, </span><span class="s1">merger.lookup_subtables[i]</span><span class="s2">, </span><span class="s1">glyph)</span>
+			<span class="s2">if </span><span class="s1">v </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s1">v = otBase.ValueRecord(valueFormat)</span>
+			<span class="s1">values[j] = v</span>
+
+	<span class="s1">merger.mergeLists(self.Value</span><span class="s2">, </span><span class="s1">padded)</span>
+
+	<span class="s4"># Merge everything else; though, there shouldn't be anything else. :)</span>
+	<span class="s1">merger.mergeObjects(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">,</span>
+			    <span class="s1">exclude=(</span><span class="s3">'Format'</span><span class="s2">, </span><span class="s3">'Coverage'</span><span class="s2">, </span><span class="s3">'Value'</span><span class="s2">, </span><span class="s3">'ValueCount'</span><span class="s2">, </span><span class="s3">'ValueFormat'</span><span class="s1">))</span>
+	<span class="s1">self.ValueFormat = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[v.getEffectiveFormat() </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">self.Value]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+<span class="s1">@AligningMerger.merger(ot.PairSet)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># Align them</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">padded = _merge_GlyphOrders(merger.font</span><span class="s2">,</span>
+				<span class="s1">[[v.SecondGlyph </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">vs.PairValueRecord] </span><span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+				<span class="s1">[vs.PairValueRecord </span><span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">lst])</span>
+
+	<span class="s1">self.PairValueRecord = pvrs = []</span>
+	<span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">glyphs:</span>
+		<span class="s1">pvr = ot.PairValueRecord()</span>
+		<span class="s1">pvr.SecondGlyph = glyph</span>
+		<span class="s1">pvr.Value1 = otBase.ValueRecord(merger.valueFormat1) </span><span class="s2">if </span><span class="s1">merger.valueFormat1 </span><span class="s2">else None</span>
+		<span class="s1">pvr.Value2 = otBase.ValueRecord(merger.valueFormat2) </span><span class="s2">if </span><span class="s1">merger.valueFormat2 </span><span class="s2">else None</span>
+		<span class="s1">pvrs.append(pvr)</span>
+	<span class="s1">self.PairValueCount = len(self.PairValueRecord)</span>
+
+	<span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">values </span><span class="s2">in </span><span class="s1">enumerate(padded):</span>
+		<span class="s2">for </span><span class="s1">j</span><span class="s2">,</span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">enumerate(glyphs):</span>
+			<span class="s4"># Fill in value from other subtables</span>
+			<span class="s1">v = ot.PairValueRecord()</span>
+			<span class="s1">v.SecondGlyph = glyph</span>
+			<span class="s2">if </span><span class="s1">values[j] </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">vpair = values[j]</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">vpair = _Lookup_PairPos_get_effective_value_pair(</span>
+					<span class="s1">merger</span><span class="s2">, </span><span class="s1">merger.lookup_subtables[i]</span><span class="s2">, </span><span class="s1">self._firstGlyph</span><span class="s2">, </span><span class="s1">glyph</span>
+				<span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">vpair </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s1">v1</span><span class="s2">, </span><span class="s1">v2 = </span><span class="s2">None, None</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">v1 = getattr(vpair</span><span class="s2">, </span><span class="s3">&quot;Value1&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+				<span class="s1">v2 = getattr(vpair</span><span class="s2">, </span><span class="s3">&quot;Value2&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+			<span class="s1">v.Value1 = otBase.ValueRecord(merger.valueFormat1</span><span class="s2">, </span><span class="s1">src=v1) </span><span class="s2">if </span><span class="s1">merger.valueFormat1 </span><span class="s2">else None</span>
+			<span class="s1">v.Value2 = otBase.ValueRecord(merger.valueFormat2</span><span class="s2">, </span><span class="s1">src=v2) </span><span class="s2">if </span><span class="s1">merger.valueFormat2 </span><span class="s2">else None</span>
+			<span class="s1">values[j] = v</span>
+	<span class="s2">del </span><span class="s1">self._firstGlyph</span>
+
+	<span class="s1">merger.mergeLists(self.PairValueRecord</span><span class="s2">, </span><span class="s1">padded)</span>
+
+<span class="s2">def </span><span class="s1">_PairPosFormat1_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger):</span>
+	<span class="s2">assert </span><span class="s1">allEqual([l.ValueFormat2 == </span><span class="s5">0 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst </span><span class="s2">if </span><span class="s1">l.PairSet])</span><span class="s2">, </span><span class="s3">&quot;Report bug against fonttools.&quot;</span>
+
+	<span class="s4"># Merge everything else; makes sure Format is the same.</span>
+	<span class="s1">merger.mergeObjects(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">,</span>
+			    <span class="s1">exclude=(</span><span class="s3">'Coverage'</span><span class="s2">,</span>
+				     <span class="s3">'PairSet'</span><span class="s2">, </span><span class="s3">'PairSetCount'</span><span class="s2">,</span>
+				     <span class="s3">'ValueFormat1'</span><span class="s2">, </span><span class="s3">'ValueFormat2'</span><span class="s1">))</span>
+
+	<span class="s1">empty = ot.PairSet()</span>
+	<span class="s1">empty.PairValueRecord = []</span>
+	<span class="s1">empty.PairValueCount = </span><span class="s5">0</span>
+
+	<span class="s4"># Align them</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">padded = _merge_GlyphOrders(merger.font</span><span class="s2">,</span>
+					    <span class="s1">[v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+					    <span class="s1">[v.PairSet </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+					    <span class="s1">default=empty)</span>
+
+	<span class="s1">self.Coverage.glyphs = glyphs</span>
+	<span class="s1">self.PairSet = [ot.PairSet() </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">glyphs]</span>
+	<span class="s1">self.PairSetCount = len(self.PairSet)</span>
+	<span class="s2">for </span><span class="s1">glyph</span><span class="s2">, </span><span class="s1">ps </span><span class="s2">in </span><span class="s1">zip(glyphs</span><span class="s2">, </span><span class="s1">self.PairSet):</span>
+		<span class="s1">ps._firstGlyph = glyph</span>
+
+	<span class="s1">merger.mergeLists(self.PairSet</span><span class="s2">, </span><span class="s1">padded)</span>
+
+<span class="s2">def </span><span class="s1">_ClassDef_invert(self</span><span class="s2">, </span><span class="s1">allGlyphs=</span><span class="s2">None</span><span class="s1">):</span>
+
+	<span class="s2">if </span><span class="s1">isinstance(self</span><span class="s2">, </span><span class="s1">dict):</span>
+		<span class="s1">classDefs = self</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">classDefs = self.classDefs </span><span class="s2">if </span><span class="s1">self </span><span class="s2">and </span><span class="s1">self.classDefs </span><span class="s2">else </span><span class="s1">{}</span>
+	<span class="s1">m = max(classDefs.values()) </span><span class="s2">if </span><span class="s1">classDefs </span><span class="s2">else </span><span class="s5">0</span>
+
+	<span class="s1">ret = []</span>
+	<span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(m + </span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s1">ret.append(set())</span>
+
+	<span class="s2">for </span><span class="s1">k</span><span class="s2">,</span><span class="s1">v </span><span class="s2">in </span><span class="s1">classDefs.items():</span>
+		<span class="s1">ret[v].add(k)</span>
+
+	<span class="s4"># Class-0 is special.  It's &quot;everything else&quot;.</span>
+	<span class="s2">if </span><span class="s1">allGlyphs </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s1">ret[</span><span class="s5">0</span><span class="s1">] = </span><span class="s2">None</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s4"># Limit all classes to glyphs in allGlyphs.</span>
+		<span class="s4"># Collect anything without a non-zero class into class=zero.</span>
+		<span class="s1">ret[</span><span class="s5">0</span><span class="s1">] = class0 = set(allGlyphs)</span>
+		<span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">ret[</span><span class="s5">1</span><span class="s1">:]:</span>
+			<span class="s1">s.intersection_update(class0)</span>
+			<span class="s1">class0.difference_update(s)</span>
+
+	<span class="s2">return </span><span class="s1">ret</span>
+
+<span class="s2">def </span><span class="s1">_ClassDef_merge_classify(lst</span><span class="s2">, </span><span class="s1">allGlyphses=</span><span class="s2">None</span><span class="s1">):</span>
+	<span class="s1">self = ot.ClassDef()</span>
+	<span class="s1">self.classDefs = classDefs = {}</span>
+	<span class="s1">allGlyphsesWasNone = allGlyphses </span><span class="s2">is None</span>
+	<span class="s2">if </span><span class="s1">allGlyphsesWasNone:</span>
+		<span class="s1">allGlyphses = [</span><span class="s2">None</span><span class="s1">] * len(lst)</span>
+
+	<span class="s1">classifier = classifyTools.Classifier()</span>
+	<span class="s2">for </span><span class="s1">classDef</span><span class="s2">,</span><span class="s1">allGlyphs </span><span class="s2">in </span><span class="s1">zip(lst</span><span class="s2">, </span><span class="s1">allGlyphses):</span>
+		<span class="s1">sets = _ClassDef_invert(classDef</span><span class="s2">, </span><span class="s1">allGlyphs)</span>
+		<span class="s2">if </span><span class="s1">allGlyphs </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">sets = sets[</span><span class="s5">1</span><span class="s1">:]</span>
+		<span class="s1">classifier.update(sets)</span>
+	<span class="s1">classes = classifier.getClasses()</span>
+
+	<span class="s2">if </span><span class="s1">allGlyphsesWasNone:</span>
+		<span class="s1">classes.insert(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">set())</span>
+
+	<span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">classSet </span><span class="s2">in </span><span class="s1">enumerate(classes):</span>
+		<span class="s2">if </span><span class="s1">i == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">continue</span>
+		<span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">classSet:</span>
+			<span class="s1">classDefs[g] = i</span>
+
+	<span class="s2">return </span><span class="s1">self</span><span class="s2">, </span><span class="s1">classes</span>
+
+<span class="s2">def </span><span class="s1">_PairPosFormat2_align_matrices(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">transparent=</span><span class="s2">False</span><span class="s1">):</span>
+
+	<span class="s1">matrices = [l.Class1Record </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span>
+
+	<span class="s4"># Align first classes</span>
+	<span class="s1">self.ClassDef1</span><span class="s2">, </span><span class="s1">classes = _ClassDef_merge_classify([l.ClassDef1 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s1">[l.Coverage.glyphs </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">self.Class1Count = len(classes)</span>
+	<span class="s1">new_matrices = []</span>
+	<span class="s2">for </span><span class="s1">l</span><span class="s2">,</span><span class="s1">matrix </span><span class="s2">in </span><span class="s1">zip(lst</span><span class="s2">, </span><span class="s1">matrices):</span>
+		<span class="s1">nullRow = </span><span class="s2">None</span>
+		<span class="s1">coverage = set(l.Coverage.glyphs)</span>
+		<span class="s1">classDef1 = l.ClassDef1.classDefs</span>
+		<span class="s1">class1Records = []</span>
+		<span class="s2">for </span><span class="s1">classSet </span><span class="s2">in </span><span class="s1">classes:</span>
+			<span class="s1">exemplarGlyph = next(iter(classSet))</span>
+			<span class="s2">if </span><span class="s1">exemplarGlyph </span><span class="s2">not in </span><span class="s1">coverage:</span>
+				<span class="s4"># Follow-up to e6125b353e1f54a0280ded5434b8e40d042de69f,</span>
+				<span class="s4"># Fixes https://github.com/googlei18n/fontmake/issues/470</span>
+				<span class="s4"># Again, revert 8d441779e5afc664960d848f62c7acdbfc71d7b9</span>
+				<span class="s4"># when merger becomes selfless.</span>
+				<span class="s1">nullRow = </span><span class="s2">None</span>
+				<span class="s2">if </span><span class="s1">nullRow </span><span class="s2">is None</span><span class="s1">:</span>
+					<span class="s1">nullRow = ot.Class1Record()</span>
+					<span class="s1">class2records = nullRow.Class2Record = []</span>
+					<span class="s4"># TODO: When merger becomes selfless, revert e6125b353e1f54a0280ded5434b8e40d042de69f</span>
+					<span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(l.Class2Count):</span>
+						<span class="s2">if </span><span class="s1">transparent:</span>
+							<span class="s1">rec2 = </span><span class="s2">None</span>
+						<span class="s2">else</span><span class="s1">:</span>
+							<span class="s1">rec2 = ot.Class2Record()</span>
+							<span class="s1">rec2.Value1 = otBase.ValueRecord(self.ValueFormat1) </span><span class="s2">if </span><span class="s1">self.ValueFormat1 </span><span class="s2">else None</span>
+							<span class="s1">rec2.Value2 = otBase.ValueRecord(self.ValueFormat2) </span><span class="s2">if </span><span class="s1">self.ValueFormat2 </span><span class="s2">else None</span>
+						<span class="s1">class2records.append(rec2)</span>
+				<span class="s1">rec1 = nullRow</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">klass = classDef1.get(exemplarGlyph</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+				<span class="s1">rec1 = matrix[klass] </span><span class="s4"># TODO handle out-of-range?</span>
+			<span class="s1">class1Records.append(rec1)</span>
+		<span class="s1">new_matrices.append(class1Records)</span>
+	<span class="s1">matrices = new_matrices</span>
+	<span class="s2">del </span><span class="s1">new_matrices</span>
+
+	<span class="s4"># Align second classes</span>
+	<span class="s1">self.ClassDef2</span><span class="s2">, </span><span class="s1">classes = _ClassDef_merge_classify([l.ClassDef2 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">self.Class2Count = len(classes)</span>
+	<span class="s1">new_matrices = []</span>
+	<span class="s2">for </span><span class="s1">l</span><span class="s2">,</span><span class="s1">matrix </span><span class="s2">in </span><span class="s1">zip(lst</span><span class="s2">, </span><span class="s1">matrices):</span>
+		<span class="s1">classDef2 = l.ClassDef2.classDefs</span>
+		<span class="s1">class1Records = []</span>
+		<span class="s2">for </span><span class="s1">rec1old </span><span class="s2">in </span><span class="s1">matrix:</span>
+			<span class="s1">oldClass2Records = rec1old.Class2Record</span>
+			<span class="s1">rec1new = ot.Class1Record()</span>
+			<span class="s1">class2Records = rec1new.Class2Record = []</span>
+			<span class="s2">for </span><span class="s1">classSet </span><span class="s2">in </span><span class="s1">classes:</span>
+				<span class="s2">if not </span><span class="s1">classSet: </span><span class="s4"># class=0</span>
+					<span class="s1">rec2 = oldClass2Records[</span><span class="s5">0</span><span class="s1">]</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">exemplarGlyph = next(iter(classSet))</span>
+					<span class="s1">klass = classDef2.get(exemplarGlyph</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+					<span class="s1">rec2 = oldClass2Records[klass]</span>
+				<span class="s1">class2Records.append(copy.deepcopy(rec2))</span>
+			<span class="s1">class1Records.append(rec1new)</span>
+		<span class="s1">new_matrices.append(class1Records)</span>
+	<span class="s1">matrices = new_matrices</span>
+	<span class="s2">del </span><span class="s1">new_matrices</span>
+
+	<span class="s2">return </span><span class="s1">matrices</span>
+
+<span class="s2">def </span><span class="s1">_PairPosFormat2_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger):</span>
+	<span class="s2">assert </span><span class="s1">allEqual([l.ValueFormat2 == </span><span class="s5">0 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst </span><span class="s2">if </span><span class="s1">l.Class1Record])</span><span class="s2">, </span><span class="s3">&quot;Report bug against fonttools.&quot;</span>
+
+	<span class="s1">merger.mergeObjects(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">,</span>
+			    <span class="s1">exclude=(</span><span class="s3">'Coverage'</span><span class="s2">,</span>
+				     <span class="s3">'ClassDef1'</span><span class="s2">, </span><span class="s3">'Class1Count'</span><span class="s2">,</span>
+				     <span class="s3">'ClassDef2'</span><span class="s2">, </span><span class="s3">'Class2Count'</span><span class="s2">,</span>
+				     <span class="s3">'Class1Record'</span><span class="s2">,</span>
+				     <span class="s3">'ValueFormat1'</span><span class="s2">, </span><span class="s3">'ValueFormat2'</span><span class="s1">))</span>
+
+	<span class="s4"># Align coverages</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">_ = _merge_GlyphOrders(merger.font</span><span class="s2">,</span>
+				       <span class="s1">[v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">self.Coverage.glyphs = glyphs</span>
+
+	<span class="s4"># Currently, if the coverage of PairPosFormat2 subtables are different,</span>
+	<span class="s4"># we do NOT bother walking down the subtable list when filling in new</span>
+	<span class="s4"># rows for alignment.  As such, this is only correct if current subtable</span>
+	<span class="s4"># is the last subtable in the lookup.  Ensure that.</span>
+	<span class="s4">#</span>
+	<span class="s4"># Note that our canonicalization process merges trailing PairPosFormat2's,</span>
+	<span class="s4"># so in reality this is rare.</span>
+	<span class="s2">for </span><span class="s1">l</span><span class="s2">,</span><span class="s1">subtables </span><span class="s2">in </span><span class="s1">zip(lst</span><span class="s2">,</span><span class="s1">merger.lookup_subtables):</span>
+		<span class="s2">if </span><span class="s1">l.Coverage.glyphs != glyphs:</span>
+			<span class="s2">assert </span><span class="s1">l == subtables[-</span><span class="s5">1</span><span class="s1">]</span>
+
+	<span class="s1">matrices = _PairPosFormat2_align_matrices(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger.font)</span>
+
+	<span class="s1">self.Class1Record = list(matrices[</span><span class="s5">0</span><span class="s1">]) </span><span class="s4"># TODO move merger to be selfless</span>
+	<span class="s1">merger.mergeLists(self.Class1Record</span><span class="s2">, </span><span class="s1">matrices)</span>
+
+<span class="s1">@AligningMerger.merger(ot.PairPos)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">merger.valueFormat1 = self.ValueFormat1 = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat1 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+	<span class="s1">merger.valueFormat2 = self.ValueFormat2 = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat2 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">_PairPosFormat1_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger)</span>
+	<span class="s2">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+		<span class="s1">_PairPosFormat2_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger)</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;pair positioning lookup&quot;</span><span class="s1">)</span>
+
+	<span class="s2">del </span><span class="s1">merger.valueFormat1</span><span class="s2">, </span><span class="s1">merger.valueFormat2</span>
+
+	<span class="s4"># Now examine the list of value records, and update to the union of format values,</span>
+	<span class="s4"># as merge might have created new values.</span>
+	<span class="s1">vf1 = </span><span class="s5">0</span>
+	<span class="s1">vf2 = </span><span class="s5">0</span>
+	<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s2">for </span><span class="s1">pairSet </span><span class="s2">in </span><span class="s1">self.PairSet:</span>
+			<span class="s2">for </span><span class="s1">pairValueRecord </span><span class="s2">in </span><span class="s1">pairSet.PairValueRecord:</span>
+				<span class="s1">pv1 = getattr(pairValueRecord</span><span class="s2">, </span><span class="s3">&quot;Value1&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">pv1 </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s1">vf1 |= pv1.getFormat()</span>
+				<span class="s1">pv2 = getattr(pairValueRecord</span><span class="s2">, </span><span class="s3">&quot;Value2&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">pv2 </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s1">vf2 |= pv2.getFormat()</span>
+	<span class="s2">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+		<span class="s2">for </span><span class="s1">class1Record </span><span class="s2">in </span><span class="s1">self.Class1Record:</span>
+			<span class="s2">for </span><span class="s1">class2Record </span><span class="s2">in </span><span class="s1">class1Record.Class2Record:</span>
+				<span class="s1">pv1 = getattr(class2Record</span><span class="s2">, </span><span class="s3">&quot;Value1&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">pv1 </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s1">vf1 |= pv1.getFormat()</span>
+				<span class="s1">pv2 = getattr(class2Record</span><span class="s2">, </span><span class="s3">&quot;Value2&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">pv2 </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s1">vf2 |= pv2.getFormat()</span>
+	<span class="s1">self.ValueFormat1 = vf1</span>
+	<span class="s1">self.ValueFormat2 = vf2</span>
+
+<span class="s2">def </span><span class="s1">_MarkBasePosFormat1_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger</span><span class="s2">, </span><span class="s1">Mark=</span><span class="s3">'Mark'</span><span class="s2">, </span><span class="s1">Base=</span><span class="s3">'Base'</span><span class="s1">):</span>
+	<span class="s1">self.ClassCount = max(l.ClassCount </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst)</span>
+
+	<span class="s1">MarkCoverageGlyphs</span><span class="s2">, </span><span class="s1">MarkRecords = \</span>
+		<span class="s1">_merge_GlyphOrders(merger.font</span><span class="s2">,</span>
+				   <span class="s1">[getattr(l</span><span class="s2">, </span><span class="s1">Mark+</span><span class="s3">'Coverage'</span><span class="s1">).glyphs </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+				   <span class="s1">[getattr(l</span><span class="s2">, </span><span class="s1">Mark+</span><span class="s3">'Array'</span><span class="s1">).MarkRecord </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">Mark+</span><span class="s3">'Coverage'</span><span class="s1">).glyphs = MarkCoverageGlyphs</span>
+
+	<span class="s1">BaseCoverageGlyphs</span><span class="s2">, </span><span class="s1">BaseRecords = \</span>
+		<span class="s1">_merge_GlyphOrders(merger.font</span><span class="s2">,</span>
+				   <span class="s1">[getattr(l</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Coverage'</span><span class="s1">).glyphs </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+				   <span class="s1">[getattr(getattr(l</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Array'</span><span class="s1">)</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Record'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Coverage'</span><span class="s1">).glyphs = BaseCoverageGlyphs</span>
+
+	<span class="s4"># MarkArray</span>
+	<span class="s1">records = []</span>
+	<span class="s2">for </span><span class="s1">g</span><span class="s2">,</span><span class="s1">glyphRecords </span><span class="s2">in </span><span class="s1">zip(MarkCoverageGlyphs</span><span class="s2">, </span><span class="s1">zip(*MarkRecords)):</span>
+		<span class="s1">allClasses = [r.Class </span><span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">glyphRecords </span><span class="s2">if </span><span class="s1">r </span><span class="s2">is not None</span><span class="s1">]</span>
+
+		<span class="s4"># TODO Right now we require that all marks have same class in</span>
+		<span class="s4"># all masters that cover them.  This is not required.</span>
+		<span class="s4">#</span>
+		<span class="s4"># We can relax that by just requiring that all marks that have</span>
+		<span class="s4"># the same class in a master, have the same class in every other</span>
+		<span class="s4"># master.  Indeed, if, say, a sparse master only covers one mark,</span>
+		<span class="s4"># that mark probably will get class 0, which would possibly be</span>
+		<span class="s4"># different from its class in other masters.</span>
+		<span class="s4">#</span>
+		<span class="s4"># We can even go further and reclassify marks to support any</span>
+		<span class="s4"># input.  But, since, it's unlikely that two marks being both,</span>
+		<span class="s4"># say, &quot;top&quot; in one master, and one being &quot;top&quot; and other being</span>
+		<span class="s4"># &quot;top-right&quot; in another master, we shouldn't do that, as any</span>
+		<span class="s4"># failures in that case will probably signify mistakes in the</span>
+		<span class="s4"># input masters.</span>
+
+		<span class="s2">if not </span><span class="s1">allEqual(allClasses):</span>
+			<span class="s2">raise </span><span class="s1">ShouldBeConstant(merger</span><span class="s2">, </span><span class="s1">expected=allClasses[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">got=allClasses)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">rec = ot.MarkRecord()</span>
+			<span class="s1">rec.Class = allClasses[</span><span class="s5">0</span><span class="s1">]</span>
+			<span class="s1">allAnchors = [</span><span class="s2">None if </span><span class="s1">r </span><span class="s2">is None else </span><span class="s1">r.MarkAnchor </span><span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">glyphRecords]</span>
+			<span class="s2">if </span><span class="s1">allNone(allAnchors):</span>
+				<span class="s1">anchor = </span><span class="s2">None</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">anchor = ot.Anchor()</span>
+				<span class="s1">anchor.Format = </span><span class="s5">1</span>
+				<span class="s1">merger.mergeThings(anchor</span><span class="s2">, </span><span class="s1">allAnchors)</span>
+			<span class="s1">rec.MarkAnchor = anchor</span>
+		<span class="s1">records.append(rec)</span>
+	<span class="s1">array = ot.MarkArray()</span>
+	<span class="s1">array.MarkRecord = records</span>
+	<span class="s1">array.MarkCount = len(records)</span>
+	<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">Mark+</span><span class="s3">&quot;Array&quot;</span><span class="s2">, </span><span class="s1">array)</span>
+
+	<span class="s4"># BaseArray</span>
+	<span class="s1">records = []</span>
+	<span class="s2">for </span><span class="s1">g</span><span class="s2">,</span><span class="s1">glyphRecords </span><span class="s2">in </span><span class="s1">zip(BaseCoverageGlyphs</span><span class="s2">, </span><span class="s1">zip(*BaseRecords)):</span>
+		<span class="s2">if </span><span class="s1">allNone(glyphRecords):</span>
+			<span class="s1">rec = </span><span class="s2">None</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">rec = getattr(ot</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Record'</span><span class="s1">)()</span>
+			<span class="s1">anchors = []</span>
+			<span class="s1">setattr(rec</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Anchor'</span><span class="s2">, </span><span class="s1">anchors)</span>
+			<span class="s1">glyphAnchors = [[] </span><span class="s2">if </span><span class="s1">r </span><span class="s2">is None else </span><span class="s1">getattr(r</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Anchor'</span><span class="s1">)</span>
+					<span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">glyphRecords]</span>
+			<span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">glyphAnchors:</span>
+				<span class="s1">l.extend([</span><span class="s2">None</span><span class="s1">] * (self.ClassCount - len(l)))</span>
+			<span class="s2">for </span><span class="s1">allAnchors </span><span class="s2">in </span><span class="s1">zip(*glyphAnchors):</span>
+				<span class="s2">if </span><span class="s1">allNone(allAnchors):</span>
+					<span class="s1">anchor = </span><span class="s2">None</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">anchor = ot.Anchor()</span>
+					<span class="s1">anchor.Format = </span><span class="s5">1</span>
+					<span class="s1">merger.mergeThings(anchor</span><span class="s2">, </span><span class="s1">allAnchors)</span>
+				<span class="s1">anchors.append(anchor)</span>
+		<span class="s1">records.append(rec)</span>
+	<span class="s1">array = getattr(ot</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Array'</span><span class="s1">)()</span>
+	<span class="s1">setattr(array</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Record'</span><span class="s2">, </span><span class="s1">records)</span>
+	<span class="s1">setattr(array</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Count'</span><span class="s2">, </span><span class="s1">len(records))</span>
+	<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">Base+</span><span class="s3">'Array'</span><span class="s2">, </span><span class="s1">array)</span>
+
+<span class="s1">@AligningMerger.merger(ot.MarkBasePos)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">if not </span><span class="s1">allEqualTo(self.Format</span><span class="s2">, </span><span class="s1">(l.Format </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst)):</span>
+		<span class="s2">raise </span><span class="s1">InconsistentFormats(</span>
+			<span class="s1">merger</span><span class="s2">,</span>
+			<span class="s1">subtable=</span><span class="s3">&quot;mark-to-base positioning lookup&quot;</span><span class="s2">,</span>
+			<span class="s1">expected=self.Format</span><span class="s2">,</span>
+			<span class="s1">got=[l.Format </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span>
+		<span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">_MarkBasePosFormat1_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger)</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;mark-to-base positioning lookup&quot;</span><span class="s1">)</span>
+
+<span class="s1">@AligningMerger.merger(ot.MarkMarkPos)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">if not </span><span class="s1">allEqualTo(self.Format</span><span class="s2">, </span><span class="s1">(l.Format </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst)):</span>
+		<span class="s2">raise </span><span class="s1">InconsistentFormats(</span>
+			<span class="s1">merger</span><span class="s2">,</span>
+			<span class="s1">subtable=</span><span class="s3">&quot;mark-to-mark positioning lookup&quot;</span><span class="s2">,</span>
+			<span class="s1">expected=self.Format</span><span class="s2">,</span>
+			<span class="s1">got=[l.Format </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span>
+		<span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">_MarkBasePosFormat1_merge(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">merger</span><span class="s2">, </span><span class="s3">'Mark1'</span><span class="s2">, </span><span class="s3">'Mark2'</span><span class="s1">)</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;mark-to-mark positioning lookup&quot;</span><span class="s1">)</span>
+
+<span class="s2">def </span><span class="s1">_PairSet_flatten(lst</span><span class="s2">, </span><span class="s1">font):</span>
+	<span class="s1">self = ot.PairSet()</span>
+	<span class="s1">self.Coverage = ot.Coverage()</span>
+
+	<span class="s4"># Align them</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">padded = _merge_GlyphOrders(font</span><span class="s2">,</span>
+				<span class="s1">[[v.SecondGlyph </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">vs.PairValueRecord] </span><span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+				<span class="s1">[vs.PairValueRecord </span><span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">lst])</span>
+
+	<span class="s1">self.Coverage.glyphs = glyphs</span>
+	<span class="s1">self.PairValueRecord = pvrs = []</span>
+	<span class="s2">for </span><span class="s1">values </span><span class="s2">in </span><span class="s1">zip(*padded):</span>
+		<span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">values:</span>
+			<span class="s2">if </span><span class="s1">v </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">pvrs.append(v)</span>
+				<span class="s2">break</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">assert False</span>
+	<span class="s1">self.PairValueCount = len(self.PairValueRecord)</span>
+
+	<span class="s2">return </span><span class="s1">self</span>
+
+<span class="s2">def </span><span class="s1">_Lookup_PairPosFormat1_subtables_flatten(lst</span><span class="s2">, </span><span class="s1">font):</span>
+	<span class="s2">assert </span><span class="s1">allEqual([l.ValueFormat2 == </span><span class="s5">0 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst </span><span class="s2">if </span><span class="s1">l.PairSet])</span><span class="s2">, </span><span class="s3">&quot;Report bug against fonttools.&quot;</span>
+
+	<span class="s1">self = ot.PairPos()</span>
+	<span class="s1">self.Format = </span><span class="s5">1</span>
+	<span class="s1">self.Coverage = ot.Coverage()</span>
+	<span class="s1">self.ValueFormat1 = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat1 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+	<span class="s1">self.ValueFormat2 = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat2 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s4"># Align them</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">padded = _merge_GlyphOrders(font</span><span class="s2">,</span>
+					    <span class="s1">[v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">,</span>
+					    <span class="s1">[v.PairSet </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst])</span>
+
+	<span class="s1">self.Coverage.glyphs = glyphs</span>
+	<span class="s1">self.PairSet = [_PairSet_flatten([v </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">values </span><span class="s2">if </span><span class="s1">v </span><span class="s2">is not None</span><span class="s1">]</span><span class="s2">, </span><span class="s1">font)</span>
+		        <span class="s2">for </span><span class="s1">values </span><span class="s2">in </span><span class="s1">zip(*padded)]</span>
+	<span class="s1">self.PairSetCount = len(self.PairSet)</span>
+	<span class="s2">return </span><span class="s1">self</span>
+
+<span class="s2">def </span><span class="s1">_Lookup_PairPosFormat2_subtables_flatten(lst</span><span class="s2">, </span><span class="s1">font):</span>
+	<span class="s2">assert </span><span class="s1">allEqual([l.ValueFormat2 == </span><span class="s5">0 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst </span><span class="s2">if </span><span class="s1">l.Class1Record])</span><span class="s2">, </span><span class="s3">&quot;Report bug against fonttools.&quot;</span>
+
+	<span class="s1">self = ot.PairPos()</span>
+	<span class="s1">self.Format = </span><span class="s5">2</span>
+	<span class="s1">self.Coverage = ot.Coverage()</span>
+	<span class="s1">self.ValueFormat1 = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat1 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+	<span class="s1">self.ValueFormat2 = reduce(int.__or__</span><span class="s2">, </span><span class="s1">[l.ValueFormat2 </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s4"># Align them</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">_ = _merge_GlyphOrders(font</span><span class="s2">,</span>
+				       <span class="s1">[v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">self.Coverage.glyphs = glyphs</span>
+
+	<span class="s1">matrices = _PairPosFormat2_align_matrices(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">transparent=</span><span class="s2">True</span><span class="s1">)</span>
+
+	<span class="s1">matrix = self.Class1Record = []</span>
+	<span class="s2">for </span><span class="s1">rows </span><span class="s2">in </span><span class="s1">zip(*matrices):</span>
+		<span class="s1">row = ot.Class1Record()</span>
+		<span class="s1">matrix.append(row)</span>
+		<span class="s1">row.Class2Record = []</span>
+		<span class="s1">row = row.Class2Record</span>
+		<span class="s2">for </span><span class="s1">cols </span><span class="s2">in </span><span class="s1">zip(*list(r.Class2Record </span><span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">rows)):</span>
+			<span class="s1">col = next(iter(c </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">cols </span><span class="s2">if </span><span class="s1">c </span><span class="s2">is not None</span><span class="s1">))</span>
+			<span class="s1">row.append(col)</span>
+
+	<span class="s2">return </span><span class="s1">self</span>
+
+<span class="s2">def </span><span class="s1">_Lookup_PairPos_subtables_canonicalize(lst</span><span class="s2">, </span><span class="s1">font):</span>
+	<span class="s0">&quot;&quot;&quot;Merge multiple Format1 subtables at the beginning of lst, 
+    and merge multiple consecutive Format2 subtables that have the same 
+    Class2 (ie. were split because of offset overflows).  Returns new list.&quot;&quot;&quot;</span>
+	<span class="s1">lst = list(lst)</span>
+
+	<span class="s1">l = len(lst)</span>
+	<span class="s1">i = </span><span class="s5">0</span>
+	<span class="s2">while </span><span class="s1">i &lt; l </span><span class="s2">and </span><span class="s1">lst[i].Format == </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">i += </span><span class="s5">1</span>
+	<span class="s1">lst[:i] = [_Lookup_PairPosFormat1_subtables_flatten(lst[:i]</span><span class="s2">, </span><span class="s1">font)]</span>
+
+	<span class="s1">l = len(lst)</span>
+	<span class="s1">i = l</span>
+	<span class="s2">while </span><span class="s1">i &gt; </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">lst[i - </span><span class="s5">1</span><span class="s1">].Format == </span><span class="s5">2</span><span class="s1">:</span>
+		<span class="s1">i -= </span><span class="s5">1</span>
+	<span class="s1">lst[i:] = [_Lookup_PairPosFormat2_subtables_flatten(lst[i:]</span><span class="s2">, </span><span class="s1">font)]</span>
+
+	<span class="s2">return </span><span class="s1">lst</span>
+
+<span class="s2">def </span><span class="s1">_Lookup_SinglePos_subtables_flatten(lst</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">min_inclusive_rec_format):</span>
+	<span class="s1">glyphs</span><span class="s2">, </span><span class="s1">_ = _merge_GlyphOrders(font</span><span class="s2">,</span>
+		<span class="s1">[v.Coverage.glyphs </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s1">num_glyphs = len(glyphs)</span>
+	<span class="s1">new = ot.SinglePos()</span>
+	<span class="s1">new.Format = </span><span class="s5">2</span>
+	<span class="s1">new.ValueFormat = min_inclusive_rec_format</span>
+	<span class="s1">new.Coverage = ot.Coverage()</span>
+	<span class="s1">new.Coverage.glyphs = glyphs</span>
+	<span class="s1">new.ValueCount = num_glyphs</span>
+	<span class="s1">new.Value = [</span><span class="s2">None</span><span class="s1">] * num_glyphs</span>
+	<span class="s2">for </span><span class="s1">singlePos </span><span class="s2">in </span><span class="s1">lst:</span>
+		<span class="s2">if </span><span class="s1">singlePos.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">val_rec = singlePos.Value</span>
+			<span class="s2">for </span><span class="s1">gname </span><span class="s2">in </span><span class="s1">singlePos.Coverage.glyphs:</span>
+				<span class="s1">i = glyphs.index(gname)</span>
+				<span class="s1">new.Value[i] = copy.deepcopy(val_rec)</span>
+		<span class="s2">elif </span><span class="s1">singlePos.Format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s2">for </span><span class="s1">j</span><span class="s2">, </span><span class="s1">gname </span><span class="s2">in </span><span class="s1">enumerate(singlePos.Coverage.glyphs):</span>
+				<span class="s1">val_rec = singlePos.Value[j]</span>
+				<span class="s1">i = glyphs.index(gname)</span>
+				<span class="s1">new.Value[i] = copy.deepcopy(val_rec)</span>
+	<span class="s2">return </span><span class="s1">[new]</span>
+
+<span class="s1">@AligningMerger.merger(ot.Lookup)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">subtables = merger.lookup_subtables = [l.SubTable </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lst]</span>
+
+	<span class="s4"># Remove Extension subtables</span>
+	<span class="s2">for </span><span class="s1">l</span><span class="s2">,</span><span class="s1">sts </span><span class="s2">in </span><span class="s1">list(zip(lst</span><span class="s2">,</span><span class="s1">subtables))+[(self</span><span class="s2">,</span><span class="s1">self.SubTable)]:</span>
+		<span class="s2">if not </span><span class="s1">sts:</span>
+			<span class="s2">continue</span>
+		<span class="s2">if </span><span class="s1">sts[</span><span class="s5">0</span><span class="s1">].__class__.__name__.startswith(</span><span class="s3">'Extension'</span><span class="s1">):</span>
+			<span class="s2">if not </span><span class="s1">allEqual([st.__class__ </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">sts]):</span>
+				<span class="s2">raise </span><span class="s1">InconsistentExtensions(</span>
+					<span class="s1">merger</span><span class="s2">,</span>
+					<span class="s1">expected=</span><span class="s3">&quot;Extension&quot;</span><span class="s2">,</span>
+					<span class="s1">got=[st.__class__.__name__ </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">sts]</span>
+				<span class="s1">)</span>
+			<span class="s2">if not </span><span class="s1">allEqual([st.ExtensionLookupType </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">sts]):</span>
+				<span class="s2">raise </span><span class="s1">InconsistentExtensions(merger)</span>
+			<span class="s1">l.LookupType = sts[</span><span class="s5">0</span><span class="s1">].ExtensionLookupType</span>
+			<span class="s1">new_sts = [st.ExtSubTable </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">sts]</span>
+			<span class="s2">del </span><span class="s1">sts[:]</span>
+			<span class="s1">sts.extend(new_sts)</span>
+
+	<span class="s1">isPairPos = self.SubTable </span><span class="s2">and </span><span class="s1">isinstance(self.SubTable[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ot.PairPos)</span>
+
+	<span class="s2">if </span><span class="s1">isPairPos:</span>
+		<span class="s4"># AFDKO and feaLib sometimes generate two Format1 subtables instead of one.</span>
+		<span class="s4"># Merge those before continuing.</span>
+		<span class="s4"># https://github.com/fonttools/fonttools/issues/719</span>
+		<span class="s1">self.SubTable = _Lookup_PairPos_subtables_canonicalize(self.SubTable</span><span class="s2">, </span><span class="s1">merger.font)</span>
+		<span class="s1">subtables = merger.lookup_subtables = [_Lookup_PairPos_subtables_canonicalize(st</span><span class="s2">, </span><span class="s1">merger.font) </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">subtables]</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">isSinglePos = self.SubTable </span><span class="s2">and </span><span class="s1">isinstance(self.SubTable[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ot.SinglePos)</span>
+		<span class="s2">if </span><span class="s1">isSinglePos:</span>
+			<span class="s1">numSubtables = [len(st) </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">subtables]</span>
+			<span class="s2">if not </span><span class="s1">all([nums == numSubtables[</span><span class="s5">0</span><span class="s1">] </span><span class="s2">for </span><span class="s1">nums </span><span class="s2">in </span><span class="s1">numSubtables]):</span>
+				<span class="s4"># Flatten list of SinglePos subtables to single Format 2 subtable,</span>
+				<span class="s4"># with all value records set to the rec format type.</span>
+				<span class="s4"># We use buildSinglePos() to optimize the lookup after merging.</span>
+				<span class="s1">valueFormatList = [t.ValueFormat </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">subtables </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">st]</span>
+				<span class="s4"># Find the minimum value record that can accomodate all the singlePos subtables.</span>
+				<span class="s1">mirf = reduce(ior</span><span class="s2">, </span><span class="s1">valueFormatList)</span>
+				<span class="s1">self.SubTable = _Lookup_SinglePos_subtables_flatten(self.SubTable</span><span class="s2">, </span><span class="s1">merger.font</span><span class="s2">, </span><span class="s1">mirf)</span>
+				<span class="s1">subtables = merger.lookup_subtables = [</span>
+					<span class="s1">_Lookup_SinglePos_subtables_flatten(st</span><span class="s2">, </span><span class="s1">merger.font</span><span class="s2">, </span><span class="s1">mirf) </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">subtables]</span>
+				<span class="s1">flattened = </span><span class="s2">True</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">flattened = </span><span class="s2">False</span>
+
+	<span class="s1">merger.mergeLists(self.SubTable</span><span class="s2">, </span><span class="s1">subtables)</span>
+	<span class="s1">self.SubTableCount = len(self.SubTable)</span>
+
+	<span class="s2">if </span><span class="s1">isPairPos:</span>
+		<span class="s4"># If format-1 subtable created during canonicalization is empty, remove it.</span>
+		<span class="s2">assert </span><span class="s1">len(self.SubTable) &gt;= </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">self.SubTable[</span><span class="s5">0</span><span class="s1">].Format == </span><span class="s5">1</span>
+		<span class="s2">if not </span><span class="s1">self.SubTable[</span><span class="s5">0</span><span class="s1">].Coverage.glyphs:</span>
+			<span class="s1">self.SubTable.pop(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">self.SubTableCount -= </span><span class="s5">1</span>
+
+		<span class="s4"># If format-2 subtable created during canonicalization is empty, remove it.</span>
+		<span class="s2">assert </span><span class="s1">len(self.SubTable) &gt;= </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">self.SubTable[-</span><span class="s5">1</span><span class="s1">].Format == </span><span class="s5">2</span>
+		<span class="s2">if not </span><span class="s1">self.SubTable[-</span><span class="s5">1</span><span class="s1">].Coverage.glyphs:</span>
+			<span class="s1">self.SubTable.pop(-</span><span class="s5">1</span><span class="s1">)</span>
+			<span class="s1">self.SubTableCount -= </span><span class="s5">1</span>
+
+		<span class="s4"># Compact the merged subtables</span>
+		<span class="s4"># This is a good moment to do it because the compaction should create</span>
+		<span class="s4"># smaller subtables, which may prevent overflows from happening.</span>
+		<span class="s4"># Keep reading the value from the ENV until ufo2ft switches to the config system</span>
+		<span class="s1">level = merger.font.cfg.get(</span>
+			<span class="s3">&quot;fontTools.otlLib.optimize.gpos:COMPRESSION_LEVEL&quot;</span><span class="s2">,</span>
+			<span class="s1">default=_compression_level_from_env()</span><span class="s2">,</span>
+        <span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">level != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">log.info(</span><span class="s3">&quot;Compacting GPOS...&quot;</span><span class="s1">)</span>
+			<span class="s1">self.SubTable = compact_pair_pos(merger.font</span><span class="s2">, </span><span class="s1">level</span><span class="s2">, </span><span class="s1">self.SubTable)</span>
+			<span class="s1">self.SubTableCount = len(self.SubTable)</span>
+
+	<span class="s2">elif </span><span class="s1">isSinglePos </span><span class="s2">and </span><span class="s1">flattened:</span>
+		<span class="s1">singlePosTable = self.SubTable[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">glyphs = singlePosTable.Coverage.glyphs</span>
+		<span class="s4"># We know that singlePosTable is Format 2, as this is set</span>
+		<span class="s4"># in _Lookup_SinglePos_subtables_flatten.</span>
+		<span class="s1">singlePosMapping = {</span>
+			<span class="s1">gname: valRecord</span>
+			<span class="s2">for </span><span class="s1">gname</span><span class="s2">, </span><span class="s1">valRecord </span><span class="s2">in </span><span class="s1">zip(glyphs</span><span class="s2">, </span><span class="s1">singlePosTable.Value)</span>
+		<span class="s1">}</span>
+		<span class="s1">self.SubTable = buildSinglePos(singlePosMapping</span><span class="s2">, </span><span class="s1">merger.font.getReverseGlyphMap())</span>
+	<span class="s1">merger.mergeObjects(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">exclude=[</span><span class="s3">'SubTable'</span><span class="s2">, </span><span class="s3">'SubTableCount'</span><span class="s1">])</span>
+
+	<span class="s2">del </span><span class="s1">merger.lookup_subtables</span>
+
+<span class="s4">#</span>
+<span class="s4"># InstancerMerger</span>
+<span class="s4">#</span>
+
+<span class="s2">class </span><span class="s1">InstancerMerger(AligningMerger):</span>
+	<span class="s0">&quot;&quot;&quot;A merger that takes multiple master fonts, and instantiates 
+    an instance.&quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">location):</span>
+		<span class="s1">Merger.__init__(self</span><span class="s2">, </span><span class="s1">font)</span>
+		<span class="s1">self.model = model</span>
+		<span class="s1">self.location = location</span>
+		<span class="s1">self.scalars = model.getScalars(location)</span>
+
+<span class="s1">@InstancerMerger.merger(ot.CaretValue)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">assert </span><span class="s1">self.Format == </span><span class="s5">1</span>
+	<span class="s1">Coords = [a.Coordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst]</span>
+	<span class="s1">model = merger.model</span>
+	<span class="s1">scalars = merger.scalars</span>
+	<span class="s1">self.Coordinate = otRound(model.interpolateFromMastersAndScalars(Coords</span><span class="s2">, </span><span class="s1">scalars))</span>
+
+<span class="s1">@InstancerMerger.merger(ot.Anchor)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">assert </span><span class="s1">self.Format == </span><span class="s5">1</span>
+	<span class="s1">XCoords = [a.XCoordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst]</span>
+	<span class="s1">YCoords = [a.YCoordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst]</span>
+	<span class="s1">model = merger.model</span>
+	<span class="s1">scalars = merger.scalars</span>
+	<span class="s1">self.XCoordinate = otRound(model.interpolateFromMastersAndScalars(XCoords</span><span class="s2">, </span><span class="s1">scalars))</span>
+	<span class="s1">self.YCoordinate = otRound(model.interpolateFromMastersAndScalars(YCoords</span><span class="s2">, </span><span class="s1">scalars))</span>
+
+<span class="s1">@InstancerMerger.merger(otBase.ValueRecord)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">model = merger.model</span>
+	<span class="s1">scalars = merger.scalars</span>
+	<span class="s4"># TODO Handle differing valueformats</span>
+	<span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">tableName </span><span class="s2">in </span><span class="s1">[(</span><span class="s3">'XAdvance'</span><span class="s2">,</span><span class="s3">'XAdvDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'YAdvance'</span><span class="s2">,</span><span class="s3">'YAdvDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'XPlacement'</span><span class="s2">,</span><span class="s3">'XPlaDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'YPlacement'</span><span class="s2">,</span><span class="s3">'YPlaDevice'</span><span class="s1">)]:</span>
+
+		<span class="s2">assert not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">tableName)</span>
+
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">name):</span>
+			<span class="s1">values = [getattr(a</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst]</span>
+			<span class="s1">value = otRound(model.interpolateFromMastersAndScalars(values</span><span class="s2">, </span><span class="s1">scalars))</span>
+			<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">value)</span>
+
+
+<span class="s4">#</span>
+<span class="s4"># MutatorMerger</span>
+<span class="s4">#</span>
+
+<span class="s2">class </span><span class="s1">MutatorMerger(AligningMerger):</span>
+	<span class="s0">&quot;&quot;&quot;A merger that takes a variable font, and instantiates 
+    an instance.  While there's no &quot;merging&quot; to be done per se, 
+    the operation can benefit from many operations that the 
+    aligning merger does.&quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">instancer</span><span class="s2">, </span><span class="s1">deleteVariations=</span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s1">Merger.__init__(self</span><span class="s2">, </span><span class="s1">font)</span>
+		<span class="s1">self.instancer = instancer</span>
+		<span class="s1">self.deleteVariations = deleteVariations</span>
+
+<span class="s1">@MutatorMerger.merger(ot.CaretValue)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+
+	<span class="s4"># Hack till we become selfless.</span>
+	<span class="s1">self.__dict__ = lst[</span><span class="s5">0</span><span class="s1">].__dict__.copy()</span>
+
+	<span class="s2">if </span><span class="s1">self.Format != </span><span class="s5">3</span><span class="s1">:</span>
+		<span class="s2">return</span>
+
+	<span class="s1">instancer = merger.instancer</span>
+	<span class="s1">dev = self.DeviceTable</span>
+	<span class="s2">if </span><span class="s1">merger.deleteVariations:</span>
+		<span class="s2">del </span><span class="s1">self.DeviceTable</span>
+	<span class="s2">if </span><span class="s1">dev:</span>
+		<span class="s2">assert </span><span class="s1">dev.DeltaFormat == </span><span class="s5">0x8000</span>
+		<span class="s1">varidx = (dev.StartSize &lt;&lt; </span><span class="s5">16</span><span class="s1">) + dev.EndSize</span>
+		<span class="s1">delta = otRound(instancer[varidx])</span>
+		<span class="s1">self.Coordinate += delta</span>
+
+	<span class="s2">if </span><span class="s1">merger.deleteVariations:</span>
+		<span class="s1">self.Format = </span><span class="s5">1</span>
+
+<span class="s1">@MutatorMerger.merger(ot.Anchor)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+
+	<span class="s4"># Hack till we become selfless.</span>
+	<span class="s1">self.__dict__ = lst[</span><span class="s5">0</span><span class="s1">].__dict__.copy()</span>
+
+	<span class="s2">if </span><span class="s1">self.Format != </span><span class="s5">3</span><span class="s1">:</span>
+		<span class="s2">return</span>
+
+	<span class="s1">instancer = merger.instancer</span>
+	<span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s3">&quot;XY&quot;</span><span class="s1">:</span>
+		<span class="s1">tableName = v+</span><span class="s3">'DeviceTable'</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">tableName):</span>
+			<span class="s2">continue</span>
+		<span class="s1">dev = getattr(self</span><span class="s2">, </span><span class="s1">tableName)</span>
+		<span class="s2">if </span><span class="s1">merger.deleteVariations:</span>
+			<span class="s1">delattr(self</span><span class="s2">, </span><span class="s1">tableName)</span>
+		<span class="s2">if </span><span class="s1">dev </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">continue</span>
+
+		<span class="s2">assert </span><span class="s1">dev.DeltaFormat == </span><span class="s5">0x8000</span>
+		<span class="s1">varidx = (dev.StartSize &lt;&lt; </span><span class="s5">16</span><span class="s1">) + dev.EndSize</span>
+		<span class="s1">delta = otRound(instancer[varidx])</span>
+
+		<span class="s1">attr = v+</span><span class="s3">'Coordinate'</span>
+		<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">attr) + delta)</span>
+
+	<span class="s2">if </span><span class="s1">merger.deleteVariations:</span>
+		<span class="s1">self.Format = </span><span class="s5">1</span>
+
+<span class="s1">@MutatorMerger.merger(otBase.ValueRecord)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+
+	<span class="s4"># Hack till we become selfless.</span>
+	<span class="s1">self.__dict__ = lst[</span><span class="s5">0</span><span class="s1">].__dict__.copy()</span>
+
+	<span class="s1">instancer = merger.instancer</span>
+	<span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">tableName </span><span class="s2">in </span><span class="s1">[(</span><span class="s3">'XAdvance'</span><span class="s2">,</span><span class="s3">'XAdvDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'YAdvance'</span><span class="s2">,</span><span class="s3">'YAdvDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'XPlacement'</span><span class="s2">,</span><span class="s3">'XPlaDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'YPlacement'</span><span class="s2">,</span><span class="s3">'YPlaDevice'</span><span class="s1">)]:</span>
+
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">tableName):</span>
+			<span class="s2">continue</span>
+		<span class="s1">dev = getattr(self</span><span class="s2">, </span><span class="s1">tableName)</span>
+		<span class="s2">if </span><span class="s1">merger.deleteVariations:</span>
+			<span class="s1">delattr(self</span><span class="s2">, </span><span class="s1">tableName)</span>
+		<span class="s2">if </span><span class="s1">dev </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">continue</span>
+
+		<span class="s2">assert </span><span class="s1">dev.DeltaFormat == </span><span class="s5">0x8000</span>
+		<span class="s1">varidx = (dev.StartSize &lt;&lt; </span><span class="s5">16</span><span class="s1">) + dev.EndSize</span>
+		<span class="s1">delta = otRound(instancer[varidx])</span>
+
+		<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) + delta)</span>
+
+
+<span class="s4">#</span>
+<span class="s4"># VariationMerger</span>
+<span class="s4">#</span>
+
+<span class="s2">class </span><span class="s1">VariationMerger(AligningMerger):</span>
+	<span class="s0">&quot;&quot;&quot;A merger that takes multiple master fonts, and builds a 
+    variable font.&quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">axisTags</span><span class="s2">, </span><span class="s1">font):</span>
+		<span class="s1">Merger.__init__(self</span><span class="s2">, </span><span class="s1">font)</span>
+		<span class="s1">self.store_builder = varStore.OnlineVarStoreBuilder(axisTags)</span>
+		<span class="s1">self.setModel(model)</span>
+
+	<span class="s2">def </span><span class="s1">setModel(self</span><span class="s2">, </span><span class="s1">model):</span>
+		<span class="s1">self.model = model</span>
+		<span class="s1">self.store_builder.setModel(model)</span>
+
+	<span class="s2">def </span><span class="s1">mergeThings(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst):</span>
+		<span class="s1">masterModel = </span><span class="s2">None</span>
+		<span class="s1">origTTFs = </span><span class="s2">None</span>
+		<span class="s2">if None in </span><span class="s1">lst:</span>
+			<span class="s2">if </span><span class="s1">allNone(lst):</span>
+				<span class="s2">if </span><span class="s1">out </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s2">raise </span><span class="s1">FoundANone(self</span><span class="s2">, </span><span class="s1">got=lst)</span>
+				<span class="s2">return</span>
+
+			<span class="s4"># temporarily subset the list of master ttfs to the ones for which</span>
+			<span class="s4"># master values are not None</span>
+			<span class="s1">origTTFs = self.ttfs</span>
+			<span class="s2">if </span><span class="s1">self.ttfs:</span>
+				<span class="s1">self.ttfs = subList([v </span><span class="s2">is not None for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst]</span><span class="s2">, </span><span class="s1">self.ttfs)</span>
+
+			<span class="s1">masterModel = self.model</span>
+			<span class="s1">model</span><span class="s2">, </span><span class="s1">lst = masterModel.getSubModel(lst)</span>
+			<span class="s1">self.setModel(model)</span>
+
+		<span class="s1">super(VariationMerger</span><span class="s2">, </span><span class="s1">self).mergeThings(out</span><span class="s2">, </span><span class="s1">lst)</span>
+
+		<span class="s2">if </span><span class="s1">masterModel:</span>
+			<span class="s1">self.setModel(masterModel)</span>
+		<span class="s2">if </span><span class="s1">origTTFs:</span>
+			<span class="s1">self.ttfs = origTTFs</span>
+
+
+<span class="s2">def </span><span class="s1">buildVarDevTable(store_builder</span><span class="s2">, </span><span class="s1">master_values):</span>
+	<span class="s2">if </span><span class="s1">allEqual(master_values):</span>
+		<span class="s2">return </span><span class="s1">master_values[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, None</span>
+	<span class="s1">base</span><span class="s2">, </span><span class="s1">varIdx = store_builder.storeMasters(master_values)</span>
+	<span class="s2">return </span><span class="s1">base</span><span class="s2">, </span><span class="s1">builder.buildVarDevTable(varIdx)</span>
+
+<span class="s1">@VariationMerger.merger(ot.BaseCoord)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">if </span><span class="s1">self.Format != </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;a baseline coordinate&quot;</span><span class="s1">)</span>
+	<span class="s1">self.Coordinate</span><span class="s2">, </span><span class="s1">DeviceTable = buildVarDevTable(merger.store_builder</span><span class="s2">, </span><span class="s1">[a.Coordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s2">if </span><span class="s1">DeviceTable:</span>
+		<span class="s1">self.Format = </span><span class="s5">3</span>
+		<span class="s1">self.DeviceTable = DeviceTable</span>
+
+<span class="s1">@VariationMerger.merger(ot.CaretValue)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">if </span><span class="s1">self.Format != </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;a caret&quot;</span><span class="s1">)</span>
+	<span class="s1">self.Coordinate</span><span class="s2">, </span><span class="s1">DeviceTable = buildVarDevTable(merger.store_builder</span><span class="s2">, </span><span class="s1">[a.Coordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s2">if </span><span class="s1">DeviceTable:</span>
+		<span class="s1">self.Format = </span><span class="s5">3</span>
+		<span class="s1">self.DeviceTable = DeviceTable</span>
+
+<span class="s1">@VariationMerger.merger(ot.Anchor)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">if </span><span class="s1">self.Format != </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">UnsupportedFormat(merger</span><span class="s2">, </span><span class="s1">subtable=</span><span class="s3">&quot;an anchor&quot;</span><span class="s1">)</span>
+	<span class="s1">self.XCoordinate</span><span class="s2">, </span><span class="s1">XDeviceTable = buildVarDevTable(merger.store_builder</span><span class="s2">, </span><span class="s1">[a.XCoordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s1">self.YCoordinate</span><span class="s2">, </span><span class="s1">YDeviceTable = buildVarDevTable(merger.store_builder</span><span class="s2">, </span><span class="s1">[a.YCoordinate </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst])</span>
+	<span class="s2">if </span><span class="s1">XDeviceTable </span><span class="s2">or </span><span class="s1">YDeviceTable:</span>
+		<span class="s1">self.Format = </span><span class="s5">3</span>
+		<span class="s1">self.XDeviceTable = XDeviceTable</span>
+		<span class="s1">self.YDeviceTable = YDeviceTable</span>
+
+<span class="s1">@VariationMerger.merger(otBase.ValueRecord)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">tableName </span><span class="s2">in </span><span class="s1">[(</span><span class="s3">'XAdvance'</span><span class="s2">,</span><span class="s3">'XAdvDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'YAdvance'</span><span class="s2">,</span><span class="s3">'YAdvDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'XPlacement'</span><span class="s2">,</span><span class="s3">'XPlaDevice'</span><span class="s1">)</span><span class="s2">,</span>
+				<span class="s1">(</span><span class="s3">'YPlacement'</span><span class="s2">,</span><span class="s3">'YPlaDevice'</span><span class="s1">)]:</span>
+
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">name):</span>
+			<span class="s1">value</span><span class="s2">, </span><span class="s1">deviceTable = buildVarDevTable(merger.store_builder</span><span class="s2">,</span>
+							      <span class="s1">[getattr(a</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">lst])</span>
+			<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">value)</span>
+			<span class="s2">if </span><span class="s1">deviceTable:</span>
+				<span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">tableName</span><span class="s2">, </span><span class="s1">deviceTable)</span>
+
+
+<span class="s2">class </span><span class="s1">COLRVariationMerger(VariationMerger):</span>
+	<span class="s0">&quot;&quot;&quot;A specialized VariationMerger that takes multiple master fonts containing 
+    COLRv1 tables, and builds a variable COLR font. 
+ 
+    COLR tables are special in that variable subtables can be associated with 
+    multiple delta-set indices (via VarIndexBase). 
+    They also contain tables that must change their type (not simply the Format) 
+    as they become variable (e.g. Affine2x3 -&gt; VarAffine2x3) so this merger takes 
+    care of that too. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">axisTags</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">allowLayerReuse=</span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s1">VariationMerger.__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">axisTags</span><span class="s2">, </span><span class="s1">font)</span>
+		<span class="s4"># maps {tuple(varIdxes): VarIndexBase} to facilitate reuse of VarIndexBase</span>
+		<span class="s4"># between variable tables with same varIdxes.</span>
+		<span class="s1">self.varIndexCache = {}</span>
+		<span class="s4"># flat list of all the varIdxes generated while merging</span>
+		<span class="s1">self.varIdxes = []</span>
+		<span class="s4"># set of id()s of the subtables that contain variations after merging</span>
+		<span class="s4"># and need to be upgraded to the associated VarType.</span>
+		<span class="s1">self.varTableIds = set()</span>
+		<span class="s4"># we keep these around for rebuilding a LayerList while merging PaintColrLayers</span>
+		<span class="s1">self.layers = []</span>
+		<span class="s1">self.layerReuseCache = </span><span class="s2">None</span>
+		<span class="s2">if </span><span class="s1">allowLayerReuse:</span>
+			<span class="s1">self.layerReuseCache = LayerReuseCache()</span>
+		<span class="s4"># flag to ensure BaseGlyphList is fully merged before LayerList gets processed</span>
+		<span class="s1">self._doneBaseGlyphs = </span><span class="s2">False</span>
+
+	<span class="s2">def </span><span class="s1">mergeTables(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">master_ttfs</span><span class="s2">, </span><span class="s1">tableTags=(</span><span class="s3">&quot;COLR&quot;</span><span class="s2">,</span><span class="s1">)):</span>
+		<span class="s2">if </span><span class="s3">&quot;COLR&quot; </span><span class="s2">in </span><span class="s1">tableTags </span><span class="s2">and </span><span class="s3">&quot;COLR&quot; </span><span class="s2">in </span><span class="s1">font:</span>
+			<span class="s4"># The merger modifies the destination COLR table in-place. If this contains</span>
+			<span class="s4"># multiple PaintColrLayers referencing the same layers from LayerList, it's</span>
+			<span class="s4"># a problem because we may risk modifying the same paint more than once, or</span>
+			<span class="s4"># worse, fail while attempting to do that.</span>
+			<span class="s4"># We don't know whether the master COLR table was built with layer reuse</span>
+			<span class="s4"># disabled, thus to be safe we rebuild its LayerList so that it contains only</span>
+			<span class="s4"># unique layers referenced from non-overlapping PaintColrLayers throughout</span>
+			<span class="s4"># the base paint graphs.</span>
+			<span class="s1">self.expandPaintColrLayers(font[</span><span class="s3">&quot;COLR&quot;</span><span class="s1">].table)</span>
+		<span class="s1">VariationMerger.mergeTables(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">master_ttfs</span><span class="s2">, </span><span class="s1">tableTags)</span>
+
+	<span class="s2">def </span><span class="s1">checkFormatEnum(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">validate=</span><span class="s2">lambda </span><span class="s1">_: </span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s1">fmt = out.Format</span>
+		<span class="s1">formatEnum = out.formatEnum</span>
+		<span class="s1">ok = </span><span class="s2">False</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">fmt = formatEnum(fmt)</span>
+		<span class="s2">except </span><span class="s1">ValueError:</span>
+			<span class="s2">pass</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">ok = validate(fmt)</span>
+		<span class="s2">if not </span><span class="s1">ok:</span>
+			<span class="s2">raise </span><span class="s1">UnsupportedFormat(</span>
+				<span class="s1">self</span><span class="s2">, </span><span class="s1">subtable=type(out).__name__</span><span class="s2">, </span><span class="s1">value=fmt</span>
+			<span class="s1">)</span>
+		<span class="s1">expected = fmt</span>
+		<span class="s1">got = []</span>
+		<span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst:</span>
+			<span class="s1">fmt = getattr(v</span><span class="s2">, </span><span class="s3">&quot;Format&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">fmt = formatEnum(fmt)</span>
+			<span class="s2">except </span><span class="s1">ValueError:</span>
+				<span class="s2">pass</span>
+			<span class="s1">got.append(fmt)</span>
+		<span class="s2">if not </span><span class="s1">allEqualTo(expected</span><span class="s2">, </span><span class="s1">got):</span>
+			<span class="s2">raise </span><span class="s1">InconsistentFormats(</span>
+				<span class="s1">self</span><span class="s2">,</span>
+				<span class="s1">subtable=type(out).__name__</span><span class="s2">,</span>
+				<span class="s1">expected=expected</span><span class="s2">,</span>
+				<span class="s1">got=got</span><span class="s2">,</span>
+			<span class="s1">)</span>
+		<span class="s2">return </span><span class="s1">expected</span>
+
+	<span class="s2">def </span><span class="s1">mergeSparseDict(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst):</span>
+		<span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">out.keys():</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">self.mergeThings(out[k]</span><span class="s2">, </span><span class="s1">[v.get(k) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">lst])</span>
+			<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+				<span class="s1">e.stack.append(</span><span class="s3">f&quot;[</span><span class="s2">{</span><span class="s1">k</span><span class="s2">!r}</span><span class="s3">]&quot;</span><span class="s1">)</span>
+				<span class="s2">raise</span>
+
+	<span class="s2">def </span><span class="s1">mergeAttrs(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">attrs):</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">attrs:</span>
+			<span class="s1">value = getattr(out</span><span class="s2">, </span><span class="s1">attr)</span>
+			<span class="s1">values = [getattr(item</span><span class="s2">, </span><span class="s1">attr) </span><span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">lst]</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">self.mergeThings(value</span><span class="s2">, </span><span class="s1">values)</span>
+			<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+				<span class="s1">e.stack.append(</span><span class="s3">f&quot;.</span><span class="s2">{</span><span class="s1">attr</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+				<span class="s2">raise</span>
+
+	<span class="s2">def </span><span class="s1">storeMastersForAttr(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">attr):</span>
+		<span class="s1">master_values = [getattr(item</span><span class="s2">, </span><span class="s1">attr) </span><span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">lst]</span>
+
+		<span class="s4"># VarStore treats deltas for fixed-size floats as integers, so we</span>
+		<span class="s4"># must convert master values to int before storing them in the builder</span>
+		<span class="s4"># then back to float.</span>
+		<span class="s1">is_fixed_size_float = </span><span class="s2">False</span>
+		<span class="s1">conv = out.getConverterByName(attr)</span>
+		<span class="s2">if </span><span class="s1">isinstance(conv</span><span class="s2">, </span><span class="s1">BaseFixedValue):</span>
+			<span class="s1">is_fixed_size_float = </span><span class="s2">True</span>
+			<span class="s1">master_values = [conv.toInt(v) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">master_values]</span>
+
+		<span class="s1">baseValue = master_values[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">varIdx = ot.NO_VARIATION_INDEX</span>
+		<span class="s2">if not </span><span class="s1">allEqual(master_values):</span>
+			<span class="s1">baseValue</span><span class="s2">, </span><span class="s1">varIdx = self.store_builder.storeMasters(master_values)</span>
+
+		<span class="s2">if </span><span class="s1">is_fixed_size_float:</span>
+			<span class="s1">baseValue = conv.fromInt(baseValue)</span>
+
+		<span class="s2">return </span><span class="s1">baseValue</span><span class="s2">, </span><span class="s1">varIdx</span>
+
+	<span class="s2">def </span><span class="s1">storeVariationIndices(self</span><span class="s2">, </span><span class="s1">varIdxes) -&gt; int:</span>
+		<span class="s4"># try to reuse an existing VarIndexBase for the same varIdxes, or else</span>
+		<span class="s4"># create a new one</span>
+		<span class="s1">key = tuple(varIdxes)</span>
+		<span class="s1">varIndexBase = self.varIndexCache.get(key)</span>
+
+		<span class="s2">if </span><span class="s1">varIndexBase </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s4"># scan for a full match anywhere in the self.varIdxes</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(self.varIdxes) - len(varIdxes) + </span><span class="s5">1</span><span class="s1">):</span>
+				<span class="s2">if </span><span class="s1">self.varIdxes[i:i+len(varIdxes)] == varIdxes:</span>
+					<span class="s1">self.varIndexCache[key] = varIndexBase = i</span>
+					<span class="s2">break</span>
+
+		<span class="s2">if </span><span class="s1">varIndexBase </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s4"># try find a partial match at the end of the self.varIdxes</span>
+			<span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">range(len(varIdxes)-</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">):</span>
+				<span class="s2">if </span><span class="s1">self.varIdxes[-n:] == varIdxes[:n]:</span>
+					<span class="s1">varIndexBase = len(self.varIdxes) - n</span>
+					<span class="s1">self.varIndexCache[key] = varIndexBase</span>
+					<span class="s1">self.varIdxes.extend(varIdxes[n:])</span>
+					<span class="s2">break</span>
+
+		<span class="s2">if </span><span class="s1">varIndexBase </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s4"># no match found, append at the end</span>
+			<span class="s1">self.varIndexCache[key] = varIndexBase = len(self.varIdxes)</span>
+			<span class="s1">self.varIdxes.extend(varIdxes)</span>
+
+		<span class="s2">return </span><span class="s1">varIndexBase</span>
+
+	<span class="s2">def </span><span class="s1">mergeVariableAttrs(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">attrs) -&gt; int:</span>
+		<span class="s1">varIndexBase = ot.NO_VARIATION_INDEX</span>
+		<span class="s1">varIdxes = []</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">attrs:</span>
+			<span class="s1">baseValue</span><span class="s2">, </span><span class="s1">varIdx = self.storeMastersForAttr(out</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">attr)</span>
+			<span class="s1">setattr(out</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">baseValue)</span>
+			<span class="s1">varIdxes.append(varIdx)</span>
+
+		<span class="s2">if </span><span class="s1">any(v != ot.NO_VARIATION_INDEX </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">varIdxes):</span>
+			<span class="s1">varIndexBase = self.storeVariationIndices(varIdxes)</span>
+
+		<span class="s2">return </span><span class="s1">varIndexBase</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s2">def </span><span class="s1">convertSubTablesToVarType(cls</span><span class="s2">, </span><span class="s1">table):</span>
+		<span class="s2">for </span><span class="s1">path </span><span class="s2">in </span><span class="s1">dfs_base_table(</span>
+			<span class="s1">table</span><span class="s2">,</span>
+			<span class="s1">skip_root=</span><span class="s2">True,</span>
+			<span class="s1">predicate=</span><span class="s2">lambda </span><span class="s1">path: (</span>
+				<span class="s1">getattr(type(path[-</span><span class="s5">1</span><span class="s1">].value)</span><span class="s2">, </span><span class="s3">&quot;VarType&quot;</span><span class="s2">, None</span><span class="s1">) </span><span class="s2">is not None</span>
+			<span class="s1">)</span>
+		<span class="s1">):</span>
+			<span class="s1">st = path[-</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s1">subTable = st.value</span>
+			<span class="s1">varType = type(subTable).VarType</span>
+			<span class="s1">newSubTable = varType()</span>
+			<span class="s1">newSubTable.__dict__.update(subTable.__dict__)</span>
+			<span class="s1">newSubTable.populateDefaults()</span>
+			<span class="s1">parent = path[-</span><span class="s5">2</span><span class="s1">].value</span>
+			<span class="s2">if </span><span class="s1">st.index </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">getattr(parent</span><span class="s2">, </span><span class="s1">st.name)[st.index] = newSubTable</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">setattr(parent</span><span class="s2">, </span><span class="s1">st.name</span><span class="s2">, </span><span class="s1">newSubTable)</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s2">def </span><span class="s1">expandPaintColrLayers(colr):</span>
+		<span class="s0">&quot;&quot;&quot;Rebuild LayerList without PaintColrLayers reuse. 
+ 
+        Each base paint graph is fully DFS-traversed (with exception of PaintColrGlyph 
+        which are irrelevant for this); any layers referenced via PaintColrLayers are 
+        collected into a new LayerList and duplicated when reuse is detected, to ensure 
+        that all paints are distinct objects at the end of the process. 
+        PaintColrLayers's FirstLayerIndex/NumLayers are updated so that no overlap 
+        is left. Also, any consecutively nested PaintColrLayers are flattened. 
+        The COLR table's LayerList is replaced with the new unique layers. 
+        A side effect is also that any layer from the old LayerList which is not 
+        referenced by any PaintColrLayers is dropped. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if not </span><span class="s1">colr.LayerList:</span>
+			<span class="s4"># if no LayerList, there's nothing to expand</span>
+			<span class="s2">return</span>
+		<span class="s1">uniqueLayerIDs = set()</span>
+		<span class="s1">newLayerList = []</span>
+		<span class="s2">for </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">colr.BaseGlyphList.BaseGlyphPaintRecord:</span>
+			<span class="s1">frontier = [rec.Paint]</span>
+			<span class="s2">while </span><span class="s1">frontier:</span>
+				<span class="s1">paint = frontier.pop()</span>
+				<span class="s2">if </span><span class="s1">paint.Format == ot.PaintFormat.PaintColrGlyph:</span>
+					<span class="s4"># don't traverse these, we treat them as constant for merging</span>
+					<span class="s2">continue</span>
+				<span class="s2">elif </span><span class="s1">paint.Format == ot.PaintFormat.PaintColrLayers:</span>
+					<span class="s4"># de-treeify any nested PaintColrLayers, append unique copies to</span>
+					<span class="s4"># the new layer list and update PaintColrLayers index/count</span>
+					<span class="s1">children = list(_flatten_layers(paint</span><span class="s2">, </span><span class="s1">colr))</span>
+					<span class="s1">first_layer_index = len(newLayerList)</span>
+					<span class="s2">for </span><span class="s1">layer </span><span class="s2">in </span><span class="s1">children:</span>
+						<span class="s2">if </span><span class="s1">id(layer) </span><span class="s2">in </span><span class="s1">uniqueLayerIDs:</span>
+							<span class="s1">layer = copy.deepcopy(layer)</span>
+							<span class="s2">assert </span><span class="s1">id(layer) </span><span class="s2">not in </span><span class="s1">uniqueLayerIDs</span>
+						<span class="s1">newLayerList.append(layer)</span>
+						<span class="s1">uniqueLayerIDs.add(id(layer))</span>
+					<span class="s1">paint.FirstLayerIndex = first_layer_index</span>
+					<span class="s1">paint.NumLayers = len(children)</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">children = paint.getChildren(colr)</span>
+				<span class="s1">frontier.extend(reversed(children))</span>
+		<span class="s4"># sanity check all the new layers are distinct objects</span>
+		<span class="s2">assert </span><span class="s1">len(newLayerList) == len(uniqueLayerIDs)</span>
+		<span class="s1">colr.LayerList.Paint = newLayerList</span>
+		<span class="s1">colr.LayerList.LayerCount = len(newLayerList)</span>
+
+
+<span class="s1">@COLRVariationMerger.merger(ot.BaseGlyphList)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># ignore BaseGlyphCount, allow sparse glyph sets across masters</span>
+	<span class="s1">out = {rec.BaseGlyph: rec </span><span class="s2">for </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">self.BaseGlyphPaintRecord}</span>
+	<span class="s1">masters = [{rec.BaseGlyph: rec </span><span class="s2">for </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">m.BaseGlyphPaintRecord} </span><span class="s2">for </span><span class="s1">m </span><span class="s2">in </span><span class="s1">lst]</span>
+
+	<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">g </span><span class="s2">in </span><span class="s1">enumerate(out.keys()):</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s4"># missing base glyphs don't participate in the merge</span>
+			<span class="s1">merger.mergeThings(out[g]</span><span class="s2">, </span><span class="s1">[v.get(g) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">masters])</span>
+		<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+			<span class="s1">e.stack.append(</span><span class="s3">f&quot;.BaseGlyphPaintRecord[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s3">]&quot;</span><span class="s1">)</span>
+			<span class="s1">e.cause[</span><span class="s3">&quot;location&quot;</span><span class="s1">] = </span><span class="s3">f&quot;base glyph </span><span class="s2">{</span><span class="s1">g</span><span class="s2">!r}</span><span class="s3">&quot;</span>
+			<span class="s2">raise</span>
+
+	<span class="s1">merger._doneBaseGlyphs = </span><span class="s2">True</span>
+
+
+<span class="s1">@COLRVariationMerger.merger(ot.LayerList)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># nothing to merge for LayerList, assuming we have already merged all PaintColrLayers</span>
+	<span class="s4"># found while traversing the paint graphs rooted at BaseGlyphPaintRecords.</span>
+	<span class="s2">assert </span><span class="s1">merger._doneBaseGlyphs</span><span class="s2">, </span><span class="s3">&quot;BaseGlyphList must be merged before LayerList&quot;</span>
+	<span class="s4"># Simply flush the final list of layers and go home.</span>
+	<span class="s1">self.LayerCount = len(merger.layers)</span>
+	<span class="s1">self.Paint = merger.layers</span>
+
+
+<span class="s2">def </span><span class="s1">_flatten_layers(root</span><span class="s2">, </span><span class="s1">colr):</span>
+	<span class="s2">assert </span><span class="s1">root.Format == ot.PaintFormat.PaintColrLayers</span>
+	<span class="s2">for </span><span class="s1">paint </span><span class="s2">in </span><span class="s1">root.getChildren(colr):</span>
+		<span class="s2">if </span><span class="s1">paint.Format == ot.PaintFormat.PaintColrLayers:</span>
+			<span class="s2">yield from </span><span class="s1">_flatten_layers(paint</span><span class="s2">, </span><span class="s1">colr)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">yield </span><span class="s1">paint</span>
+
+
+<span class="s2">def </span><span class="s1">_merge_PaintColrLayers(self</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># we only enforce that the (flat) number of layers is the same across all masters</span>
+	<span class="s4"># but we allow FirstLayerIndex to differ to acommodate for sparse glyph sets.</span>
+
+	<span class="s1">out_layers = list(_flatten_layers(out</span><span class="s2">, </span><span class="s1">self.font[</span><span class="s3">&quot;COLR&quot;</span><span class="s1">].table))</span>
+
+	<span class="s4"># sanity check ttfs are subset to current values (see VariationMerger.mergeThings)</span>
+	<span class="s4"># before matching each master PaintColrLayers to its respective COLR by position</span>
+	<span class="s2">assert </span><span class="s1">len(self.ttfs) == len(lst)</span>
+	<span class="s1">master_layerses = [</span>
+		<span class="s1">list(_flatten_layers(lst[i]</span><span class="s2">, </span><span class="s1">self.ttfs[i][</span><span class="s3">&quot;COLR&quot;</span><span class="s1">].table))</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(lst))</span>
+	<span class="s1">]</span>
+
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">self.mergeLists(out_layers</span><span class="s2">, </span><span class="s1">master_layerses)</span>
+	<span class="s2">except </span><span class="s1">VarLibMergeError </span><span class="s2">as </span><span class="s1">e:</span>
+		<span class="s4"># NOTE: This attribute doesn't actually exist in PaintColrLayers but it's</span>
+		<span class="s4"># handy to have it in the stack trace for debugging.</span>
+		<span class="s1">e.stack.append(</span><span class="s3">&quot;.Layers&quot;</span><span class="s1">)</span>
+		<span class="s2">raise</span>
+
+	<span class="s4"># following block is very similar to LayerListBuilder._beforeBuildPaintColrLayers</span>
+	<span class="s4"># but I couldn't find a nice way to share the code between the two...</span>
+
+	<span class="s2">if </span><span class="s1">self.layerReuseCache </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s4"># successful reuse can make the list smaller</span>
+		<span class="s1">out_layers = self.layerReuseCache.try_reuse(out_layers)</span>
+
+	<span class="s4"># if the list is still too big we need to tree-fy it</span>
+	<span class="s1">is_tree = len(out_layers) &gt; MAX_PAINT_COLR_LAYER_COUNT</span>
+	<span class="s1">out_layers = build_n_ary_tree(out_layers</span><span class="s2">, </span><span class="s1">n=MAX_PAINT_COLR_LAYER_COUNT)</span>
+
+	<span class="s4"># We now have a tree of sequences with Paint leaves.</span>
+	<span class="s4"># Convert the sequences into PaintColrLayers.</span>
+	<span class="s2">def </span><span class="s1">listToColrLayers(paint):</span>
+		<span class="s2">if </span><span class="s1">isinstance(paint</span><span class="s2">, </span><span class="s1">list):</span>
+			<span class="s1">layers = [listToColrLayers(l) </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">paint]</span>
+			<span class="s1">paint = ot.Paint()</span>
+			<span class="s1">paint.Format = int(ot.PaintFormat.PaintColrLayers)</span>
+			<span class="s1">paint.NumLayers = len(layers)</span>
+			<span class="s1">paint.FirstLayerIndex = len(self.layers)</span>
+			<span class="s1">self.layers.extend(layers)</span>
+			<span class="s2">if </span><span class="s1">self.layerReuseCache </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">self.layerReuseCache.add(layers</span><span class="s2">, </span><span class="s1">paint.FirstLayerIndex)</span>
+		<span class="s2">return </span><span class="s1">paint</span>
+
+	<span class="s1">out_layers = [listToColrLayers(l) </span><span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">out_layers]</span>
+
+	<span class="s2">if </span><span class="s1">len(out_layers) == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">out_layers[</span><span class="s5">0</span><span class="s1">].Format == ot.PaintFormat.PaintColrLayers:</span>
+		<span class="s4"># special case when the reuse cache finds a single perfect PaintColrLayers match</span>
+		<span class="s4"># (it can only come from a successful reuse, _flatten_layers has gotten rid of</span>
+		<span class="s4"># all nested PaintColrLayers already); we assign it directly and avoid creating</span>
+		<span class="s4"># an extra table</span>
+		<span class="s1">out.NumLayers = out_layers[</span><span class="s5">0</span><span class="s1">].NumLayers</span>
+		<span class="s1">out.FirstLayerIndex = out_layers[</span><span class="s5">0</span><span class="s1">].FirstLayerIndex</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">out.NumLayers = len(out_layers)</span>
+		<span class="s1">out.FirstLayerIndex = len(self.layers)</span>
+
+		<span class="s1">self.layers.extend(out_layers)</span>
+
+		<span class="s4"># Register our parts for reuse provided we aren't a tree</span>
+		<span class="s4"># If we are a tree the leaves registered for reuse and that will suffice</span>
+		<span class="s2">if </span><span class="s1">self.layerReuseCache </span><span class="s2">is not None and not </span><span class="s1">is_tree:</span>
+			<span class="s1">self.layerReuseCache.add(out_layers</span><span class="s2">, </span><span class="s1">out.FirstLayerIndex)</span>
+
+
+<span class="s1">@COLRVariationMerger.merger((ot.Paint</span><span class="s2">, </span><span class="s1">ot.ClipBox))</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">fmt = merger.checkFormatEnum(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, lambda </span><span class="s1">fmt: </span><span class="s2">not </span><span class="s1">fmt.is_variable())</span>
+
+	<span class="s2">if </span><span class="s1">fmt </span><span class="s2">is </span><span class="s1">ot.PaintFormat.PaintColrLayers:</span>
+		<span class="s1">_merge_PaintColrLayers(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst)</span>
+		<span class="s2">return</span>
+
+	<span class="s1">varFormat = fmt.as_variable()</span>
+
+	<span class="s1">varAttrs = ()</span>
+	<span class="s2">if </span><span class="s1">varFormat </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">varAttrs = otBase.getVariableAttrs(type(self)</span><span class="s2">, </span><span class="s1">varFormat)</span>
+	<span class="s1">staticAttrs = (c.name </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">self.getConverters() </span><span class="s2">if </span><span class="s1">c.name </span><span class="s2">not in </span><span class="s1">varAttrs)</span>
+
+	<span class="s1">merger.mergeAttrs(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">staticAttrs)</span>
+
+	<span class="s1">varIndexBase = merger.mergeVariableAttrs(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">varAttrs)</span>
+
+	<span class="s1">subTables = [st.value </span><span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">self.iterSubTables()]</span>
+
+	<span class="s4"># Convert table to variable if itself has variations or any subtables have</span>
+	<span class="s1">isVariable = (</span>
+		<span class="s1">varIndexBase != ot.NO_VARIATION_INDEX</span>
+		<span class="s2">or </span><span class="s1">any(id(table) </span><span class="s2">in </span><span class="s1">merger.varTableIds </span><span class="s2">for </span><span class="s1">table </span><span class="s2">in </span><span class="s1">subTables)</span>
+	<span class="s1">)</span>
+
+	<span class="s2">if </span><span class="s1">isVariable:</span>
+		<span class="s2">if </span><span class="s1">varAttrs:</span>
+			<span class="s4"># Some PaintVar* don't have any scalar attributes that can vary,</span>
+			<span class="s4"># only indirect offsets to other variable subtables, thus have</span>
+			<span class="s4"># no VarIndexBase of their own (e.g. PaintVarTransform)</span>
+			<span class="s1">self.VarIndexBase = varIndexBase</span>
+
+		<span class="s2">if </span><span class="s1">subTables:</span>
+			<span class="s4"># Convert Affine2x3 -&gt; VarAffine2x3, ColorLine -&gt; VarColorLine, etc.</span>
+			<span class="s1">merger.convertSubTablesToVarType(self)</span>
+
+		<span class="s2">assert </span><span class="s1">varFormat </span><span class="s2">is not None</span>
+		<span class="s1">self.Format = int(varFormat)</span>
+
+
+<span class="s1">@COLRVariationMerger.merger((ot.Affine2x3</span><span class="s2">, </span><span class="s1">ot.ColorStop))</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">varType = type(self).VarType</span>
+
+	<span class="s1">varAttrs = otBase.getVariableAttrs(varType)</span>
+	<span class="s1">staticAttrs = (c.name </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">self.getConverters() </span><span class="s2">if </span><span class="s1">c.name </span><span class="s2">not in </span><span class="s1">varAttrs)</span>
+
+	<span class="s1">merger.mergeAttrs(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">staticAttrs)</span>
+
+	<span class="s1">varIndexBase = merger.mergeVariableAttrs(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">varAttrs)</span>
+
+	<span class="s2">if </span><span class="s1">varIndexBase != ot.NO_VARIATION_INDEX:</span>
+		<span class="s1">self.VarIndexBase = varIndexBase</span>
+		<span class="s4"># mark as having variations so the parent table will convert to Var{Type}</span>
+		<span class="s1">merger.varTableIds.add(id(self))</span>
+
+
+<span class="s1">@COLRVariationMerger.merger(ot.ColorLine)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s1">merger.mergeAttrs(self</span><span class="s2">, </span><span class="s1">lst</span><span class="s2">, </span><span class="s1">(c.name </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">self.getConverters()))</span>
+
+	<span class="s2">if </span><span class="s1">any(id(stop) </span><span class="s2">in </span><span class="s1">merger.varTableIds </span><span class="s2">for </span><span class="s1">stop </span><span class="s2">in </span><span class="s1">self.ColorStop):</span>
+		<span class="s1">merger.convertSubTablesToVarType(self)</span>
+		<span class="s1">merger.varTableIds.add(id(self))</span>
+
+
+<span class="s1">@COLRVariationMerger.merger(ot.ClipList</span><span class="s2">, </span><span class="s3">&quot;clips&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">merge(merger</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">lst):</span>
+	<span class="s4"># 'sparse' in that we allow non-default masters to omit ClipBox entries</span>
+	<span class="s4"># for some/all glyphs (i.e. they don't participate)</span>
+	<span class="s1">merger.mergeSparseDict(self</span><span class="s2">, </span><span class="s1">lst)</span>
+</pre>
+</body>
+</html>

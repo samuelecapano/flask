@@ -1,0 +1,423 @@
+<html>
+<head>
+<title>_helpers.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_helpers.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2017 The Abseil Authors.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;Internal helper functions for Abseil Python flags library.&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">collections</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">re</span>
+<span class="s3">import </span><span class="s1">struct</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">textwrap</span>
+<span class="s3">try</span><span class="s1">:</span>
+  <span class="s3">import </span><span class="s1">fcntl</span>
+<span class="s3">except </span><span class="s1">ImportError:</span>
+  <span class="s1">fcntl = </span><span class="s3">None</span>
+<span class="s3">try</span><span class="s1">:</span>
+  <span class="s0"># Importing termios will fail on non-unix platforms.</span>
+  <span class="s3">import </span><span class="s1">termios</span>
+<span class="s3">except </span><span class="s1">ImportError:</span>
+  <span class="s1">termios = </span><span class="s3">None</span>
+
+
+<span class="s1">_DEFAULT_HELP_WIDTH = </span><span class="s4">80  </span><span class="s0"># Default width of help output.</span>
+<span class="s0"># Minimal &quot;sane&quot; width of help output. We assume that any value below 40 is</span>
+<span class="s0"># unreasonable.</span>
+<span class="s1">_MIN_HELP_WIDTH = </span><span class="s4">40</span>
+
+<span class="s0"># Define the allowed error rate in an input string to get suggestions.</span>
+<span class="s0">#</span>
+<span class="s0"># We lean towards a high threshold because we tend to be matching a phrase,</span>
+<span class="s0"># and the simple algorithm used here is geared towards correcting word</span>
+<span class="s0"># spellings.</span>
+<span class="s0">#</span>
+<span class="s0"># For manual testing, consider &quot;&lt;command&gt; --list&quot; which produced a large number</span>
+<span class="s0"># of spurious suggestions when we used &quot;least_errors &gt; 0.5&quot; instead of</span>
+<span class="s0"># &quot;least_erros &gt;= 0.5&quot;.</span>
+<span class="s1">_SUGGESTION_ERROR_RATE_THRESHOLD = </span><span class="s4">0.50</span>
+
+<span class="s0"># Characters that cannot appear or are highly discouraged in an XML 1.0</span>
+<span class="s0"># document. (See http://www.w3.org/TR/REC-xml/#charsets or</span>
+<span class="s0"># https://en.wikipedia.org/wiki/Valid_characters_in_XML#XML_1.0)</span>
+<span class="s1">_ILLEGAL_XML_CHARS_REGEX = re.compile(</span>
+    <span class="s5">u'[</span><span class="s3">\x00</span><span class="s5">-</span><span class="s3">\x08\x0b\x0c\x0e</span><span class="s5">-</span><span class="s3">\x1f\x7f</span><span class="s5">-</span><span class="s3">\x84\x86</span><span class="s5">-</span><span class="s3">\x9f\ud800</span><span class="s5">-</span><span class="s3">\udfff\ufffe\uffff</span><span class="s5">]'</span><span class="s1">)</span>
+
+<span class="s0"># This is a set of module ids for the modules that disclaim key flags.</span>
+<span class="s0"># This module is explicitly added to this set so that we never consider it to</span>
+<span class="s0"># define key flag.</span>
+<span class="s1">disclaim_module_ids = set([id(sys.modules[__name__])])</span>
+
+
+<span class="s0"># Define special flags here so that help may be generated for them.</span>
+<span class="s0"># NOTE: Please do NOT use SPECIAL_FLAGS from outside flags module.</span>
+<span class="s0"># Initialized inside flagvalues.py.</span>
+<span class="s1">SPECIAL_FLAGS = </span><span class="s3">None</span>
+
+
+<span class="s0"># This points to the flags module, initialized in flags/__init__.py.</span>
+<span class="s0"># This should only be used in adopt_module_key_flags to take SPECIAL_FLAGS into</span>
+<span class="s0"># account.</span>
+<span class="s1">FLAGS_MODULE = </span><span class="s3">None</span>
+
+
+<span class="s3">class </span><span class="s1">_ModuleObjectAndName(</span>
+    <span class="s1">collections.namedtuple(</span><span class="s5">'_ModuleObjectAndName'</span><span class="s3">, </span><span class="s5">'module module_name'</span><span class="s1">)):</span>
+  <span class="s2">&quot;&quot;&quot;Module object and name. 
+ 
+  Fields: 
+  - module: object, module object. 
+  - module_name: str, module name. 
+  &quot;&quot;&quot;</span>
+
+
+<span class="s3">def </span><span class="s1">get_module_object_and_name(globals_dict):</span>
+  <span class="s2">&quot;&quot;&quot;Returns the module that defines a global environment, and its name. 
+ 
+  Args: 
+    globals_dict: A dictionary that should correspond to an environment 
+      providing the values of the globals. 
+ 
+  Returns: 
+    _ModuleObjectAndName - pair of module object &amp; module name. 
+    Returns (None, None) if the module could not be identified. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">name = globals_dict.get(</span><span class="s5">'__name__'</span><span class="s3">, None</span><span class="s1">)</span>
+  <span class="s1">module = sys.modules.get(name</span><span class="s3">, None</span><span class="s1">)</span>
+  <span class="s0"># Pick a more informative name for the main module.</span>
+  <span class="s3">return </span><span class="s1">_ModuleObjectAndName(module</span><span class="s3">,</span>
+                              <span class="s1">(sys.argv[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">if </span><span class="s1">name == </span><span class="s5">'__main__' </span><span class="s3">else </span><span class="s1">name))</span>
+
+
+<span class="s3">def </span><span class="s1">get_calling_module_object_and_name():</span>
+  <span class="s2">&quot;&quot;&quot;Returns the module that's calling into this module. 
+ 
+  We generally use this function to get the name of the module calling a 
+  DEFINE_foo... function. 
+ 
+  Returns: 
+    The module object that called into this one. 
+ 
+  Raises: 
+    AssertionError: Raised when no calling module could be identified. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">for </span><span class="s1">depth </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">sys.getrecursionlimit()):</span>
+    <span class="s0"># sys._getframe is the right thing to use here, as it's the best</span>
+    <span class="s0"># way to walk up the call stack.</span>
+    <span class="s1">globals_for_frame = sys._getframe(depth).f_globals  </span><span class="s0"># pylint: disable=protected-access</span>
+    <span class="s1">module</span><span class="s3">, </span><span class="s1">module_name = get_module_object_and_name(globals_for_frame)</span>
+    <span class="s3">if </span><span class="s1">id(module) </span><span class="s3">not in </span><span class="s1">disclaim_module_ids </span><span class="s3">and </span><span class="s1">module_name </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">_ModuleObjectAndName(module</span><span class="s3">, </span><span class="s1">module_name)</span>
+  <span class="s3">raise </span><span class="s1">AssertionError(</span><span class="s5">'No module was found'</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">get_calling_module():</span>
+  <span class="s2">&quot;&quot;&quot;Returns the name of the module that's calling into this module.&quot;&quot;&quot;</span>
+  <span class="s3">return </span><span class="s1">get_calling_module_object_and_name().module_name</span>
+
+
+<span class="s3">def </span><span class="s1">create_xml_dom_element(doc</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value):</span>
+  <span class="s2">&quot;&quot;&quot;Returns an XML DOM element with name and text value. 
+ 
+  Args: 
+    doc: minidom.Document, the DOM document it should create nodes from. 
+    name: str, the tag of XML element. 
+    value: object, whose string representation will be used 
+        as the value of the XML element. Illegal or highly discouraged xml 1.0 
+        characters are stripped. 
+ 
+  Returns: 
+    An instance of minidom.Element. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">s = str(value)</span>
+  <span class="s3">if </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">bool):</span>
+    <span class="s0"># Display boolean values as the C++ flag library does: no caps.</span>
+    <span class="s1">s = s.lower()</span>
+  <span class="s0"># Remove illegal xml characters.</span>
+  <span class="s1">s = _ILLEGAL_XML_CHARS_REGEX.sub(</span><span class="s5">u''</span><span class="s3">, </span><span class="s1">s)</span>
+
+  <span class="s1">e = doc.createElement(name)</span>
+  <span class="s1">e.appendChild(doc.createTextNode(s))</span>
+  <span class="s3">return </span><span class="s1">e</span>
+
+
+<span class="s3">def </span><span class="s1">get_help_width():</span>
+  <span class="s2">&quot;&quot;&quot;Returns the integer width of help lines that is used in TextWrap.&quot;&quot;&quot;</span>
+  <span class="s3">if not </span><span class="s1">sys.stdout.isatty() </span><span class="s3">or </span><span class="s1">termios </span><span class="s3">is None or </span><span class="s1">fcntl </span><span class="s3">is None</span><span class="s1">:</span>
+    <span class="s3">return </span><span class="s1">_DEFAULT_HELP_WIDTH</span>
+  <span class="s3">try</span><span class="s1">:</span>
+    <span class="s1">data = fcntl.ioctl(sys.stdout</span><span class="s3">, </span><span class="s1">termios.TIOCGWINSZ</span><span class="s3">, </span><span class="s5">'1234'</span><span class="s1">)</span>
+    <span class="s1">columns = struct.unpack(</span><span class="s5">'hh'</span><span class="s3">, </span><span class="s1">data)[</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s0"># Emacs mode returns 0.</span>
+    <span class="s0"># Here we assume that any value below 40 is unreasonable.</span>
+    <span class="s3">if </span><span class="s1">columns &gt;= _MIN_HELP_WIDTH:</span>
+      <span class="s3">return </span><span class="s1">columns</span>
+    <span class="s0"># Returning an int as default is fine, int(int) just return the int.</span>
+    <span class="s3">return </span><span class="s1">int(os.getenv(</span><span class="s5">'COLUMNS'</span><span class="s3">, </span><span class="s1">_DEFAULT_HELP_WIDTH))</span>
+
+  <span class="s3">except </span><span class="s1">(TypeError</span><span class="s3">, </span><span class="s1">IOError</span><span class="s3">, </span><span class="s1">struct.error):</span>
+    <span class="s3">return </span><span class="s1">_DEFAULT_HELP_WIDTH</span>
+
+
+<span class="s3">def </span><span class="s1">get_flag_suggestions(attempt</span><span class="s3">, </span><span class="s1">longopt_list):</span>
+  <span class="s2">&quot;&quot;&quot;Returns helpful similar matches for an invalid flag.&quot;&quot;&quot;</span>
+  <span class="s0"># Don't suggest on very short strings, or if no longopts are specified.</span>
+  <span class="s3">if </span><span class="s1">len(attempt) &lt;= </span><span class="s4">2 </span><span class="s3">or not </span><span class="s1">longopt_list:</span>
+    <span class="s3">return </span><span class="s1">[]</span>
+
+  <span class="s1">option_names = [v.split(</span><span class="s5">'='</span><span class="s1">)[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">longopt_list]</span>
+
+  <span class="s0"># Find close approximations in flag prefixes.</span>
+  <span class="s0"># This also handles the case where the flag is spelled right but ambiguous.</span>
+  <span class="s1">distances = [(_damerau_levenshtein(attempt</span><span class="s3">, </span><span class="s1">option[</span><span class="s4">0</span><span class="s1">:len(attempt)])</span><span class="s3">, </span><span class="s1">option)</span>
+               <span class="s3">for </span><span class="s1">option </span><span class="s3">in </span><span class="s1">option_names]</span>
+  <span class="s0"># t[0] is distance, and sorting by t[1] allows us to have stable output.</span>
+  <span class="s1">distances.sort()</span>
+
+  <span class="s1">least_errors</span><span class="s3">, </span><span class="s1">_ = distances[</span><span class="s4">0</span><span class="s1">]</span>
+  <span class="s0"># Don't suggest excessively bad matches.</span>
+  <span class="s3">if </span><span class="s1">least_errors &gt;= _SUGGESTION_ERROR_RATE_THRESHOLD * len(attempt):</span>
+    <span class="s3">return </span><span class="s1">[]</span>
+
+  <span class="s1">suggestions = []</span>
+  <span class="s3">for </span><span class="s1">errors</span><span class="s3">, </span><span class="s1">name </span><span class="s3">in </span><span class="s1">distances:</span>
+    <span class="s3">if </span><span class="s1">errors == least_errors:</span>
+      <span class="s1">suggestions.append(name)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">break</span>
+  <span class="s3">return </span><span class="s1">suggestions</span>
+
+
+<span class="s3">def </span><span class="s1">_damerau_levenshtein(a</span><span class="s3">, </span><span class="s1">b):</span>
+  <span class="s2">&quot;&quot;&quot;Returns Damerau-Levenshtein edit distance from a to b.&quot;&quot;&quot;</span>
+  <span class="s1">memo = {}</span>
+
+  <span class="s3">def </span><span class="s1">distance(x</span><span class="s3">, </span><span class="s1">y):</span>
+    <span class="s2">&quot;&quot;&quot;Recursively defined string distance with memoization.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">(x</span><span class="s3">, </span><span class="s1">y) </span><span class="s3">in </span><span class="s1">memo:</span>
+      <span class="s3">return </span><span class="s1">memo[x</span><span class="s3">, </span><span class="s1">y]</span>
+    <span class="s3">if not </span><span class="s1">x:</span>
+      <span class="s1">d = len(y)</span>
+    <span class="s3">elif not </span><span class="s1">y:</span>
+      <span class="s1">d = len(x)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">d = min(</span>
+          <span class="s1">distance(x[</span><span class="s4">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">y) + </span><span class="s4">1</span><span class="s3">,  </span><span class="s0"># correct an insertion error</span>
+          <span class="s1">distance(x</span><span class="s3">, </span><span class="s1">y[</span><span class="s4">1</span><span class="s1">:]) + </span><span class="s4">1</span><span class="s3">,  </span><span class="s0"># correct a deletion error</span>
+          <span class="s1">distance(x[</span><span class="s4">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">y[</span><span class="s4">1</span><span class="s1">:]) + (x[</span><span class="s4">0</span><span class="s1">] != y[</span><span class="s4">0</span><span class="s1">]))  </span><span class="s0"># correct a wrong character</span>
+      <span class="s3">if </span><span class="s1">len(x) &gt;= </span><span class="s4">2 </span><span class="s3">and </span><span class="s1">len(y) &gt;= </span><span class="s4">2 </span><span class="s3">and </span><span class="s1">x[</span><span class="s4">0</span><span class="s1">] == y[</span><span class="s4">1</span><span class="s1">] </span><span class="s3">and </span><span class="s1">x[</span><span class="s4">1</span><span class="s1">] == y[</span><span class="s4">0</span><span class="s1">]:</span>
+        <span class="s0"># Correct a transposition.</span>
+        <span class="s1">t = distance(x[</span><span class="s4">2</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">y[</span><span class="s4">2</span><span class="s1">:]) + </span><span class="s4">1</span>
+        <span class="s3">if </span><span class="s1">d &gt; t:</span>
+          <span class="s1">d = t</span>
+
+    <span class="s1">memo[x</span><span class="s3">, </span><span class="s1">y] = d</span>
+    <span class="s3">return </span><span class="s1">d</span>
+  <span class="s3">return </span><span class="s1">distance(a</span><span class="s3">, </span><span class="s1">b)</span>
+
+
+<span class="s3">def </span><span class="s1">text_wrap(text</span><span class="s3">, </span><span class="s1">length=</span><span class="s3">None, </span><span class="s1">indent=</span><span class="s5">''</span><span class="s3">, </span><span class="s1">firstline_indent=</span><span class="s3">None</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Wraps a given text to a maximum line length and returns it. 
+ 
+  It turns lines that only contain whitespace into empty lines, keeps new lines, 
+  and expands tabs using 4 spaces. 
+ 
+  Args: 
+    text: str, text to wrap. 
+    length: int, maximum length of a line, includes indentation. 
+        If this is None then use get_help_width() 
+    indent: str, indent for all but first line. 
+    firstline_indent: str, indent for first line; if None, fall back to indent. 
+ 
+  Returns: 
+    str, the wrapped text. 
+ 
+  Raises: 
+    ValueError: Raised if indent or firstline_indent not shorter than length. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># Get defaults where callee used None</span>
+  <span class="s3">if </span><span class="s1">length </span><span class="s3">is None</span><span class="s1">:</span>
+    <span class="s1">length = get_help_width()</span>
+  <span class="s3">if </span><span class="s1">indent </span><span class="s3">is None</span><span class="s1">:</span>
+    <span class="s1">indent = </span><span class="s5">''</span>
+  <span class="s3">if </span><span class="s1">firstline_indent </span><span class="s3">is None</span><span class="s1">:</span>
+    <span class="s1">firstline_indent = indent</span>
+
+  <span class="s3">if </span><span class="s1">len(indent) &gt;= length:</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'Length of indent exceeds length'</span><span class="s1">)</span>
+  <span class="s3">if </span><span class="s1">len(firstline_indent) &gt;= length:</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'Length of first line indent exceeds length'</span><span class="s1">)</span>
+
+  <span class="s1">text = text.expandtabs(</span><span class="s4">4</span><span class="s1">)</span>
+
+  <span class="s1">result = []</span>
+  <span class="s0"># Create one wrapper for the first paragraph and one for subsequent</span>
+  <span class="s0"># paragraphs that does not have the initial wrapping.</span>
+  <span class="s1">wrapper = textwrap.TextWrapper(</span>
+      <span class="s1">width=length</span><span class="s3">, </span><span class="s1">initial_indent=firstline_indent</span><span class="s3">, </span><span class="s1">subsequent_indent=indent)</span>
+  <span class="s1">subsequent_wrapper = textwrap.TextWrapper(</span>
+      <span class="s1">width=length</span><span class="s3">, </span><span class="s1">initial_indent=indent</span><span class="s3">, </span><span class="s1">subsequent_indent=indent)</span>
+
+  <span class="s0"># textwrap does not have any special treatment for newlines. From the docs:</span>
+  <span class="s0"># &quot;...newlines may appear in the middle of a line and cause strange output.</span>
+  <span class="s0"># For this reason, text should be split into paragraphs (using</span>
+  <span class="s0"># str.splitlines() or similar) which are wrapped separately.&quot;</span>
+  <span class="s3">for </span><span class="s1">paragraph </span><span class="s3">in </span><span class="s1">(p.strip() </span><span class="s3">for </span><span class="s1">p </span><span class="s3">in </span><span class="s1">text.splitlines()):</span>
+    <span class="s3">if </span><span class="s1">paragraph:</span>
+      <span class="s1">result.extend(wrapper.wrap(paragraph))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">result.append(</span><span class="s5">''</span><span class="s1">)  </span><span class="s0"># Keep empty lines.</span>
+    <span class="s0"># Replace initial wrapper with wrapper for subsequent paragraphs.</span>
+    <span class="s1">wrapper = subsequent_wrapper</span>
+
+  <span class="s3">return </span><span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">.join(result)</span>
+
+
+<span class="s3">def </span><span class="s1">flag_dict_to_args(flag_map</span><span class="s3">, </span><span class="s1">multi_flags=</span><span class="s3">None</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Convert a dict of values into process call parameters. 
+ 
+  This method is used to convert a dictionary into a sequence of parameters 
+  for a binary that parses arguments using this module. 
+ 
+  Args: 
+    flag_map: dict, a mapping where the keys are flag names (strings). 
+        values are treated according to their type: 
+ 
+        * If value is ``None``, then only the name is emitted. 
+        * If value is ``True``, then only the name is emitted. 
+        * If value is ``False``, then only the name prepended with 'no' is 
+          emitted. 
+        * If value is a string then ``--name=value`` is emitted. 
+        * If value is a collection, this will emit 
+          ``--name=value1,value2,value3``, unless the flag name is in 
+          ``multi_flags``, in which case this will emit 
+          ``--name=value1 --name=value2 --name=value3``. 
+        * Everything else is converted to string an passed as such. 
+ 
+    multi_flags: set, names (strings) of flags that should be treated as 
+        multi-flags. 
+  Yields: 
+    sequence of string suitable for a subprocess execution. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">for </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">flag_map.items():</span>
+    <span class="s3">if </span><span class="s1">value </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">yield </span><span class="s5">'--%s' </span><span class="s1">% key</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">bool):</span>
+      <span class="s3">if </span><span class="s1">value:</span>
+        <span class="s3">yield </span><span class="s5">'--%s' </span><span class="s1">% key</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">yield </span><span class="s5">'--no%s' </span><span class="s1">% key</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">(bytes</span><span class="s3">, </span><span class="s1">type(</span><span class="s5">u''</span><span class="s1">))):</span>
+      <span class="s0"># We don't want strings to be handled like python collections.</span>
+      <span class="s3">yield </span><span class="s5">'--%s=%s' </span><span class="s1">% (key</span><span class="s3">, </span><span class="s1">value)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s0"># Now we attempt to deal with collections.</span>
+      <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">multi_flags </span><span class="s3">and </span><span class="s1">key </span><span class="s3">in </span><span class="s1">multi_flags:</span>
+          <span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">value:</span>
+            <span class="s3">yield </span><span class="s5">'--%s=%s' </span><span class="s1">% (key</span><span class="s3">, </span><span class="s1">str(item))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s3">yield </span><span class="s5">'--%s=%s' </span><span class="s1">% (key</span><span class="s3">, </span><span class="s5">','</span><span class="s1">.join(str(item) </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">value))</span>
+      <span class="s3">except </span><span class="s1">TypeError:</span>
+        <span class="s0"># Default case.</span>
+        <span class="s3">yield </span><span class="s5">'--%s=%s' </span><span class="s1">% (key</span><span class="s3">, </span><span class="s1">value)</span>
+
+
+<span class="s3">def </span><span class="s1">trim_docstring(docstring):</span>
+  <span class="s2">&quot;&quot;&quot;Removes indentation from triple-quoted strings. 
+ 
+  This is the function specified in PEP 257 to handle docstrings: 
+  https://www.python.org/dev/peps/pep-0257/. 
+ 
+  Args: 
+    docstring: str, a python docstring. 
+ 
+  Returns: 
+    str, docstring with indentation removed. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">if not </span><span class="s1">docstring:</span>
+    <span class="s3">return </span><span class="s5">''</span>
+
+  <span class="s0"># If you've got a line longer than this you have other problems...</span>
+  <span class="s1">max_indent = </span><span class="s4">1 </span><span class="s1">&lt;&lt; </span><span class="s4">29</span>
+
+  <span class="s0"># Convert tabs to spaces (following the normal Python rules)</span>
+  <span class="s0"># and split into a list of lines:</span>
+  <span class="s1">lines = docstring.expandtabs().splitlines()</span>
+
+  <span class="s0"># Determine minimum indentation (first line doesn't count):</span>
+  <span class="s1">indent = max_indent</span>
+  <span class="s3">for </span><span class="s1">line </span><span class="s3">in </span><span class="s1">lines[</span><span class="s4">1</span><span class="s1">:]:</span>
+    <span class="s1">stripped = line.lstrip()</span>
+    <span class="s3">if </span><span class="s1">stripped:</span>
+      <span class="s1">indent = min(indent</span><span class="s3">, </span><span class="s1">len(line) - len(stripped))</span>
+  <span class="s0"># Remove indentation (first line is special):</span>
+  <span class="s1">trimmed = [lines[</span><span class="s4">0</span><span class="s1">].strip()]</span>
+  <span class="s3">if </span><span class="s1">indent &lt; max_indent:</span>
+    <span class="s3">for </span><span class="s1">line </span><span class="s3">in </span><span class="s1">lines[</span><span class="s4">1</span><span class="s1">:]:</span>
+      <span class="s1">trimmed.append(line[indent:].rstrip())</span>
+  <span class="s0"># Strip off trailing and leading blank lines:</span>
+  <span class="s3">while </span><span class="s1">trimmed </span><span class="s3">and not </span><span class="s1">trimmed[-</span><span class="s4">1</span><span class="s1">]:</span>
+    <span class="s1">trimmed.pop()</span>
+  <span class="s3">while </span><span class="s1">trimmed </span><span class="s3">and not </span><span class="s1">trimmed[</span><span class="s4">0</span><span class="s1">]:</span>
+    <span class="s1">trimmed.pop(</span><span class="s4">0</span><span class="s1">)</span>
+  <span class="s0"># Return a single string:</span>
+  <span class="s3">return </span><span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">.join(trimmed)</span>
+
+
+<span class="s3">def </span><span class="s1">doc_to_help(doc):</span>
+  <span class="s2">&quot;&quot;&quot;Takes a __doc__ string and reformats it as help.&quot;&quot;&quot;</span>
+
+  <span class="s0"># Get rid of starting and ending white space. Using lstrip() or even</span>
+  <span class="s0"># strip() could drop more than maximum of first line and right space</span>
+  <span class="s0"># of last line.</span>
+  <span class="s1">doc = doc.strip()</span>
+
+  <span class="s0"># Get rid of all empty lines.</span>
+  <span class="s1">whitespace_only_line = re.compile(</span><span class="s5">'^[ </span><span class="s3">\t</span><span class="s5">]+$'</span><span class="s3">, </span><span class="s1">re.M)</span>
+  <span class="s1">doc = whitespace_only_line.sub(</span><span class="s5">''</span><span class="s3">, </span><span class="s1">doc)</span>
+
+  <span class="s0"># Cut out common space at line beginnings.</span>
+  <span class="s1">doc = trim_docstring(doc)</span>
+
+  <span class="s0"># Just like this module's comment, comments tend to be aligned somehow.</span>
+  <span class="s0"># In other words they all start with the same amount of white space.</span>
+  <span class="s0"># 1) keep double new lines;</span>
+  <span class="s0"># 2) keep ws after new lines if not empty line;</span>
+  <span class="s0"># 3) all other new lines shall be changed to a space;</span>
+  <span class="s0"># Solution: Match new lines between non white space and replace with space.</span>
+  <span class="s1">doc = re.sub(</span><span class="s5">r'(?&lt;=\S)\n(?=\S)'</span><span class="s3">, </span><span class="s5">' '</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">, </span><span class="s1">flags=re.M)</span>
+
+  <span class="s3">return </span><span class="s1">doc</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,282 @@
+<html>
+<head>
+<title>macRes.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+macRes.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">BytesIO</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">sstruct</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">tostr</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">OrderedDict</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">MutableMapping</span>
+
+
+<span class="s0">class </span><span class="s1">ResourceError(Exception):</span>
+	<span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">ResourceReader(MutableMapping):</span>
+	<span class="s2">&quot;&quot;&quot;Reader for Mac OS resource forks. 
+ 
+    Parses a resource fork and returns resources according to their type. 
+    If run on OS X, this will open the resource fork in the filesystem. 
+    Otherwise, it will open the file itself and attempt to read it as 
+    though it were a resource fork. 
+ 
+    The returned object can be indexed by type and iterated over, 
+    returning in each case a list of py:class:`Resource` objects 
+    representing all the resources of a certain type. 
+ 
+    &quot;&quot;&quot;</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fileOrPath):</span>
+		<span class="s2">&quot;&quot;&quot;Open a file 
+ 
+        Args: 
+            fileOrPath: Either an object supporting a ``read`` method, an 
+                ``os.PathLike`` object, or a string. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">self._resources = OrderedDict()</span>
+		<span class="s0">if </span><span class="s1">hasattr(fileOrPath</span><span class="s0">, </span><span class="s3">'read'</span><span class="s1">):</span>
+			<span class="s1">self.file = fileOrPath</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">try</span><span class="s1">:</span>
+				<span class="s4"># try reading from the resource fork (only works on OS X)</span>
+				<span class="s1">self.file = self.openResourceFork(fileOrPath)</span>
+				<span class="s1">self._readFile()</span>
+				<span class="s0">return</span>
+			<span class="s0">except </span><span class="s1">(ResourceError</span><span class="s0">, </span><span class="s1">IOError):</span>
+				<span class="s4"># if it fails, use the data fork</span>
+				<span class="s1">self.file = self.openDataFork(fileOrPath)</span>
+		<span class="s1">self._readFile()</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">openResourceFork(path):</span>
+		<span class="s0">if </span><span class="s1">hasattr(path</span><span class="s0">, </span><span class="s3">&quot;__fspath__&quot;</span><span class="s1">):  </span><span class="s4"># support os.PathLike objects</span>
+			<span class="s1">path = path.__fspath__()</span>
+		<span class="s0">with </span><span class="s1">open(path + </span><span class="s3">'/..namedfork/rsrc'</span><span class="s0">, </span><span class="s3">'rb'</span><span class="s1">) </span><span class="s0">as </span><span class="s1">resfork:</span>
+			<span class="s1">data = resfork.read()</span>
+		<span class="s1">infile = BytesIO(data)</span>
+		<span class="s1">infile.name = path</span>
+		<span class="s0">return </span><span class="s1">infile</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">openDataFork(path):</span>
+		<span class="s0">with </span><span class="s1">open(path</span><span class="s0">, </span><span class="s3">'rb'</span><span class="s1">) </span><span class="s0">as </span><span class="s1">datafork:</span>
+			<span class="s1">data = datafork.read()</span>
+		<span class="s1">infile = BytesIO(data)</span>
+		<span class="s1">infile.name = path</span>
+		<span class="s0">return </span><span class="s1">infile</span>
+
+	<span class="s0">def </span><span class="s1">_readFile(self):</span>
+		<span class="s1">self._readHeaderAndMap()</span>
+		<span class="s1">self._readTypeList()</span>
+
+	<span class="s0">def </span><span class="s1">_read(self</span><span class="s0">, </span><span class="s1">numBytes</span><span class="s0">, </span><span class="s1">offset=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">offset </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s0">try</span><span class="s1">:</span>
+				<span class="s1">self.file.seek(offset)</span>
+			<span class="s0">except </span><span class="s1">OverflowError:</span>
+				<span class="s0">raise </span><span class="s1">ResourceError(</span><span class="s3">&quot;Failed to seek offset ('offset' is too large)&quot;</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">self.file.tell() != offset:</span>
+				<span class="s0">raise </span><span class="s1">ResourceError(</span><span class="s3">'Failed to seek offset (reached EOF)'</span><span class="s1">)</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">data = self.file.read(numBytes)</span>
+		<span class="s0">except </span><span class="s1">OverflowError:</span>
+			<span class="s0">raise </span><span class="s1">ResourceError(</span><span class="s3">&quot;Cannot read resource ('numBytes' is too large)&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">len(data) != numBytes:</span>
+			<span class="s0">raise </span><span class="s1">ResourceError(</span><span class="s3">'Cannot read resource (not enough data)'</span><span class="s1">)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_readHeaderAndMap(self):</span>
+		<span class="s1">self.file.seek(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">headerData = self._read(ResourceForkHeaderSize)</span>
+		<span class="s1">sstruct.unpack(ResourceForkHeader</span><span class="s0">, </span><span class="s1">headerData</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s4"># seek to resource map, skip reserved</span>
+		<span class="s1">mapOffset = self.mapOffset + </span><span class="s5">22</span>
+		<span class="s1">resourceMapData = self._read(ResourceMapHeaderSize</span><span class="s0">, </span><span class="s1">mapOffset)</span>
+		<span class="s1">sstruct.unpack(ResourceMapHeader</span><span class="s0">, </span><span class="s1">resourceMapData</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">self.absTypeListOffset = self.mapOffset + self.typeListOffset</span>
+		<span class="s1">self.absNameListOffset = self.mapOffset + self.nameListOffset</span>
+
+	<span class="s0">def </span><span class="s1">_readTypeList(self):</span>
+		<span class="s1">absTypeListOffset = self.absTypeListOffset</span>
+		<span class="s1">numTypesData = self._read(</span><span class="s5">2</span><span class="s0">, </span><span class="s1">absTypeListOffset)</span>
+		<span class="s1">self.numTypes</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">'&gt;H'</span><span class="s0">, </span><span class="s1">numTypesData)</span>
+		<span class="s1">absTypeListOffset2 = absTypeListOffset + </span><span class="s5">2</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.numTypes + </span><span class="s5">1</span><span class="s1">):</span>
+			<span class="s1">resTypeItemOffset = absTypeListOffset2 + ResourceTypeItemSize * i</span>
+			<span class="s1">resTypeItemData = self._read(ResourceTypeItemSize</span><span class="s0">, </span><span class="s1">resTypeItemOffset)</span>
+			<span class="s1">item = sstruct.unpack(ResourceTypeItem</span><span class="s0">, </span><span class="s1">resTypeItemData)</span>
+			<span class="s1">resType = tostr(item[</span><span class="s3">'type'</span><span class="s1">]</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">'mac-roman'</span><span class="s1">)</span>
+			<span class="s1">refListOffset = absTypeListOffset + item[</span><span class="s3">'refListOffset'</span><span class="s1">]</span>
+			<span class="s1">numRes = item[</span><span class="s3">'numRes'</span><span class="s1">] + </span><span class="s5">1</span>
+			<span class="s1">resources = self._readReferenceList(resType</span><span class="s0">, </span><span class="s1">refListOffset</span><span class="s0">, </span><span class="s1">numRes)</span>
+			<span class="s1">self._resources[resType] = resources</span>
+
+	<span class="s0">def </span><span class="s1">_readReferenceList(self</span><span class="s0">, </span><span class="s1">resType</span><span class="s0">, </span><span class="s1">refListOffset</span><span class="s0">, </span><span class="s1">numRes):</span>
+		<span class="s1">resources = []</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numRes):</span>
+			<span class="s1">refOffset = refListOffset + ResourceRefItemSize * i</span>
+			<span class="s1">refData = self._read(ResourceRefItemSize</span><span class="s0">, </span><span class="s1">refOffset)</span>
+			<span class="s1">res = Resource(resType)</span>
+			<span class="s1">res.decompile(refData</span><span class="s0">, </span><span class="s1">self)</span>
+			<span class="s1">resources.append(res)</span>
+		<span class="s0">return </span><span class="s1">resources</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">resType):</span>
+		<span class="s0">return </span><span class="s1">self._resources[resType]</span>
+
+	<span class="s0">def </span><span class="s1">__delitem__(self</span><span class="s0">, </span><span class="s1">resType):</span>
+		<span class="s0">del </span><span class="s1">self._resources[resType]</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">resType</span><span class="s0">, </span><span class="s1">resources):</span>
+		<span class="s1">self._resources[resType] = resources</span>
+
+	<span class="s0">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">return </span><span class="s1">len(self._resources)</span>
+
+	<span class="s0">def </span><span class="s1">__iter__(self):</span>
+		<span class="s0">return </span><span class="s1">iter(self._resources)</span>
+
+	<span class="s0">def </span><span class="s1">keys(self):</span>
+		<span class="s0">return </span><span class="s1">self._resources.keys()</span>
+
+	<span class="s1">@property</span>
+	<span class="s0">def </span><span class="s1">types(self):</span>
+		<span class="s2">&quot;&quot;&quot;A list of the types of resources in the resource fork.&quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">list(self._resources.keys())</span>
+
+	<span class="s0">def </span><span class="s1">countResources(self</span><span class="s0">, </span><span class="s1">resType):</span>
+		<span class="s2">&quot;&quot;&quot;Return the number of resources of a given type.&quot;&quot;&quot;</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">len(self[resType])</span>
+		<span class="s0">except </span><span class="s1">KeyError:</span>
+			<span class="s0">return </span><span class="s5">0</span>
+
+	<span class="s0">def </span><span class="s1">getIndices(self</span><span class="s0">, </span><span class="s1">resType):</span>
+		<span class="s2">&quot;&quot;&quot;Returns a list of indices of resources of a given type.&quot;&quot;&quot;</span>
+		<span class="s1">numRes = self.countResources(resType)</span>
+		<span class="s0">if </span><span class="s1">numRes:</span>
+			<span class="s0">return </span><span class="s1">list(range(</span><span class="s5">1</span><span class="s0">, </span><span class="s1">numRes+</span><span class="s5">1</span><span class="s1">))</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">[]</span>
+
+	<span class="s0">def </span><span class="s1">getNames(self</span><span class="s0">, </span><span class="s1">resType):</span>
+		<span class="s2">&quot;&quot;&quot;Return list of names of all resources of a given type.&quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">[res.name </span><span class="s0">for </span><span class="s1">res </span><span class="s0">in </span><span class="s1">self.get(resType</span><span class="s0">, </span><span class="s1">[]) </span><span class="s0">if </span><span class="s1">res.name </span><span class="s0">is not None</span><span class="s1">]</span>
+
+	<span class="s0">def </span><span class="s1">getIndResource(self</span><span class="s0">, </span><span class="s1">resType</span><span class="s0">, </span><span class="s1">index):</span>
+		<span class="s2">&quot;&quot;&quot;Return resource of given type located at an index ranging from 1 
+        to the number of resources for that type, or None if not found. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">index &lt; </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s0">return None</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">res = self[resType][index-</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s0">except </span><span class="s1">(KeyError</span><span class="s0">, </span><span class="s1">IndexError):</span>
+			<span class="s0">return None</span>
+		<span class="s0">return </span><span class="s1">res</span>
+
+	<span class="s0">def </span><span class="s1">getNamedResource(self</span><span class="s0">, </span><span class="s1">resType</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s2">&quot;&quot;&quot;Return the named resource of given type, else return None.&quot;&quot;&quot;</span>
+		<span class="s1">name = tostr(name</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">'mac-roman'</span><span class="s1">)</span>
+		<span class="s0">for </span><span class="s1">res </span><span class="s0">in </span><span class="s1">self.get(resType</span><span class="s0">, </span><span class="s1">[]):</span>
+			<span class="s0">if </span><span class="s1">res.name == name:</span>
+				<span class="s0">return </span><span class="s1">res</span>
+		<span class="s0">return None</span>
+
+	<span class="s0">def </span><span class="s1">close(self):</span>
+		<span class="s0">if not </span><span class="s1">self.file.closed:</span>
+			<span class="s1">self.file.close()</span>
+
+
+<span class="s0">class </span><span class="s1">Resource(object):</span>
+	<span class="s2">&quot;&quot;&quot;Represents a resource stored within a resource fork. 
+ 
+    Attributes: 
+        type: resource type. 
+        data: resource data. 
+        id: ID. 
+        name: resource name. 
+        attr: attributes. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">resType=</span><span class="s0">None, </span><span class="s1">resData=</span><span class="s0">None, </span><span class="s1">resID=</span><span class="s0">None, </span><span class="s1">resName=</span><span class="s0">None,</span>
+			     <span class="s1">resAttr=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.type = resType</span>
+		<span class="s1">self.data = resData</span>
+		<span class="s1">self.id = resID</span>
+		<span class="s1">self.name = resName</span>
+		<span class="s1">self.attr = resAttr</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">refData</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s1">sstruct.unpack(ResourceRefItem</span><span class="s0">, </span><span class="s1">refData</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s4"># interpret 3-byte dataOffset as (padded) ULONG to unpack it with struct</span>
+		<span class="s1">self.dataOffset</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">'&gt;L'</span><span class="s0">, </span><span class="s1">bytesjoin([</span><span class="s6">b&quot;</span><span class="s0">\0</span><span class="s6">&quot;</span><span class="s0">, </span><span class="s1">self.dataOffset]))</span>
+		<span class="s1">absDataOffset = reader.dataOffset + self.dataOffset</span>
+		<span class="s1">dataLength</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">reader._read(</span><span class="s5">4</span><span class="s0">, </span><span class="s1">absDataOffset))</span>
+		<span class="s1">self.data = reader._read(dataLength)</span>
+		<span class="s0">if </span><span class="s1">self.nameOffset == -</span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s0">return</span>
+		<span class="s1">absNameOffset = reader.absNameListOffset + self.nameOffset</span>
+		<span class="s1">nameLength</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">'B'</span><span class="s0">, </span><span class="s1">reader._read(</span><span class="s5">1</span><span class="s0">, </span><span class="s1">absNameOffset))</span>
+		<span class="s1">name</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">'&gt;%ss' </span><span class="s1">% nameLength</span><span class="s0">, </span><span class="s1">reader._read(nameLength))</span>
+		<span class="s1">self.name = tostr(name</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">'mac-roman'</span><span class="s1">)</span>
+
+
+<span class="s1">ResourceForkHeader = </span><span class="s3">&quot;&quot;&quot; 
+        &gt; # big endian 
+        dataOffset:     L 
+        mapOffset:      L 
+        dataLen:        L 
+        mapLen:         L 
+&quot;&quot;&quot;</span>
+
+<span class="s1">ResourceForkHeaderSize = sstruct.calcsize(ResourceForkHeader)</span>
+
+<span class="s1">ResourceMapHeader = </span><span class="s3">&quot;&quot;&quot; 
+        &gt; # big endian 
+        attr:              H 
+        typeListOffset:    H 
+        nameListOffset:    H 
+&quot;&quot;&quot;</span>
+
+<span class="s1">ResourceMapHeaderSize = sstruct.calcsize(ResourceMapHeader)</span>
+
+<span class="s1">ResourceTypeItem = </span><span class="s3">&quot;&quot;&quot; 
+        &gt; # big endian 
+        type:              4s 
+        numRes:            H 
+        refListOffset:     H 
+&quot;&quot;&quot;</span>
+
+<span class="s1">ResourceTypeItemSize = sstruct.calcsize(ResourceTypeItem)</span>
+
+<span class="s1">ResourceRefItem = </span><span class="s3">&quot;&quot;&quot; 
+        &gt; # big endian 
+        id:                h 
+        nameOffset:        h 
+        attr:              B 
+        dataOffset:        3s 
+        reserved:          L 
+&quot;&quot;&quot;</span>
+
+<span class="s1">ResourceRefItemSize = sstruct.calcsize(ResourceRefItem)</span>
+</pre>
+</body>
+</html>

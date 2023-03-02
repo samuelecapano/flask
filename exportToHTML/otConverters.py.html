@@ -1,0 +1,1834 @@
+<html>
+<head>
+<title>otConverters.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+otConverters.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc.fixedTools </span><span class="s0">import </span><span class="s1">(</span>
+	<span class="s1">fixedToFloat </span><span class="s0">as </span><span class="s1">fi2fl</span><span class="s0">,</span>
+	<span class="s1">floatToFixed </span><span class="s0">as </span><span class="s1">fl2fi</span><span class="s0">,</span>
+	<span class="s1">floatToFixedToStr </span><span class="s0">as </span><span class="s1">fl2str</span><span class="s0">,</span>
+	<span class="s1">strToFixedToFloat </span><span class="s0">as </span><span class="s1">str2fl</span><span class="s0">,</span>
+	<span class="s1">ensureVersionIsLong </span><span class="s0">as </span><span class="s1">fi2ve</span><span class="s0">,</span>
+	<span class="s1">versionToFixed </span><span class="s0">as </span><span class="s1">ve2fi</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s0">import </span><span class="s1">nearestMultipleShortestRepr</span><span class="s0">, </span><span class="s1">otRound</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">tobytes</span><span class="s0">, </span><span class="s1">tostr</span><span class="s0">, </span><span class="s1">pad</span><span class="s0">, </span><span class="s1">safeEval</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib </span><span class="s0">import </span><span class="s1">getSearchRange</span>
+<span class="s0">from </span><span class="s1">.otBase </span><span class="s0">import </span><span class="s1">(CountReference</span><span class="s0">, </span><span class="s1">FormatSwitchingBaseTable</span><span class="s0">,</span>
+                     <span class="s1">OTTableReader</span><span class="s0">, </span><span class="s1">OTTableWriter</span><span class="s0">, </span><span class="s1">ValueRecordFactory)</span>
+<span class="s0">from </span><span class="s1">.otTables </span><span class="s0">import </span><span class="s1">(lookupTypes</span><span class="s0">, </span><span class="s1">AATStateTable</span><span class="s0">, </span><span class="s1">AATState</span><span class="s0">, </span><span class="s1">AATAction</span><span class="s0">,</span>
+                       <span class="s1">ContextualMorphAction</span><span class="s0">, </span><span class="s1">LigatureMorphAction</span><span class="s0">,</span>
+                       <span class="s1">InsertionMorphAction</span><span class="s0">, </span><span class="s1">MorxSubtable</span><span class="s0">,</span>
+                       <span class="s1">ExtendMode </span><span class="s0">as </span><span class="s1">_ExtendMode</span><span class="s0">,</span>
+                       <span class="s1">CompositeMode </span><span class="s0">as </span><span class="s1">_CompositeMode</span><span class="s0">,</span>
+                       <span class="s1">NO_VARIATION_INDEX)</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">zip_longest</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">partial</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Optional</span>
+<span class="s0">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+<span class="s1">istuple = </span><span class="s0">lambda </span><span class="s1">t: isinstance(t</span><span class="s0">, </span><span class="s1">tuple)</span>
+
+
+<span class="s0">def </span><span class="s1">buildConverters(tableSpec</span><span class="s0">, </span><span class="s1">tableNamespace):</span>
+	<span class="s2">&quot;&quot;&quot;Given a table spec from otData.py, build a converter object for each 
+    field of the table. This is called for each table in otData.py, and 
+    the results are assigned to the corresponding class in otTables.py.&quot;&quot;&quot;</span>
+	<span class="s1">converters = []</span>
+	<span class="s1">convertersByName = {}</span>
+	<span class="s0">for </span><span class="s1">tp</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">descr </span><span class="s0">in </span><span class="s1">tableSpec:</span>
+		<span class="s1">tableName = name</span>
+		<span class="s0">if </span><span class="s1">name.startswith(</span><span class="s3">&quot;ValueFormat&quot;</span><span class="s1">):</span>
+			<span class="s0">assert </span><span class="s1">tp == </span><span class="s3">&quot;uint16&quot;</span>
+			<span class="s1">converterClass = ValueFormat</span>
+		<span class="s0">elif </span><span class="s1">name.endswith(</span><span class="s3">&quot;Count&quot;</span><span class="s1">) </span><span class="s0">or </span><span class="s1">name </span><span class="s0">in </span><span class="s1">(</span><span class="s3">&quot;StructLength&quot;</span><span class="s0">, </span><span class="s3">&quot;MorphType&quot;</span><span class="s1">):</span>
+			<span class="s1">converterClass = {</span>
+				<span class="s3">&quot;uint8&quot;</span><span class="s1">: ComputedUInt8</span><span class="s0">,</span>
+				<span class="s3">&quot;uint16&quot;</span><span class="s1">: ComputedUShort</span><span class="s0">,</span>
+				<span class="s3">&quot;uint32&quot;</span><span class="s1">: ComputedULong</span><span class="s0">,</span>
+			<span class="s1">}[tp]</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">&quot;SubTable&quot;</span><span class="s1">:</span>
+			<span class="s1">converterClass = SubTable</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">&quot;ExtSubTable&quot;</span><span class="s1">:</span>
+			<span class="s1">converterClass = ExtSubTable</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">&quot;SubStruct&quot;</span><span class="s1">:</span>
+			<span class="s1">converterClass = SubStruct</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">&quot;FeatureParams&quot;</span><span class="s1">:</span>
+			<span class="s1">converterClass = FeatureParams</span>
+		<span class="s0">elif </span><span class="s1">name </span><span class="s0">in </span><span class="s1">(</span><span class="s3">&quot;CIDGlyphMapping&quot;</span><span class="s0">, </span><span class="s3">&quot;GlyphCIDMapping&quot;</span><span class="s1">):</span>
+			<span class="s1">converterClass = StructWithLength</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">if not </span><span class="s1">tp </span><span class="s0">in </span><span class="s1">converterMapping </span><span class="s0">and </span><span class="s3">'(' </span><span class="s0">not in </span><span class="s1">tp:</span>
+				<span class="s1">tableName = tp</span>
+				<span class="s1">converterClass = Struct</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">converterClass = eval(tp</span><span class="s0">, </span><span class="s1">tableNamespace</span><span class="s0">, </span><span class="s1">converterMapping)</span>
+
+		<span class="s1">conv = converterClass(name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">description=descr)</span>
+
+		<span class="s0">if </span><span class="s1">conv.tableClass:</span>
+			<span class="s4"># A &quot;template&quot; such as OffsetTo(AType) knowss the table class already</span>
+			<span class="s1">tableClass = conv.tableClass</span>
+		<span class="s0">elif </span><span class="s1">tp </span><span class="s0">in </span><span class="s1">(</span><span class="s3">'MortChain'</span><span class="s0">, </span><span class="s3">'MortSubtable'</span><span class="s0">, </span><span class="s3">'MorxChain'</span><span class="s1">):</span>
+			<span class="s1">tableClass = tableNamespace.get(tp)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">tableClass = tableNamespace.get(tableName)</span>
+
+		<span class="s0">if not </span><span class="s1">conv.tableClass:</span>
+			<span class="s1">conv.tableClass = tableClass</span>
+
+		<span class="s0">if </span><span class="s1">name </span><span class="s0">in </span><span class="s1">[</span><span class="s3">&quot;SubTable&quot;</span><span class="s0">, </span><span class="s3">&quot;ExtSubTable&quot;</span><span class="s0">, </span><span class="s3">&quot;SubStruct&quot;</span><span class="s1">]:</span>
+			<span class="s1">conv.lookupTypes = tableNamespace[</span><span class="s3">'lookupTypes'</span><span class="s1">]</span>
+			<span class="s4"># also create reverse mapping</span>
+			<span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">conv.lookupTypes.values():</span>
+				<span class="s0">for </span><span class="s1">cls </span><span class="s0">in </span><span class="s1">t.values():</span>
+					<span class="s1">convertersByName[cls.__name__] = Table(name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">cls)</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s3">&quot;FeatureParams&quot;</span><span class="s1">:</span>
+			<span class="s1">conv.featureParamTypes = tableNamespace[</span><span class="s3">'featureParamTypes'</span><span class="s1">]</span>
+			<span class="s1">conv.defaultFeatureParams = tableNamespace[</span><span class="s3">'FeatureParams'</span><span class="s1">]</span>
+			<span class="s0">for </span><span class="s1">cls </span><span class="s0">in </span><span class="s1">conv.featureParamTypes.values():</span>
+				<span class="s1">convertersByName[cls.__name__] = Table(name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">cls)</span>
+		<span class="s1">converters.append(conv)</span>
+		<span class="s0">assert </span><span class="s1">name </span><span class="s0">not in </span><span class="s1">convertersByName</span><span class="s0">, </span><span class="s1">name</span>
+		<span class="s1">convertersByName[name] = conv</span>
+	<span class="s0">return </span><span class="s1">converters</span><span class="s0">, </span><span class="s1">convertersByName</span>
+
+
+<span class="s0">class </span><span class="s1">_MissingItem(tuple):</span>
+	<span class="s1">__slots__ = ()</span>
+
+
+<span class="s0">try</span><span class="s1">:</span>
+	<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">UserList</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+	<span class="s0">from </span><span class="s1">UserList </span><span class="s0">import </span><span class="s1">UserList</span>
+
+
+<span class="s0">class </span><span class="s1">_LazyList(UserList):</span>
+
+	<span class="s0">def </span><span class="s1">__getslice__(self</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">j):</span>
+		<span class="s0">return </span><span class="s1">self.__getitem__(slice(i</span><span class="s0">, </span><span class="s1">j))</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">k):</span>
+		<span class="s0">if </span><span class="s1">isinstance(k</span><span class="s0">, </span><span class="s1">slice):</span>
+			<span class="s1">indices = range(*k.indices(len(self)))</span>
+			<span class="s0">return </span><span class="s1">[self[i] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">indices]</span>
+		<span class="s1">item = self.data[k]</span>
+		<span class="s0">if </span><span class="s1">isinstance(item</span><span class="s0">, </span><span class="s1">_MissingItem):</span>
+			<span class="s1">self.reader.seek(self.pos + item[</span><span class="s5">0</span><span class="s1">] * self.recordSize)</span>
+			<span class="s1">item = self.conv.read(self.reader</span><span class="s0">, </span><span class="s1">self.font</span><span class="s0">, </span><span class="s1">{})</span>
+			<span class="s1">self.data[k] = item</span>
+		<span class="s0">return </span><span class="s1">item</span>
+
+	<span class="s0">def </span><span class="s1">__add__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">_LazyList):</span>
+			<span class="s1">other = list(other)</span>
+		<span class="s0">elif </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">list):</span>
+			<span class="s0">pass</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+		<span class="s0">return </span><span class="s1">list(self) + other</span>
+
+	<span class="s0">def </span><span class="s1">__radd__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if not </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">list):</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+		<span class="s0">return </span><span class="s1">other + list(self)</span>
+
+
+<span class="s0">class </span><span class="s1">BaseConverter(object):</span>
+
+	<span class="s2">&quot;&quot;&quot;Base class for converter objects. Apart from the constructor, this 
+    is an abstract class.&quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass=</span><span class="s0">None, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">description=</span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+		<span class="s1">self.name = name</span>
+		<span class="s1">self.repeat = repeat</span>
+		<span class="s1">self.aux = aux</span>
+		<span class="s1">self.tableClass = tableClass</span>
+		<span class="s1">self.isCount = name.endswith(</span><span class="s3">&quot;Count&quot;</span><span class="s1">) </span><span class="s0">or </span><span class="s1">name </span><span class="s0">in </span><span class="s1">[</span><span class="s3">'DesignAxisRecordSize'</span><span class="s0">, </span><span class="s3">'ValueRecordSize'</span><span class="s1">]</span>
+		<span class="s1">self.isLookupType = name.endswith(</span><span class="s3">&quot;LookupType&quot;</span><span class="s1">) </span><span class="s0">or </span><span class="s1">name == </span><span class="s3">&quot;MorphType&quot;</span>
+		<span class="s1">self.isPropagated = name </span><span class="s0">in </span><span class="s1">[</span>
+			<span class="s3">&quot;ClassCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;Class2Count&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;FeatureTag&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;SettingsCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;VarRegionCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;MappingCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;RegionAxisCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;DesignAxisCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;DesignAxisRecordSize&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;AxisValueCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;ValueRecordSize&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;AxisCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;BaseGlyphRecordCount&quot;</span><span class="s0">,</span>
+			<span class="s3">&quot;LayerRecordCount&quot;</span><span class="s0">,</span>
+		<span class="s1">]</span>
+		<span class="s1">self.description = description</span>
+
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s2">&quot;&quot;&quot;Read an array of values from the reader.&quot;&quot;&quot;</span>
+		<span class="s1">lazy = font.lazy </span><span class="s0">and </span><span class="s1">count &gt; </span><span class="s5">8</span>
+		<span class="s0">if </span><span class="s1">lazy:</span>
+			<span class="s1">recordSize = self.getRecordSize(reader)</span>
+			<span class="s0">if </span><span class="s1">recordSize </span><span class="s0">is </span><span class="s1">NotImplemented:</span>
+				<span class="s1">lazy = </span><span class="s0">False</span>
+		<span class="s0">if not </span><span class="s1">lazy:</span>
+			<span class="s1">l = []</span>
+			<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(count):</span>
+				<span class="s1">l.append(self.read(reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict))</span>
+			<span class="s0">return </span><span class="s1">l</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">l = _LazyList()</span>
+			<span class="s1">l.reader = reader.copy()</span>
+			<span class="s1">l.pos = l.reader.pos</span>
+			<span class="s1">l.font = font</span>
+			<span class="s1">l.conv = self</span>
+			<span class="s1">l.recordSize = recordSize</span>
+			<span class="s1">l.extend(_MissingItem([i]) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(count))</span>
+			<span class="s1">reader.advance(count * recordSize)</span>
+			<span class="s0">return </span><span class="s1">l</span>
+
+	<span class="s0">def </span><span class="s1">getRecordSize(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'staticSize'</span><span class="s1">): </span><span class="s0">return </span><span class="s1">self.staticSize</span>
+		<span class="s0">return </span><span class="s1">NotImplemented</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s2">&quot;&quot;&quot;Read a value from the reader.&quot;&quot;&quot;</span>
+		<span class="s0">raise </span><span class="s1">NotImplementedError(self)</span>
+
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">enumerate(values):</span>
+				<span class="s1">self.write(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">i)</span>
+		<span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+			<span class="s1">e.args = e.args + (i</span><span class="s0">,</span><span class="s1">)</span>
+			<span class="s0">raise</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Write a value to the writer.&quot;&quot;&quot;</span>
+		<span class="s0">raise </span><span class="s1">NotImplementedError(self)</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s2">&quot;&quot;&quot;Read a value from XML.&quot;&quot;&quot;</span>
+		<span class="s0">raise </span><span class="s1">NotImplementedError(self)</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s2">&quot;&quot;&quot;Write a value to XML.&quot;&quot;&quot;</span>
+		<span class="s0">raise </span><span class="s1">NotImplementedError(self)</span>
+
+	<span class="s1">varIndexBasePlusOffsetRE = re.compile(</span><span class="s3">r&quot;VarIndexBase\s*\+\s*(\d+)&quot;</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">getVarIndexOffset(self) -&gt; Optional[int]:</span>
+		<span class="s2">&quot;&quot;&quot;If description has `VarIndexBase + {offset}`, return the offset else None.&quot;&quot;&quot;</span>
+		<span class="s1">m = self.varIndexBasePlusOffsetRE.search(self.description)</span>
+		<span class="s0">if not </span><span class="s1">m:</span>
+			<span class="s0">return None</span>
+		<span class="s0">return </span><span class="s1">int(m.group(</span><span class="s5">1</span><span class="s1">))</span>
+
+
+<span class="s0">class </span><span class="s1">SimpleValue(BaseConverter):</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">toString(value):</span>
+		<span class="s0">return </span><span class="s1">value</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(value):</span>
+		<span class="s0">return </span><span class="s1">value</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">self.toString(value))])</span>
+		<span class="s1">xmlWriter.newline()</span>
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">return </span><span class="s1">self.fromString(attrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+
+<span class="s0">class </span><span class="s1">OptionalValue(SimpleValue):</span>
+	<span class="s1">DEFAULT = </span><span class="s0">None</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s0">if </span><span class="s1">value != self.DEFAULT:</span>
+			<span class="s1">attrs.append((</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">self.toString(value)))</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">if </span><span class="s3">&quot;value&quot; </span><span class="s0">in </span><span class="s1">attrs:</span>
+			<span class="s0">return </span><span class="s1">self.fromString(attrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+		<span class="s0">return </span><span class="s1">self.DEFAULT</span>
+
+<span class="s0">class </span><span class="s1">IntValue(SimpleValue):</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(value):</span>
+		<span class="s0">return </span><span class="s1">int(value</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span>
+
+<span class="s0">class </span><span class="s1">Long(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readLong()</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">reader.readLongArray(count)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeLong(value)</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeLongArray(values)</span>
+
+<span class="s0">class </span><span class="s1">ULong(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readULong()</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">reader.readULongArray(count)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeULong(value)</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeULongArray(values)</span>
+
+<span class="s0">class </span><span class="s1">Flags32(ULong):</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">toString(value):</span>
+		<span class="s0">return </span><span class="s3">&quot;0x%08X&quot; </span><span class="s1">% value</span>
+
+<span class="s0">class </span><span class="s1">VarIndex(OptionalValue</span><span class="s0">, </span><span class="s1">ULong):</span>
+	<span class="s1">DEFAULT = NO_VARIATION_INDEX</span>
+
+<span class="s0">class </span><span class="s1">Short(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readShort()</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">reader.readShortArray(count)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeShort(value)</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeShortArray(values)</span>
+
+<span class="s0">class </span><span class="s1">UShort(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readUShort()</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">reader.readUShortArray(count)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeUShort(value)</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeUShortArray(values)</span>
+
+<span class="s0">class </span><span class="s1">Int8(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">1</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readInt8()</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">reader.readInt8Array(count)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeInt8(value)</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeInt8Array(values)</span>
+
+<span class="s0">class </span><span class="s1">UInt8(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">1</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readUInt8()</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">reader.readUInt8Array(count)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeUInt8(value)</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeUInt8Array(values)</span>
+
+<span class="s0">class </span><span class="s1">UInt24(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">3</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readUInt24()</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeUInt24(value)</span>
+
+<span class="s0">class </span><span class="s1">ComputedInt(IntValue):</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s0">if </span><span class="s1">value </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">xmlWriter.comment(</span><span class="s3">&quot;%s=%s&quot; </span><span class="s1">% (name</span><span class="s0">, </span><span class="s1">value))</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+<span class="s0">class </span><span class="s1">ComputedUInt8(ComputedInt</span><span class="s0">, </span><span class="s1">UInt8):</span>
+	<span class="s0">pass</span>
+<span class="s0">class </span><span class="s1">ComputedUShort(ComputedInt</span><span class="s0">, </span><span class="s1">UShort):</span>
+	<span class="s0">pass</span>
+<span class="s0">class </span><span class="s1">ComputedULong(ComputedInt</span><span class="s0">, </span><span class="s1">ULong):</span>
+	<span class="s0">pass</span>
+
+<span class="s0">class </span><span class="s1">Tag(SimpleValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readTag()</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeTag(value)</span>
+
+<span class="s0">class </span><span class="s1">GlyphID(SimpleValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+	<span class="s1">typecode = </span><span class="s3">&quot;H&quot;</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">font.getGlyphNameMany(reader.readArray(self.typecode</span><span class="s0">, </span><span class="s1">self.staticSize</span><span class="s0">, </span><span class="s1">count))</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">font.getGlyphName(reader.readValue(self.typecode</span><span class="s0">, </span><span class="s1">self.staticSize))</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeArray(self.typecode</span><span class="s0">, </span><span class="s1">font.getGlyphIDMany(values))</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeValue(self.typecode</span><span class="s0">, </span><span class="s1">font.getGlyphID(value))</span>
+
+
+<span class="s0">class </span><span class="s1">GlyphID32(GlyphID):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s1">typecode = </span><span class="s3">&quot;L&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">NameID(UShort):</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">value)])</span>
+		<span class="s0">if </span><span class="s1">font </span><span class="s0">and </span><span class="s1">value:</span>
+			<span class="s1">nameTable = font.get(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">nameTable:</span>
+				<span class="s1">name = nameTable.getDebugName(value)</span>
+				<span class="s1">xmlWriter.write(</span><span class="s3">&quot;  &quot;</span><span class="s1">)</span>
+				<span class="s0">if </span><span class="s1">name:</span>
+					<span class="s1">xmlWriter.comment(name)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">xmlWriter.comment(</span><span class="s3">&quot;missing from name table&quot;</span><span class="s1">)</span>
+					<span class="s1">log.warning(</span><span class="s3">&quot;name id %d missing from name table&quot; </span><span class="s1">% value)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+<span class="s0">class </span><span class="s1">STATFlags(UShort):</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">value)])</span>
+		<span class="s1">flags = []</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x01</span><span class="s1">:</span>
+			<span class="s1">flags.append(</span><span class="s3">&quot;OlderSiblingFontAttribute&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x02</span><span class="s1">:</span>
+			<span class="s1">flags.append(</span><span class="s3">&quot;ElidableAxisValueName&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">flags:</span>
+			<span class="s1">xmlWriter.write(</span><span class="s3">&quot;  &quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.comment(</span><span class="s3">&quot; &quot;</span><span class="s1">.join(flags))</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+<span class="s0">class </span><span class="s1">FloatValue(SimpleValue):</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(value):</span>
+		<span class="s0">return </span><span class="s1">float(value)</span>
+
+<span class="s0">class </span><span class="s1">DeciPoints(FloatValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader.readUShort() / </span><span class="s5">10</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeUShort(round(value * </span><span class="s5">10</span><span class="s1">))</span>
+
+<span class="s0">class </span><span class="s1">BaseFixedValue(FloatValue):</span>
+	<span class="s1">staticSize = NotImplemented</span>
+	<span class="s1">precisionBits = NotImplemented</span>
+	<span class="s1">readerMethod = NotImplemented</span>
+	<span class="s1">writerMethod = NotImplemented</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return  </span><span class="s1">self.fromInt(getattr(reader</span><span class="s0">, </span><span class="s1">self.readerMethod)())</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">getattr(writer</span><span class="s0">, </span><span class="s1">self.writerMethod)(self.toInt(value))</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">fromInt(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">fi2fl(value</span><span class="s0">, </span><span class="s1">cls.precisionBits)</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">toInt(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">fl2fi(value</span><span class="s0">, </span><span class="s1">cls.precisionBits)</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">str2fl(value</span><span class="s0">, </span><span class="s1">cls.precisionBits)</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">toString(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">fl2str(value</span><span class="s0">, </span><span class="s1">cls.precisionBits)</span>
+
+<span class="s0">class </span><span class="s1">Fixed(BaseFixedValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s1">precisionBits = </span><span class="s5">16</span>
+	<span class="s1">readerMethod = </span><span class="s3">&quot;readLong&quot;</span>
+	<span class="s1">writerMethod = </span><span class="s3">&quot;writeLong&quot;</span>
+
+<span class="s0">class </span><span class="s1">F2Dot14(BaseFixedValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+	<span class="s1">precisionBits = </span><span class="s5">14</span>
+	<span class="s1">readerMethod = </span><span class="s3">&quot;readShort&quot;</span>
+	<span class="s1">writerMethod = </span><span class="s3">&quot;writeShort&quot;</span>
+
+<span class="s0">class </span><span class="s1">Angle(F2Dot14):</span>
+	<span class="s4"># angles are specified in degrees, and encoded as F2Dot14 fractions of half</span>
+	<span class="s4"># circle: e.g. 1.0 =&gt; 180, -0.5 =&gt; -90, -2.0 =&gt; -360, etc.</span>
+	<span class="s1">bias = </span><span class="s5">0.0</span>
+	<span class="s1">factor = </span><span class="s5">1.0</span><span class="s1">/(</span><span class="s5">1</span><span class="s1">&lt;&lt;</span><span class="s5">14</span><span class="s1">) * </span><span class="s5">180  </span><span class="s4"># 0.010986328125</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">fromInt(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">(super().fromInt(value) + cls.bias) * </span><span class="s5">180</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">toInt(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">super().toInt((value / </span><span class="s5">180</span><span class="s1">) - cls.bias)</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s4"># quantize to nearest multiples of minimum fixed-precision angle</span>
+		<span class="s0">return </span><span class="s1">otRound(float(value) / cls.factor) * cls.factor</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">toString(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">nearestMultipleShortestRepr(value</span><span class="s0">, </span><span class="s1">cls.factor)</span>
+
+<span class="s0">class </span><span class="s1">BiasedAngle(Angle):</span>
+	<span class="s4"># A bias of 1.0 is used in the representation of start and end angles</span>
+	<span class="s4"># of COLRv1 PaintSweepGradients to allow for encoding +360deg</span>
+	<span class="s1">bias = </span><span class="s5">1.0</span>
+
+<span class="s0">class </span><span class="s1">Version(SimpleValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">value = reader.readLong()</span>
+		<span class="s0">assert </span><span class="s1">(value &gt;&gt; </span><span class="s5">16</span><span class="s1">) == </span><span class="s5">1</span><span class="s0">, </span><span class="s3">&quot;Unsupported version 0x%08x&quot; </span><span class="s1">% value</span>
+		<span class="s0">return </span><span class="s1">value</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">value = fi2ve(value)</span>
+		<span class="s0">assert </span><span class="s1">(value &gt;&gt; </span><span class="s5">16</span><span class="s1">) == </span><span class="s5">1</span><span class="s0">, </span><span class="s3">&quot;Unsupported version 0x%08x&quot; </span><span class="s1">% value</span>
+		<span class="s1">writer.writeLong(value)</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(value):</span>
+		<span class="s0">return </span><span class="s1">ve2fi(value)</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">toString(value):</span>
+		<span class="s0">return </span><span class="s3">&quot;0x%08x&quot; </span><span class="s1">% value</span>
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">fromFloat(v):</span>
+		<span class="s0">return </span><span class="s1">fl2fi(v</span><span class="s0">, </span><span class="s5">16</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">Char64(SimpleValue):</span>
+	<span class="s2">&quot;&quot;&quot;An ASCII string with up to 64 characters. 
+ 
+    Unused character positions are filled with 0x00 bytes. 
+    Used in Apple AAT fonts in the `gcid` table. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">staticSize = </span><span class="s5">64</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">data = reader.readData(self.staticSize)</span>
+		<span class="s1">zeroPos = data.find(</span><span class="s6">b&quot;</span><span class="s0">\0</span><span class="s6">&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">zeroPos &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">data = data[:zeroPos]</span>
+		<span class="s1">s = tostr(data</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">&quot;ascii&quot;</span><span class="s0">, </span><span class="s1">errors=</span><span class="s3">&quot;replace&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">s != tostr(data</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">&quot;ascii&quot;</span><span class="s0">, </span><span class="s1">errors=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+			<span class="s1">log.warning(</span><span class="s3">'replaced non-ASCII characters in &quot;%s&quot;' </span><span class="s1">%</span>
+			            <span class="s1">s)</span>
+		<span class="s0">return </span><span class="s1">s</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">data = tobytes(value</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">&quot;ascii&quot;</span><span class="s0">, </span><span class="s1">errors=</span><span class="s3">&quot;replace&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">data != tobytes(value</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">&quot;ascii&quot;</span><span class="s0">, </span><span class="s1">errors=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+			<span class="s1">log.warning(</span><span class="s3">'replacing non-ASCII characters in &quot;%s&quot;' </span><span class="s1">%</span>
+			            <span class="s1">value)</span>
+		<span class="s0">if </span><span class="s1">len(data) &gt; self.staticSize:</span>
+			<span class="s1">log.warning(</span><span class="s3">'truncating overlong &quot;%s&quot; to %d bytes' </span><span class="s1">%</span>
+			            <span class="s1">(value</span><span class="s0">, </span><span class="s1">self.staticSize))</span>
+		<span class="s1">data = (data + </span><span class="s6">b&quot;</span><span class="s0">\0</span><span class="s6">&quot; </span><span class="s1">* self.staticSize)[:self.staticSize]</span>
+		<span class="s1">writer.writeData(data)</span>
+
+
+<span class="s0">class </span><span class="s1">Struct(BaseConverter):</span>
+
+	<span class="s0">def </span><span class="s1">getRecordSize(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">return </span><span class="s1">self.tableClass </span><span class="s0">and </span><span class="s1">self.tableClass.getRecordSize(reader)</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">table = self.tableClass()</span>
+		<span class="s1">table.decompile(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">value.compile(writer</span><span class="s0">, </span><span class="s1">font)</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">attrs:</span>
+				<span class="s4"># If there are attributes (probably index), then</span>
+				<span class="s4"># don't drop this even if it's NULL.  It will mess</span>
+				<span class="s4"># up the array indices of the containing element.</span>
+				<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;empty&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)])</span>
+				<span class="s1">xmlWriter.newline()</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">pass </span><span class="s4"># NULL table, ignore</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">value.toXML(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">name=name)</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">if </span><span class="s3">&quot;empty&quot; </span><span class="s0">in </span><span class="s1">attrs </span><span class="s0">and </span><span class="s1">safeEval(attrs[</span><span class="s3">&quot;empty&quot;</span><span class="s1">]):</span>
+			<span class="s0">return None</span>
+		<span class="s1">table = self.tableClass()</span>
+		<span class="s1">Format = attrs.get(</span><span class="s3">&quot;Format&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">Format </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">table.Format = int(Format)</span>
+
+		<span class="s1">noPostRead = </span><span class="s0">not </span><span class="s1">hasattr(table</span><span class="s0">, </span><span class="s3">'postRead'</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">noPostRead:</span>
+			<span class="s4"># TODO Cache table.hasPropagated.</span>
+			<span class="s1">cleanPropagation = </span><span class="s0">False</span>
+			<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">table.getConverters():</span>
+				<span class="s0">if </span><span class="s1">conv.isPropagated:</span>
+					<span class="s1">cleanPropagation = </span><span class="s0">True</span>
+					<span class="s0">if not </span><span class="s1">hasattr(font</span><span class="s0">, </span><span class="s3">'_propagator'</span><span class="s1">):</span>
+						<span class="s1">font._propagator = {}</span>
+					<span class="s1">propagator = font._propagator</span>
+					<span class="s0">assert </span><span class="s1">conv.name </span><span class="s0">not in </span><span class="s1">propagator</span><span class="s0">, </span><span class="s1">(conv.name</span><span class="s0">, </span><span class="s1">propagator)</span>
+					<span class="s1">setattr(table</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, None</span><span class="s1">)</span>
+					<span class="s1">propagator[conv.name] = CountReference(table.__dict__</span><span class="s0">, </span><span class="s1">conv.name)</span>
+
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+				<span class="s1">table.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">pass</span>
+
+		<span class="s1">table.populateDefaults(propagator=getattr(font</span><span class="s0">, </span><span class="s3">'_propagator'</span><span class="s0">, None</span><span class="s1">))</span>
+
+		<span class="s0">if </span><span class="s1">noPostRead:</span>
+			<span class="s0">if </span><span class="s1">cleanPropagation:</span>
+				<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">table.getConverters():</span>
+					<span class="s0">if </span><span class="s1">conv.isPropagated:</span>
+						<span class="s1">propagator = font._propagator</span>
+						<span class="s0">del </span><span class="s1">propagator[conv.name]</span>
+						<span class="s0">if not </span><span class="s1">propagator:</span>
+							<span class="s0">del </span><span class="s1">font._propagator</span>
+
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">__repr__(self):</span>
+		<span class="s0">return </span><span class="s3">&quot;Struct of &quot; </span><span class="s1">+ repr(self.tableClass)</span>
+
+
+<span class="s0">class </span><span class="s1">StructWithLength(Struct):</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">pos = reader.pos</span>
+		<span class="s1">table = self.tableClass()</span>
+		<span class="s1">table.decompile(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">reader.seek(pos + table.StructLength)</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">for </span><span class="s1">convIndex</span><span class="s0">, </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">enumerate(value.getConverters()):</span>
+			<span class="s0">if </span><span class="s1">conv.name == </span><span class="s3">&quot;StructLength&quot;</span><span class="s1">:</span>
+				<span class="s0">break</span>
+		<span class="s1">lengthIndex = len(writer.items) + convIndex</span>
+		<span class="s0">if </span><span class="s1">isinstance(value</span><span class="s0">, </span><span class="s1">FormatSwitchingBaseTable):</span>
+			<span class="s1">lengthIndex += </span><span class="s5">1  </span><span class="s4"># implicit Format field</span>
+		<span class="s1">deadbeef = {</span><span class="s5">1</span><span class="s1">:</span><span class="s5">0xDE</span><span class="s0">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">0xDEAD</span><span class="s0">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">0xDEADBEEF</span><span class="s1">}[conv.staticSize]</span>
+
+		<span class="s1">before = writer.getDataLength()</span>
+		<span class="s1">value.StructLength = deadbeef</span>
+		<span class="s1">value.compile(writer</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">length = writer.getDataLength() - before</span>
+		<span class="s1">lengthWriter = writer.getSubWriter()</span>
+		<span class="s1">conv.write(lengthWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">length)</span>
+		<span class="s0">assert</span><span class="s1">(writer.items[lengthIndex] ==</span>
+		       <span class="s6">b&quot;</span><span class="s0">\xde\xad\xbe\xef</span><span class="s6">&quot;</span><span class="s1">[:conv.staticSize])</span>
+		<span class="s1">writer.items[lengthIndex] = lengthWriter.getAllData()</span>
+
+
+<span class="s0">class </span><span class="s1">Table(Struct):</span>
+
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+
+	<span class="s0">def </span><span class="s1">readOffset(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">return </span><span class="s1">reader.readUShort()</span>
+
+	<span class="s0">def </span><span class="s1">writeNullOffset(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">offset = self.readOffset(reader)</span>
+		<span class="s0">if </span><span class="s1">offset == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s0">return None</span>
+		<span class="s1">table = self.tableClass()</span>
+		<span class="s1">reader = reader.getSubReader(offset)</span>
+		<span class="s0">if </span><span class="s1">font.lazy:</span>
+			<span class="s1">table.reader = reader</span>
+			<span class="s1">table.font = font</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">table.decompile(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">self.writeNullOffset(writer)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">subWriter = writer.getSubWriter(offsetSize=self.staticSize)</span>
+			<span class="s1">subWriter.name = self.name</span>
+			<span class="s0">if </span><span class="s1">repeatIndex </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">subWriter.repeatIndex = repeatIndex</span>
+			<span class="s1">writer.writeSubTable(subWriter)</span>
+			<span class="s1">value.compile(subWriter</span><span class="s0">, </span><span class="s1">font)</span>
+
+<span class="s0">class </span><span class="s1">LTable(Table):</span>
+
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+
+	<span class="s0">def </span><span class="s1">readOffset(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">return </span><span class="s1">reader.readULong()</span>
+
+	<span class="s0">def </span><span class="s1">writeNullOffset(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s1">writer.writeULong(</span><span class="s5">0</span><span class="s1">)</span>
+
+
+<span class="s4"># Table pointed to by a 24-bit, 3-byte long offset</span>
+<span class="s0">class </span><span class="s1">Table24(Table):</span>
+
+	<span class="s1">staticSize = </span><span class="s5">3</span>
+
+	<span class="s0">def </span><span class="s1">readOffset(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">return </span><span class="s1">reader.readUInt24()</span>
+
+	<span class="s0">def </span><span class="s1">writeNullOffset(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s1">writer.writeUInt24(</span><span class="s5">0</span><span class="s1">)</span>
+
+
+<span class="s4"># TODO Clean / merge the SubTable and SubStruct</span>
+
+<span class="s0">class </span><span class="s1">SubStruct(Struct):</span>
+	<span class="s0">def </span><span class="s1">getConverter(self</span><span class="s0">, </span><span class="s1">tableType</span><span class="s0">, </span><span class="s1">lookupType):</span>
+		<span class="s1">tableClass = self.lookupTypes[tableType][lookupType]</span>
+		<span class="s0">return </span><span class="s1">self.__class__(self.name</span><span class="s0">, </span><span class="s1">self.repeat</span><span class="s0">, </span><span class="s1">self.aux</span><span class="s0">, </span><span class="s1">tableClass)</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">super(SubStruct</span><span class="s0">, </span><span class="s1">self).xmlWrite(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, None, </span><span class="s1">attrs)</span>
+
+<span class="s0">class </span><span class="s1">SubTable(Table):</span>
+	<span class="s0">def </span><span class="s1">getConverter(self</span><span class="s0">, </span><span class="s1">tableType</span><span class="s0">, </span><span class="s1">lookupType):</span>
+		<span class="s1">tableClass = self.lookupTypes[tableType][lookupType]</span>
+		<span class="s0">return </span><span class="s1">self.__class__(self.name</span><span class="s0">, </span><span class="s1">self.repeat</span><span class="s0">, </span><span class="s1">self.aux</span><span class="s0">, </span><span class="s1">tableClass)</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">super(SubTable</span><span class="s0">, </span><span class="s1">self).xmlWrite(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, None, </span><span class="s1">attrs)</span>
+
+<span class="s0">class </span><span class="s1">ExtSubTable(LTable</span><span class="s0">, </span><span class="s1">SubTable):</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.Extension = </span><span class="s0">True </span><span class="s4"># actually, mere presence of the field flags it as an Ext Subtable writer.</span>
+		<span class="s1">Table.write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex)</span>
+
+
+<span class="s0">class </span><span class="s1">FeatureParams(Table):</span>
+	<span class="s0">def </span><span class="s1">getConverter(self</span><span class="s0">, </span><span class="s1">featureTag):</span>
+		<span class="s1">tableClass = self.featureParamTypes.get(featureTag</span><span class="s0">, </span><span class="s1">self.defaultFeatureParams)</span>
+		<span class="s0">return </span><span class="s1">self.__class__(self.name</span><span class="s0">, </span><span class="s1">self.repeat</span><span class="s0">, </span><span class="s1">self.aux</span><span class="s0">, </span><span class="s1">tableClass)</span>
+
+
+<span class="s0">class </span><span class="s1">ValueFormat(IntValue):</span>
+	<span class="s1">staticSize = </span><span class="s5">2</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass=</span><span class="s0">None, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">description=</span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+		<span class="s1">BaseConverter.__init__(</span>
+			<span class="s1">self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass</span><span class="s0">, </span><span class="s1">description=description</span>
+		<span class="s1">)</span>
+		<span class="s1">self.which = </span><span class="s3">&quot;ValueFormat&quot; </span><span class="s1">+ (</span><span class="s3">&quot;2&quot; </span><span class="s0">if </span><span class="s1">name[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;2&quot; </span><span class="s0">else </span><span class="s3">&quot;1&quot;</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">format = reader.readUShort()</span>
+		<span class="s1">reader[self.which] = ValueRecordFactory(format)</span>
+		<span class="s0">return </span><span class="s1">format</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">format</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer.writeUShort(format)</span>
+		<span class="s1">writer[self.which] = ValueRecordFactory(format)</span>
+
+
+<span class="s0">class </span><span class="s1">ValueRecord(ValueFormat):</span>
+	<span class="s0">def </span><span class="s1">getRecordSize(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">return </span><span class="s5">2 </span><span class="s1">* len(reader[self.which])</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">reader[self.which].readValueRecord(reader</span><span class="s0">, </span><span class="s1">font)</span>
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">writer[self.which].writeValueRecord(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value)</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">pass  </span><span class="s4"># NULL table, ignore</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">value.toXML(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">self.name</span><span class="s0">, </span><span class="s1">attrs)</span>
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">from </span><span class="s1">.otBase </span><span class="s0">import </span><span class="s1">ValueRecord</span>
+		<span class="s1">value = ValueRecord()</span>
+		<span class="s1">value.fromXML(</span><span class="s0">None, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">return </span><span class="s1">value</span>
+
+
+<span class="s0">class </span><span class="s1">AATLookup(BaseConverter):</span>
+	<span class="s1">BIN_SEARCH_HEADER_SIZE = </span><span class="s5">10</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">description=</span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+		<span class="s1">BaseConverter.__init__(</span>
+			<span class="s1">self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass</span><span class="s0">, </span><span class="s1">description=description</span>
+		<span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">issubclass(self.tableClass</span><span class="s0">, </span><span class="s1">SimpleValue):</span>
+			<span class="s1">self.converter = self.tableClass(name=</span><span class="s3">'Value'</span><span class="s0">, </span><span class="s1">repeat=</span><span class="s0">None, </span><span class="s1">aux=</span><span class="s0">None</span><span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.converter = Table(name=</span><span class="s3">'Value'</span><span class="s0">, </span><span class="s1">repeat=</span><span class="s0">None, </span><span class="s1">aux=</span><span class="s0">None, </span><span class="s1">tableClass=self.tableClass)</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">format = reader.readUShort()</span>
+		<span class="s0">if </span><span class="s1">format == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.readFormat0(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">elif </span><span class="s1">format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.readFormat2(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">elif </span><span class="s1">format == </span><span class="s5">4</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.readFormat4(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">elif </span><span class="s1">format == </span><span class="s5">6</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.readFormat6(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">elif </span><span class="s1">format == </span><span class="s5">8</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.readFormat8(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">assert False, </span><span class="s3">&quot;unsupported lookup format: %d&quot; </span><span class="s1">% format</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">values = list(sorted([(font.getGlyphID(glyph)</span><span class="s0">, </span><span class="s1">val)</span>
+		                      <span class="s0">for </span><span class="s1">glyph</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">value.items()]))</span>
+		<span class="s4"># TODO: Also implement format 4.</span>
+		<span class="s1">formats = list(sorted(filter(</span><span class="s0">None, </span><span class="s1">[</span>
+			<span class="s1">self.buildFormat0(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values)</span><span class="s0">,</span>
+			<span class="s1">self.buildFormat2(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values)</span><span class="s0">,</span>
+			<span class="s1">self.buildFormat6(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values)</span><span class="s0">,</span>
+			<span class="s1">self.buildFormat8(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values)</span><span class="s0">,</span>
+		<span class="s1">])))</span>
+		<span class="s4"># We use the format ID as secondary sort key to make the output</span>
+		<span class="s4"># deterministic when multiple formats have same encoded size.</span>
+		<span class="s1">dataSize</span><span class="s0">, </span><span class="s1">lookupFormat</span><span class="s0">, </span><span class="s1">writeMethod = formats[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">pos = writer.getDataLength()</span>
+		<span class="s1">writeMethod()</span>
+		<span class="s1">actualSize = writer.getDataLength() - pos</span>
+		<span class="s0">assert </span><span class="s1">actualSize == dataSize</span><span class="s0">, </span><span class="s1">(</span>
+			<span class="s3">&quot;AATLookup format %d claimed to write %d bytes, but wrote %d&quot; </span><span class="s1">%</span>
+			<span class="s1">(lookupFormat</span><span class="s0">, </span><span class="s1">dataSize</span><span class="s0">, </span><span class="s1">actualSize))</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">writeBinSearchHeader(writer</span><span class="s0">, </span><span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize):</span>
+		<span class="s1">writer.writeUShort(unitSize)</span>
+		<span class="s1">writer.writeUShort(numUnits)</span>
+		<span class="s1">searchRange</span><span class="s0">, </span><span class="s1">entrySelector</span><span class="s0">, </span><span class="s1">rangeShift = \</span>
+			<span class="s1">getSearchRange(n=numUnits</span><span class="s0">, </span><span class="s1">itemSize=unitSize)</span>
+		<span class="s1">writer.writeUShort(searchRange)</span>
+		<span class="s1">writer.writeUShort(entrySelector)</span>
+		<span class="s1">writer.writeUShort(rangeShift)</span>
+
+	<span class="s0">def </span><span class="s1">buildFormat0(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">numGlyphs = len(font.getGlyphOrder())</span>
+		<span class="s0">if </span><span class="s1">len(values) != numGlyphs:</span>
+			<span class="s0">return None</span>
+		<span class="s1">valueSize = self.converter.staticSize</span>
+		<span class="s0">return </span><span class="s1">(</span><span class="s5">2 </span><span class="s1">+ numGlyphs * valueSize</span><span class="s0">, </span><span class="s5">0</span><span class="s0">,</span>
+			<span class="s0">lambda</span><span class="s1">: self.writeFormat0(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values))</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat0(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s0">for </span><span class="s1">glyphID_</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">values:</span>
+			<span class="s1">self.converter.write(</span>
+				<span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None,</span>
+				<span class="s1">value=value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">buildFormat2(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">segStart</span><span class="s0">, </span><span class="s1">segValue = values[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">segEnd = segStart</span>
+		<span class="s1">segments = []</span>
+		<span class="s0">for </span><span class="s1">glyphID</span><span class="s0">, </span><span class="s1">curValue </span><span class="s0">in </span><span class="s1">values[</span><span class="s5">1</span><span class="s1">:]:</span>
+			<span class="s0">if </span><span class="s1">glyphID != segEnd + </span><span class="s5">1 </span><span class="s0">or </span><span class="s1">curValue != segValue:</span>
+				<span class="s1">segments.append((segStart</span><span class="s0">, </span><span class="s1">segEnd</span><span class="s0">, </span><span class="s1">segValue))</span>
+				<span class="s1">segStart = segEnd = glyphID</span>
+				<span class="s1">segValue = curValue</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">segEnd = glyphID</span>
+		<span class="s1">segments.append((segStart</span><span class="s0">, </span><span class="s1">segEnd</span><span class="s0">, </span><span class="s1">segValue))</span>
+		<span class="s1">valueSize = self.converter.staticSize</span>
+		<span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize = len(segments) + </span><span class="s5">1</span><span class="s0">, </span><span class="s1">valueSize + </span><span class="s5">4</span>
+		<span class="s0">return </span><span class="s1">(</span><span class="s5">2 </span><span class="s1">+ self.BIN_SEARCH_HEADER_SIZE + numUnits * unitSize</span><span class="s0">, </span><span class="s5">2</span><span class="s0">,</span>
+		        <span class="s0">lambda</span><span class="s1">: self.writeFormat2(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">segments))</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat2(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">segments):</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">2</span><span class="s1">)</span>
+		<span class="s1">valueSize = self.converter.staticSize</span>
+		<span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize = len(segments)</span><span class="s0">, </span><span class="s1">valueSize + </span><span class="s5">4</span>
+		<span class="s1">self.writeBinSearchHeader(writer</span><span class="s0">, </span><span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize)</span>
+		<span class="s0">for </span><span class="s1">firstGlyph</span><span class="s0">, </span><span class="s1">lastGlyph</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">segments:</span>
+			<span class="s1">writer.writeUShort(lastGlyph)</span>
+			<span class="s1">writer.writeUShort(firstGlyph)</span>
+			<span class="s1">self.converter.write(</span>
+				<span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None,</span>
+				<span class="s1">value=value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">)</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">0xFFFF</span><span class="s1">)</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">0xFFFF</span><span class="s1">)</span>
+		<span class="s1">writer.writeData(</span><span class="s6">b'</span><span class="s0">\x00</span><span class="s6">' </span><span class="s1">* valueSize)</span>
+
+	<span class="s0">def </span><span class="s1">buildFormat6(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">valueSize = self.converter.staticSize</span>
+		<span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize = len(values)</span><span class="s0">, </span><span class="s1">valueSize + </span><span class="s5">2</span>
+		<span class="s0">return </span><span class="s1">(</span><span class="s5">2 </span><span class="s1">+ self.BIN_SEARCH_HEADER_SIZE + (numUnits + </span><span class="s5">1</span><span class="s1">) * unitSize</span><span class="s0">, </span><span class="s5">6</span><span class="s0">,</span>
+			<span class="s0">lambda</span><span class="s1">: self.writeFormat6(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values))</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat6(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">6</span><span class="s1">)</span>
+		<span class="s1">valueSize = self.converter.staticSize</span>
+		<span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize = len(values)</span><span class="s0">, </span><span class="s1">valueSize + </span><span class="s5">2</span>
+		<span class="s1">self.writeBinSearchHeader(writer</span><span class="s0">, </span><span class="s1">numUnits</span><span class="s0">, </span><span class="s1">unitSize)</span>
+		<span class="s0">for </span><span class="s1">glyphID</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">values:</span>
+			<span class="s1">writer.writeUShort(glyphID)</span>
+			<span class="s1">self.converter.write(</span>
+				<span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None,</span>
+				<span class="s1">value=value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">)</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">0xFFFF</span><span class="s1">)</span>
+		<span class="s1">writer.writeData(</span><span class="s6">b'</span><span class="s0">\x00</span><span class="s6">' </span><span class="s1">* valueSize)</span>
+
+	<span class="s0">def </span><span class="s1">buildFormat8(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">minGlyphID</span><span class="s0">, </span><span class="s1">maxGlyphID = values[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">values[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s0">if </span><span class="s1">len(values) != maxGlyphID - minGlyphID + </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s0">return None</span>
+		<span class="s1">valueSize = self.converter.staticSize</span>
+		<span class="s0">return </span><span class="s1">(</span><span class="s5">6 </span><span class="s1">+ len(values) * valueSize</span><span class="s0">, </span><span class="s5">8</span><span class="s0">,</span>
+                        <span class="s0">lambda</span><span class="s1">: self.writeFormat8(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values))</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat8(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">firstGlyphID = values[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">writer.writeUShort(</span><span class="s5">8</span><span class="s1">)</span>
+		<span class="s1">writer.writeUShort(firstGlyphID)</span>
+		<span class="s1">writer.writeUShort(len(values))</span>
+		<span class="s0">for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">values:</span>
+			<span class="s1">self.converter.write(</span>
+				<span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None,</span>
+				<span class="s1">value=value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">readFormat0(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">numGlyphs = len(font.getGlyphOrder())</span>
+		<span class="s1">data = self.converter.readArray(</span>
+			<span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None, </span><span class="s1">count=numGlyphs)</span>
+		<span class="s0">return </span><span class="s1">{font.getGlyphName(k): value</span>
+		        <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">enumerate(data)}</span>
+
+	<span class="s0">def </span><span class="s1">readFormat2(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = {}</span>
+		<span class="s1">pos = reader.pos - </span><span class="s5">2  </span><span class="s4"># start of table is at UShort for format</span>
+		<span class="s1">unitSize</span><span class="s0">, </span><span class="s1">numUnits = reader.readUShort()</span><span class="s0">, </span><span class="s1">reader.readUShort()</span>
+		<span class="s0">assert </span><span class="s1">unitSize &gt;= </span><span class="s5">4 </span><span class="s1">+ self.converter.staticSize</span><span class="s0">, </span><span class="s1">unitSize</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numUnits):</span>
+			<span class="s1">reader.seek(pos + i * unitSize + </span><span class="s5">12</span><span class="s1">)</span>
+			<span class="s1">last = reader.readUShort()</span>
+			<span class="s1">first = reader.readUShort()</span>
+			<span class="s1">value = self.converter.read(reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">last != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(first</span><span class="s0">, </span><span class="s1">last + </span><span class="s5">1</span><span class="s1">):</span>
+					<span class="s1">mapping[font.getGlyphName(k)] = value</span>
+		<span class="s0">return </span><span class="s1">mapping</span>
+
+	<span class="s0">def </span><span class="s1">readFormat4(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = {}</span>
+		<span class="s1">pos = reader.pos - </span><span class="s5">2  </span><span class="s4"># start of table is at UShort for format</span>
+		<span class="s1">unitSize = reader.readUShort()</span>
+		<span class="s0">assert </span><span class="s1">unitSize &gt;= </span><span class="s5">6</span><span class="s0">, </span><span class="s1">unitSize</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(reader.readUShort()):</span>
+			<span class="s1">reader.seek(pos + i * unitSize + </span><span class="s5">12</span><span class="s1">)</span>
+			<span class="s1">last = reader.readUShort()</span>
+			<span class="s1">first = reader.readUShort()</span>
+			<span class="s1">offset = reader.readUShort()</span>
+			<span class="s0">if </span><span class="s1">last != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s1">dataReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)  </span><span class="s4"># relative to current position</span>
+				<span class="s1">dataReader.seek(pos + offset)  </span><span class="s4"># relative to start of table</span>
+				<span class="s1">data = self.converter.readArray(</span>
+					<span class="s1">dataReader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None,</span>
+					<span class="s1">count=last - first + </span><span class="s5">1</span><span class="s1">)</span>
+				<span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">enumerate(data):</span>
+					<span class="s1">mapping[font.getGlyphName(first + k)] = v</span>
+		<span class="s0">return </span><span class="s1">mapping</span>
+
+	<span class="s0">def </span><span class="s1">readFormat6(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = {}</span>
+		<span class="s1">pos = reader.pos - </span><span class="s5">2  </span><span class="s4"># start of table is at UShort for format</span>
+		<span class="s1">unitSize = reader.readUShort()</span>
+		<span class="s0">assert </span><span class="s1">unitSize &gt;= </span><span class="s5">2 </span><span class="s1">+ self.converter.staticSize</span><span class="s0">, </span><span class="s1">unitSize</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(reader.readUShort()):</span>
+			<span class="s1">reader.seek(pos + i * unitSize + </span><span class="s5">12</span><span class="s1">)</span>
+			<span class="s1">glyphID = reader.readUShort()</span>
+			<span class="s1">value = self.converter.read(</span>
+				<span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">glyphID != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s1">mapping[font.getGlyphName(glyphID)] = value</span>
+		<span class="s0">return </span><span class="s1">mapping</span>
+
+	<span class="s0">def </span><span class="s1">readFormat8(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">first = reader.readUShort()</span>
+		<span class="s1">count = reader.readUShort()</span>
+		<span class="s1">data = self.converter.readArray(</span>
+			<span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict=</span><span class="s0">None, </span><span class="s1">count=count)</span>
+		<span class="s0">return </span><span class="s1">{font.getGlyphName(first + k): value</span>
+		        <span class="s0">for </span><span class="s1">(k</span><span class="s0">, </span><span class="s1">value) </span><span class="s0">in </span><span class="s1">enumerate(data)}</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">value = {}</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s1">name</span><span class="s0">, </span><span class="s1">a</span><span class="s0">, </span><span class="s1">eltContent = element</span>
+				<span class="s0">if </span><span class="s1">name == </span><span class="s3">&quot;Lookup&quot;</span><span class="s1">:</span>
+					<span class="s1">value[a[</span><span class="s3">&quot;glyph&quot;</span><span class="s1">]] = self.converter.xmlRead(a</span><span class="s0">, </span><span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">return </span><span class="s1">value</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">glyph</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">sorted(value.items()):</span>
+			<span class="s1">self.converter.xmlWrite(</span>
+				<span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value=value</span><span class="s0">,</span>
+				<span class="s1">name=</span><span class="s3">&quot;Lookup&quot;</span><span class="s0">, </span><span class="s1">attrs=[(</span><span class="s3">&quot;glyph&quot;</span><span class="s0">, </span><span class="s1">glyph)])</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+
+<span class="s4"># The AAT 'ankr' table has an unusual structure: An offset to an AATLookup</span>
+<span class="s4"># followed by an offset to a glyph data table. Other than usual, the</span>
+<span class="s4"># offsets in the AATLookup are not relative to the beginning of</span>
+<span class="s4"># the beginning of the 'ankr' table, but relative to the glyph data table.</span>
+<span class="s4"># So, to find the anchor data for a glyph, one needs to add the offset</span>
+<span class="s4"># to the data table to the offset found in the AATLookup, and then use</span>
+<span class="s4"># the sum of these two offsets to find the actual data.</span>
+<span class="s0">class </span><span class="s1">AATLookupWithDataOffset(BaseConverter):</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">lookupOffset = reader.readULong()</span>
+		<span class="s1">dataOffset = reader.readULong()</span>
+		<span class="s1">lookupReader = reader.getSubReader(lookupOffset)</span>
+		<span class="s1">lookup = AATLookup(</span><span class="s3">'DataOffsets'</span><span class="s0">, None, None, </span><span class="s1">UShort)</span>
+		<span class="s1">offsets = lookup.read(lookupReader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict)</span>
+		<span class="s1">result = {}</span>
+		<span class="s0">for </span><span class="s1">glyph</span><span class="s0">, </span><span class="s1">offset </span><span class="s0">in </span><span class="s1">offsets.items():</span>
+			<span class="s1">dataReader = reader.getSubReader(offset + dataOffset)</span>
+			<span class="s1">item = self.tableClass()</span>
+			<span class="s1">item.decompile(dataReader</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s1">result[glyph] = item</span>
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s4"># We do not work with OTTableWriter sub-writers because</span>
+		<span class="s4"># the offsets in our AATLookup are relative to our data</span>
+		<span class="s4"># table, for which we need to provide an offset value itself.</span>
+		<span class="s4"># It might have been possible to somehow make a kludge for</span>
+		<span class="s4"># performing this indirect offset computation directly inside</span>
+		<span class="s4"># OTTableWriter. But this would have made the internal logic</span>
+		<span class="s4"># of OTTableWriter even more complex than it already is,</span>
+		<span class="s4"># so we decided to roll our own offset computation for the</span>
+		<span class="s4"># contents of the AATLookup and associated data table.</span>
+		<span class="s1">offsetByGlyph</span><span class="s0">, </span><span class="s1">offsetByData</span><span class="s0">, </span><span class="s1">dataLen = {}</span><span class="s0">, </span><span class="s1">{}</span><span class="s0">, </span><span class="s5">0</span>
+		<span class="s1">compiledData = []</span>
+		<span class="s0">for </span><span class="s1">glyph </span><span class="s0">in </span><span class="s1">sorted(value</span><span class="s0">, </span><span class="s1">key=font.getGlyphID):</span>
+			<span class="s1">subWriter = OTTableWriter()</span>
+			<span class="s1">value[glyph].compile(subWriter</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s1">data = subWriter.getAllData()</span>
+			<span class="s1">offset = offsetByData.get(data</span><span class="s0">, None</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">offset == </span><span class="s0">None</span><span class="s1">:</span>
+				<span class="s1">offset = dataLen</span>
+				<span class="s1">dataLen = dataLen + len(data)</span>
+				<span class="s1">offsetByData[data] = offset</span>
+				<span class="s1">compiledData.append(data)</span>
+			<span class="s1">offsetByGlyph[glyph] = offset</span>
+		<span class="s4"># For calculating the offsets to our AATLookup and data table,</span>
+		<span class="s4"># we can use the regular OTTableWriter infrastructure.</span>
+		<span class="s1">lookupWriter = writer.getSubWriter(offsetSize=</span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s1">lookup = AATLookup(</span><span class="s3">'DataOffsets'</span><span class="s0">, None, None, </span><span class="s1">UShort)</span>
+		<span class="s1">lookup.write(lookupWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">offsetByGlyph</span><span class="s0">, None</span><span class="s1">)</span>
+
+		<span class="s1">dataWriter = writer.getSubWriter(offsetSize=</span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s1">writer.writeSubTable(lookupWriter)</span>
+		<span class="s1">writer.writeSubTable(dataWriter)</span>
+		<span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">compiledData:</span>
+			<span class="s1">dataWriter.writeData(d)</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">lookup = AATLookup(</span><span class="s3">'DataOffsets'</span><span class="s0">, None, None, </span><span class="s1">self.tableClass)</span>
+		<span class="s0">return </span><span class="s1">lookup.xmlRead(attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font)</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">lookup = AATLookup(</span><span class="s3">'DataOffsets'</span><span class="s0">, None, None, </span><span class="s1">self.tableClass)</span>
+		<span class="s1">lookup.xmlWrite(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs)</span>
+
+
+<span class="s0">class </span><span class="s1">MorxSubtableConverter(BaseConverter):</span>
+	<span class="s1">_PROCESSING_ORDERS = {</span>
+		<span class="s4"># bits 30 and 28 of morx.CoverageFlags; see morx spec</span>
+		<span class="s1">(</span><span class="s0">False, False</span><span class="s1">): </span><span class="s3">&quot;LayoutOrder&quot;</span><span class="s0">,</span>
+		<span class="s1">(</span><span class="s0">True, False</span><span class="s1">): </span><span class="s3">&quot;ReversedLayoutOrder&quot;</span><span class="s0">,</span>
+		<span class="s1">(</span><span class="s0">False, True</span><span class="s1">): </span><span class="s3">&quot;LogicalOrder&quot;</span><span class="s0">,</span>
+		<span class="s1">(</span><span class="s0">True, True</span><span class="s1">): </span><span class="s3">&quot;ReversedLogicalOrder&quot;</span><span class="s0">,</span>
+	<span class="s1">}</span>
+
+	<span class="s1">_PROCESSING_ORDERS_REVERSED = {</span>
+		<span class="s1">val: key </span><span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">_PROCESSING_ORDERS.items()</span>
+	<span class="s1">}</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass=</span><span class="s0">None, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">description=</span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+		<span class="s1">BaseConverter.__init__(</span>
+			<span class="s1">self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass</span><span class="s0">, </span><span class="s1">description=description</span>
+		<span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">_setTextDirectionFromCoverageFlags(self</span><span class="s0">, </span><span class="s1">flags</span><span class="s0">, </span><span class="s1">subtable):</span>
+		<span class="s0">if </span><span class="s1">(flags &amp; </span><span class="s5">0x20</span><span class="s1">) != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">subtable.TextDirection = </span><span class="s3">&quot;Any&quot;</span>
+		<span class="s0">elif </span><span class="s1">(flags &amp; </span><span class="s5">0x80</span><span class="s1">) != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">subtable.TextDirection = </span><span class="s3">&quot;Vertical&quot;</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">subtable.TextDirection = </span><span class="s3">&quot;Horizontal&quot;</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">pos = reader.pos</span>
+		<span class="s1">m = MorxSubtable()</span>
+		<span class="s1">m.StructLength = reader.readULong()</span>
+		<span class="s1">flags = reader.readUInt8()</span>
+		<span class="s1">orderKey = ((flags &amp; </span><span class="s5">0x40</span><span class="s1">) != </span><span class="s5">0</span><span class="s0">, </span><span class="s1">(flags &amp; </span><span class="s5">0x10</span><span class="s1">) != </span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">m.ProcessingOrder = self._PROCESSING_ORDERS[orderKey]</span>
+		<span class="s1">self._setTextDirectionFromCoverageFlags(flags</span><span class="s0">, </span><span class="s1">m)</span>
+		<span class="s1">m.Reserved = reader.readUShort()</span>
+		<span class="s1">m.Reserved |= (flags &amp; </span><span class="s5">0xF</span><span class="s1">) &lt;&lt; </span><span class="s5">16</span>
+		<span class="s1">m.MorphType = reader.readUInt8()</span>
+		<span class="s1">m.SubFeatureFlags = reader.readULong()</span>
+		<span class="s1">tableClass = lookupTypes[</span><span class="s3">&quot;morx&quot;</span><span class="s1">].get(m.MorphType)</span>
+		<span class="s0">if </span><span class="s1">tableClass </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">assert False, </span><span class="s1">(</span><span class="s3">&quot;unsupported 'morx' lookup type %s&quot; </span><span class="s1">%</span>
+			               <span class="s1">m.MorphType)</span>
+		<span class="s4"># To decode AAT ligatures, we need to know the subtable size.</span>
+		<span class="s4"># The easiest way to pass this along is to create a new reader</span>
+		<span class="s4"># that works on just the subtable as its data.</span>
+		<span class="s1">headerLength = reader.pos - pos</span>
+		<span class="s1">data = reader.data[</span>
+			<span class="s1">reader.pos</span>
+			<span class="s1">: reader.pos + m.StructLength - headerLength]</span>
+		<span class="s0">assert </span><span class="s1">len(data) == m.StructLength - headerLength</span>
+		<span class="s1">subReader = OTTableReader(data=data</span><span class="s0">, </span><span class="s1">tableTag=reader.tableTag)</span>
+		<span class="s1">m.SubStruct = tableClass()</span>
+		<span class="s1">m.SubStruct.decompile(subReader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">reader.seek(pos + m.StructLength)</span>
+		<span class="s0">return </span><span class="s1">m</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.comment(</span><span class="s3">&quot;StructLength=%d&quot; </span><span class="s1">% value.StructLength)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;TextDirection&quot;</span><span class="s0">, </span><span class="s1">value=value.TextDirection)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;ProcessingOrder&quot;</span><span class="s0">,</span>
+		                    <span class="s1">value=value.ProcessingOrder)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">if </span><span class="s1">value.Reserved != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;Reserved&quot;</span><span class="s0">,</span>
+			                    <span class="s1">value=</span><span class="s3">&quot;0x%04x&quot; </span><span class="s1">% value.Reserved)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.comment(</span><span class="s3">&quot;MorphType=%d&quot; </span><span class="s1">% value.MorphType)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;SubFeatureFlags&quot;</span><span class="s0">,</span>
+		                    <span class="s1">value=</span><span class="s3">&quot;0x%08x&quot; </span><span class="s1">% value.SubFeatureFlags)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">value.SubStruct.toXML(xmlWriter</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">m = MorxSubtable()</span>
+		<span class="s1">covFlags = </span><span class="s5">0</span>
+		<span class="s1">m.Reserved = </span><span class="s5">0</span>
+		<span class="s0">for </span><span class="s1">eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eltName == </span><span class="s3">&quot;CoverageFlags&quot;</span><span class="s1">:</span>
+				<span class="s4"># Only in XML from old versions of fonttools.</span>
+				<span class="s1">covFlags = safeEval(eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+				<span class="s1">orderKey = ((covFlags &amp; </span><span class="s5">0x40</span><span class="s1">) != </span><span class="s5">0</span><span class="s0">,</span>
+				            <span class="s1">(covFlags &amp; </span><span class="s5">0x10</span><span class="s1">) != </span><span class="s5">0</span><span class="s1">)</span>
+				<span class="s1">m.ProcessingOrder = self._PROCESSING_ORDERS[</span>
+					<span class="s1">orderKey]</span>
+				<span class="s1">self._setTextDirectionFromCoverageFlags(</span>
+					<span class="s1">covFlags</span><span class="s0">, </span><span class="s1">m)</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;ProcessingOrder&quot;</span><span class="s1">:</span>
+				<span class="s1">m.ProcessingOrder = eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">]</span>
+				<span class="s0">assert </span><span class="s1">m.ProcessingOrder </span><span class="s0">in </span><span class="s1">self._PROCESSING_ORDERS_REVERSED</span><span class="s0">, </span><span class="s3">&quot;unknown ProcessingOrder: %s&quot; </span><span class="s1">% m.ProcessingOrder</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;TextDirection&quot;</span><span class="s1">:</span>
+				<span class="s1">m.TextDirection = eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">]</span>
+				<span class="s0">assert </span><span class="s1">m.TextDirection </span><span class="s0">in </span><span class="s1">{</span><span class="s3">&quot;Horizontal&quot;</span><span class="s0">, </span><span class="s3">&quot;Vertical&quot;</span><span class="s0">, </span><span class="s3">&quot;Any&quot;</span><span class="s1">}</span><span class="s0">, </span><span class="s3">&quot;unknown TextDirection %s&quot; </span><span class="s1">% m.TextDirection</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;Reserved&quot;</span><span class="s1">:</span>
+				<span class="s1">m.Reserved = safeEval(eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;SubFeatureFlags&quot;</span><span class="s1">:</span>
+				<span class="s1">m.SubFeatureFlags = safeEval(eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s0">elif </span><span class="s1">eltName.endswith(</span><span class="s3">&quot;Morph&quot;</span><span class="s1">):</span>
+				<span class="s1">m.fromXML(eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">assert False, </span><span class="s1">eltName</span>
+		<span class="s1">m.Reserved = (covFlags &amp; </span><span class="s5">0xF</span><span class="s1">) &lt;&lt; </span><span class="s5">16 </span><span class="s1">| m.Reserved</span>
+		<span class="s0">return </span><span class="s1">m</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">covFlags = (value.Reserved &amp; </span><span class="s5">0x000F0000</span><span class="s1">) &gt;&gt; </span><span class="s5">16</span>
+		<span class="s1">reverseOrder</span><span class="s0">, </span><span class="s1">logicalOrder = self._PROCESSING_ORDERS_REVERSED[</span>
+			<span class="s1">value.ProcessingOrder]</span>
+		<span class="s1">covFlags |= </span><span class="s5">0x80 </span><span class="s0">if </span><span class="s1">value.TextDirection == </span><span class="s3">&quot;Vertical&quot; </span><span class="s0">else </span><span class="s5">0</span>
+		<span class="s1">covFlags |= </span><span class="s5">0x40 </span><span class="s0">if </span><span class="s1">reverseOrder </span><span class="s0">else </span><span class="s5">0</span>
+		<span class="s1">covFlags |= </span><span class="s5">0x20 </span><span class="s0">if </span><span class="s1">value.TextDirection == </span><span class="s3">&quot;Any&quot; </span><span class="s0">else </span><span class="s5">0</span>
+		<span class="s1">covFlags |= </span><span class="s5">0x10 </span><span class="s0">if </span><span class="s1">logicalOrder </span><span class="s0">else </span><span class="s5">0</span>
+		<span class="s1">value.CoverageFlags = covFlags</span>
+		<span class="s1">lengthIndex = len(writer.items)</span>
+		<span class="s1">before = writer.getDataLength()</span>
+		<span class="s1">value.StructLength = </span><span class="s5">0xdeadbeef</span>
+		<span class="s4"># The high nibble of value.Reserved is actuallly encoded</span>
+		<span class="s4"># into coverageFlags, so we need to clear it here.</span>
+		<span class="s1">origReserved = value.Reserved </span><span class="s4"># including high nibble</span>
+		<span class="s1">value.Reserved = value.Reserved &amp; </span><span class="s5">0xFFFF </span><span class="s4"># without high nibble</span>
+		<span class="s1">value.compile(writer</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">value.Reserved = origReserved  </span><span class="s4"># restore original value</span>
+		<span class="s0">assert </span><span class="s1">writer.items[lengthIndex] == </span><span class="s6">b&quot;</span><span class="s0">\xde\xad\xbe\xef</span><span class="s6">&quot;</span>
+		<span class="s1">length = writer.getDataLength() - before</span>
+		<span class="s1">writer.items[lengthIndex] = struct.pack(</span><span class="s3">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">length)</span>
+
+
+<span class="s4"># https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6Tables.html#ExtendedStateHeader</span>
+<span class="s4"># TODO: Untangle the implementation of the various lookup-specific formats.</span>
+<span class="s0">class </span><span class="s1">STXHeader(BaseConverter):</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">description=</span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+		<span class="s1">BaseConverter.__init__(</span>
+			<span class="s1">self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">repeat</span><span class="s0">, </span><span class="s1">aux</span><span class="s0">, </span><span class="s1">tableClass</span><span class="s0">, </span><span class="s1">description=description</span>
+		<span class="s1">)</span>
+		<span class="s0">assert </span><span class="s1">issubclass(self.tableClass</span><span class="s0">, </span><span class="s1">AATAction)</span>
+		<span class="s1">self.classLookup = AATLookup(</span><span class="s3">&quot;GlyphClasses&quot;</span><span class="s0">, None, None, </span><span class="s1">UShort)</span>
+		<span class="s0">if </span><span class="s1">issubclass(self.tableClass</span><span class="s0">, </span><span class="s1">ContextualMorphAction):</span>
+			<span class="s1">self.perGlyphLookup = AATLookup(</span><span class="s3">&quot;PerGlyphLookup&quot;</span><span class="s0">,</span>
+			                                <span class="s0">None, None, </span><span class="s1">GlyphID)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.perGlyphLookup = </span><span class="s0">None</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">table = AATStateTable()</span>
+		<span class="s1">pos = reader.pos</span>
+		<span class="s1">classTableReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">stateArrayReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">entryTableReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">actionReader = </span><span class="s0">None</span>
+		<span class="s1">ligaturesReader = </span><span class="s0">None</span>
+		<span class="s1">table.GlyphClassCount = reader.readULong()</span>
+		<span class="s1">classTableReader.seek(pos + reader.readULong())</span>
+		<span class="s1">stateArrayReader.seek(pos + reader.readULong())</span>
+		<span class="s1">entryTableReader.seek(pos + reader.readULong())</span>
+		<span class="s0">if </span><span class="s1">self.perGlyphLookup </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">perGlyphTableReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">perGlyphTableReader.seek(pos + reader.readULong())</span>
+		<span class="s0">if </span><span class="s1">issubclass(self.tableClass</span><span class="s0">, </span><span class="s1">LigatureMorphAction):</span>
+			<span class="s1">actionReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">actionReader.seek(pos + reader.readULong())</span>
+			<span class="s1">ligComponentReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">ligComponentReader.seek(pos + reader.readULong())</span>
+			<span class="s1">ligaturesReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">ligaturesReader.seek(pos + reader.readULong())</span>
+			<span class="s1">numLigComponents = (ligaturesReader.pos</span>
+			                    <span class="s1">- ligComponentReader.pos) // </span><span class="s5">2</span>
+			<span class="s0">assert </span><span class="s1">numLigComponents &gt;= </span><span class="s5">0</span>
+			<span class="s1">table.LigComponents = \</span>
+				<span class="s1">ligComponentReader.readUShortArray(numLigComponents)</span>
+			<span class="s1">table.Ligatures = self._readLigatures(ligaturesReader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">elif </span><span class="s1">issubclass(self.tableClass</span><span class="s0">, </span><span class="s1">InsertionMorphAction):</span>
+			<span class="s1">actionReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">actionReader.seek(pos + reader.readULong())</span>
+		<span class="s1">table.GlyphClasses = self.classLookup.read(classTableReader</span><span class="s0">,</span>
+		                                           <span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict)</span>
+		<span class="s1">numStates = int((entryTableReader.pos - stateArrayReader.pos)</span>
+		                 <span class="s1">/ (table.GlyphClassCount * </span><span class="s5">2</span><span class="s1">))</span>
+		<span class="s0">for </span><span class="s1">stateIndex </span><span class="s0">in </span><span class="s1">range(numStates):</span>
+			<span class="s1">state = AATState()</span>
+			<span class="s1">table.States.append(state)</span>
+			<span class="s0">for </span><span class="s1">glyphClass </span><span class="s0">in </span><span class="s1">range(table.GlyphClassCount):</span>
+				<span class="s1">entryIndex = stateArrayReader.readUShort()</span>
+				<span class="s1">state.Transitions[glyphClass] = \</span>
+					<span class="s1">self._readTransition(entryTableReader</span><span class="s0">,</span>
+					                     <span class="s1">entryIndex</span><span class="s0">, </span><span class="s1">font</span><span class="s0">,</span>
+					                     <span class="s1">actionReader)</span>
+		<span class="s0">if </span><span class="s1">self.perGlyphLookup </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">table.PerGlyphLookups = self._readPerGlyphLookups(</span>
+				<span class="s1">table</span><span class="s0">, </span><span class="s1">perGlyphTableReader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">_readTransition(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">entryIndex</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">actionReader):</span>
+		<span class="s1">transition = self.tableClass()</span>
+		<span class="s1">entryReader = reader.getSubReader(</span>
+			<span class="s1">reader.pos + entryIndex * transition.staticSize)</span>
+		<span class="s1">transition.decompile(entryReader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">actionReader)</span>
+		<span class="s0">return </span><span class="s1">transition</span>
+
+	<span class="s0">def </span><span class="s1">_readLigatures(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">limit = len(reader.data)</span>
+		<span class="s1">numLigatureGlyphs = (limit - reader.pos) // </span><span class="s5">2</span>
+		<span class="s0">return </span><span class="s1">font.getGlyphNameMany(reader.readUShortArray(numLigatureGlyphs))</span>
+
+	<span class="s0">def </span><span class="s1">_countPerGlyphLookups(self</span><span class="s0">, </span><span class="s1">table):</span>
+		<span class="s4"># Somewhat annoyingly, the morx table does not encode</span>
+		<span class="s4"># the size of the per-glyph table. So we need to find</span>
+		<span class="s4"># the maximum value that MorphActions use as index</span>
+		<span class="s4"># into this table.</span>
+		<span class="s1">numLookups = </span><span class="s5">0</span>
+		<span class="s0">for </span><span class="s1">state </span><span class="s0">in </span><span class="s1">table.States:</span>
+			<span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">state.Transitions.values():</span>
+				<span class="s0">if </span><span class="s1">isinstance(t</span><span class="s0">, </span><span class="s1">ContextualMorphAction):</span>
+					<span class="s0">if </span><span class="s1">t.MarkIndex != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+						<span class="s1">numLookups = max(</span>
+							<span class="s1">numLookups</span><span class="s0">,</span>
+							<span class="s1">t.MarkIndex + </span><span class="s5">1</span><span class="s1">)</span>
+					<span class="s0">if </span><span class="s1">t.CurrentIndex != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+						<span class="s1">numLookups = max(</span>
+							<span class="s1">numLookups</span><span class="s0">,</span>
+							<span class="s1">t.CurrentIndex + </span><span class="s5">1</span><span class="s1">)</span>
+		<span class="s0">return </span><span class="s1">numLookups</span>
+
+	<span class="s0">def </span><span class="s1">_readPerGlyphLookups(self</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">pos = reader.pos</span>
+		<span class="s1">lookups = []</span>
+		<span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(self._countPerGlyphLookups(table)):</span>
+			<span class="s1">lookupReader = reader.getSubReader(</span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s1">lookupReader.seek(pos + reader.readULong())</span>
+			<span class="s1">lookups.append(</span>
+				<span class="s1">self.perGlyphLookup.read(lookupReader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">{}))</span>
+		<span class="s0">return </span><span class="s1">lookups</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">glyphClassWriter = OTTableWriter()</span>
+		<span class="s1">self.classLookup.write(glyphClassWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">,</span>
+		                       <span class="s1">value.GlyphClasses</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">)</span>
+		<span class="s1">glyphClassData = pad(glyphClassWriter.getAllData()</span><span class="s0">, </span><span class="s5">2</span><span class="s1">)</span>
+		<span class="s1">glyphClassCount = max(value.GlyphClasses.values()) + </span><span class="s5">1</span>
+		<span class="s1">glyphClassTableOffset = </span><span class="s5">16  </span><span class="s4"># size of STXHeader</span>
+		<span class="s0">if </span><span class="s1">self.perGlyphLookup </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">glyphClassTableOffset += </span><span class="s5">4</span>
+
+		<span class="s1">glyphClassTableOffset += self.tableClass.actionHeaderSize</span>
+		<span class="s1">actionData</span><span class="s0">, </span><span class="s1">actionIndex = \</span>
+			<span class="s1">self.tableClass.compileActions(font</span><span class="s0">, </span><span class="s1">value.States)</span>
+		<span class="s1">stateArrayData</span><span class="s0">, </span><span class="s1">entryTableData = self._compileStates(</span>
+			<span class="s1">font</span><span class="s0">, </span><span class="s1">value.States</span><span class="s0">, </span><span class="s1">glyphClassCount</span><span class="s0">, </span><span class="s1">actionIndex)</span>
+		<span class="s1">stateArrayOffset = glyphClassTableOffset + len(glyphClassData)</span>
+		<span class="s1">entryTableOffset = stateArrayOffset + len(stateArrayData)</span>
+		<span class="s1">perGlyphOffset = entryTableOffset + len(entryTableData)</span>
+		<span class="s1">perGlyphData = \</span>
+			<span class="s1">pad(self._compilePerGlyphLookups(value</span><span class="s0">, </span><span class="s1">font)</span><span class="s0">, </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">actionData </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">actionOffset = entryTableOffset + len(entryTableData)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">actionOffset = </span><span class="s0">None</span>
+
+		<span class="s1">ligaturesOffset</span><span class="s0">, </span><span class="s1">ligComponentsOffset = </span><span class="s0">None, None</span>
+		<span class="s1">ligComponentsData = self._compileLigComponents(value</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">ligaturesData = self._compileLigatures(value</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">if </span><span class="s1">ligComponentsData </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s0">assert </span><span class="s1">len(perGlyphData) == </span><span class="s5">0</span>
+			<span class="s1">ligComponentsOffset = actionOffset + len(actionData)</span>
+			<span class="s1">ligaturesOffset = ligComponentsOffset + len(ligComponentsData)</span>
+
+		<span class="s1">writer.writeULong(glyphClassCount)</span>
+		<span class="s1">writer.writeULong(glyphClassTableOffset)</span>
+		<span class="s1">writer.writeULong(stateArrayOffset)</span>
+		<span class="s1">writer.writeULong(entryTableOffset)</span>
+		<span class="s0">if </span><span class="s1">self.perGlyphLookup </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">writer.writeULong(perGlyphOffset)</span>
+		<span class="s0">if </span><span class="s1">actionOffset </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">writer.writeULong(actionOffset)</span>
+		<span class="s0">if </span><span class="s1">ligComponentsOffset </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">writer.writeULong(ligComponentsOffset)</span>
+			<span class="s1">writer.writeULong(ligaturesOffset)</span>
+		<span class="s1">writer.writeData(glyphClassData)</span>
+		<span class="s1">writer.writeData(stateArrayData)</span>
+		<span class="s1">writer.writeData(entryTableData)</span>
+		<span class="s1">writer.writeData(perGlyphData)</span>
+		<span class="s0">if </span><span class="s1">actionData </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">writer.writeData(actionData)</span>
+		<span class="s0">if </span><span class="s1">ligComponentsData </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">writer.writeData(ligComponentsData)</span>
+		<span class="s0">if </span><span class="s1">ligaturesData </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">writer.writeData(ligaturesData)</span>
+
+	<span class="s0">def </span><span class="s1">_compileStates(self</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">states</span><span class="s0">, </span><span class="s1">glyphClassCount</span><span class="s0">, </span><span class="s1">actionIndex):</span>
+		<span class="s1">stateArrayWriter = OTTableWriter()</span>
+		<span class="s1">entries</span><span class="s0">, </span><span class="s1">entryIDs = []</span><span class="s0">, </span><span class="s1">{}</span>
+		<span class="s0">for </span><span class="s1">state </span><span class="s0">in </span><span class="s1">states:</span>
+			<span class="s0">for </span><span class="s1">glyphClass </span><span class="s0">in </span><span class="s1">range(glyphClassCount):</span>
+				<span class="s1">transition = state.Transitions[glyphClass]</span>
+				<span class="s1">entryWriter = OTTableWriter()</span>
+				<span class="s1">transition.compile(entryWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">,</span>
+				                   <span class="s1">actionIndex)</span>
+				<span class="s1">entryData = entryWriter.getAllData()</span>
+				<span class="s0">assert </span><span class="s1">len(entryData)  == transition.staticSize</span><span class="s0">, </span><span class="s1">( \</span>
+					<span class="s3">&quot;%s has staticSize %d, &quot;</span>
+					<span class="s3">&quot;but actually wrote %d bytes&quot; </span><span class="s1">% (</span>
+						<span class="s1">repr(transition)</span><span class="s0">,</span>
+						<span class="s1">transition.staticSize</span><span class="s0">,</span>
+						<span class="s1">len(entryData)))</span>
+				<span class="s1">entryIndex = entryIDs.get(entryData)</span>
+				<span class="s0">if </span><span class="s1">entryIndex </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s1">entryIndex = len(entries)</span>
+					<span class="s1">entryIDs[entryData] = entryIndex</span>
+					<span class="s1">entries.append(entryData)</span>
+				<span class="s1">stateArrayWriter.writeUShort(entryIndex)</span>
+		<span class="s1">stateArrayData = pad(stateArrayWriter.getAllData()</span><span class="s0">, </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s1">entryTableData = pad(bytesjoin(entries)</span><span class="s0">, </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s0">return </span><span class="s1">stateArrayData</span><span class="s0">, </span><span class="s1">entryTableData</span>
+
+	<span class="s0">def </span><span class="s1">_compilePerGlyphLookups(self</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">if </span><span class="s1">self.perGlyphLookup </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+		<span class="s1">numLookups = self._countPerGlyphLookups(table)</span>
+		<span class="s0">assert </span><span class="s1">len(table.PerGlyphLookups) == numLookups</span><span class="s0">, </span><span class="s1">(</span>
+			<span class="s3">&quot;len(AATStateTable.PerGlyphLookups) is %d, &quot;</span>
+			<span class="s3">&quot;but the actions inside the table refer to %d&quot; </span><span class="s1">%</span>
+				<span class="s1">(len(table.PerGlyphLookups)</span><span class="s0">, </span><span class="s1">numLookups))</span>
+		<span class="s1">writer = OTTableWriter()</span>
+		<span class="s0">for </span><span class="s1">lookup </span><span class="s0">in </span><span class="s1">table.PerGlyphLookups:</span>
+			<span class="s1">lookupWriter = writer.getSubWriter(offsetSize=</span><span class="s5">4</span><span class="s1">)</span>
+			<span class="s1">self.perGlyphLookup.write(lookupWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">,</span>
+			                          <span class="s1">{}</span><span class="s0">, </span><span class="s1">lookup</span><span class="s0">, None</span><span class="s1">)</span>
+			<span class="s1">writer.writeSubTable(lookupWriter)</span>
+		<span class="s0">return </span><span class="s1">writer.getAllData()</span>
+
+	<span class="s0">def </span><span class="s1">_compileLigComponents(self</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">if not </span><span class="s1">hasattr(table</span><span class="s0">, </span><span class="s3">&quot;LigComponents&quot;</span><span class="s1">):</span>
+			<span class="s0">return None</span>
+		<span class="s1">writer = OTTableWriter()</span>
+		<span class="s0">for </span><span class="s1">component </span><span class="s0">in </span><span class="s1">table.LigComponents:</span>
+			<span class="s1">writer.writeUShort(component)</span>
+		<span class="s0">return </span><span class="s1">writer.getAllData()</span>
+
+	<span class="s0">def </span><span class="s1">_compileLigatures(self</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">if not </span><span class="s1">hasattr(table</span><span class="s0">, </span><span class="s3">&quot;Ligatures&quot;</span><span class="s1">):</span>
+			<span class="s0">return None</span>
+		<span class="s1">writer = OTTableWriter()</span>
+		<span class="s0">for </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">table.Ligatures:</span>
+			<span class="s1">writer.writeUShort(font.getGlyphID(glyphName))</span>
+		<span class="s0">return </span><span class="s1">writer.getAllData()</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.comment(</span><span class="s3">&quot;GlyphClassCount=%s&quot; </span><span class="s1">%value.GlyphClassCount)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">g</span><span class="s0">, </span><span class="s1">klass </span><span class="s0">in </span><span class="s1">sorted(value.GlyphClasses.items()):</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;GlyphClass&quot;</span><span class="s0">, </span><span class="s1">glyph=g</span><span class="s0">, </span><span class="s1">value=klass)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">stateIndex</span><span class="s0">, </span><span class="s1">state </span><span class="s0">in </span><span class="s1">enumerate(value.States):</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s3">&quot;State&quot;</span><span class="s0">, </span><span class="s1">index=stateIndex)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s0">for </span><span class="s1">glyphClass</span><span class="s0">, </span><span class="s1">trans </span><span class="s0">in </span><span class="s1">sorted(state.Transitions.items()):</span>
+				<span class="s1">trans.toXML(xmlWriter</span><span class="s0">, </span><span class="s1">font=font</span><span class="s0">,</span>
+				            <span class="s1">attrs={</span><span class="s3">&quot;onGlyphClass&quot;</span><span class="s1">: glyphClass}</span><span class="s0">,</span>
+				            <span class="s1">name=</span><span class="s3">&quot;Transition&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s3">&quot;State&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">lookup </span><span class="s0">in </span><span class="s1">enumerate(value.PerGlyphLookups):</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s3">&quot;PerGlyphLookup&quot;</span><span class="s0">, </span><span class="s1">index=i)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s0">for </span><span class="s1">glyph</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">sorted(lookup.items()):</span>
+				<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;Lookup&quot;</span><span class="s0">, </span><span class="s1">glyph=glyph</span><span class="s0">,</span>
+				                    <span class="s1">value=val)</span>
+				<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s3">&quot;PerGlyphLookup&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">if </span><span class="s1">hasattr(value</span><span class="s0">, </span><span class="s3">&quot;LigComponents&quot;</span><span class="s1">):</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s3">&quot;LigComponents&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">enumerate(getattr(value</span><span class="s0">, </span><span class="s3">&quot;LigComponents&quot;</span><span class="s1">)):</span>
+				<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;LigComponent&quot;</span><span class="s0">, </span><span class="s1">index=i</span><span class="s0">,</span>
+				                    <span class="s1">value=val)</span>
+				<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s3">&quot;LigComponents&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self._xmlWriteLigatures(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">_xmlWriteLigatures(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s0">if not </span><span class="s1">hasattr(value</span><span class="s0">, </span><span class="s3">&quot;Ligatures&quot;</span><span class="s1">):</span>
+			<span class="s0">return</span>
+		<span class="s1">xmlWriter.begintag(</span><span class="s3">&quot;Ligatures&quot;</span><span class="s1">)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">g </span><span class="s0">in </span><span class="s1">enumerate(getattr(value</span><span class="s0">, </span><span class="s3">&quot;Ligatures&quot;</span><span class="s1">)):</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s3">&quot;Ligature&quot;</span><span class="s0">, </span><span class="s1">index=i</span><span class="s0">, </span><span class="s1">glyph=g)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(</span><span class="s3">&quot;Ligatures&quot;</span><span class="s1">)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">table = AATStateTable()</span>
+		<span class="s0">for </span><span class="s1">eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eltName == </span><span class="s3">&quot;GlyphClass&quot;</span><span class="s1">:</span>
+				<span class="s1">glyph = eltAttrs[</span><span class="s3">&quot;glyph&quot;</span><span class="s1">]</span>
+				<span class="s1">value = eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">]</span>
+				<span class="s1">table.GlyphClasses[glyph] = safeEval(value)</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;State&quot;</span><span class="s1">:</span>
+				<span class="s1">state = self._xmlReadState(eltAttrs</span><span class="s0">, </span><span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+				<span class="s1">table.States.append(state)</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;PerGlyphLookup&quot;</span><span class="s1">:</span>
+				<span class="s1">lookup = self.perGlyphLookup.xmlRead(</span>
+					<span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+				<span class="s1">table.PerGlyphLookups.append(lookup)</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;LigComponents&quot;</span><span class="s1">:</span>
+				<span class="s1">table.LigComponents = \</span>
+					<span class="s1">self._xmlReadLigComponents(</span>
+						<span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s0">elif </span><span class="s1">eltName == </span><span class="s3">&quot;Ligatures&quot;</span><span class="s1">:</span>
+				<span class="s1">table.Ligatures = \</span>
+					<span class="s1">self._xmlReadLigatures(</span>
+						<span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">table.GlyphClassCount = max(table.GlyphClasses.values()) + </span><span class="s5">1</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">_xmlReadState(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">state = AATState()</span>
+		<span class="s0">for </span><span class="s1">eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">eltContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eltName == </span><span class="s3">&quot;Transition&quot;</span><span class="s1">:</span>
+				<span class="s1">glyphClass = safeEval(eltAttrs[</span><span class="s3">&quot;onGlyphClass&quot;</span><span class="s1">])</span>
+				<span class="s1">transition = self.tableClass()</span>
+				<span class="s1">transition.fromXML(eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">,</span>
+				                   <span class="s1">eltContent</span><span class="s0">, </span><span class="s1">font)</span>
+				<span class="s1">state.Transitions[glyphClass] = transition</span>
+		<span class="s0">return </span><span class="s1">state</span>
+
+	<span class="s0">def </span><span class="s1">_xmlReadLigComponents(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">ligComponents = []</span>
+		<span class="s0">for </span><span class="s1">eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">_eltContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eltName == </span><span class="s3">&quot;LigComponent&quot;</span><span class="s1">:</span>
+				<span class="s1">ligComponents.append(</span>
+					<span class="s1">safeEval(eltAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">]))</span>
+		<span class="s0">return </span><span class="s1">ligComponents</span>
+
+	<span class="s0">def </span><span class="s1">_xmlReadLigatures(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">ligs = []</span>
+		<span class="s0">for </span><span class="s1">eltName</span><span class="s0">, </span><span class="s1">eltAttrs</span><span class="s0">, </span><span class="s1">_eltContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eltName == </span><span class="s3">&quot;Ligature&quot;</span><span class="s1">:</span>
+				<span class="s1">ligs.append(eltAttrs[</span><span class="s3">&quot;glyph&quot;</span><span class="s1">])</span>
+		<span class="s0">return </span><span class="s1">ligs</span>
+
+
+<span class="s0">class </span><span class="s1">CIDGlyphMap(BaseConverter):</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">numCIDs = reader.readUShort()</span>
+		<span class="s1">result = {}</span>
+		<span class="s0">for </span><span class="s1">cid</span><span class="s0">, </span><span class="s1">glyphID </span><span class="s0">in </span><span class="s1">enumerate(reader.readUShortArray(numCIDs)):</span>
+			<span class="s0">if </span><span class="s1">glyphID != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s1">result[cid] = font.getGlyphName(glyphID)</span>
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">items = {cid: font.getGlyphID(glyph)</span>
+		         <span class="s0">for </span><span class="s1">cid</span><span class="s0">, </span><span class="s1">glyph </span><span class="s0">in </span><span class="s1">value.items()}</span>
+		<span class="s1">count = max(items) + </span><span class="s5">1 </span><span class="s0">if </span><span class="s1">items </span><span class="s0">else </span><span class="s5">0</span>
+		<span class="s1">writer.writeUShort(count)</span>
+		<span class="s0">for </span><span class="s1">cid </span><span class="s0">in </span><span class="s1">range(count):</span>
+			<span class="s1">writer.writeUShort(items.get(cid</span><span class="s0">, </span><span class="s5">0xFFFF</span><span class="s1">))</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">result = {}</span>
+		<span class="s0">for </span><span class="s1">eName</span><span class="s0">, </span><span class="s1">eAttrs</span><span class="s0">, </span><span class="s1">_eContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eName == </span><span class="s3">&quot;CID&quot;</span><span class="s1">:</span>
+				<span class="s1">result[safeEval(eAttrs[</span><span class="s3">&quot;cid&quot;</span><span class="s1">])] = \</span>
+					<span class="s1">eAttrs[</span><span class="s3">&quot;glyph&quot;</span><span class="s1">].strip()</span>
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">cid</span><span class="s0">, </span><span class="s1">glyph </span><span class="s0">in </span><span class="s1">sorted(value.items()):</span>
+			<span class="s0">if </span><span class="s1">glyph </span><span class="s0">is not None and </span><span class="s1">glyph != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s1">xmlWriter.simpletag(</span>
+					<span class="s3">&quot;CID&quot;</span><span class="s0">, </span><span class="s1">cid=cid</span><span class="s0">, </span><span class="s1">glyph=glyph)</span>
+				<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+
+<span class="s0">class </span><span class="s1">GlyphCIDMap(BaseConverter):</span>
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">glyphOrder = font.getGlyphOrder()</span>
+		<span class="s1">count = reader.readUShort()</span>
+		<span class="s1">cids = reader.readUShortArray(count)</span>
+		<span class="s0">if </span><span class="s1">count &gt; len(glyphOrder):</span>
+			<span class="s1">log.warning(</span><span class="s3">&quot;GlyphCIDMap has %d elements, &quot;</span>
+			            <span class="s3">&quot;but the font has only %d glyphs; &quot;</span>
+			            <span class="s3">&quot;ignoring the rest&quot; </span><span class="s1">%</span>
+			             <span class="s1">(count</span><span class="s0">, </span><span class="s1">len(glyphOrder)))</span>
+		<span class="s1">result = {}</span>
+		<span class="s0">for </span><span class="s1">glyphID </span><span class="s0">in </span><span class="s1">range(min(len(cids)</span><span class="s0">, </span><span class="s1">len(glyphOrder))):</span>
+			<span class="s1">cid = cids[glyphID]</span>
+			<span class="s0">if </span><span class="s1">cid != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s1">result[glyphOrder[glyphID]] = cid</span>
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">items = {font.getGlyphID(g): cid</span>
+		         <span class="s0">for </span><span class="s1">g</span><span class="s0">, </span><span class="s1">cid </span><span class="s0">in </span><span class="s1">value.items()</span>
+		         <span class="s0">if </span><span class="s1">cid </span><span class="s0">is not None and </span><span class="s1">cid != </span><span class="s5">0xFFFF</span><span class="s1">}</span>
+		<span class="s1">count = max(items) + </span><span class="s5">1 </span><span class="s0">if </span><span class="s1">items </span><span class="s0">else </span><span class="s5">0</span>
+		<span class="s1">writer.writeUShort(count)</span>
+		<span class="s0">for </span><span class="s1">glyphID </span><span class="s0">in </span><span class="s1">range(count):</span>
+			<span class="s1">writer.writeUShort(items.get(glyphID</span><span class="s0">, </span><span class="s5">0xFFFF</span><span class="s1">))</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">result = {}</span>
+		<span class="s0">for </span><span class="s1">eName</span><span class="s0">, </span><span class="s1">eAttrs</span><span class="s0">, </span><span class="s1">_eContent </span><span class="s0">in </span><span class="s1">filter(istuple</span><span class="s0">, </span><span class="s1">content):</span>
+			<span class="s0">if </span><span class="s1">eName == </span><span class="s3">&quot;CID&quot;</span><span class="s1">:</span>
+				<span class="s1">result[eAttrs[</span><span class="s3">&quot;glyph&quot;</span><span class="s1">]] = \</span>
+					<span class="s1">safeEval(eAttrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">for </span><span class="s1">glyph</span><span class="s0">, </span><span class="s1">cid </span><span class="s0">in </span><span class="s1">sorted(value.items()):</span>
+			<span class="s0">if </span><span class="s1">cid </span><span class="s0">is not None and </span><span class="s1">cid != </span><span class="s5">0xFFFF</span><span class="s1">:</span>
+				<span class="s1">xmlWriter.simpletag(</span>
+					<span class="s3">&quot;CID&quot;</span><span class="s0">, </span><span class="s1">glyph=glyph</span><span class="s0">, </span><span class="s1">value=cid)</span>
+				<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+
+<span class="s0">class </span><span class="s1">DeltaValue(BaseConverter):</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">StartSize = tableDict[</span><span class="s3">&quot;StartSize&quot;</span><span class="s1">]</span>
+		<span class="s1">EndSize = tableDict[</span><span class="s3">&quot;EndSize&quot;</span><span class="s1">]</span>
+		<span class="s1">DeltaFormat = tableDict[</span><span class="s3">&quot;DeltaFormat&quot;</span><span class="s1">]</span>
+		<span class="s0">assert </span><span class="s1">DeltaFormat </span><span class="s0">in </span><span class="s1">(</span><span class="s5">1</span><span class="s0">, </span><span class="s5">2</span><span class="s0">, </span><span class="s5">3</span><span class="s1">)</span><span class="s0">, </span><span class="s3">&quot;illegal DeltaFormat&quot;</span>
+		<span class="s1">nItems = EndSize - StartSize + </span><span class="s5">1</span>
+		<span class="s1">nBits = </span><span class="s5">1 </span><span class="s1">&lt;&lt; DeltaFormat</span>
+		<span class="s1">minusOffset = </span><span class="s5">1 </span><span class="s1">&lt;&lt; nBits</span>
+		<span class="s1">mask = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; nBits) - </span><span class="s5">1</span>
+		<span class="s1">signMask = </span><span class="s5">1 </span><span class="s1">&lt;&lt; (nBits - </span><span class="s5">1</span><span class="s1">)</span>
+
+		<span class="s1">DeltaValue = []</span>
+		<span class="s1">tmp</span><span class="s0">, </span><span class="s1">shift = </span><span class="s5">0</span><span class="s0">, </span><span class="s5">0</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(nItems):</span>
+			<span class="s0">if </span><span class="s1">shift == </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s1">tmp</span><span class="s0">, </span><span class="s1">shift = reader.readUShort()</span><span class="s0">, </span><span class="s5">16</span>
+			<span class="s1">shift = shift - nBits</span>
+			<span class="s1">value = (tmp &gt;&gt; shift) &amp; mask</span>
+			<span class="s0">if </span><span class="s1">value &amp; signMask:</span>
+				<span class="s1">value = value - minusOffset</span>
+			<span class="s1">DeltaValue.append(value)</span>
+		<span class="s0">return </span><span class="s1">DeltaValue</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">StartSize = tableDict[</span><span class="s3">&quot;StartSize&quot;</span><span class="s1">]</span>
+		<span class="s1">EndSize = tableDict[</span><span class="s3">&quot;EndSize&quot;</span><span class="s1">]</span>
+		<span class="s1">DeltaFormat = tableDict[</span><span class="s3">&quot;DeltaFormat&quot;</span><span class="s1">]</span>
+		<span class="s1">DeltaValue = value</span>
+		<span class="s0">assert </span><span class="s1">DeltaFormat </span><span class="s0">in </span><span class="s1">(</span><span class="s5">1</span><span class="s0">, </span><span class="s5">2</span><span class="s0">, </span><span class="s5">3</span><span class="s1">)</span><span class="s0">, </span><span class="s3">&quot;illegal DeltaFormat&quot;</span>
+		<span class="s1">nItems = EndSize - StartSize + </span><span class="s5">1</span>
+		<span class="s1">nBits = </span><span class="s5">1 </span><span class="s1">&lt;&lt; DeltaFormat</span>
+		<span class="s0">assert </span><span class="s1">len(DeltaValue) == nItems</span>
+		<span class="s1">mask = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; nBits) - </span><span class="s5">1</span>
+
+		<span class="s1">tmp</span><span class="s0">, </span><span class="s1">shift = </span><span class="s5">0</span><span class="s0">, </span><span class="s5">16</span>
+		<span class="s0">for </span><span class="s1">value </span><span class="s0">in </span><span class="s1">DeltaValue:</span>
+			<span class="s1">shift = shift - nBits</span>
+			<span class="s1">tmp = tmp | ((value &amp; mask) &lt;&lt; shift)</span>
+			<span class="s0">if </span><span class="s1">shift == </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s1">writer.writeUShort(tmp)</span>
+				<span class="s1">tmp</span><span class="s0">, </span><span class="s1">shift = </span><span class="s5">0</span><span class="s0">, </span><span class="s5">16</span>
+		<span class="s0">if </span><span class="s1">shift != </span><span class="s5">16</span><span class="s1">:</span>
+			<span class="s1">writer.writeUShort(tmp)</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">value)])</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">return </span><span class="s1">safeEval(attrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+
+
+<span class="s0">class </span><span class="s1">VarIdxMapValue(BaseConverter):</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">fmt = tableDict[</span><span class="s3">'EntryFormat'</span><span class="s1">]</span>
+		<span class="s1">nItems = tableDict[</span><span class="s3">'MappingCount'</span><span class="s1">]</span>
+
+		<span class="s1">innerBits = </span><span class="s5">1 </span><span class="s1">+ (fmt &amp; </span><span class="s5">0x000F</span><span class="s1">)</span>
+		<span class="s1">innerMask = (</span><span class="s5">1</span><span class="s1">&lt;&lt;innerBits) - </span><span class="s5">1</span>
+		<span class="s1">outerMask = </span><span class="s5">0xFFFFFFFF </span><span class="s1">- innerMask</span>
+		<span class="s1">outerShift = </span><span class="s5">16 </span><span class="s1">- innerBits</span>
+
+		<span class="s1">entrySize = </span><span class="s5">1 </span><span class="s1">+ ((fmt &amp; </span><span class="s5">0x0030</span><span class="s1">) &gt;&gt; </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s1">readArray = {</span>
+			<span class="s5">1</span><span class="s1">: reader.readUInt8Array</span><span class="s0">,</span>
+			<span class="s5">2</span><span class="s1">: reader.readUShortArray</span><span class="s0">,</span>
+			<span class="s5">3</span><span class="s1">: reader.readUInt24Array</span><span class="s0">,</span>
+			<span class="s5">4</span><span class="s1">: reader.readULongArray</span><span class="s0">,</span>
+		<span class="s1">}[entrySize]</span>
+
+		<span class="s0">return </span><span class="s1">[(((raw &amp; outerMask) &lt;&lt; outerShift) | (raw &amp; innerMask))</span>
+			<span class="s0">for </span><span class="s1">raw </span><span class="s0">in </span><span class="s1">readArray(nItems)]</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">fmt = tableDict[</span><span class="s3">'EntryFormat'</span><span class="s1">]</span>
+		<span class="s1">mapping = value</span>
+		<span class="s1">writer[</span><span class="s3">'MappingCount'</span><span class="s1">].setValue(len(mapping))</span>
+
+		<span class="s1">innerBits = </span><span class="s5">1 </span><span class="s1">+ (fmt &amp; </span><span class="s5">0x000F</span><span class="s1">)</span>
+		<span class="s1">innerMask = (</span><span class="s5">1</span><span class="s1">&lt;&lt;innerBits) - </span><span class="s5">1</span>
+		<span class="s1">outerShift = </span><span class="s5">16 </span><span class="s1">- innerBits</span>
+
+		<span class="s1">entrySize = </span><span class="s5">1 </span><span class="s1">+ ((fmt &amp; </span><span class="s5">0x0030</span><span class="s1">) &gt;&gt; </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s1">writeArray = {</span>
+			<span class="s5">1</span><span class="s1">: writer.writeUInt8Array</span><span class="s0">,</span>
+			<span class="s5">2</span><span class="s1">: writer.writeUShortArray</span><span class="s0">,</span>
+			<span class="s5">3</span><span class="s1">: writer.writeUInt24Array</span><span class="s0">,</span>
+			<span class="s5">4</span><span class="s1">: writer.writeULongArray</span><span class="s0">,</span>
+		<span class="s1">}[entrySize]</span>
+
+		<span class="s1">writeArray([(((idx &amp; </span><span class="s5">0xFFFF0000</span><span class="s1">) &gt;&gt; outerShift) | (idx &amp; innerMask))</span>
+			    <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">mapping])</span>
+
+
+<span class="s0">class </span><span class="s1">VarDataValue(BaseConverter):</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s1">values = []</span>
+
+		<span class="s1">regionCount = tableDict[</span><span class="s3">&quot;VarRegionCount&quot;</span><span class="s1">]</span>
+		<span class="s1">wordCount = tableDict[</span><span class="s3">&quot;NumShorts&quot;</span><span class="s1">]</span>
+
+		<span class="s4"># https://github.com/fonttools/fonttools/issues/2279</span>
+		<span class="s1">longWords = bool(wordCount &amp; </span><span class="s5">0x8000</span><span class="s1">)</span>
+		<span class="s1">wordCount = wordCount &amp; </span><span class="s5">0x7FFF</span>
+
+		<span class="s0">if </span><span class="s1">longWords:</span>
+			<span class="s1">readBigArray</span><span class="s0">, </span><span class="s1">readSmallArray = reader.readLongArray</span><span class="s0">, </span><span class="s1">reader.readShortArray</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">readBigArray</span><span class="s0">, </span><span class="s1">readSmallArray = reader.readShortArray</span><span class="s0">, </span><span class="s1">reader.readInt8Array</span>
+
+		<span class="s1">n1</span><span class="s0">, </span><span class="s1">n2 = min(regionCount</span><span class="s0">, </span><span class="s1">wordCount)</span><span class="s0">, </span><span class="s1">max(regionCount</span><span class="s0">, </span><span class="s1">wordCount)</span>
+		<span class="s1">values.extend(readBigArray(n1))</span>
+		<span class="s1">values.extend(readSmallArray(n2 - n1))</span>
+		<span class="s0">if </span><span class="s1">n2 &gt; regionCount: </span><span class="s4"># Padding</span>
+			<span class="s0">del </span><span class="s1">values[regionCount:]</span>
+
+		<span class="s0">return </span><span class="s1">values</span>
+
+	<span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">repeatIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">regionCount = tableDict[</span><span class="s3">&quot;VarRegionCount&quot;</span><span class="s1">]</span>
+		<span class="s1">wordCount = tableDict[</span><span class="s3">&quot;NumShorts&quot;</span><span class="s1">]</span>
+
+		<span class="s4"># https://github.com/fonttools/fonttools/issues/2279</span>
+		<span class="s1">longWords = bool(wordCount &amp; </span><span class="s5">0x8000</span><span class="s1">)</span>
+		<span class="s1">wordCount = wordCount &amp; </span><span class="s5">0x7FFF</span>
+
+		<span class="s1">(writeBigArray</span><span class="s0">, </span><span class="s1">writeSmallArray) = {</span>
+			<span class="s0">False</span><span class="s1">: (writer.writeShortArray</span><span class="s0">, </span><span class="s1">writer.writeInt8Array)</span><span class="s0">,</span>
+			<span class="s0">True</span><span class="s1">:  (writer.writeLongArray</span><span class="s0">,  </span><span class="s1">writer.writeShortArray)</span><span class="s0">,</span>
+		<span class="s1">}[longWords]</span>
+
+		<span class="s1">n1</span><span class="s0">, </span><span class="s1">n2 = min(regionCount</span><span class="s0">, </span><span class="s1">wordCount)</span><span class="s0">, </span><span class="s1">max(regionCount</span><span class="s0">, </span><span class="s1">wordCount)</span>
+		<span class="s1">writeBigArray(values[:n1])</span>
+		<span class="s1">writeSmallArray(values[n1:regionCount])</span>
+		<span class="s0">if </span><span class="s1">n2 &gt; regionCount: </span><span class="s4"># Padding</span>
+			<span class="s1">writer.writeSmallArray([</span><span class="s5">0</span><span class="s1">] * (n2 - regionCount))</span>
+
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">value)])</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">xmlRead(self</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">return </span><span class="s1">safeEval(attrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+
+<span class="s0">class </span><span class="s1">LookupFlag(UShort):</span>
+	<span class="s0">def </span><span class="s1">xmlWrite(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs):</span>
+		<span class="s1">xmlWriter.simpletag(name</span><span class="s0">, </span><span class="s1">attrs + [(</span><span class="s3">&quot;value&quot;</span><span class="s0">, </span><span class="s1">value)])</span>
+		<span class="s1">flags = []</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x01</span><span class="s1">: flags.append(</span><span class="s3">&quot;rightToLeft&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x02</span><span class="s1">: flags.append(</span><span class="s3">&quot;ignoreBaseGlyphs&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x04</span><span class="s1">: flags.append(</span><span class="s3">&quot;ignoreLigatures&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x08</span><span class="s1">: flags.append(</span><span class="s3">&quot;ignoreMarks&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0x10</span><span class="s1">: flags.append(</span><span class="s3">&quot;useMarkFilteringSet&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">value &amp; </span><span class="s5">0xff00</span><span class="s1">: flags.append(</span><span class="s3">&quot;markAttachmentType[%i]&quot; </span><span class="s1">% (value &gt;&gt; </span><span class="s5">8</span><span class="s1">))</span>
+		<span class="s0">if </span><span class="s1">flags:</span>
+			<span class="s1">xmlWriter.comment(</span><span class="s3">&quot; &quot;</span><span class="s1">.join(flags))</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+
+<span class="s0">class </span><span class="s1">_UInt8Enum(UInt8):</span>
+	<span class="s1">enumClass = NotImplemented</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict):</span>
+		<span class="s0">return </span><span class="s1">self.enumClass(super().read(reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">tableDict))</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">fromString(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">getattr(cls.enumClass</span><span class="s0">, </span><span class="s1">value.upper())</span>
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">toString(cls</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">return </span><span class="s1">cls.enumClass(value).name.lower()</span>
+
+
+<span class="s0">class </span><span class="s1">ExtendMode(_UInt8Enum):</span>
+	<span class="s1">enumClass = _ExtendMode</span>
+
+
+<span class="s0">class </span><span class="s1">CompositeMode(_UInt8Enum):</span>
+	<span class="s1">enumClass = _CompositeMode</span>
+
+
+<span class="s1">converterMapping = {</span>
+	<span class="s4"># type      class</span>
+	<span class="s3">&quot;int8&quot;</span><span class="s1">:		Int8</span><span class="s0">,</span>
+	<span class="s3">&quot;int16&quot;</span><span class="s1">:	Short</span><span class="s0">,</span>
+	<span class="s3">&quot;uint8&quot;</span><span class="s1">:	UInt8</span><span class="s0">,</span>
+	<span class="s3">&quot;uint16&quot;</span><span class="s1">:	UShort</span><span class="s0">,</span>
+	<span class="s3">&quot;uint24&quot;</span><span class="s1">:	UInt24</span><span class="s0">,</span>
+	<span class="s3">&quot;uint32&quot;</span><span class="s1">:	ULong</span><span class="s0">,</span>
+	<span class="s3">&quot;char64&quot;</span><span class="s1">:	Char64</span><span class="s0">,</span>
+	<span class="s3">&quot;Flags32&quot;</span><span class="s1">:	Flags32</span><span class="s0">,</span>
+	<span class="s3">&quot;VarIndex&quot;</span><span class="s1">:	VarIndex</span><span class="s0">,</span>
+	<span class="s3">&quot;Version&quot;</span><span class="s1">:	Version</span><span class="s0">,</span>
+	<span class="s3">&quot;Tag&quot;</span><span class="s1">:		Tag</span><span class="s0">,</span>
+	<span class="s3">&quot;GlyphID&quot;</span><span class="s1">:	GlyphID</span><span class="s0">,</span>
+	<span class="s3">&quot;GlyphID32&quot;</span><span class="s1">:	GlyphID32</span><span class="s0">,</span>
+	<span class="s3">&quot;NameID&quot;</span><span class="s1">:	NameID</span><span class="s0">,</span>
+	<span class="s3">&quot;DeciPoints&quot;</span><span class="s1">:	DeciPoints</span><span class="s0">,</span>
+	<span class="s3">&quot;Fixed&quot;</span><span class="s1">:	Fixed</span><span class="s0">,</span>
+	<span class="s3">&quot;F2Dot14&quot;</span><span class="s1">:	F2Dot14</span><span class="s0">,</span>
+	<span class="s3">&quot;Angle&quot;</span><span class="s1">:	Angle</span><span class="s0">,</span>
+	<span class="s3">&quot;BiasedAngle&quot;</span><span class="s1">:	BiasedAngle</span><span class="s0">,</span>
+	<span class="s3">&quot;struct&quot;</span><span class="s1">:	Struct</span><span class="s0">,</span>
+	<span class="s3">&quot;Offset&quot;</span><span class="s1">:	Table</span><span class="s0">,</span>
+	<span class="s3">&quot;LOffset&quot;</span><span class="s1">:	LTable</span><span class="s0">,</span>
+	<span class="s3">&quot;Offset24&quot;</span><span class="s1">:	Table24</span><span class="s0">,</span>
+	<span class="s3">&quot;ValueRecord&quot;</span><span class="s1">:	ValueRecord</span><span class="s0">,</span>
+	<span class="s3">&quot;DeltaValue&quot;</span><span class="s1">:	DeltaValue</span><span class="s0">,</span>
+	<span class="s3">&quot;VarIdxMapValue&quot;</span><span class="s1">:	VarIdxMapValue</span><span class="s0">,</span>
+	<span class="s3">&quot;VarDataValue&quot;</span><span class="s1">:	VarDataValue</span><span class="s0">,</span>
+	<span class="s3">&quot;LookupFlag&quot;</span><span class="s1">: LookupFlag</span><span class="s0">,</span>
+	<span class="s3">&quot;ExtendMode&quot;</span><span class="s1">: ExtendMode</span><span class="s0">,</span>
+	<span class="s3">&quot;CompositeMode&quot;</span><span class="s1">: CompositeMode</span><span class="s0">,</span>
+	<span class="s3">&quot;STATFlags&quot;</span><span class="s1">: STATFlags</span><span class="s0">,</span>
+
+	<span class="s4"># AAT</span>
+	<span class="s3">&quot;CIDGlyphMap&quot;</span><span class="s1">:	CIDGlyphMap</span><span class="s0">,</span>
+	<span class="s3">&quot;GlyphCIDMap&quot;</span><span class="s1">:	GlyphCIDMap</span><span class="s0">,</span>
+	<span class="s3">&quot;MortChain&quot;</span><span class="s1">:	StructWithLength</span><span class="s0">,</span>
+	<span class="s3">&quot;MortSubtable&quot;</span><span class="s1">: StructWithLength</span><span class="s0">,</span>
+	<span class="s3">&quot;MorxChain&quot;</span><span class="s1">:	StructWithLength</span><span class="s0">,</span>
+	<span class="s3">&quot;MorxSubtable&quot;</span><span class="s1">: MorxSubtableConverter</span><span class="s0">,</span>
+
+	<span class="s4"># &quot;Template&quot; types</span>
+	<span class="s3">&quot;AATLookup&quot;</span><span class="s1">:	</span><span class="s0">lambda </span><span class="s1">C: partial(AATLookup</span><span class="s0">, </span><span class="s1">tableClass=C)</span><span class="s0">,</span>
+	<span class="s3">&quot;AATLookupWithDataOffset&quot;</span><span class="s1">:	</span><span class="s0">lambda </span><span class="s1">C: partial(AATLookupWithDataOffset</span><span class="s0">, </span><span class="s1">tableClass=C)</span><span class="s0">,</span>
+	<span class="s3">&quot;STXHeader&quot;</span><span class="s1">:	</span><span class="s0">lambda </span><span class="s1">C: partial(STXHeader</span><span class="s0">, </span><span class="s1">tableClass=C)</span><span class="s0">,</span>
+	<span class="s3">&quot;OffsetTo&quot;</span><span class="s1">:	</span><span class="s0">lambda </span><span class="s1">C: partial(Table</span><span class="s0">, </span><span class="s1">tableClass=C)</span><span class="s0">,</span>
+	<span class="s3">&quot;LOffsetTo&quot;</span><span class="s1">:	</span><span class="s0">lambda </span><span class="s1">C: partial(LTable</span><span class="s0">, </span><span class="s1">tableClass=C)</span><span class="s0">,</span>
+	<span class="s3">&quot;LOffset24To&quot;</span><span class="s1">:	</span><span class="s0">lambda </span><span class="s1">C: partial(Table24</span><span class="s0">, </span><span class="s1">tableClass=C)</span><span class="s0">,</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,346 @@
+<html>
+<head>
+<title>ufo.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ufo.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2015 Google Inc. All Rights Reserved.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#     http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+
+<span class="s2">&quot;&quot;&quot;Converts cubic bezier curves to quadratic splines. 
+ 
+Conversion is performed such that the quadratic splines keep the same end-curve 
+tangents as the original cubics. The approach is iterative, increasing the 
+number of segments for a spline until the error gets below a bound. 
+ 
+Respective curves from multiple fonts will be converted at once to ensure that 
+the resulting splines are interpolation-compatible. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">from </span><span class="s1">fontTools.pens.basePen </span><span class="s3">import </span><span class="s1">AbstractPen</span>
+<span class="s3">from </span><span class="s1">fontTools.pens.pointPen </span><span class="s3">import </span><span class="s1">PointToSegmentPen</span>
+<span class="s3">from </span><span class="s1">fontTools.pens.reverseContourPen </span><span class="s3">import </span><span class="s1">ReverseContourPen</span>
+
+<span class="s3">from </span><span class="s1">. </span><span class="s3">import </span><span class="s1">curves_to_quadratic</span>
+<span class="s3">from </span><span class="s1">.errors </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">UnequalZipLengthsError</span><span class="s3">, </span><span class="s1">IncompatibleSegmentNumberError</span><span class="s3">,</span>
+    <span class="s1">IncompatibleSegmentTypesError</span><span class="s3">, </span><span class="s1">IncompatibleGlyphsError</span><span class="s3">,</span>
+    <span class="s1">IncompatibleFontsError)</span>
+
+
+<span class="s1">__all__ = [</span><span class="s4">'fonts_to_quadratic'</span><span class="s3">, </span><span class="s4">'font_to_quadratic'</span><span class="s1">]</span>
+
+<span class="s0"># The default approximation error below is a relative value (1/1000 of the EM square).</span>
+<span class="s0"># Later on, we convert it to absolute font units by multiplying it by a font's UPEM</span>
+<span class="s0"># (see fonts_to_quadratic).</span>
+<span class="s1">DEFAULT_MAX_ERR = </span><span class="s5">0.001</span>
+<span class="s1">CURVE_TYPE_LIB_KEY = </span><span class="s4">&quot;com.github.googlei18n.cu2qu.curve_type&quot;</span>
+
+<span class="s1">logger = logging.getLogger(__name__)</span>
+
+
+<span class="s1">_zip = zip</span>
+<span class="s3">def </span><span class="s1">zip(*args):</span>
+    <span class="s2">&quot;&quot;&quot;Ensure each argument to zip has the same length. Also make sure a list is 
+    returned for python 2/3 compatibility. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">len(set(len(a) </span><span class="s3">for </span><span class="s1">a </span><span class="s3">in </span><span class="s1">args)) != </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">UnequalZipLengthsError(*args)</span>
+    <span class="s3">return </span><span class="s1">list(_zip(*args))</span>
+
+
+<span class="s3">class </span><span class="s1">GetSegmentsPen(AbstractPen):</span>
+    <span class="s2">&quot;&quot;&quot;Pen to collect segments into lists of points for conversion. 
+ 
+    Curves always include their initial on-curve point, so some points are 
+    duplicated between segments. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._last_pt = </span><span class="s3">None</span>
+        <span class="s1">self.segments = []</span>
+
+    <span class="s3">def </span><span class="s1">_add_segment(self</span><span class="s3">, </span><span class="s1">tag</span><span class="s3">, </span><span class="s1">*args):</span>
+        <span class="s3">if </span><span class="s1">tag </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'move'</span><span class="s3">, </span><span class="s4">'line'</span><span class="s3">, </span><span class="s4">'qcurve'</span><span class="s3">, </span><span class="s4">'curve'</span><span class="s1">]:</span>
+            <span class="s1">self._last_pt = args[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">self.segments.append((tag</span><span class="s3">, </span><span class="s1">args))</span>
+
+    <span class="s3">def </span><span class="s1">moveTo(self</span><span class="s3">, </span><span class="s1">pt):</span>
+        <span class="s1">self._add_segment(</span><span class="s4">'move'</span><span class="s3">, </span><span class="s1">pt)</span>
+
+    <span class="s3">def </span><span class="s1">lineTo(self</span><span class="s3">, </span><span class="s1">pt):</span>
+        <span class="s1">self._add_segment(</span><span class="s4">'line'</span><span class="s3">, </span><span class="s1">pt)</span>
+
+    <span class="s3">def </span><span class="s1">qCurveTo(self</span><span class="s3">, </span><span class="s1">*points):</span>
+        <span class="s1">self._add_segment(</span><span class="s4">'qcurve'</span><span class="s3">, </span><span class="s1">self._last_pt</span><span class="s3">, </span><span class="s1">*points)</span>
+
+    <span class="s3">def </span><span class="s1">curveTo(self</span><span class="s3">, </span><span class="s1">*points):</span>
+        <span class="s1">self._add_segment(</span><span class="s4">'curve'</span><span class="s3">, </span><span class="s1">self._last_pt</span><span class="s3">, </span><span class="s1">*points)</span>
+
+    <span class="s3">def </span><span class="s1">closePath(self):</span>
+        <span class="s1">self._add_segment(</span><span class="s4">'close'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">endPath(self):</span>
+        <span class="s1">self._add_segment(</span><span class="s4">'end'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">addComponent(self</span><span class="s3">, </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">transformation):</span>
+        <span class="s3">pass</span>
+
+
+<span class="s3">def </span><span class="s1">_get_segments(glyph):</span>
+    <span class="s2">&quot;&quot;&quot;Get a glyph's segments as extracted by GetSegmentsPen.&quot;&quot;&quot;</span>
+
+    <span class="s1">pen = GetSegmentsPen()</span>
+    <span class="s0"># glyph.draw(pen)</span>
+    <span class="s0"># We can't simply draw the glyph with the pen, but we must initialize the</span>
+    <span class="s0"># PointToSegmentPen explicitly with outputImpliedClosingLine=True.</span>
+    <span class="s0"># By default PointToSegmentPen does not outputImpliedClosingLine -- unless</span>
+    <span class="s0"># last and first point on closed contour are duplicated. Because we are</span>
+    <span class="s0"># converting multiple glyphs at the same time, we want to make sure</span>
+    <span class="s0"># this function returns the same number of segments, whether or not</span>
+    <span class="s0"># the last and first point overlap.</span>
+    <span class="s0"># https://github.com/googlefonts/fontmake/issues/572</span>
+    <span class="s0"># https://github.com/fonttools/fonttools/pull/1720</span>
+    <span class="s1">pointPen = PointToSegmentPen(pen</span><span class="s3">, </span><span class="s1">outputImpliedClosingLine=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s1">glyph.drawPoints(pointPen)</span>
+    <span class="s3">return </span><span class="s1">pen.segments</span>
+
+
+<span class="s3">def </span><span class="s1">_set_segments(glyph</span><span class="s3">, </span><span class="s1">segments</span><span class="s3">, </span><span class="s1">reverse_direction):</span>
+    <span class="s2">&quot;&quot;&quot;Draw segments as extracted by GetSegmentsPen back to a glyph.&quot;&quot;&quot;</span>
+
+    <span class="s1">glyph.clearContours()</span>
+    <span class="s1">pen = glyph.getPen()</span>
+    <span class="s3">if </span><span class="s1">reverse_direction:</span>
+        <span class="s1">pen = ReverseContourPen(pen)</span>
+    <span class="s3">for </span><span class="s1">tag</span><span class="s3">, </span><span class="s1">args </span><span class="s3">in </span><span class="s1">segments:</span>
+        <span class="s3">if </span><span class="s1">tag == </span><span class="s4">'move'</span><span class="s1">:</span>
+            <span class="s1">pen.moveTo(*args)</span>
+        <span class="s3">elif </span><span class="s1">tag == </span><span class="s4">'line'</span><span class="s1">:</span>
+            <span class="s1">pen.lineTo(*args)</span>
+        <span class="s3">elif </span><span class="s1">tag == </span><span class="s4">'curve'</span><span class="s1">:</span>
+            <span class="s1">pen.curveTo(*args[</span><span class="s5">1</span><span class="s1">:])</span>
+        <span class="s3">elif </span><span class="s1">tag == </span><span class="s4">'qcurve'</span><span class="s1">:</span>
+            <span class="s1">pen.qCurveTo(*args[</span><span class="s5">1</span><span class="s1">:])</span>
+        <span class="s3">elif </span><span class="s1">tag == </span><span class="s4">'close'</span><span class="s1">:</span>
+            <span class="s1">pen.closePath()</span>
+        <span class="s3">elif </span><span class="s1">tag == </span><span class="s4">'end'</span><span class="s1">:</span>
+            <span class="s1">pen.endPath()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">AssertionError(</span><span class="s4">'Unhandled segment type &quot;%s&quot;' </span><span class="s1">% tag)</span>
+
+
+<span class="s3">def </span><span class="s1">_segments_to_quadratic(segments</span><span class="s3">, </span><span class="s1">max_err</span><span class="s3">, </span><span class="s1">stats):</span>
+    <span class="s2">&quot;&quot;&quot;Return quadratic approximations of cubic segments.&quot;&quot;&quot;</span>
+
+    <span class="s3">assert </span><span class="s1">all(s[</span><span class="s5">0</span><span class="s1">] == </span><span class="s4">'curve' </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">segments)</span><span class="s3">, </span><span class="s4">'Non-cubic given to convert'</span>
+
+    <span class="s1">new_points = curves_to_quadratic([s[</span><span class="s5">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">segments]</span><span class="s3">, </span><span class="s1">max_err)</span>
+    <span class="s1">n = len(new_points[</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s3">assert </span><span class="s1">all(len(s) == n </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">new_points[</span><span class="s5">1</span><span class="s1">:])</span><span class="s3">, </span><span class="s4">'Converted incompatibly'</span>
+
+    <span class="s1">spline_length = str(n - </span><span class="s5">2</span><span class="s1">)</span>
+    <span class="s1">stats[spline_length] = stats.get(spline_length</span><span class="s3">, </span><span class="s5">0</span><span class="s1">) + </span><span class="s5">1</span>
+
+    <span class="s3">return </span><span class="s1">[(</span><span class="s4">'qcurve'</span><span class="s3">, </span><span class="s1">p) </span><span class="s3">for </span><span class="s1">p </span><span class="s3">in </span><span class="s1">new_points]</span>
+
+
+<span class="s3">def </span><span class="s1">_glyphs_to_quadratic(glyphs</span><span class="s3">, </span><span class="s1">max_err</span><span class="s3">, </span><span class="s1">reverse_direction</span><span class="s3">, </span><span class="s1">stats):</span>
+    <span class="s2">&quot;&quot;&quot;Do the actual conversion of a set of compatible glyphs, after arguments 
+    have been set up. 
+ 
+    Return True if the glyphs were modified, else return False. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">segments_by_location = zip(*[_get_segments(g) </span><span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">glyphs])</span>
+    <span class="s3">except </span><span class="s1">UnequalZipLengthsError:</span>
+        <span class="s3">raise </span><span class="s1">IncompatibleSegmentNumberError(glyphs)</span>
+    <span class="s3">if not </span><span class="s1">any(segments_by_location):</span>
+        <span class="s3">return False</span>
+
+    <span class="s0"># always modify input glyphs if reverse_direction is True</span>
+    <span class="s1">glyphs_modified = reverse_direction</span>
+
+    <span class="s1">new_segments_by_location = []</span>
+    <span class="s1">incompatible = {}</span>
+    <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">segments </span><span class="s3">in </span><span class="s1">enumerate(segments_by_location):</span>
+        <span class="s1">tag = segments[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s3">if not </span><span class="s1">all(s[</span><span class="s5">0</span><span class="s1">] == tag </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">segments[</span><span class="s5">1</span><span class="s1">:]):</span>
+            <span class="s1">incompatible[i] = [s[</span><span class="s5">0</span><span class="s1">] </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">segments]</span>
+        <span class="s3">elif </span><span class="s1">tag == </span><span class="s4">'curve'</span><span class="s1">:</span>
+            <span class="s1">segments = _segments_to_quadratic(segments</span><span class="s3">, </span><span class="s1">max_err</span><span class="s3">, </span><span class="s1">stats)</span>
+            <span class="s1">glyphs_modified = </span><span class="s3">True</span>
+        <span class="s1">new_segments_by_location.append(segments)</span>
+
+    <span class="s3">if </span><span class="s1">glyphs_modified:</span>
+        <span class="s1">new_segments_by_glyph = zip(*new_segments_by_location)</span>
+        <span class="s3">for </span><span class="s1">glyph</span><span class="s3">, </span><span class="s1">new_segments </span><span class="s3">in </span><span class="s1">zip(glyphs</span><span class="s3">, </span><span class="s1">new_segments_by_glyph):</span>
+            <span class="s1">_set_segments(glyph</span><span class="s3">, </span><span class="s1">new_segments</span><span class="s3">, </span><span class="s1">reverse_direction)</span>
+
+    <span class="s3">if </span><span class="s1">incompatible:</span>
+        <span class="s3">raise </span><span class="s1">IncompatibleSegmentTypesError(glyphs</span><span class="s3">, </span><span class="s1">segments=incompatible)</span>
+    <span class="s3">return </span><span class="s1">glyphs_modified</span>
+
+
+<span class="s3">def </span><span class="s1">glyphs_to_quadratic(</span>
+        <span class="s1">glyphs</span><span class="s3">, </span><span class="s1">max_err=</span><span class="s3">None, </span><span class="s1">reverse_direction=</span><span class="s3">False, </span><span class="s1">stats=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Convert the curves of a set of compatible of glyphs to quadratic. 
+ 
+    All curves will be converted to quadratic at once, ensuring interpolation 
+    compatibility. If this is not required, calling glyphs_to_quadratic with one 
+    glyph at a time may yield slightly more optimized results. 
+ 
+    Return True if glyphs were modified, else return False. 
+ 
+    Raises IncompatibleGlyphsError if glyphs have non-interpolatable outlines. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">stats </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">stats = {}</span>
+
+    <span class="s3">if not </span><span class="s1">max_err:</span>
+        <span class="s0"># assume 1000 is the default UPEM</span>
+        <span class="s1">max_err = DEFAULT_MAX_ERR * </span><span class="s5">1000</span>
+
+    <span class="s3">if </span><span class="s1">isinstance(max_err</span><span class="s3">, </span><span class="s1">(list</span><span class="s3">, </span><span class="s1">tuple)):</span>
+        <span class="s1">max_errors = max_err</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">max_errors = [max_err] * len(glyphs)</span>
+    <span class="s3">assert </span><span class="s1">len(max_errors) == len(glyphs)</span>
+
+    <span class="s3">return </span><span class="s1">_glyphs_to_quadratic(glyphs</span><span class="s3">, </span><span class="s1">max_errors</span><span class="s3">, </span><span class="s1">reverse_direction</span><span class="s3">, </span><span class="s1">stats)</span>
+
+
+<span class="s3">def </span><span class="s1">fonts_to_quadratic(</span>
+        <span class="s1">fonts</span><span class="s3">, </span><span class="s1">max_err_em=</span><span class="s3">None, </span><span class="s1">max_err=</span><span class="s3">None, </span><span class="s1">reverse_direction=</span><span class="s3">False,</span>
+        <span class="s1">stats=</span><span class="s3">None, </span><span class="s1">dump_stats=</span><span class="s3">False, </span><span class="s1">remember_curve_type=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Convert the curves of a collection of fonts to quadratic. 
+ 
+    All curves will be converted to quadratic at once, ensuring interpolation 
+    compatibility. If this is not required, calling fonts_to_quadratic with one 
+    font at a time may yield slightly more optimized results. 
+ 
+    Return True if fonts were modified, else return False. 
+ 
+    By default, cu2qu stores the curve type in the fonts' lib, under a private 
+    key &quot;com.github.googlei18n.cu2qu.curve_type&quot;, and will not try to convert 
+    them again if the curve type is already set to &quot;quadratic&quot;. 
+    Setting 'remember_curve_type' to False disables this optimization. 
+ 
+    Raises IncompatibleFontsError if same-named glyphs from different fonts 
+    have non-interpolatable outlines. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">remember_curve_type:</span>
+        <span class="s1">curve_types = {f.lib.get(CURVE_TYPE_LIB_KEY</span><span class="s3">, </span><span class="s4">&quot;cubic&quot;</span><span class="s1">) </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">fonts}</span>
+        <span class="s3">if </span><span class="s1">len(curve_types) == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">curve_type = next(iter(curve_types))</span>
+            <span class="s3">if </span><span class="s1">curve_type == </span><span class="s4">&quot;quadratic&quot;</span><span class="s1">:</span>
+                <span class="s1">logger.info(</span><span class="s4">&quot;Curves already converted to quadratic&quot;</span><span class="s1">)</span>
+                <span class="s3">return False</span>
+            <span class="s3">elif </span><span class="s1">curve_type == </span><span class="s4">&quot;cubic&quot;</span><span class="s1">:</span>
+                <span class="s3">pass  </span><span class="s0"># keep converting</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s3">raise </span><span class="s1">NotImplementedError(curve_type)</span>
+        <span class="s3">elif </span><span class="s1">len(curve_types) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0"># going to crash later if they do differ</span>
+            <span class="s1">logger.warning(</span><span class="s4">&quot;fonts may contain different curve types&quot;</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">stats </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">stats = {}</span>
+
+    <span class="s3">if </span><span class="s1">max_err_em </span><span class="s3">and </span><span class="s1">max_err:</span>
+        <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'Only one of max_err and max_err_em can be specified.'</span><span class="s1">)</span>
+    <span class="s3">if not </span><span class="s1">(max_err_em </span><span class="s3">or </span><span class="s1">max_err):</span>
+        <span class="s1">max_err_em = DEFAULT_MAX_ERR</span>
+
+    <span class="s3">if </span><span class="s1">isinstance(max_err</span><span class="s3">, </span><span class="s1">(list</span><span class="s3">, </span><span class="s1">tuple)):</span>
+        <span class="s3">assert </span><span class="s1">len(max_err) == len(fonts)</span>
+        <span class="s1">max_errors = max_err</span>
+    <span class="s3">elif </span><span class="s1">max_err:</span>
+        <span class="s1">max_errors = [max_err] * len(fonts)</span>
+
+    <span class="s3">if </span><span class="s1">isinstance(max_err_em</span><span class="s3">, </span><span class="s1">(list</span><span class="s3">, </span><span class="s1">tuple)):</span>
+        <span class="s3">assert </span><span class="s1">len(fonts) == len(max_err_em)</span>
+        <span class="s1">max_errors = [f.info.unitsPerEm * e</span>
+                      <span class="s3">for </span><span class="s1">f</span><span class="s3">, </span><span class="s1">e </span><span class="s3">in </span><span class="s1">zip(fonts</span><span class="s3">, </span><span class="s1">max_err_em)]</span>
+    <span class="s3">elif </span><span class="s1">max_err_em:</span>
+        <span class="s1">max_errors = [f.info.unitsPerEm * max_err_em </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">fonts]</span>
+
+    <span class="s1">modified = </span><span class="s3">False</span>
+    <span class="s1">glyph_errors = {}</span>
+    <span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">set().union(*(f.keys() </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">fonts)):</span>
+        <span class="s1">glyphs = []</span>
+        <span class="s1">cur_max_errors = []</span>
+        <span class="s3">for </span><span class="s1">font</span><span class="s3">, </span><span class="s1">error </span><span class="s3">in </span><span class="s1">zip(fonts</span><span class="s3">, </span><span class="s1">max_errors):</span>
+            <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">font:</span>
+                <span class="s1">glyphs.append(font[name])</span>
+                <span class="s1">cur_max_errors.append(error)</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">modified |= _glyphs_to_quadratic(</span>
+                <span class="s1">glyphs</span><span class="s3">, </span><span class="s1">cur_max_errors</span><span class="s3">, </span><span class="s1">reverse_direction</span><span class="s3">, </span><span class="s1">stats)</span>
+        <span class="s3">except </span><span class="s1">IncompatibleGlyphsError </span><span class="s3">as </span><span class="s1">exc:</span>
+            <span class="s1">logger.error(exc)</span>
+            <span class="s1">glyph_errors[name] = exc</span>
+
+    <span class="s3">if </span><span class="s1">glyph_errors:</span>
+        <span class="s3">raise </span><span class="s1">IncompatibleFontsError(glyph_errors)</span>
+
+    <span class="s3">if </span><span class="s1">modified </span><span class="s3">and </span><span class="s1">dump_stats:</span>
+        <span class="s1">spline_lengths = sorted(stats.keys())</span>
+        <span class="s1">logger.info(</span><span class="s4">'New spline lengths: %s' </span><span class="s1">% (</span><span class="s4">', '</span><span class="s1">.join(</span>
+                    <span class="s4">'%s: %d' </span><span class="s1">% (l</span><span class="s3">, </span><span class="s1">stats[l]) </span><span class="s3">for </span><span class="s1">l </span><span class="s3">in </span><span class="s1">spline_lengths)))</span>
+
+    <span class="s3">if </span><span class="s1">remember_curve_type:</span>
+        <span class="s3">for </span><span class="s1">font </span><span class="s3">in </span><span class="s1">fonts:</span>
+            <span class="s1">curve_type = font.lib.get(CURVE_TYPE_LIB_KEY</span><span class="s3">, </span><span class="s4">&quot;cubic&quot;</span><span class="s1">)</span>
+            <span class="s3">if </span><span class="s1">curve_type != </span><span class="s4">&quot;quadratic&quot;</span><span class="s1">:</span>
+                <span class="s1">font.lib[CURVE_TYPE_LIB_KEY] = </span><span class="s4">&quot;quadratic&quot;</span>
+                <span class="s1">modified = </span><span class="s3">True</span>
+    <span class="s3">return </span><span class="s1">modified</span>
+
+
+<span class="s3">def </span><span class="s1">glyph_to_quadratic(glyph</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Convenience wrapper around glyphs_to_quadratic, for just one glyph. 
+    Return True if the glyph was modified, else return False. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">return </span><span class="s1">glyphs_to_quadratic([glyph]</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s3">def </span><span class="s1">font_to_quadratic(font</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Convenience wrapper around fonts_to_quadratic, for just one font. 
+    Return True if the font was modified, else return False. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">return </span><span class="s1">fonts_to_quadratic([font]</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+</pre>
+</body>
+</html>

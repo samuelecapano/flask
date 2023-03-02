@@ -1,0 +1,1444 @@
+<html>
+<head>
+<title>_flagvalues.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_flagvalues.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2017 The Abseil Authors.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+<span class="s2">&quot;&quot;&quot;Defines the FlagValues class - registry of 'Flag' objects. 
+ 
+Do NOT import this module directly. Import the flags package and use the 
+aliases defined at the package level instead. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">copy</span>
+<span class="s3">import </span><span class="s1">itertools</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">from </span><span class="s1">typing </span><span class="s3">import </span><span class="s1">Generic</span><span class="s3">, </span><span class="s1">TypeVar</span>
+<span class="s3">from </span><span class="s1">xml.dom </span><span class="s3">import </span><span class="s1">minidom</span>
+
+<span class="s3">from </span><span class="s1">absl.flags </span><span class="s3">import </span><span class="s1">_exceptions</span>
+<span class="s3">from </span><span class="s1">absl.flags </span><span class="s3">import </span><span class="s1">_flag</span>
+<span class="s3">from </span><span class="s1">absl.flags </span><span class="s3">import </span><span class="s1">_helpers</span>
+<span class="s3">from </span><span class="s1">absl.flags </span><span class="s3">import </span><span class="s1">_validators_classes</span>
+
+<span class="s0"># Add flagvalues module to disclaimed module ids.</span>
+<span class="s1">_helpers.disclaim_module_ids.add(id(sys.modules[__name__]))</span>
+
+<span class="s1">_T = TypeVar(</span><span class="s4">'_T'</span><span class="s1">)</span>
+
+
+<span class="s3">class </span><span class="s1">FlagValues:</span>
+  <span class="s2">&quot;&quot;&quot;Registry of :class:`~absl.flags.Flag` objects. 
+ 
+  A :class:`FlagValues` can then scan command line arguments, passing flag 
+  arguments through to the 'Flag' objects that it owns.  It also 
+  provides easy access to the flag values.  Typically only one 
+  :class:`FlagValues` object is needed by an application: 
+  :const:`FLAGS`. 
+ 
+  This class is heavily overloaded: 
+ 
+  :class:`Flag` objects are registered via ``__setitem__``:: 
+ 
+       FLAGS['longname'] = x   # register a new flag 
+ 
+  The ``.value`` attribute of the registered :class:`~absl.flags.Flag` objects 
+  can be accessed as attributes of this :class:`FlagValues` object, through 
+  ``__getattr__``.  Both the long and short name of the original 
+  :class:`~absl.flags.Flag` objects can be used to access its value:: 
+ 
+       FLAGS.longname  # parsed flag value 
+       FLAGS.x  # parsed flag value (short name) 
+ 
+  Command line arguments are scanned and passed to the registered 
+  :class:`~absl.flags.Flag` objects through the ``__call__`` method.  Unparsed 
+  arguments, including ``argv[0]`` (e.g. the program name) are returned:: 
+ 
+       argv = FLAGS(sys.argv)  # scan command line arguments 
+ 
+  The original registered :class:`~absl.flags.Flag` objects can be retrieved 
+  through the use of the dictionary-like operator, ``__getitem__``:: 
+ 
+       x = FLAGS['longname']   # access the registered Flag object 
+ 
+  The ``str()`` operator of a :class:`absl.flags.FlagValues` object provides 
+  help for all of the registered :class:`~absl.flags.Flag` objects. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s0"># A note on collections.abc.Mapping:</span>
+  <span class="s0"># FlagValues defines __getitem__, __iter__, and __len__. It makes perfect</span>
+  <span class="s0"># sense to let it be a collections.abc.Mapping class. However, we are not</span>
+  <span class="s0"># able to do so. The mixin methods, e.g. keys, values, are not uncommon flag</span>
+  <span class="s0"># names. Those flag values would not be accessible via the FLAGS.xxx form.</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self):</span>
+    <span class="s0"># Since everything in this class is so heavily overloaded, the only</span>
+    <span class="s0"># way of defining and using fields is to access __dict__ directly.</span>
+
+    <span class="s0"># Dictionary: flag name (string) -&gt; Flag object.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__flags'</span><span class="s1">] = {}</span>
+
+    <span class="s0"># Set: name of hidden flag (string).</span>
+    <span class="s0"># Holds flags that should not be directly accessible from Python.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__hiddenflags'</span><span class="s1">] = set()</span>
+
+    <span class="s0"># Dictionary: module name (string) -&gt; list of Flag objects that are defined</span>
+    <span class="s0"># by that module.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__flags_by_module'</span><span class="s1">] = {}</span>
+    <span class="s0"># Dictionary: module id (int) -&gt; list of Flag objects that are defined by</span>
+    <span class="s0"># that module.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__flags_by_module_id'</span><span class="s1">] = {}</span>
+    <span class="s0"># Dictionary: module name (string) -&gt; list of Flag objects that are</span>
+    <span class="s0"># key for that module.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__key_flags_by_module'</span><span class="s1">] = {}</span>
+
+    <span class="s0"># Bool: True if flags were parsed.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__flags_parsed'</span><span class="s1">] = </span><span class="s3">False</span>
+
+    <span class="s0"># Bool: True if unparse_flags() was called.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__unparse_flags_called'</span><span class="s1">] = </span><span class="s3">False</span>
+
+    <span class="s0"># None or Method(name, value) to call from __setattr__ for an unknown flag.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__set_unknown'</span><span class="s1">] = </span><span class="s3">None</span>
+
+    <span class="s0"># A set of banned flag names. This is to prevent users from accidentally</span>
+    <span class="s0"># defining a flag that has the same name as a method on this class.</span>
+    <span class="s0"># Users can still allow defining the flag by passing</span>
+    <span class="s0"># allow_using_method_names=True in DEFINE_xxx functions.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__banned_flag_names'</span><span class="s1">] = frozenset(dir(FlagValues))</span>
+
+    <span class="s0"># Bool: Whether to use GNU style scanning.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__use_gnu_getopt'</span><span class="s1">] = </span><span class="s3">True</span>
+
+    <span class="s0"># Bool: Whether use_gnu_getopt has been explicitly set by the user.</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__use_gnu_getopt_explicitly_set'</span><span class="s1">] = </span><span class="s3">False</span>
+
+    <span class="s0"># Function: Takes a flag name as parameter, returns a tuple</span>
+    <span class="s0"># (is_retired, type_is_bool).</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__is_retired_flag_func'</span><span class="s1">] = </span><span class="s3">None</span>
+
+  <span class="s3">def </span><span class="s1">set_gnu_getopt(self</span><span class="s3">, </span><span class="s1">gnu_getopt=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Sets whether or not to use GNU style scanning. 
+ 
+    GNU style allows mixing of flag and non-flag arguments. See 
+    http://docs.python.org/library/getopt.html#getopt.gnu_getopt 
+ 
+    Args: 
+      gnu_getopt: bool, whether or not to use GNU style scanning. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__use_gnu_getopt'</span><span class="s1">] = gnu_getopt</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__use_gnu_getopt_explicitly_set'</span><span class="s1">] = </span><span class="s3">True</span>
+
+  <span class="s3">def </span><span class="s1">is_gnu_getopt(self):</span>
+    <span class="s3">return </span><span class="s1">self.__dict__[</span><span class="s4">'__use_gnu_getopt'</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">_flags(self):</span>
+    <span class="s3">return </span><span class="s1">self.__dict__[</span><span class="s4">'__flags'</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">flags_by_module_dict(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the dictionary of module_name -&gt; list of defined flags. 
+ 
+    Returns: 
+      A dictionary.  Its keys are module names (strings).  Its values 
+      are lists of Flag objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.__dict__[</span><span class="s4">'__flags_by_module'</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">flags_by_module_id_dict(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the dictionary of module_id -&gt; list of defined flags. 
+ 
+    Returns: 
+      A dictionary.  Its keys are module IDs (ints).  Its values 
+      are lists of Flag objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.__dict__[</span><span class="s4">'__flags_by_module_id'</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">key_flags_by_module_dict(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the dictionary of module_name -&gt; list of key flags. 
+ 
+    Returns: 
+      A dictionary.  Its keys are module names (strings).  Its values 
+      are lists of Flag objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.__dict__[</span><span class="s4">'__key_flags_by_module'</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">register_flag_by_module(self</span><span class="s3">, </span><span class="s1">module_name</span><span class="s3">, </span><span class="s1">flag):</span>
+    <span class="s2">&quot;&quot;&quot;Records the module that defines a specific flag. 
+ 
+    We keep track of which flag is defined by which module so that we 
+    can later sort the flags by module. 
+ 
+    Args: 
+      module_name: str, the name of a Python module. 
+      flag: Flag, the Flag instance that is key to the module. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">flags_by_module = self.flags_by_module_dict()</span>
+    <span class="s1">flags_by_module.setdefault(module_name</span><span class="s3">, </span><span class="s1">[]).append(flag)</span>
+
+  <span class="s3">def </span><span class="s1">register_flag_by_module_id(self</span><span class="s3">, </span><span class="s1">module_id</span><span class="s3">, </span><span class="s1">flag):</span>
+    <span class="s2">&quot;&quot;&quot;Records the module that defines a specific flag. 
+ 
+    Args: 
+      module_id: int, the ID of the Python module. 
+      flag: Flag, the Flag instance that is key to the module. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">flags_by_module_id = self.flags_by_module_id_dict()</span>
+    <span class="s1">flags_by_module_id.setdefault(module_id</span><span class="s3">, </span><span class="s1">[]).append(flag)</span>
+
+  <span class="s3">def </span><span class="s1">register_key_flag_for_module(self</span><span class="s3">, </span><span class="s1">module_name</span><span class="s3">, </span><span class="s1">flag):</span>
+    <span class="s2">&quot;&quot;&quot;Specifies that a flag is a key flag for a module. 
+ 
+    Args: 
+      module_name: str, the name of a Python module. 
+      flag: Flag, the Flag instance that is key to the module. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key_flags_by_module = self.key_flags_by_module_dict()</span>
+    <span class="s0"># The list of key flags for the module named module_name.</span>
+    <span class="s1">key_flags = key_flags_by_module.setdefault(module_name</span><span class="s3">, </span><span class="s1">[])</span>
+    <span class="s0"># Add flag, but avoid duplicates.</span>
+    <span class="s3">if </span><span class="s1">flag </span><span class="s3">not in </span><span class="s1">key_flags:</span>
+      <span class="s1">key_flags.append(flag)</span>
+
+  <span class="s3">def </span><span class="s1">_flag_is_registered(self</span><span class="s3">, </span><span class="s1">flag_obj):</span>
+    <span class="s2">&quot;&quot;&quot;Checks whether a Flag object is registered under long name or short name. 
+ 
+    Args: 
+      flag_obj: Flag, the Flag instance to check for. 
+ 
+    Returns: 
+      bool, True iff flag_obj is registered under long name or short name. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">flag_dict = self._flags()</span>
+    <span class="s0"># Check whether flag_obj is registered under its long name.</span>
+    <span class="s1">name = flag_obj.name</span>
+    <span class="s3">if </span><span class="s1">flag_dict.get(name</span><span class="s3">, None</span><span class="s1">) == flag_obj:</span>
+      <span class="s3">return True</span>
+    <span class="s0"># Check whether flag_obj is registered under its short name.</span>
+    <span class="s1">short_name = flag_obj.short_name</span>
+    <span class="s3">if </span><span class="s1">(short_name </span><span class="s3">is not None and </span><span class="s1">flag_dict.get(short_name</span><span class="s3">, None</span><span class="s1">) == flag_obj):</span>
+      <span class="s3">return True</span>
+    <span class="s3">return False</span>
+
+  <span class="s3">def </span><span class="s1">_cleanup_unregistered_flag_from_module_dicts(self</span><span class="s3">, </span><span class="s1">flag_obj):</span>
+    <span class="s2">&quot;&quot;&quot;Cleans up unregistered flags from all module -&gt; [flags] dictionaries. 
+ 
+    If flag_obj is registered under either its long name or short name, it 
+    won't be removed from the dictionaries. 
+ 
+    Args: 
+      flag_obj: Flag, the Flag instance to clean up for. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self._flag_is_registered(flag_obj):</span>
+      <span class="s3">return</span>
+    <span class="s3">for </span><span class="s1">flags_by_module_dict </span><span class="s3">in </span><span class="s1">(self.flags_by_module_dict()</span><span class="s3">,</span>
+                                 <span class="s1">self.flags_by_module_id_dict()</span><span class="s3">,</span>
+                                 <span class="s1">self.key_flags_by_module_dict()):</span>
+      <span class="s3">for </span><span class="s1">flags_in_module </span><span class="s3">in </span><span class="s1">flags_by_module_dict.values():</span>
+        <span class="s0"># While (as opposed to if) takes care of multiple occurrences of a</span>
+        <span class="s0"># flag in the list for the same module.</span>
+        <span class="s3">while </span><span class="s1">flag_obj </span><span class="s3">in </span><span class="s1">flags_in_module:</span>
+          <span class="s1">flags_in_module.remove(flag_obj)</span>
+
+  <span class="s3">def </span><span class="s1">get_flags_for_module(self</span><span class="s3">, </span><span class="s1">module):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the list of flags defined by a module. 
+ 
+    Args: 
+      module: module|str, the module to get flags from. 
+ 
+    Returns: 
+      [Flag], a new list of Flag instances.  Caller may update this list as 
+      desired: none of those changes will affect the internals of this 
+      FlagValue instance. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance(module</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s1">module = module.__name__</span>
+    <span class="s3">if </span><span class="s1">module == </span><span class="s4">'__main__'</span><span class="s1">:</span>
+      <span class="s1">module = sys.argv[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s3">return </span><span class="s1">list(self.flags_by_module_dict().get(module</span><span class="s3">, </span><span class="s1">[]))</span>
+
+  <span class="s3">def </span><span class="s1">get_key_flags_for_module(self</span><span class="s3">, </span><span class="s1">module):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the list of key flags for a module. 
+ 
+    Args: 
+      module: module|str, the module to get key flags from. 
+ 
+    Returns: 
+      [Flag], a new list of Flag instances.  Caller may update this list as 
+      desired: none of those changes will affect the internals of this 
+      FlagValue instance. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance(module</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s1">module = module.__name__</span>
+    <span class="s3">if </span><span class="s1">module == </span><span class="s4">'__main__'</span><span class="s1">:</span>
+      <span class="s1">module = sys.argv[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s0"># Any flag is a key flag for the module that defined it.  NOTE:</span>
+    <span class="s0"># key_flags is a fresh list: we can update it without affecting the</span>
+    <span class="s0"># internals of this FlagValues object.</span>
+    <span class="s1">key_flags = self.get_flags_for_module(module)</span>
+
+    <span class="s0"># Take into account flags explicitly declared as key for a module.</span>
+    <span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">self.key_flags_by_module_dict().get(module</span><span class="s3">, </span><span class="s1">[]):</span>
+      <span class="s3">if </span><span class="s1">flag </span><span class="s3">not in </span><span class="s1">key_flags:</span>
+        <span class="s1">key_flags.append(flag)</span>
+    <span class="s3">return </span><span class="s1">key_flags</span>
+
+  <span class="s3">def </span><span class="s1">find_module_defining_flag(self</span><span class="s3">, </span><span class="s1">flagname</span><span class="s3">, </span><span class="s1">default=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Return the name of the module defining this flag, or default. 
+ 
+    Args: 
+      flagname: str, name of the flag to lookup. 
+      default: Value to return if flagname is not defined. Defaults to None. 
+ 
+    Returns: 
+      The name of the module which registered the flag with this name. 
+      If no such module exists (i.e. no flag with this name exists), 
+      we return default. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">registered_flag = self._flags().get(flagname)</span>
+    <span class="s3">if </span><span class="s1">registered_flag </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">default</span>
+    <span class="s3">for </span><span class="s1">module</span><span class="s3">, </span><span class="s1">flags </span><span class="s3">in </span><span class="s1">self.flags_by_module_dict().items():</span>
+      <span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flags:</span>
+        <span class="s0"># It must compare the flag with the one in _flags. This is because a</span>
+        <span class="s0"># flag might be overridden only for its long name (or short name),</span>
+        <span class="s0"># and only its short name (or long name) is considered registered.</span>
+        <span class="s3">if </span><span class="s1">(flag.name == registered_flag.name </span><span class="s3">and</span>
+            <span class="s1">flag.short_name == registered_flag.short_name):</span>
+          <span class="s3">return </span><span class="s1">module</span>
+    <span class="s3">return </span><span class="s1">default</span>
+
+  <span class="s3">def </span><span class="s1">find_module_id_defining_flag(self</span><span class="s3">, </span><span class="s1">flagname</span><span class="s3">, </span><span class="s1">default=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Return the ID of the module defining this flag, or default. 
+ 
+    Args: 
+      flagname: str, name of the flag to lookup. 
+      default: Value to return if flagname is not defined. Defaults to None. 
+ 
+    Returns: 
+      The ID of the module which registered the flag with this name. 
+      If no such module exists (i.e. no flag with this name exists), 
+      we return default. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">registered_flag = self._flags().get(flagname)</span>
+    <span class="s3">if </span><span class="s1">registered_flag </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">default</span>
+    <span class="s3">for </span><span class="s1">module_id</span><span class="s3">, </span><span class="s1">flags </span><span class="s3">in </span><span class="s1">self.flags_by_module_id_dict().items():</span>
+      <span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flags:</span>
+        <span class="s0"># It must compare the flag with the one in _flags. This is because a</span>
+        <span class="s0"># flag might be overridden only for its long name (or short name),</span>
+        <span class="s0"># and only its short name (or long name) is considered registered.</span>
+        <span class="s3">if </span><span class="s1">(flag.name == registered_flag.name </span><span class="s3">and</span>
+            <span class="s1">flag.short_name == registered_flag.short_name):</span>
+          <span class="s3">return </span><span class="s1">module_id</span>
+    <span class="s3">return </span><span class="s1">default</span>
+
+  <span class="s3">def </span><span class="s1">_register_unknown_flag_setter(self</span><span class="s3">, </span><span class="s1">setter):</span>
+    <span class="s2">&quot;&quot;&quot;Allow set default values for undefined flags. 
+ 
+    Args: 
+      setter: Method(name, value) to call to __setattr__ an unknown flag. Must 
+        raise NameError or ValueError for invalid name/value. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__set_unknown'</span><span class="s1">] = setter</span>
+
+  <span class="s3">def </span><span class="s1">_set_unknown_flag(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns value if setting flag |name| to |value| returned True. 
+ 
+    Args: 
+      name: str, name of the flag to set. 
+      value: Value to set. 
+ 
+    Returns: 
+      Flag value on successful call. 
+ 
+    Raises: 
+      UnrecognizedFlagError 
+      IllegalFlagValueError 
+    &quot;&quot;&quot;</span>
+    <span class="s1">setter = self.__dict__[</span><span class="s4">'__set_unknown'</span><span class="s1">]</span>
+    <span class="s3">if </span><span class="s1">setter:</span>
+      <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">setter(name</span><span class="s3">, </span><span class="s1">value)</span>
+        <span class="s3">return </span><span class="s1">value</span>
+      <span class="s3">except </span><span class="s1">(TypeError</span><span class="s3">, </span><span class="s1">ValueError):  </span><span class="s0"># Flag value is not valid.</span>
+        <span class="s3">raise </span><span class="s1">_exceptions.IllegalFlagValueError(</span>
+            <span class="s4">'&quot;{1}&quot; is not valid for --{0}'</span><span class="s1">.format(name</span><span class="s3">, </span><span class="s1">value))</span>
+      <span class="s3">except </span><span class="s1">NameError:  </span><span class="s0"># Flag name is not valid.</span>
+        <span class="s3">pass</span>
+    <span class="s3">raise </span><span class="s1">_exceptions.UnrecognizedFlagError(name</span><span class="s3">, </span><span class="s1">value)</span>
+
+  <span class="s3">def </span><span class="s1">append_flag_values(self</span><span class="s3">, </span><span class="s1">flag_values):</span>
+    <span class="s2">&quot;&quot;&quot;Appends flags registered in another FlagValues instance. 
+ 
+    Args: 
+      flag_values: FlagValues, the FlagValues instance from which to copy flags. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">for </span><span class="s1">flag_name</span><span class="s3">, </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flag_values._flags().items():  </span><span class="s0"># pylint: disable=protected-access</span>
+      <span class="s0"># Each flags with short_name appears here twice (once under its</span>
+      <span class="s0"># normal name, and again with its short name).  To prevent</span>
+      <span class="s0"># problems (DuplicateFlagError) with double flag registration, we</span>
+      <span class="s0"># perform a check to make sure that the entry we're looking at is</span>
+      <span class="s0"># for its normal name.</span>
+      <span class="s3">if </span><span class="s1">flag_name == flag.name:</span>
+        <span class="s3">try</span><span class="s1">:</span>
+          <span class="s1">self[flag_name] = flag</span>
+        <span class="s3">except </span><span class="s1">_exceptions.DuplicateFlagError:</span>
+          <span class="s3">raise </span><span class="s1">_exceptions.DuplicateFlagError.from_flag(</span>
+              <span class="s1">flag_name</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">other_flag_values=flag_values)</span>
+
+  <span class="s3">def </span><span class="s1">remove_flag_values(self</span><span class="s3">, </span><span class="s1">flag_values):</span>
+    <span class="s2">&quot;&quot;&quot;Remove flags that were previously appended from another FlagValues. 
+ 
+    Args: 
+      flag_values: FlagValues, the FlagValues instance containing flags to 
+        remove. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">for </span><span class="s1">flag_name </span><span class="s3">in </span><span class="s1">flag_values:</span>
+      <span class="s1">self.__delattr__(flag_name)</span>
+
+  <span class="s3">def </span><span class="s1">__setitem__(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">flag):</span>
+    <span class="s2">&quot;&quot;&quot;Registers a new flag variable.&quot;&quot;&quot;</span>
+    <span class="s1">fl = self._flags()</span>
+    <span class="s3">if not </span><span class="s1">isinstance(flag</span><span class="s3">, </span><span class="s1">_flag.Flag):</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.IllegalFlagValueError(</span>
+          <span class="s4">f'Expect Flag instances, found type </span><span class="s3">{</span><span class="s1">type(flag)</span><span class="s3">}</span><span class="s4">. '</span>
+          <span class="s4">&quot;Maybe you didn't mean to use FlagValue.__setitem__?&quot;</span><span class="s1">)</span>
+    <span class="s3">if not </span><span class="s1">isinstance(name</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.Error(</span><span class="s4">'Flag name must be a string'</span><span class="s1">)</span>
+    <span class="s3">if not </span><span class="s1">name:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.Error(</span><span class="s4">'Flag name cannot be empty'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s4">' ' </span><span class="s3">in </span><span class="s1">name:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.Error(</span><span class="s4">'Flag name cannot contain a space'</span><span class="s1">)</span>
+    <span class="s1">self._check_method_name_conflicts(name</span><span class="s3">, </span><span class="s1">flag)</span>
+    <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">fl </span><span class="s3">and not </span><span class="s1">flag.allow_override </span><span class="s3">and not </span><span class="s1">fl[name].allow_override:</span>
+      <span class="s1">module</span><span class="s3">, </span><span class="s1">module_name = _helpers.get_calling_module_object_and_name()</span>
+      <span class="s3">if </span><span class="s1">(self.find_module_defining_flag(name) == module_name </span><span class="s3">and</span>
+          <span class="s1">id(module) != self.find_module_id_defining_flag(name)):</span>
+        <span class="s0"># If the flag has already been defined by a module with the same name,</span>
+        <span class="s0"># but a different ID, we can stop here because it indicates that the</span>
+        <span class="s0"># module is simply being imported a subsequent time.</span>
+        <span class="s3">return</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.DuplicateFlagError.from_flag(name</span><span class="s3">, </span><span class="s1">self)</span>
+    <span class="s1">short_name = flag.short_name</span>
+    <span class="s0"># If a new flag overrides an old one, we need to cleanup the old flag's</span>
+    <span class="s0"># modules if it's not registered.</span>
+    <span class="s1">flags_to_cleanup = set()</span>
+    <span class="s3">if </span><span class="s1">short_name </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s3">if </span><span class="s1">(short_name </span><span class="s3">in </span><span class="s1">fl </span><span class="s3">and not </span><span class="s1">flag.allow_override </span><span class="s3">and</span>
+          <span class="s3">not </span><span class="s1">fl[short_name].allow_override):</span>
+        <span class="s3">raise </span><span class="s1">_exceptions.DuplicateFlagError.from_flag(short_name</span><span class="s3">, </span><span class="s1">self)</span>
+      <span class="s3">if </span><span class="s1">short_name </span><span class="s3">in </span><span class="s1">fl </span><span class="s3">and </span><span class="s1">fl[short_name] != flag:</span>
+        <span class="s1">flags_to_cleanup.add(fl[short_name])</span>
+      <span class="s1">fl[short_name] = flag</span>
+    <span class="s3">if </span><span class="s1">(name </span><span class="s3">not in </span><span class="s1">fl  </span><span class="s0"># new flag</span>
+        <span class="s3">or </span><span class="s1">fl[name].using_default_value </span><span class="s3">or not </span><span class="s1">flag.using_default_value):</span>
+      <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">fl </span><span class="s3">and </span><span class="s1">fl[name] != flag:</span>
+        <span class="s1">flags_to_cleanup.add(fl[name])</span>
+      <span class="s1">fl[name] = flag</span>
+    <span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">flags_to_cleanup:</span>
+      <span class="s1">self._cleanup_unregistered_flag_from_module_dicts(f)</span>
+
+  <span class="s3">def </span><span class="s1">__dir__(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns list of names of all defined flags. 
+ 
+    Useful for TAB-completion in ipython. 
+ 
+    Returns: 
+      [str], a list of names of all defined flags. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">sorted(self.__dict__[</span><span class="s4">'__flags'</span><span class="s1">])</span>
+
+  <span class="s3">def </span><span class="s1">__getitem__(self</span><span class="s3">, </span><span class="s1">name):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the Flag object for the flag --name.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self._flags()[name]</span>
+
+  <span class="s3">def </span><span class="s1">_hide_flag(self</span><span class="s3">, </span><span class="s1">name):</span>
+    <span class="s2">&quot;&quot;&quot;Marks the flag --name as hidden.&quot;&quot;&quot;</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__hiddenflags'</span><span class="s1">].add(name)</span>
+
+  <span class="s3">def </span><span class="s1">__getattr__(self</span><span class="s3">, </span><span class="s1">name):</span>
+    <span class="s2">&quot;&quot;&quot;Retrieves the 'value' attribute of the flag --name.&quot;&quot;&quot;</span>
+    <span class="s1">fl = self._flags()</span>
+    <span class="s3">if </span><span class="s1">name </span><span class="s3">not in </span><span class="s1">fl:</span>
+      <span class="s3">raise </span><span class="s1">AttributeError(name)</span>
+    <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">self.__dict__[</span><span class="s4">'__hiddenflags'</span><span class="s1">]:</span>
+      <span class="s3">raise </span><span class="s1">AttributeError(name)</span>
+
+    <span class="s3">if </span><span class="s1">self.__dict__[</span><span class="s4">'__flags_parsed'</span><span class="s1">] </span><span class="s3">or </span><span class="s1">fl[name].present:</span>
+      <span class="s3">return </span><span class="s1">fl[name].value</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.UnparsedFlagAccessError(</span>
+          <span class="s4">'Trying to access flag --%s before flags were parsed.' </span><span class="s1">% name)</span>
+
+  <span class="s3">def </span><span class="s1">__setattr__(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Sets the 'value' attribute of the flag --name.&quot;&quot;&quot;</span>
+    <span class="s1">self._set_attributes(**{name: value})</span>
+    <span class="s3">return </span><span class="s1">value</span>
+
+  <span class="s3">def </span><span class="s1">_set_attributes(self</span><span class="s3">, </span><span class="s1">**attributes):</span>
+    <span class="s2">&quot;&quot;&quot;Sets multiple flag values together, triggers validators afterwards.&quot;&quot;&quot;</span>
+    <span class="s1">fl = self._flags()</span>
+    <span class="s1">known_flags = set()</span>
+    <span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">attributes.items():</span>
+      <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">self.__dict__[</span><span class="s4">'__hiddenflags'</span><span class="s1">]:</span>
+        <span class="s3">raise </span><span class="s1">AttributeError(name)</span>
+      <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">fl:</span>
+        <span class="s1">fl[name].value = value</span>
+        <span class="s1">known_flags.add(name)</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">self._set_unknown_flag(name</span><span class="s3">, </span><span class="s1">value)</span>
+    <span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">known_flags:</span>
+      <span class="s1">self._assert_validators(fl[name].validators)</span>
+      <span class="s1">fl[name].using_default_value = </span><span class="s3">False</span>
+
+  <span class="s3">def </span><span class="s1">validate_all_flags(self):</span>
+    <span class="s2">&quot;&quot;&quot;Verifies whether all flags pass validation. 
+ 
+    Raises: 
+      AttributeError: Raised if validators work with a non-existing flag. 
+      IllegalFlagValueError: Raised if validation fails for at least one 
+          validator. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">all_validators = set()</span>
+    <span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">self._flags().values():</span>
+      <span class="s1">all_validators.update(flag.validators)</span>
+    <span class="s1">self._assert_validators(all_validators)</span>
+
+  <span class="s3">def </span><span class="s1">_assert_validators(self</span><span class="s3">, </span><span class="s1">validators):</span>
+    <span class="s2">&quot;&quot;&quot;Asserts if all validators in the list are satisfied. 
+ 
+    It asserts validators in the order they were created. 
+ 
+    Args: 
+      validators: Iterable(validators.Validator), validators to be verified. 
+ 
+    Raises: 
+      AttributeError: Raised if validators work with a non-existing flag. 
+      IllegalFlagValueError: Raised if validation fails for at least one 
+          validator. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">messages = []</span>
+    <span class="s1">bad_flags = set()</span>
+    <span class="s3">for </span><span class="s1">validator </span><span class="s3">in </span><span class="s1">sorted(</span>
+        <span class="s1">validators</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">validator: validator.insertion_index):</span>
+      <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">isinstance(validator</span><span class="s3">, </span><span class="s1">_validators_classes.SingleFlagValidator):</span>
+          <span class="s3">if </span><span class="s1">validator.flag_name </span><span class="s3">in </span><span class="s1">bad_flags:</span>
+            <span class="s3">continue</span>
+        <span class="s3">elif </span><span class="s1">isinstance(validator</span><span class="s3">, </span><span class="s1">_validators_classes.MultiFlagsValidator):</span>
+          <span class="s3">if </span><span class="s1">bad_flags &amp; set(validator.flag_names):</span>
+            <span class="s3">continue</span>
+        <span class="s1">validator.verify(self)</span>
+      <span class="s3">except </span><span class="s1">_exceptions.ValidationError </span><span class="s3">as </span><span class="s1">e:</span>
+        <span class="s3">if </span><span class="s1">isinstance(validator</span><span class="s3">, </span><span class="s1">_validators_classes.SingleFlagValidator):</span>
+          <span class="s1">bad_flags.add(validator.flag_name)</span>
+        <span class="s3">elif </span><span class="s1">isinstance(validator</span><span class="s3">, </span><span class="s1">_validators_classes.MultiFlagsValidator):</span>
+          <span class="s1">bad_flags.update(set(validator.flag_names))</span>
+        <span class="s1">message = validator.print_flags_with_values(self)</span>
+        <span class="s1">messages.append(</span><span class="s4">'%s: %s' </span><span class="s1">% (message</span><span class="s3">, </span><span class="s1">str(e)))</span>
+    <span class="s3">if </span><span class="s1">messages:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.IllegalFlagValueError(</span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">.join(messages))</span>
+
+  <span class="s3">def </span><span class="s1">__delattr__(self</span><span class="s3">, </span><span class="s1">flag_name):</span>
+    <span class="s2">&quot;&quot;&quot;Deletes a previously-defined flag from a flag object. 
+ 
+    This method makes sure we can delete a flag by using 
+ 
+      del FLAGS.&lt;flag_name&gt; 
+ 
+    E.g., 
+ 
+      flags.DEFINE_integer('foo', 1, 'Integer flag.') 
+      del flags.FLAGS.foo 
+ 
+    If a flag is also registered by its the other name (long name or short 
+    name), the other name won't be deleted. 
+ 
+    Args: 
+      flag_name: str, the name of the flag to be deleted. 
+ 
+    Raises: 
+      AttributeError: Raised when there is no registered flag named flag_name. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fl = self._flags()</span>
+    <span class="s3">if </span><span class="s1">flag_name </span><span class="s3">not in </span><span class="s1">fl:</span>
+      <span class="s3">raise </span><span class="s1">AttributeError(flag_name)</span>
+
+    <span class="s1">flag_obj = fl[flag_name]</span>
+    <span class="s3">del </span><span class="s1">fl[flag_name]</span>
+
+    <span class="s1">self._cleanup_unregistered_flag_from_module_dicts(flag_obj)</span>
+
+  <span class="s3">def </span><span class="s1">set_default(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Changes the default value of the named flag object. 
+ 
+    The flag's current value is also updated if the flag is currently using 
+    the default value, i.e. not specified in the command line, and not set 
+    by FLAGS.name = value. 
+ 
+    Args: 
+      name: str, the name of the flag to modify. 
+      value: The new default value. 
+ 
+    Raises: 
+      UnrecognizedFlagError: Raised when there is no registered flag named name. 
+      IllegalFlagValueError: Raised when value is not valid. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fl = self._flags()</span>
+    <span class="s3">if </span><span class="s1">name </span><span class="s3">not in </span><span class="s1">fl:</span>
+      <span class="s1">self._set_unknown_flag(name</span><span class="s3">, </span><span class="s1">value)</span>
+      <span class="s3">return</span>
+    <span class="s1">fl[name]._set_default(value)  </span><span class="s0"># pylint: disable=protected-access</span>
+    <span class="s1">self._assert_validators(fl[name].validators)</span>
+
+  <span class="s3">def </span><span class="s1">__contains__(self</span><span class="s3">, </span><span class="s1">name):</span>
+    <span class="s2">&quot;&quot;&quot;Returns True if name is a value (flag) in the dict.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">name </span><span class="s3">in </span><span class="s1">self._flags()</span>
+
+  <span class="s3">def </span><span class="s1">__len__(self):</span>
+    <span class="s3">return </span><span class="s1">len(self.__dict__[</span><span class="s4">'__flags'</span><span class="s1">])</span>
+
+  <span class="s3">def </span><span class="s1">__iter__(self):</span>
+    <span class="s3">return </span><span class="s1">iter(self._flags())</span>
+
+  <span class="s3">def </span><span class="s1">__call__(self</span><span class="s3">, </span><span class="s1">argv</span><span class="s3">, </span><span class="s1">known_only=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Parses flags from argv; stores parsed flags into this FlagValues object. 
+ 
+    All unparsed arguments are returned. 
+ 
+    Args: 
+       argv: a tuple/list of strings. 
+       known_only: bool, if True, parse and remove known flags; return the rest 
+         untouched. Unknown flags specified by --undefok are not returned. 
+ 
+    Returns: 
+       The list of arguments not parsed as options, including argv[0]. 
+ 
+    Raises: 
+       Error: Raised on any parsing error. 
+       TypeError: Raised on passing wrong type of arguments. 
+       ValueError: Raised on flag value parsing error. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(argv</span><span class="s3">, </span><span class="s1">(str</span><span class="s3">, </span><span class="s1">bytes)):</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span>
+          <span class="s4">'argv should be a tuple/list of strings, not bytes or string.'</span><span class="s1">)</span>
+    <span class="s3">if not </span><span class="s1">argv:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">'argv cannot be an empty list, and must contain the program name as '</span>
+          <span class="s4">'the first element.'</span><span class="s1">)</span>
+
+    <span class="s0"># This pre parses the argv list for --flagfile=&lt;&gt; options.</span>
+    <span class="s1">program_name = argv[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">args = self.read_flags_from_files(argv[</span><span class="s5">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">force_gnu=</span><span class="s3">False</span><span class="s1">)</span>
+
+    <span class="s0"># Parse the arguments.</span>
+    <span class="s1">unknown_flags</span><span class="s3">, </span><span class="s1">unparsed_args = self._parse_args(args</span><span class="s3">, </span><span class="s1">known_only)</span>
+
+    <span class="s0"># Handle unknown flags by raising UnrecognizedFlagError.</span>
+    <span class="s0"># Note some users depend on us raising this particular error.</span>
+    <span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">unknown_flags:</span>
+      <span class="s1">suggestions = _helpers.get_flag_suggestions(name</span><span class="s3">, </span><span class="s1">list(self))</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.UnrecognizedFlagError(</span>
+          <span class="s1">name</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">suggestions=suggestions)</span>
+
+    <span class="s1">self.mark_as_parsed()</span>
+    <span class="s1">self.validate_all_flags()</span>
+    <span class="s3">return </span><span class="s1">[program_name] + unparsed_args</span>
+
+  <span class="s3">def </span><span class="s1">__getstate__(self):</span>
+    <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;can't pickle FlagValues&quot;</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__copy__(self):</span>
+    <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'FlagValues does not support shallow copies. '</span>
+                    <span class="s4">'Use absl.testing.flagsaver or copy.deepcopy instead.'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__deepcopy__(self</span><span class="s3">, </span><span class="s1">memo):</span>
+    <span class="s1">result = object.__new__(type(self))</span>
+    <span class="s1">result.__dict__.update(copy.deepcopy(self.__dict__</span><span class="s3">, </span><span class="s1">memo))</span>
+    <span class="s3">return </span><span class="s1">result</span>
+
+  <span class="s3">def </span><span class="s1">_set_is_retired_flag_func(self</span><span class="s3">, </span><span class="s1">is_retired_flag_func):</span>
+    <span class="s2">&quot;&quot;&quot;Sets a function for checking retired flags. 
+ 
+    Do not use it. This is a private absl API used to check retired flags 
+    registered by the absl C++ flags library. 
+ 
+    Args: 
+      is_retired_flag_func: Callable(str) -&gt; (bool, bool), a function takes flag 
+        name as parameter, returns a tuple (is_retired, type_is_bool). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__is_retired_flag_func'</span><span class="s1">] = is_retired_flag_func</span>
+
+  <span class="s3">def </span><span class="s1">_parse_args(self</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">known_only):</span>
+    <span class="s2">&quot;&quot;&quot;Helper function to do the main argument parsing. 
+ 
+    This function goes through args and does the bulk of the flag parsing. 
+    It will find the corresponding flag in our flag dictionary, and call its 
+    .parse() method on the flag value. 
+ 
+    Args: 
+      args: [str], a list of strings with the arguments to parse. 
+      known_only: bool, if True, parse and remove known flags; return the rest 
+        untouched. Unknown flags specified by --undefok are not returned. 
+ 
+    Returns: 
+      A tuple with the following: 
+          unknown_flags: List of (flag name, arg) for flags we don't know about. 
+          unparsed_args: List of arguments we did not parse. 
+ 
+    Raises: 
+       Error: Raised on any parsing error. 
+       ValueError: Raised on flag value parsing error. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">unparsed_names_and_args = []  </span><span class="s0"># A list of (flag name or None, arg).</span>
+    <span class="s1">undefok = set()</span>
+    <span class="s1">retired_flag_func = self.__dict__[</span><span class="s4">'__is_retired_flag_func'</span><span class="s1">]</span>
+
+    <span class="s1">flag_dict = self._flags()</span>
+    <span class="s1">args = iter(args)</span>
+    <span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">args:</span>
+      <span class="s1">value = </span><span class="s3">None</span>
+
+      <span class="s3">def </span><span class="s1">get_value():</span>
+        <span class="s0"># pylint: disable=cell-var-from-loop</span>
+        <span class="s3">try</span><span class="s1">:</span>
+          <span class="s3">return </span><span class="s1">next(args) </span><span class="s3">if </span><span class="s1">value </span><span class="s3">is None else </span><span class="s1">value</span>
+        <span class="s3">except </span><span class="s1">StopIteration:</span>
+          <span class="s3">raise </span><span class="s1">_exceptions.Error(</span><span class="s4">'Missing value for flag ' </span><span class="s1">+ arg)  </span><span class="s0"># pylint: disable=undefined-loop-variable</span>
+
+      <span class="s3">if not </span><span class="s1">arg.startswith(</span><span class="s4">'-'</span><span class="s1">):</span>
+        <span class="s0"># A non-argument: default is break, GNU is skip.</span>
+        <span class="s1">unparsed_names_and_args.append((</span><span class="s3">None, </span><span class="s1">arg))</span>
+        <span class="s3">if </span><span class="s1">self.is_gnu_getopt():</span>
+          <span class="s3">continue</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s3">break</span>
+
+      <span class="s3">if </span><span class="s1">arg == </span><span class="s4">'--'</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">known_only:</span>
+          <span class="s1">unparsed_names_and_args.append((</span><span class="s3">None, </span><span class="s1">arg))</span>
+        <span class="s3">break</span>
+
+      <span class="s0"># At this point, arg must start with '-'.</span>
+      <span class="s3">if </span><span class="s1">arg.startswith(</span><span class="s4">'--'</span><span class="s1">):</span>
+        <span class="s1">arg_without_dashes = arg[</span><span class="s5">2</span><span class="s1">:]</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">arg_without_dashes = arg[</span><span class="s5">1</span><span class="s1">:]</span>
+
+      <span class="s3">if </span><span class="s4">'=' </span><span class="s3">in </span><span class="s1">arg_without_dashes:</span>
+        <span class="s1">name</span><span class="s3">, </span><span class="s1">value = arg_without_dashes.split(</span><span class="s4">'='</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">name</span><span class="s3">, </span><span class="s1">value = arg_without_dashes</span><span class="s3">, None</span>
+
+      <span class="s3">if not </span><span class="s1">name:</span>
+        <span class="s0"># The argument is all dashes (including one dash).</span>
+        <span class="s1">unparsed_names_and_args.append((</span><span class="s3">None, </span><span class="s1">arg))</span>
+        <span class="s3">if </span><span class="s1">self.is_gnu_getopt():</span>
+          <span class="s3">continue</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s3">break</span>
+
+      <span class="s0"># --undefok is a special case.</span>
+      <span class="s3">if </span><span class="s1">name == </span><span class="s4">'undefok'</span><span class="s1">:</span>
+        <span class="s1">value = get_value()</span>
+        <span class="s1">undefok.update(v.strip() </span><span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">value.split(</span><span class="s4">','</span><span class="s1">))</span>
+        <span class="s1">undefok.update(</span><span class="s4">'no' </span><span class="s1">+ v.strip() </span><span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">value.split(</span><span class="s4">','</span><span class="s1">))</span>
+        <span class="s3">continue</span>
+
+      <span class="s1">flag = flag_dict.get(name)</span>
+      <span class="s3">if </span><span class="s1">flag </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">flag.boolean </span><span class="s3">and </span><span class="s1">value </span><span class="s3">is None</span><span class="s1">:</span>
+          <span class="s1">value = </span><span class="s4">'true'</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s1">value = get_value()</span>
+      <span class="s3">elif </span><span class="s1">name.startswith(</span><span class="s4">'no'</span><span class="s1">) </span><span class="s3">and </span><span class="s1">len(name) &gt; </span><span class="s5">2</span><span class="s1">:</span>
+        <span class="s0"># Boolean flags can take the form of --noflag, with no value.</span>
+        <span class="s1">noflag = flag_dict.get(name[</span><span class="s5">2</span><span class="s1">:])</span>
+        <span class="s3">if </span><span class="s1">noflag </span><span class="s3">is not None and </span><span class="s1">noflag.boolean:</span>
+          <span class="s3">if </span><span class="s1">value </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(arg + </span><span class="s4">' does not take an argument'</span><span class="s1">)</span>
+          <span class="s1">flag = noflag</span>
+          <span class="s1">value = </span><span class="s4">'false'</span>
+
+      <span class="s3">if </span><span class="s1">retired_flag_func </span><span class="s3">and </span><span class="s1">flag </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">is_retired</span><span class="s3">, </span><span class="s1">is_bool = retired_flag_func(name)</span>
+
+        <span class="s0"># If we didn't recognize that flag, but it starts with</span>
+        <span class="s0"># &quot;no&quot; then maybe it was a boolean flag specified in the</span>
+        <span class="s0"># --nofoo form.</span>
+        <span class="s3">if not </span><span class="s1">is_retired </span><span class="s3">and </span><span class="s1">name.startswith(</span><span class="s4">'no'</span><span class="s1">):</span>
+          <span class="s1">is_retired</span><span class="s3">, </span><span class="s1">is_bool = retired_flag_func(name[</span><span class="s5">2</span><span class="s1">:])</span>
+          <span class="s1">is_retired = is_retired </span><span class="s3">and </span><span class="s1">is_bool</span>
+
+        <span class="s3">if </span><span class="s1">is_retired:</span>
+          <span class="s3">if not </span><span class="s1">is_bool </span><span class="s3">and </span><span class="s1">value </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s0"># This happens when a non-bool retired flag is specified</span>
+            <span class="s0"># in format of &quot;--flag value&quot;.</span>
+            <span class="s1">get_value()</span>
+          <span class="s1">logging.error(</span>
+              <span class="s4">'Flag &quot;%s&quot; is retired and should no longer '</span>
+              <span class="s4">'be specified. See go/totw/90.'</span><span class="s3">, </span><span class="s1">name)</span>
+          <span class="s3">continue</span>
+
+      <span class="s3">if </span><span class="s1">flag </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s0"># LINT.IfChange</span>
+        <span class="s1">flag.parse(value)</span>
+        <span class="s1">flag.using_default_value = </span><span class="s3">False</span>
+        <span class="s0"># LINT.ThenChange(../testing/flagsaver.py:flag_override_parsing)</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">unparsed_names_and_args.append((name</span><span class="s3">, </span><span class="s1">arg))</span>
+
+    <span class="s1">unknown_flags = []</span>
+    <span class="s1">unparsed_args = []</span>
+    <span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">unparsed_names_and_args:</span>
+      <span class="s3">if </span><span class="s1">name </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s0"># Positional arguments.</span>
+        <span class="s1">unparsed_args.append(arg)</span>
+      <span class="s3">elif </span><span class="s1">name </span><span class="s3">in </span><span class="s1">undefok:</span>
+        <span class="s0"># Remove undefok flags.</span>
+        <span class="s3">continue</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s0"># This is an unknown flag.</span>
+        <span class="s3">if </span><span class="s1">known_only:</span>
+          <span class="s1">unparsed_args.append(arg)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s1">unknown_flags.append((name</span><span class="s3">, </span><span class="s1">arg))</span>
+
+    <span class="s1">unparsed_args.extend(list(args))</span>
+    <span class="s3">return </span><span class="s1">unknown_flags</span><span class="s3">, </span><span class="s1">unparsed_args</span>
+
+  <span class="s3">def </span><span class="s1">is_parsed(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns whether flags were parsed.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.__dict__[</span><span class="s4">'__flags_parsed'</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">mark_as_parsed(self):</span>
+    <span class="s2">&quot;&quot;&quot;Explicitly marks flags as parsed. 
+ 
+    Use this when the caller knows that this FlagValues has been parsed as if 
+    a ``__call__()`` invocation has happened.  This is only a public method for 
+    use by things like appcommands which do additional command like parsing. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__flags_parsed'</span><span class="s1">] = </span><span class="s3">True</span>
+
+  <span class="s3">def </span><span class="s1">unparse_flags(self):</span>
+    <span class="s2">&quot;&quot;&quot;Unparses all flags to the point before any FLAGS(argv) was called.&quot;&quot;&quot;</span>
+    <span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">self._flags().values():</span>
+      <span class="s1">f.unparse()</span>
+    <span class="s0"># We log this message before marking flags as unparsed to avoid a</span>
+    <span class="s0"># problem when the logging library causes flags access.</span>
+    <span class="s1">logging.info(</span><span class="s4">'unparse_flags() called; flags access will now raise errors.'</span><span class="s1">)</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__flags_parsed'</span><span class="s1">] = </span><span class="s3">False</span>
+    <span class="s1">self.__dict__[</span><span class="s4">'__unparse_flags_called'</span><span class="s1">] = </span><span class="s3">True</span>
+
+  <span class="s3">def </span><span class="s1">flag_values_dict(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a dictionary that maps flag names to flag values.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">{name: flag.value </span><span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">self._flags().items()}</span>
+
+  <span class="s3">def </span><span class="s1">__str__(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a help string for all known flags.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.get_help()</span>
+
+  <span class="s3">def </span><span class="s1">get_help(self</span><span class="s3">, </span><span class="s1">prefix=</span><span class="s4">''</span><span class="s3">, </span><span class="s1">include_special_flags=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a help string for all known flags. 
+ 
+    Args: 
+      prefix: str, per-line output prefix. 
+      include_special_flags: bool, whether to include description of 
+        SPECIAL_FLAGS, i.e. --flagfile and --undefok. 
+ 
+    Returns: 
+      str, formatted help message. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">flags_by_module = self.flags_by_module_dict()</span>
+    <span class="s3">if </span><span class="s1">flags_by_module:</span>
+      <span class="s1">modules = sorted(flags_by_module)</span>
+      <span class="s0"># Print the help for the main module first, if possible.</span>
+      <span class="s1">main_module = sys.argv[</span><span class="s5">0</span><span class="s1">]</span>
+      <span class="s3">if </span><span class="s1">main_module </span><span class="s3">in </span><span class="s1">modules:</span>
+        <span class="s1">modules.remove(main_module)</span>
+        <span class="s1">modules = [main_module] + modules</span>
+      <span class="s3">return </span><span class="s1">self._get_help_for_modules(modules</span><span class="s3">, </span><span class="s1">prefix</span><span class="s3">, </span><span class="s1">include_special_flags)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">output_lines = []</span>
+      <span class="s0"># Just print one long list of flags.</span>
+      <span class="s1">values = self._flags().values()</span>
+      <span class="s3">if </span><span class="s1">include_special_flags:</span>
+        <span class="s1">values = itertools.chain(</span>
+            <span class="s1">values</span><span class="s3">, </span><span class="s1">_helpers.SPECIAL_FLAGS._flags().values())  </span><span class="s0"># pylint: disable=protected-access</span>
+      <span class="s1">self._render_flag_list(values</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix)</span>
+      <span class="s3">return </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">.join(output_lines)</span>
+
+  <span class="s3">def </span><span class="s1">_get_help_for_modules(self</span><span class="s3">, </span><span class="s1">modules</span><span class="s3">, </span><span class="s1">prefix</span><span class="s3">, </span><span class="s1">include_special_flags):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the help string for a list of modules. 
+ 
+    Private to absl.flags package. 
+ 
+    Args: 
+      modules: List[str], a list of modules to get the help string for. 
+      prefix: str, a string that is prepended to each generated help line. 
+      include_special_flags: bool, whether to include description of 
+        SPECIAL_FLAGS, i.e. --flagfile and --undefok. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">output_lines = []</span>
+    <span class="s3">for </span><span class="s1">module </span><span class="s3">in </span><span class="s1">modules:</span>
+      <span class="s1">self._render_our_module_flags(module</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix)</span>
+    <span class="s3">if </span><span class="s1">include_special_flags:</span>
+      <span class="s1">self._render_module_flags(</span>
+          <span class="s4">'absl.flags'</span><span class="s3">,</span>
+          <span class="s1">_helpers.SPECIAL_FLAGS._flags().values()</span><span class="s3">,  </span><span class="s0"># pylint: disable=protected-access</span>
+          <span class="s1">output_lines</span><span class="s3">,</span>
+          <span class="s1">prefix)</span>
+    <span class="s3">return </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">.join(output_lines)</span>
+
+  <span class="s3">def </span><span class="s1">_render_module_flags(self</span><span class="s3">, </span><span class="s1">module</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix=</span><span class="s4">''</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a help string for a given module.&quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance(module</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s1">module = module.__name__</span>
+    <span class="s1">output_lines.append(</span><span class="s4">'</span><span class="s3">\n</span><span class="s4">%s%s:' </span><span class="s1">% (prefix</span><span class="s3">, </span><span class="s1">module))</span>
+    <span class="s1">self._render_flag_list(flags</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix + </span><span class="s4">'  '</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">_render_our_module_flags(self</span><span class="s3">, </span><span class="s1">module</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix=</span><span class="s4">''</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a help string for a given module.&quot;&quot;&quot;</span>
+    <span class="s1">flags = self.get_flags_for_module(module)</span>
+    <span class="s3">if </span><span class="s1">flags:</span>
+      <span class="s1">self._render_module_flags(module</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix)</span>
+
+  <span class="s3">def </span><span class="s1">_render_our_module_key_flags(self</span><span class="s3">, </span><span class="s1">module</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix=</span><span class="s4">''</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a help string for the key flags of a given module. 
+ 
+    Args: 
+      module: module|str, the module to render key flags for. 
+      output_lines: [str], a list of strings.  The generated help message lines 
+        will be appended to this list. 
+      prefix: str, a string that is prepended to each generated help line. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key_flags = self.get_key_flags_for_module(module)</span>
+    <span class="s3">if </span><span class="s1">key_flags:</span>
+      <span class="s1">self._render_module_flags(module</span><span class="s3">, </span><span class="s1">key_flags</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix)</span>
+
+  <span class="s3">def </span><span class="s1">module_help(self</span><span class="s3">, </span><span class="s1">module):</span>
+    <span class="s2">&quot;&quot;&quot;Describes the key flags of a module. 
+ 
+    Args: 
+      module: module|str, the module to describe the key flags for. 
+ 
+    Returns: 
+      str, describing the key flags of a module. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">helplist = []</span>
+    <span class="s1">self._render_our_module_key_flags(module</span><span class="s3">, </span><span class="s1">helplist)</span>
+    <span class="s3">return </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">.join(helplist)</span>
+
+  <span class="s3">def </span><span class="s1">main_module_help(self):</span>
+    <span class="s2">&quot;&quot;&quot;Describes the key flags of the main module. 
+ 
+    Returns: 
+      str, describing the key flags of the main module. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.module_help(sys.argv[</span><span class="s5">0</span><span class="s1">])</span>
+
+  <span class="s3">def </span><span class="s1">_render_flag_list(self</span><span class="s3">, </span><span class="s1">flaglist</span><span class="s3">, </span><span class="s1">output_lines</span><span class="s3">, </span><span class="s1">prefix=</span><span class="s4">'  '</span><span class="s1">):</span>
+    <span class="s1">fl = self._flags()</span>
+    <span class="s1">special_fl = _helpers.SPECIAL_FLAGS._flags()  </span><span class="s0"># pylint: disable=protected-access</span>
+    <span class="s1">flaglist = [(flag.name</span><span class="s3">, </span><span class="s1">flag) </span><span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flaglist]</span>
+    <span class="s1">flaglist.sort()</span>
+    <span class="s1">flagset = {}</span>
+    <span class="s3">for </span><span class="s1">(name</span><span class="s3">, </span><span class="s1">flag) </span><span class="s3">in </span><span class="s1">flaglist:</span>
+      <span class="s0"># It's possible this flag got deleted or overridden since being</span>
+      <span class="s0"># registered in the per-module flaglist.  Check now against the</span>
+      <span class="s0"># canonical source of current flag information, the _flags.</span>
+      <span class="s3">if </span><span class="s1">fl.get(name</span><span class="s3">, None</span><span class="s1">) != flag </span><span class="s3">and </span><span class="s1">special_fl.get(name</span><span class="s3">, None</span><span class="s1">) != flag:</span>
+        <span class="s0"># a different flag is using this name now</span>
+        <span class="s3">continue</span>
+      <span class="s0"># only print help once</span>
+      <span class="s3">if </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flagset:</span>
+        <span class="s3">continue</span>
+      <span class="s1">flagset[flag] = </span><span class="s5">1</span>
+      <span class="s1">flaghelp = </span><span class="s4">''</span>
+      <span class="s3">if </span><span class="s1">flag.short_name:</span>
+        <span class="s1">flaghelp += </span><span class="s4">'-%s,' </span><span class="s1">% flag.short_name</span>
+      <span class="s3">if </span><span class="s1">flag.boolean:</span>
+        <span class="s1">flaghelp += </span><span class="s4">'--[no]%s:' </span><span class="s1">% flag.name</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">flaghelp += </span><span class="s4">'--%s:' </span><span class="s1">% flag.name</span>
+      <span class="s1">flaghelp += </span><span class="s4">' '</span>
+      <span class="s3">if </span><span class="s1">flag.help:</span>
+        <span class="s1">flaghelp += flag.help</span>
+      <span class="s1">flaghelp = _helpers.text_wrap(</span>
+          <span class="s1">flaghelp</span><span class="s3">, </span><span class="s1">indent=prefix + </span><span class="s4">'  '</span><span class="s3">, </span><span class="s1">firstline_indent=prefix)</span>
+      <span class="s3">if </span><span class="s1">flag.default_as_str:</span>
+        <span class="s1">flaghelp += </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span>
+        <span class="s1">flaghelp += _helpers.text_wrap(</span>
+            <span class="s4">'(default: %s)' </span><span class="s1">% flag.default_as_str</span><span class="s3">, </span><span class="s1">indent=prefix + </span><span class="s4">'  '</span><span class="s1">)</span>
+      <span class="s3">if </span><span class="s1">flag.parser.syntactic_help:</span>
+        <span class="s1">flaghelp += </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span>
+        <span class="s1">flaghelp += _helpers.text_wrap(</span>
+            <span class="s4">'(%s)' </span><span class="s1">% flag.parser.syntactic_help</span><span class="s3">, </span><span class="s1">indent=prefix + </span><span class="s4">'  '</span><span class="s1">)</span>
+      <span class="s1">output_lines.append(flaghelp)</span>
+
+  <span class="s3">def </span><span class="s1">get_flag_value(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">default):  </span><span class="s0"># pylint: disable=invalid-name</span>
+    <span class="s2">&quot;&quot;&quot;Returns the value of a flag (if not None) or a default value. 
+ 
+    Args: 
+      name: str, the name of a flag. 
+      default: Default value to use if the flag value is None. 
+ 
+    Returns: 
+      Requested flag value or default. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">value = self.__getattr__(name)</span>
+    <span class="s3">if </span><span class="s1">value </span><span class="s3">is not None</span><span class="s1">:  </span><span class="s0"># Can't do if not value, b/c value might be '0' or &quot;&quot;</span>
+      <span class="s3">return </span><span class="s1">value</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">default</span>
+
+  <span class="s3">def </span><span class="s1">_is_flag_file_directive(self</span><span class="s3">, </span><span class="s1">flag_string):</span>
+    <span class="s2">&quot;&quot;&quot;Checks whether flag_string contain a --flagfile=&lt;foo&gt; directive.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(flag_string</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s3">if </span><span class="s1">flag_string.startswith(</span><span class="s4">'--flagfile='</span><span class="s1">):</span>
+        <span class="s3">return </span><span class="s5">1</span>
+      <span class="s3">elif </span><span class="s1">flag_string == </span><span class="s4">'--flagfile'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s5">1</span>
+      <span class="s3">elif </span><span class="s1">flag_string.startswith(</span><span class="s4">'-flagfile='</span><span class="s1">):</span>
+        <span class="s3">return </span><span class="s5">1</span>
+      <span class="s3">elif </span><span class="s1">flag_string == </span><span class="s4">'-flagfile'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s5">1</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s5">0</span>
+    <span class="s3">return </span><span class="s5">0</span>
+
+  <span class="s3">def </span><span class="s1">_extract_filename(self</span><span class="s3">, </span><span class="s1">flagfile_str):</span>
+    <span class="s2">&quot;&quot;&quot;Returns filename from a flagfile_str of form -[-]flagfile=filename. 
+ 
+    The cases of --flagfile foo and -flagfile foo shouldn't be hitting 
+    this function, as they are dealt with in the level above this 
+    function. 
+ 
+    Args: 
+      flagfile_str: str, the flagfile string. 
+ 
+    Returns: 
+      str, the filename from a flagfile_str of form -[-]flagfile=filename. 
+ 
+    Raises: 
+      Error: Raised when illegal --flagfile is provided. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">flagfile_str.startswith(</span><span class="s4">'--flagfile='</span><span class="s1">):</span>
+      <span class="s3">return </span><span class="s1">os.path.expanduser((flagfile_str[(len(</span><span class="s4">'--flagfile='</span><span class="s1">)):]).strip())</span>
+    <span class="s3">elif </span><span class="s1">flagfile_str.startswith(</span><span class="s4">'-flagfile='</span><span class="s1">):</span>
+      <span class="s3">return </span><span class="s1">os.path.expanduser((flagfile_str[(len(</span><span class="s4">'-flagfile='</span><span class="s1">)):]).strip())</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.Error(</span><span class="s4">'Hit illegal --flagfile type: %s' </span><span class="s1">% flagfile_str)</span>
+
+  <span class="s3">def </span><span class="s1">_get_flag_file_lines(self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">parsed_file_stack=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the useful (!=comments, etc) lines from a file with flags. 
+ 
+    Args: 
+      filename: str, the name of the flag file. 
+      parsed_file_stack: [str], a list of the names of the files that we have 
+        recursively encountered at the current depth. MUTATED BY THIS FUNCTION 
+        (but the original value is preserved upon successfully returning from 
+        function call). 
+ 
+    Returns: 
+      List of strings. See the note below. 
+ 
+    NOTE(springer): This function checks for a nested --flagfile=&lt;foo&gt; 
+    tag and handles the lower file recursively. It returns a list of 
+    all the lines that _could_ contain command flags. This is 
+    EVERYTHING except whitespace lines and comments (lines starting 
+    with '#' or '//'). 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># For consistency with the cpp version, ignore empty values.</span>
+    <span class="s3">if not </span><span class="s1">filename:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+    <span class="s3">if </span><span class="s1">parsed_file_stack </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s1">parsed_file_stack = []</span>
+    <span class="s0"># We do a little safety check for reparsing a file we've already encountered</span>
+    <span class="s0"># at a previous depth.</span>
+    <span class="s3">if </span><span class="s1">filename </span><span class="s3">in </span><span class="s1">parsed_file_stack:</span>
+      <span class="s1">sys.stderr.write(</span><span class="s4">'Warning: Hit circular flagfile dependency. Ignoring'</span>
+                       <span class="s4">' flagfile: %s</span><span class="s3">\n</span><span class="s4">' </span><span class="s1">% (filename</span><span class="s3">,</span><span class="s1">))</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">parsed_file_stack.append(filename)</span>
+
+    <span class="s1">line_list = []  </span><span class="s0"># All line from flagfile.</span>
+    <span class="s1">flag_line_list = []  </span><span class="s0"># Subset of lines w/o comments, blanks, flagfile= tags.</span>
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s1">file_obj = open(filename</span><span class="s3">, </span><span class="s4">'r'</span><span class="s1">)</span>
+    <span class="s3">except </span><span class="s1">IOError </span><span class="s3">as </span><span class="s1">e_msg:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.CantOpenFlagFileError(</span>
+          <span class="s4">'ERROR:: Unable to open flagfile: %s' </span><span class="s1">% e_msg)</span>
+
+    <span class="s3">with </span><span class="s1">file_obj:</span>
+      <span class="s1">line_list = file_obj.readlines()</span>
+
+    <span class="s0"># This is where we check each line in the file we just read.</span>
+    <span class="s3">for </span><span class="s1">line </span><span class="s3">in </span><span class="s1">line_list:</span>
+      <span class="s3">if </span><span class="s1">line.isspace():</span>
+        <span class="s3">pass</span>
+      <span class="s0"># Checks for comment (a line that starts with '#').</span>
+      <span class="s3">elif </span><span class="s1">line.startswith(</span><span class="s4">'#'</span><span class="s1">) </span><span class="s3">or </span><span class="s1">line.startswith(</span><span class="s4">'//'</span><span class="s1">):</span>
+        <span class="s3">pass</span>
+      <span class="s0"># Checks for a nested &quot;--flagfile=&lt;bar&gt;&quot; flag in the current file.</span>
+      <span class="s0"># If we find one, recursively parse down into that file.</span>
+      <span class="s3">elif </span><span class="s1">self._is_flag_file_directive(line):</span>
+        <span class="s1">sub_filename = self._extract_filename(line)</span>
+        <span class="s1">included_flags = self._get_flag_file_lines(</span>
+            <span class="s1">sub_filename</span><span class="s3">, </span><span class="s1">parsed_file_stack=parsed_file_stack)</span>
+        <span class="s1">flag_line_list.extend(included_flags)</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s0"># Any line that's not a comment or a nested flagfile should get</span>
+        <span class="s0"># copied into 2nd position.  This leaves earlier arguments</span>
+        <span class="s0"># further back in the list, thus giving them higher priority.</span>
+        <span class="s1">flag_line_list.append(line.strip())</span>
+
+    <span class="s1">parsed_file_stack.pop()</span>
+    <span class="s3">return </span><span class="s1">flag_line_list</span>
+
+  <span class="s3">def </span><span class="s1">read_flags_from_files(self</span><span class="s3">, </span><span class="s1">argv</span><span class="s3">, </span><span class="s1">force_gnu=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Processes command line args, but also allow args to be read from file. 
+ 
+    Args: 
+      argv: [str], a list of strings, usually sys.argv[1:], which may contain 
+        one or more flagfile directives of the form --flagfile=&quot;./filename&quot;. 
+        Note that the name of the program (sys.argv[0]) should be omitted. 
+      force_gnu: bool, if False, --flagfile parsing obeys the 
+        FLAGS.is_gnu_getopt() value. If True, ignore the value and always follow 
+        gnu_getopt semantics. 
+ 
+    Returns: 
+      A new list which has the original list combined with what we read 
+      from any flagfile(s). 
+ 
+    Raises: 
+      IllegalFlagValueError: Raised when --flagfile is provided with no 
+          argument. 
+ 
+    This function is called by FLAGS(argv). 
+    It scans the input list for a flag that looks like: 
+    --flagfile=&lt;somefile&gt;. Then it opens &lt;somefile&gt;, reads all valid key 
+    and value pairs and inserts them into the input list in exactly the 
+    place where the --flagfile arg is found. 
+ 
+    Note that your application's flags are still defined the usual way 
+    using absl.flags DEFINE_flag() type functions. 
+ 
+    Notes (assuming we're getting a commandline of some sort as our input): 
+ 
+    * For duplicate flags, the last one we hit should &quot;win&quot;. 
+    * Since flags that appear later win, a flagfile's settings can be &quot;weak&quot; 
+        if the --flagfile comes at the beginning of the argument sequence, 
+        and it can be &quot;strong&quot; if the --flagfile comes at the end. 
+    * A further &quot;--flagfile=&lt;otherfile.cfg&gt;&quot; CAN be nested in a flagfile. 
+        It will be expanded in exactly the spot where it is found. 
+    * In a flagfile, a line beginning with # or // is a comment. 
+    * Entirely blank lines _should_ be ignored. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">rest_of_args = argv</span>
+    <span class="s1">new_argv = []</span>
+    <span class="s3">while </span><span class="s1">rest_of_args:</span>
+      <span class="s1">current_arg = rest_of_args[</span><span class="s5">0</span><span class="s1">]</span>
+      <span class="s1">rest_of_args = rest_of_args[</span><span class="s5">1</span><span class="s1">:]</span>
+      <span class="s3">if </span><span class="s1">self._is_flag_file_directive(current_arg):</span>
+        <span class="s0"># This handles the case of -(-)flagfile foo.  In this case the</span>
+        <span class="s0"># next arg really is part of this one.</span>
+        <span class="s3">if </span><span class="s1">current_arg == </span><span class="s4">'--flagfile' </span><span class="s3">or </span><span class="s1">current_arg == </span><span class="s4">'-flagfile'</span><span class="s1">:</span>
+          <span class="s3">if not </span><span class="s1">rest_of_args:</span>
+            <span class="s3">raise </span><span class="s1">_exceptions.IllegalFlagValueError(</span>
+                <span class="s4">'--flagfile with no argument'</span><span class="s1">)</span>
+          <span class="s1">flag_filename = os.path.expanduser(rest_of_args[</span><span class="s5">0</span><span class="s1">])</span>
+          <span class="s1">rest_of_args = rest_of_args[</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s0"># This handles the case of (-)-flagfile=foo.</span>
+          <span class="s1">flag_filename = self._extract_filename(current_arg)</span>
+        <span class="s1">new_argv.extend(self._get_flag_file_lines(flag_filename))</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">new_argv.append(current_arg)</span>
+        <span class="s0"># Stop parsing after '--', like getopt and gnu_getopt.</span>
+        <span class="s3">if </span><span class="s1">current_arg == </span><span class="s4">'--'</span><span class="s1">:</span>
+          <span class="s3">break</span>
+        <span class="s0"># Stop parsing after a non-flag, like getopt.</span>
+        <span class="s3">if not </span><span class="s1">current_arg.startswith(</span><span class="s4">'-'</span><span class="s1">):</span>
+          <span class="s3">if not </span><span class="s1">force_gnu </span><span class="s3">and not </span><span class="s1">self.__dict__[</span><span class="s4">'__use_gnu_getopt'</span><span class="s1">]:</span>
+            <span class="s3">break</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s3">if </span><span class="s1">(</span><span class="s4">'=' </span><span class="s3">not in </span><span class="s1">current_arg </span><span class="s3">and </span><span class="s1">rest_of_args </span><span class="s3">and</span>
+              <span class="s3">not </span><span class="s1">rest_of_args[</span><span class="s5">0</span><span class="s1">].startswith(</span><span class="s4">'-'</span><span class="s1">)):</span>
+            <span class="s0"># If this is an occurrence of a legitimate --x y, skip the value</span>
+            <span class="s0"># so that it won't be mistaken for a standalone arg.</span>
+            <span class="s1">fl = self._flags()</span>
+            <span class="s1">name = current_arg.lstrip(</span><span class="s4">'-'</span><span class="s1">)</span>
+            <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">fl </span><span class="s3">and not </span><span class="s1">fl[name].boolean:</span>
+              <span class="s1">current_arg = rest_of_args[</span><span class="s5">0</span><span class="s1">]</span>
+              <span class="s1">rest_of_args = rest_of_args[</span><span class="s5">1</span><span class="s1">:]</span>
+              <span class="s1">new_argv.append(current_arg)</span>
+
+    <span class="s3">if </span><span class="s1">rest_of_args:</span>
+      <span class="s1">new_argv.extend(rest_of_args)</span>
+
+    <span class="s3">return </span><span class="s1">new_argv</span>
+
+  <span class="s3">def </span><span class="s1">flags_into_string(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a string with the flags assignments from this FlagValues object. 
+ 
+    This function ignores flags whose value is None.  Each flag 
+    assignment is separated by a newline. 
+ 
+    NOTE: MUST mirror the behavior of the C++ CommandlineFlagsIntoString 
+    from https://github.com/gflags/gflags. 
+ 
+    Returns: 
+      str, the string with the flags assignments from this FlagValues object. 
+      The flags are ordered by (module_name, flag_name). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">module_flags = sorted(self.flags_by_module_dict().items())</span>
+    <span class="s1">s = </span><span class="s4">''</span>
+    <span class="s3">for </span><span class="s1">unused_module_name</span><span class="s3">, </span><span class="s1">flags </span><span class="s3">in </span><span class="s1">module_flags:</span>
+      <span class="s1">flags = sorted(flags</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">f: f.name)</span>
+      <span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flags:</span>
+        <span class="s3">if </span><span class="s1">flag.value </span><span class="s3">is not None</span><span class="s1">:</span>
+          <span class="s1">s += flag.serialize() + </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span>
+    <span class="s3">return </span><span class="s1">s</span>
+
+  <span class="s3">def </span><span class="s1">append_flags_into_file(self</span><span class="s3">, </span><span class="s1">filename):</span>
+    <span class="s2">&quot;&quot;&quot;Appends all flags assignments from this FlagInfo object to a file. 
+ 
+    Output will be in the format of a flagfile. 
+ 
+    NOTE: MUST mirror the behavior of the C++ AppendFlagsIntoFile 
+    from https://github.com/gflags/gflags. 
+ 
+    Args: 
+      filename: str, name of the file. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s4">'a'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">out_file:</span>
+      <span class="s1">out_file.write(self.flags_into_string())</span>
+
+  <span class="s3">def </span><span class="s1">write_help_in_xml_format(self</span><span class="s3">, </span><span class="s1">outfile=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Outputs flag documentation in XML format. 
+ 
+    NOTE: We use element names that are consistent with those used by 
+    the C++ command-line flag library, from 
+    https://github.com/gflags/gflags. 
+    We also use a few new elements (e.g., &lt;key&gt;), but we do not 
+    interfere / overlap with existing XML elements used by the C++ 
+    library.  Please maintain this consistency. 
+ 
+    Args: 
+      outfile: File object we write to.  Default None means sys.stdout. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">doc = minidom.Document()</span>
+    <span class="s1">all_flag = doc.createElement(</span><span class="s4">'AllFlags'</span><span class="s1">)</span>
+    <span class="s1">doc.appendChild(all_flag)</span>
+
+    <span class="s1">all_flag.appendChild(</span>
+        <span class="s1">_helpers.create_xml_dom_element(doc</span><span class="s3">, </span><span class="s4">'program'</span><span class="s3">,</span>
+                                        <span class="s1">os.path.basename(sys.argv[</span><span class="s5">0</span><span class="s1">])))</span>
+
+    <span class="s1">usage_doc = sys.modules[</span><span class="s4">'__main__'</span><span class="s1">].__doc__</span>
+    <span class="s3">if not </span><span class="s1">usage_doc:</span>
+      <span class="s1">usage_doc = </span><span class="s4">'</span><span class="s3">\n</span><span class="s4">USAGE: %s [flags]</span><span class="s3">\n</span><span class="s4">' </span><span class="s1">% sys.argv[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">usage_doc = usage_doc.replace(</span><span class="s4">'%s'</span><span class="s3">, </span><span class="s1">sys.argv[</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s1">all_flag.appendChild(</span>
+        <span class="s1">_helpers.create_xml_dom_element(doc</span><span class="s3">, </span><span class="s4">'usage'</span><span class="s3">, </span><span class="s1">usage_doc))</span>
+
+    <span class="s0"># Get list of key flags for the main module.</span>
+    <span class="s1">key_flags = self.get_key_flags_for_module(sys.argv[</span><span class="s5">0</span><span class="s1">])</span>
+
+    <span class="s0"># Sort flags by declaring module name and next by flag name.</span>
+    <span class="s1">flags_by_module = self.flags_by_module_dict()</span>
+    <span class="s1">all_module_names = list(flags_by_module.keys())</span>
+    <span class="s1">all_module_names.sort()</span>
+    <span class="s3">for </span><span class="s1">module_name </span><span class="s3">in </span><span class="s1">all_module_names:</span>
+      <span class="s1">flag_list = [(f.name</span><span class="s3">, </span><span class="s1">f) </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">flags_by_module[module_name]]</span>
+      <span class="s1">flag_list.sort()</span>
+      <span class="s3">for </span><span class="s1">unused_flag_name</span><span class="s3">, </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">flag_list:</span>
+        <span class="s1">is_key = flag </span><span class="s3">in </span><span class="s1">key_flags</span>
+        <span class="s1">all_flag.appendChild(</span>
+            <span class="s1">flag._create_xml_dom_element(  </span><span class="s0"># pylint: disable=protected-access</span>
+                <span class="s1">doc</span><span class="s3">,</span>
+                <span class="s1">module_name</span><span class="s3">,</span>
+                <span class="s1">is_key=is_key))</span>
+
+    <span class="s1">outfile = outfile </span><span class="s3">or </span><span class="s1">sys.stdout</span>
+    <span class="s1">outfile.write(</span>
+        <span class="s1">doc.toprettyxml(indent=</span><span class="s4">'  '</span><span class="s3">, </span><span class="s1">encoding=</span><span class="s4">'utf-8'</span><span class="s1">).decode(</span><span class="s4">'utf-8'</span><span class="s1">))</span>
+    <span class="s1">outfile.flush()</span>
+
+  <span class="s3">def </span><span class="s1">_check_method_name_conflicts(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">flag):</span>
+    <span class="s3">if </span><span class="s1">flag.allow_using_method_names:</span>
+      <span class="s3">return</span>
+    <span class="s1">short_name = flag.short_name</span>
+    <span class="s1">flag_names = {name} </span><span class="s3">if </span><span class="s1">short_name </span><span class="s3">is None else </span><span class="s1">{name</span><span class="s3">, </span><span class="s1">short_name}</span>
+    <span class="s3">for </span><span class="s1">flag_name </span><span class="s3">in </span><span class="s1">flag_names:</span>
+      <span class="s3">if </span><span class="s1">flag_name </span><span class="s3">in </span><span class="s1">self.__dict__[</span><span class="s4">'__banned_flag_names'</span><span class="s1">]:</span>
+        <span class="s3">raise </span><span class="s1">_exceptions.FlagNameConflictsWithMethodError(</span>
+            <span class="s4">'Cannot define a flag named &quot;{name}&quot;. It conflicts with a method '</span>
+            <span class="s4">'on class &quot;{class_name}&quot;. To allow defining it, use '</span>
+            <span class="s4">'allow_using_method_names and access the flag value with '</span>
+            <span class="s4">&quot;FLAGS['{name}'].value. FLAGS.{name} returns the method, &quot;</span>
+            <span class="s4">'not the flag value.'</span><span class="s1">.format(</span>
+                <span class="s1">name=flag_name</span><span class="s3">, </span><span class="s1">class_name=type(self).__name__))</span>
+
+
+<span class="s1">FLAGS = FlagValues()</span>
+
+
+<span class="s3">class </span><span class="s1">FlagHolder(Generic[_T]):</span>
+  <span class="s2">&quot;&quot;&quot;Holds a defined flag. 
+ 
+  This facilitates a cleaner api around global state. Instead of:: 
+ 
+      flags.DEFINE_integer('foo', ...) 
+      flags.DEFINE_integer('bar', ...) 
+ 
+      def method(): 
+        # prints parsed value of 'bar' flag 
+        print(flags.FLAGS.foo) 
+        # runtime error due to typo or possibly bad coding style. 
+        print(flags.FLAGS.baz) 
+ 
+  it encourages code like:: 
+ 
+      _FOO_FLAG = flags.DEFINE_integer('foo', ...) 
+      _BAR_FLAG = flags.DEFINE_integer('bar', ...) 
+ 
+      def method(): 
+        print(_FOO_FLAG.value) 
+        print(_BAR_FLAG.value) 
+ 
+  since the name of the flag appears only once in the source code. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">flag_values</span><span class="s3">, </span><span class="s1">flag</span><span class="s3">, </span><span class="s1">ensure_non_none_value=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Constructs a FlagHolder instance providing typesafe access to flag. 
+ 
+    Args: 
+      flag_values: The container the flag is registered to. 
+      flag: The flag object for this flag. 
+      ensure_non_none_value: Is the value of the flag allowed to be None. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self._flagvalues = flag_values</span>
+    <span class="s0"># We take the entire flag object, but only keep the name. Why?</span>
+    <span class="s0"># - We want FlagHolder[T] to be generic container</span>
+    <span class="s0"># - flag_values contains all flags, so has no reference to T.</span>
+    <span class="s0"># - typecheckers don't like to see a generic class where none of the ctor</span>
+    <span class="s0">#   arguments refer to the generic type.</span>
+    <span class="s1">self._name = flag.name</span>
+    <span class="s0"># We intentionally do NOT check if the default value is None.</span>
+    <span class="s0"># This allows future use of this for &quot;required flags with None default&quot;</span>
+    <span class="s1">self._ensure_non_none_value = ensure_non_none_value</span>
+
+  <span class="s3">def </span><span class="s1">__eq__(self</span><span class="s3">, </span><span class="s1">other):</span>
+    <span class="s3">raise </span><span class="s1">TypeError(</span>
+        <span class="s4">&quot;unsupported operand type(s) for ==: '{0}' and '{1}' &quot;</span>
+        <span class="s4">&quot;(did you mean to use '{0}.value' instead?)&quot;</span><span class="s1">.format(</span>
+            <span class="s1">type(self).__name__</span><span class="s3">, </span><span class="s1">type(other).__name__))</span>
+
+  <span class="s3">def </span><span class="s1">__bool__(self):</span>
+    <span class="s3">raise </span><span class="s1">TypeError(</span>
+        <span class="s4">&quot;bool() not supported for instances of type '{0}' &quot;</span>
+        <span class="s4">&quot;(did you mean to use '{0}.value' instead?)&quot;</span><span class="s1">.format(</span>
+            <span class="s1">type(self).__name__))</span>
+
+  <span class="s1">__nonzero__ = __bool__</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">name(self):</span>
+    <span class="s3">return </span><span class="s1">self._name</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">value(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the value of the flag. 
+ 
+    If ``_ensure_non_none_value`` is ``True``, then return value is not 
+    ``None``. 
+ 
+    Raises: 
+      UnparsedFlagAccessError: if flag parsing has not finished. 
+      IllegalFlagValueError: if value is None unexpectedly. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">val = getattr(self._flagvalues</span><span class="s3">, </span><span class="s1">self._name)</span>
+    <span class="s3">if </span><span class="s1">self._ensure_non_none_value </span><span class="s3">and </span><span class="s1">val </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">_exceptions.IllegalFlagValueError(</span>
+          <span class="s4">'Unexpected None value for flag %s' </span><span class="s1">% self._name)</span>
+    <span class="s3">return </span><span class="s1">val</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">default(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the default value of the flag.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self._flagvalues[self._name].default</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">present(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns True if the flag was parsed from command-line flags.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">bool(self._flagvalues[self._name].present)</span>
+
+
+<span class="s3">def </span><span class="s1">resolve_flag_ref(flag_ref</span><span class="s3">, </span><span class="s1">flag_values):</span>
+  <span class="s2">&quot;&quot;&quot;Helper to validate and resolve a flag reference argument.&quot;&quot;&quot;</span>
+  <span class="s3">if </span><span class="s1">isinstance(flag_ref</span><span class="s3">, </span><span class="s1">FlagHolder):</span>
+    <span class="s1">new_flag_values = flag_ref._flagvalues  </span><span class="s0"># pylint: disable=protected-access</span>
+    <span class="s3">if </span><span class="s1">flag_values != FLAGS </span><span class="s3">and </span><span class="s1">flag_values != new_flag_values:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">'flag_values must not be customized when operating on a FlagHolder'</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">flag_ref.name</span><span class="s3">, </span><span class="s1">new_flag_values</span>
+  <span class="s3">return </span><span class="s1">flag_ref</span><span class="s3">, </span><span class="s1">flag_values</span>
+
+
+<span class="s3">def </span><span class="s1">resolve_flag_refs(flag_refs</span><span class="s3">, </span><span class="s1">flag_values):</span>
+  <span class="s2">&quot;&quot;&quot;Helper to validate and resolve flag reference list arguments.&quot;&quot;&quot;</span>
+  <span class="s1">fv = </span><span class="s3">None</span>
+  <span class="s1">names = []</span>
+  <span class="s3">for </span><span class="s1">ref </span><span class="s3">in </span><span class="s1">flag_refs:</span>
+    <span class="s3">if </span><span class="s1">isinstance(ref</span><span class="s3">, </span><span class="s1">FlagHolder):</span>
+      <span class="s1">newfv = ref._flagvalues  </span><span class="s0"># pylint: disable=protected-access</span>
+      <span class="s1">name = ref.name</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">newfv = flag_values</span>
+      <span class="s1">name = ref</span>
+    <span class="s3">if </span><span class="s1">fv </span><span class="s3">and </span><span class="s1">fv != newfv:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">'multiple FlagValues instances used in invocation. '</span>
+          <span class="s4">'FlagHolders must be registered to the same FlagValues instance as '</span>
+          <span class="s4">'do flag names, if provided.'</span><span class="s1">)</span>
+    <span class="s1">fv = newfv</span>
+    <span class="s1">names.append(name)</span>
+  <span class="s3">return </span><span class="s1">names</span><span class="s3">, </span><span class="s1">fv</span>
+</pre>
+</body>
+</html>

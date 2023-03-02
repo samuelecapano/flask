@@ -1,0 +1,580 @@
+<html>
+<head>
+<title>xml_reporter.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+xml_reporter.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2017 The Abseil Authors.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;A Python test reporter that generates test reports in JUnit XML format.&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">datetime</span>
+<span class="s3">import </span><span class="s1">re</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">threading</span>
+<span class="s3">import </span><span class="s1">time</span>
+<span class="s3">import </span><span class="s1">traceback</span>
+<span class="s3">import </span><span class="s1">unittest</span>
+<span class="s3">from </span><span class="s1">xml.sax </span><span class="s3">import </span><span class="s1">saxutils</span>
+<span class="s3">from </span><span class="s1">absl.testing </span><span class="s3">import </span><span class="s1">_pretty_print_reporter</span>
+
+
+<span class="s0"># See http://www.w3.org/TR/REC-xml/#NT-Char</span>
+<span class="s1">_bad_control_character_codes = set(range(</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0x20</span><span class="s1">)) - {</span><span class="s4">0x9</span><span class="s3">, </span><span class="s4">0xA</span><span class="s3">, </span><span class="s4">0xD</span><span class="s1">}</span>
+
+
+<span class="s1">_control_character_conversions = {</span>
+    <span class="s1">chr(i): </span><span class="s5">'</span><span class="s3">\\</span><span class="s5">x{:02x}'</span><span class="s1">.format(i) </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">_bad_control_character_codes}</span>
+
+
+<span class="s1">_escape_xml_attr_conversions = {</span>
+    <span class="s5">'&quot;'</span><span class="s1">: </span><span class="s5">'&amp;quot;'</span><span class="s3">,</span>
+    <span class="s5">&quot;'&quot;</span><span class="s1">: </span><span class="s5">'&amp;apos;'</span><span class="s3">,</span>
+    <span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">: </span><span class="s5">'&amp;#xA;'</span><span class="s3">,</span>
+    <span class="s5">'</span><span class="s3">\t</span><span class="s5">'</span><span class="s1">: </span><span class="s5">'&amp;#x9;'</span><span class="s3">,</span>
+    <span class="s5">'</span><span class="s3">\r</span><span class="s5">'</span><span class="s1">: </span><span class="s5">'&amp;#xD;'</span><span class="s3">,</span>
+    <span class="s5">' '</span><span class="s1">: </span><span class="s5">'&amp;#x20;'</span><span class="s1">}</span>
+<span class="s1">_escape_xml_attr_conversions.update(_control_character_conversions)</span>
+
+
+<span class="s0"># When class or module level function fails, unittest/suite.py adds a</span>
+<span class="s0"># _ErrorHolder instance instead of a real TestCase, and it has a description</span>
+<span class="s0"># like &quot;setUpClass (__main__.MyTestCase)&quot;.</span>
+<span class="s1">_CLASS_OR_MODULE_LEVEL_TEST_DESC_REGEX = re.compile(</span><span class="s5">r'^(\w+) \((\S+)\)$'</span><span class="s1">)</span>
+
+
+<span class="s0"># NOTE: while saxutils.quoteattr() theoretically does the same thing; it</span>
+<span class="s0"># seems to often end up being too smart for it's own good not escaping properly.</span>
+<span class="s0"># This function is much more reliable.</span>
+<span class="s3">def </span><span class="s1">_escape_xml_attr(content):</span>
+  <span class="s2">&quot;&quot;&quot;Escapes xml attributes.&quot;&quot;&quot;</span>
+  <span class="s0"># Note: saxutils doesn't escape the quotes.</span>
+  <span class="s3">return </span><span class="s1">saxutils.escape(content</span><span class="s3">, </span><span class="s1">_escape_xml_attr_conversions)</span>
+
+
+<span class="s3">def </span><span class="s1">_escape_cdata(s):</span>
+  <span class="s2">&quot;&quot;&quot;Escapes a string to be used as XML CDATA. 
+ 
+  CDATA characters are treated strictly as character data, not as XML markup, 
+  but there are still certain restrictions on them. 
+ 
+  Args: 
+    s: the string to be escaped. 
+  Returns: 
+    An escaped version of the input string. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">for </span><span class="s1">char</span><span class="s3">, </span><span class="s1">escaped </span><span class="s3">in </span><span class="s1">_control_character_conversions.items():</span>
+    <span class="s1">s = s.replace(char</span><span class="s3">, </span><span class="s1">escaped)</span>
+  <span class="s3">return </span><span class="s1">s.replace(</span><span class="s5">']]&gt;'</span><span class="s3">, </span><span class="s5">']] &gt;'</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">_iso8601_timestamp(timestamp):</span>
+  <span class="s2">&quot;&quot;&quot;Produces an ISO8601 datetime. 
+ 
+  Args: 
+    timestamp: an Epoch based timestamp in seconds. 
+ 
+  Returns: 
+    A iso8601 format timestamp if the input is a valid timestamp, None otherwise 
+  &quot;&quot;&quot;</span>
+  <span class="s3">if </span><span class="s1">timestamp </span><span class="s3">is None or </span><span class="s1">timestamp &lt; </span><span class="s4">0</span><span class="s1">:</span>
+    <span class="s3">return None</span>
+  <span class="s3">return </span><span class="s1">datetime.datetime.fromtimestamp(</span>
+      <span class="s1">timestamp</span><span class="s3">, </span><span class="s1">tz=datetime.timezone.utc).isoformat()</span>
+
+
+<span class="s3">def </span><span class="s1">_print_xml_element_header(element</span><span class="s3">, </span><span class="s1">attributes</span><span class="s3">, </span><span class="s1">stream</span><span class="s3">, </span><span class="s1">indentation=</span><span class="s5">''</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Prints an XML header of an arbitrary element. 
+ 
+  Args: 
+    element: element name (testsuites, testsuite, testcase) 
+    attributes: 2-tuple list with (attributes, values) already escaped 
+    stream: output stream to write test report XML to 
+    indentation: indentation added to the element header 
+  &quot;&quot;&quot;</span>
+  <span class="s1">stream.write(</span><span class="s5">'%s&lt;%s' </span><span class="s1">% (indentation</span><span class="s3">, </span><span class="s1">element))</span>
+  <span class="s3">for </span><span class="s1">attribute </span><span class="s3">in </span><span class="s1">attributes:</span>
+    <span class="s3">if </span><span class="s1">(len(attribute) == </span><span class="s4">2 </span><span class="s3">and </span><span class="s1">attribute[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">is not None and</span>
+        <span class="s1">attribute[</span><span class="s4">1</span><span class="s1">] </span><span class="s3">is not None</span><span class="s1">):</span>
+      <span class="s1">stream.write(</span><span class="s5">' %s=&quot;%s&quot;' </span><span class="s1">% (attribute[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">attribute[</span><span class="s4">1</span><span class="s1">]))</span>
+  <span class="s1">stream.write(</span><span class="s5">'&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+
+<span class="s0"># Copy time.time which ensures the real time is used internally.</span>
+<span class="s0"># This prevents bad interactions with tests that stub out time.</span>
+<span class="s1">_time_copy = time.time</span>
+
+<span class="s3">if </span><span class="s1">hasattr(traceback</span><span class="s3">, </span><span class="s5">'_some_str'</span><span class="s1">):</span>
+  <span class="s0"># Use the traceback module str function to format safely.</span>
+  <span class="s1">_safe_str = traceback._some_str</span>
+<span class="s3">else</span><span class="s1">:</span>
+  <span class="s1">_safe_str = str  </span><span class="s0"># pylint: disable=invalid-name</span>
+
+
+<span class="s3">class </span><span class="s1">_TestCaseResult(object):</span>
+  <span class="s2">&quot;&quot;&quot;Private helper for _TextAndXMLTestResult that represents a test result. 
+ 
+  Attributes: 
+    test: A TestCase instance of an individual test method. 
+    name: The name of the individual test method. 
+    full_class_name: The full name of the test class. 
+    run_time: The duration (in seconds) it took to run the test. 
+    start_time: Epoch relative timestamp of when test started (in seconds) 
+    errors: A list of error 4-tuples. Error tuple entries are 
+        1) a string identifier of either &quot;failure&quot; or &quot;error&quot; 
+        2) an exception_type 
+        3) an exception_message 
+        4) a string version of a sys.exc_info()-style tuple of values 
+           ('error', err[0], err[1], self._exc_info_to_string(err)) 
+           If the length of errors is 0, then the test is either passed or 
+           skipped. 
+    skip_reason: A string explaining why the test was skipped. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s1">self.run_time = -</span><span class="s4">1</span>
+    <span class="s1">self.start_time = -</span><span class="s4">1</span>
+    <span class="s1">self.skip_reason = </span><span class="s3">None</span>
+    <span class="s1">self.errors = []</span>
+    <span class="s1">self.test = test</span>
+
+    <span class="s0"># Parse the test id to get its test name and full class path.</span>
+    <span class="s0"># Unfortunately there is no better way of knowning the test and class.</span>
+    <span class="s0"># Worse, unittest uses _ErrorHandler instances to represent class / module</span>
+    <span class="s0"># level failures.</span>
+    <span class="s1">test_desc = test.id() </span><span class="s3">or </span><span class="s1">str(test)</span>
+    <span class="s0"># Check if it's something like &quot;setUpClass (__main__.TestCase)&quot;.</span>
+    <span class="s1">match = _CLASS_OR_MODULE_LEVEL_TEST_DESC_REGEX.match(test_desc)</span>
+    <span class="s3">if </span><span class="s1">match:</span>
+      <span class="s1">name = match.group(</span><span class="s4">1</span><span class="s1">)</span>
+      <span class="s1">full_class_name = match.group(</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">class_name = unittest.util.strclass(test.__class__)</span>
+      <span class="s3">if </span><span class="s1">isinstance(test</span><span class="s3">, </span><span class="s1">unittest.case._SubTest):</span>
+        <span class="s0"># If the test case is a _SubTest, the real TestCase instance is</span>
+        <span class="s0"># available as _SubTest.test_case.</span>
+        <span class="s1">class_name = unittest.util.strclass(test.test_case.__class__)</span>
+      <span class="s3">if </span><span class="s1">test_desc.startswith(class_name + </span><span class="s5">'.'</span><span class="s1">):</span>
+        <span class="s0"># In a typical unittest.TestCase scenario, test.id() returns with</span>
+        <span class="s0"># a class name formatted using unittest.util.strclass.</span>
+        <span class="s1">name = test_desc[len(class_name)+</span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">full_class_name = class_name</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s0"># Otherwise make a best effort to guess the test name and full class</span>
+        <span class="s0"># path.</span>
+        <span class="s1">parts = test_desc.rsplit(</span><span class="s5">'.'</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">name = parts[-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">full_class_name = parts[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">if </span><span class="s1">len(parts) == </span><span class="s4">2 </span><span class="s3">else </span><span class="s5">''</span>
+    <span class="s1">self.name = _escape_xml_attr(name)</span>
+    <span class="s1">self.full_class_name = _escape_xml_attr(full_class_name)</span>
+
+  <span class="s3">def </span><span class="s1">set_run_time(self</span><span class="s3">, </span><span class="s1">time_in_secs):</span>
+    <span class="s1">self.run_time = time_in_secs</span>
+
+  <span class="s3">def </span><span class="s1">set_start_time(self</span><span class="s3">, </span><span class="s1">time_in_secs):</span>
+    <span class="s1">self.start_time = time_in_secs</span>
+
+  <span class="s3">def </span><span class="s1">print_xml_summary(self</span><span class="s3">, </span><span class="s1">stream):</span>
+    <span class="s2">&quot;&quot;&quot;Prints an XML Summary of a TestCase. 
+ 
+    Status and result are populated as per JUnit XML test result reporter. 
+    A test that has been skipped will always have a skip reason, 
+    as every skip method in Python's unittest requires the reason arg to be 
+    passed. 
+ 
+    Args: 
+      stream: output stream to write test report XML to 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">self.skip_reason </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s1">status = </span><span class="s5">'run'</span>
+      <span class="s1">result = </span><span class="s5">'completed'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">status = </span><span class="s5">'notrun'</span>
+      <span class="s1">result = </span><span class="s5">'suppressed'</span>
+
+    <span class="s1">test_case_attributes = [</span>
+        <span class="s1">(</span><span class="s5">'name'</span><span class="s3">, </span><span class="s5">'%s' </span><span class="s1">% self.name)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'status'</span><span class="s3">, </span><span class="s5">'%s' </span><span class="s1">% status)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'result'</span><span class="s3">, </span><span class="s5">'%s' </span><span class="s1">% result)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'time'</span><span class="s3">, </span><span class="s5">'%.3f' </span><span class="s1">% self.run_time)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'classname'</span><span class="s3">, </span><span class="s1">self.full_class_name)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'timestamp'</span><span class="s3">, </span><span class="s1">_iso8601_timestamp(self.start_time))</span><span class="s3">,</span>
+    <span class="s1">]</span>
+    <span class="s1">_print_xml_element_header(</span><span class="s5">'testcase'</span><span class="s3">, </span><span class="s1">test_case_attributes</span><span class="s3">, </span><span class="s1">stream</span><span class="s3">, </span><span class="s5">'  '</span><span class="s1">)</span>
+    <span class="s1">self._print_testcase_details(stream)</span>
+    <span class="s1">stream.write(</span><span class="s5">'  &lt;/testcase&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">_print_testcase_details(self</span><span class="s3">, </span><span class="s1">stream):</span>
+    <span class="s3">for </span><span class="s1">error </span><span class="s3">in </span><span class="s1">self.errors:</span>
+      <span class="s1">outcome</span><span class="s3">, </span><span class="s1">exception_type</span><span class="s3">, </span><span class="s1">message</span><span class="s3">, </span><span class="s1">error_msg = error  </span><span class="s0"># pylint: disable=unpacking-non-sequence</span>
+      <span class="s1">message = _escape_xml_attr(_safe_str(message))</span>
+      <span class="s1">exception_type = _escape_xml_attr(str(exception_type))</span>
+      <span class="s1">error_msg = _escape_cdata(error_msg)</span>
+      <span class="s1">stream.write(</span><span class="s5">'  &lt;%s message=&quot;%s&quot; type=&quot;%s&quot;&gt;&lt;![CDATA[%s]]&gt;&lt;/%s&gt;</span><span class="s3">\n</span><span class="s5">'</span>
+                   <span class="s1">% (outcome</span><span class="s3">, </span><span class="s1">message</span><span class="s3">, </span><span class="s1">exception_type</span><span class="s3">, </span><span class="s1">error_msg</span><span class="s3">, </span><span class="s1">outcome))</span>
+
+
+<span class="s3">class </span><span class="s1">_TestSuiteResult(object):</span>
+  <span class="s2">&quot;&quot;&quot;Private helper for _TextAndXMLTestResult.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self):</span>
+    <span class="s1">self.suites = {}</span>
+    <span class="s1">self.failure_counts = {}</span>
+    <span class="s1">self.error_counts = {}</span>
+    <span class="s1">self.overall_start_time = -</span><span class="s4">1</span>
+    <span class="s1">self.overall_end_time = -</span><span class="s4">1</span>
+    <span class="s1">self._testsuites_properties = {}</span>
+
+  <span class="s3">def </span><span class="s1">add_test_case_result(self</span><span class="s3">, </span><span class="s1">test_case_result):</span>
+    <span class="s1">suite_name = type(test_case_result.test).__name__</span>
+    <span class="s3">if </span><span class="s1">suite_name == </span><span class="s5">'_ErrorHolder'</span><span class="s1">:</span>
+      <span class="s0"># _ErrorHolder is a special case created by unittest for class / module</span>
+      <span class="s0"># level functions.</span>
+      <span class="s1">suite_name = test_case_result.full_class_name.rsplit(</span><span class="s5">'.'</span><span class="s1">)[-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s3">if </span><span class="s1">isinstance(test_case_result.test</span><span class="s3">, </span><span class="s1">unittest.case._SubTest):</span>
+      <span class="s0"># If the test case is a _SubTest, the real TestCase instance is</span>
+      <span class="s0"># available as _SubTest.test_case.</span>
+      <span class="s1">suite_name = type(test_case_result.test.test_case).__name__</span>
+
+    <span class="s1">self._setup_test_suite(suite_name)</span>
+    <span class="s1">self.suites[suite_name].append(test_case_result)</span>
+    <span class="s3">for </span><span class="s1">error </span><span class="s3">in </span><span class="s1">test_case_result.errors:</span>
+      <span class="s0"># Only count the first failure or error so that the sum is equal to the</span>
+      <span class="s0"># total number of *testcases* that have failures or errors.</span>
+      <span class="s3">if </span><span class="s1">error[</span><span class="s4">0</span><span class="s1">] == </span><span class="s5">'failure'</span><span class="s1">:</span>
+        <span class="s1">self.failure_counts[suite_name] += </span><span class="s4">1</span>
+        <span class="s3">break</span>
+      <span class="s3">elif </span><span class="s1">error[</span><span class="s4">0</span><span class="s1">] == </span><span class="s5">'error'</span><span class="s1">:</span>
+        <span class="s1">self.error_counts[suite_name] += </span><span class="s4">1</span>
+        <span class="s3">break</span>
+
+  <span class="s3">def </span><span class="s1">print_xml_summary(self</span><span class="s3">, </span><span class="s1">stream):</span>
+    <span class="s1">overall_test_count = sum(len(x) </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">self.suites.values())</span>
+    <span class="s1">overall_failures = sum(self.failure_counts.values())</span>
+    <span class="s1">overall_errors = sum(self.error_counts.values())</span>
+    <span class="s1">overall_attributes = [</span>
+        <span class="s1">(</span><span class="s5">'name'</span><span class="s3">, </span><span class="s5">''</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'tests'</span><span class="s3">, </span><span class="s5">'%d' </span><span class="s1">% overall_test_count)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'failures'</span><span class="s3">, </span><span class="s5">'%d' </span><span class="s1">% overall_failures)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'errors'</span><span class="s3">, </span><span class="s5">'%d' </span><span class="s1">% overall_errors)</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'time'</span><span class="s3">, </span><span class="s5">'%.3f' </span><span class="s1">% (self.overall_end_time - self.overall_start_time))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s5">'timestamp'</span><span class="s3">, </span><span class="s1">_iso8601_timestamp(self.overall_start_time))</span><span class="s3">,</span>
+    <span class="s1">]</span>
+    <span class="s1">_print_xml_element_header(</span><span class="s5">'testsuites'</span><span class="s3">, </span><span class="s1">overall_attributes</span><span class="s3">, </span><span class="s1">stream)</span>
+    <span class="s3">if </span><span class="s1">self._testsuites_properties:</span>
+      <span class="s1">stream.write(</span><span class="s5">'    &lt;properties&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+      <span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">sorted(self._testsuites_properties.items()):</span>
+        <span class="s1">stream.write(</span><span class="s5">'      &lt;property name=&quot;%s&quot; value=&quot;%s&quot;&gt;&lt;/property&gt;</span><span class="s3">\n</span><span class="s5">' </span><span class="s1">%</span>
+                     <span class="s1">(_escape_xml_attr(name)</span><span class="s3">, </span><span class="s1">_escape_xml_attr(str(value))))</span>
+      <span class="s1">stream.write(</span><span class="s5">'    &lt;/properties&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+
+    <span class="s3">for </span><span class="s1">suite_name </span><span class="s3">in </span><span class="s1">self.suites:</span>
+      <span class="s1">suite = self.suites[suite_name]</span>
+      <span class="s1">suite_end_time = max(x.start_time + x.run_time </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">suite)</span>
+      <span class="s1">suite_start_time = min(x.start_time </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">suite)</span>
+      <span class="s1">failures = self.failure_counts[suite_name]</span>
+      <span class="s1">errors = self.error_counts[suite_name]</span>
+      <span class="s1">suite_attributes = [</span>
+          <span class="s1">(</span><span class="s5">'name'</span><span class="s3">, </span><span class="s5">'%s' </span><span class="s1">% suite_name)</span><span class="s3">,</span>
+          <span class="s1">(</span><span class="s5">'tests'</span><span class="s3">, </span><span class="s5">'%d' </span><span class="s1">% len(suite))</span><span class="s3">,</span>
+          <span class="s1">(</span><span class="s5">'failures'</span><span class="s3">, </span><span class="s5">'%d' </span><span class="s1">% failures)</span><span class="s3">,</span>
+          <span class="s1">(</span><span class="s5">'errors'</span><span class="s3">, </span><span class="s5">'%d' </span><span class="s1">% errors)</span><span class="s3">,</span>
+          <span class="s1">(</span><span class="s5">'time'</span><span class="s3">, </span><span class="s5">'%.3f' </span><span class="s1">% (suite_end_time - suite_start_time))</span><span class="s3">,</span>
+          <span class="s1">(</span><span class="s5">'timestamp'</span><span class="s3">, </span><span class="s1">_iso8601_timestamp(suite_start_time))</span><span class="s3">,</span>
+      <span class="s1">]</span>
+      <span class="s1">_print_xml_element_header(</span><span class="s5">'testsuite'</span><span class="s3">, </span><span class="s1">suite_attributes</span><span class="s3">, </span><span class="s1">stream)</span>
+
+      <span class="s3">for </span><span class="s1">test_case_result </span><span class="s3">in </span><span class="s1">suite:</span>
+        <span class="s1">test_case_result.print_xml_summary(stream)</span>
+      <span class="s1">stream.write(</span><span class="s5">'&lt;/testsuite&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+    <span class="s1">stream.write(</span><span class="s5">'&lt;/testsuites&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">_setup_test_suite(self</span><span class="s3">, </span><span class="s1">suite_name):</span>
+    <span class="s2">&quot;&quot;&quot;Adds a test suite to the set of suites tracked by this test run. 
+ 
+    Args: 
+      suite_name: string, The name of the test suite being initialized. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">suite_name </span><span class="s3">in </span><span class="s1">self.suites:</span>
+      <span class="s3">return</span>
+    <span class="s1">self.suites[suite_name] = []</span>
+    <span class="s1">self.failure_counts[suite_name] = </span><span class="s4">0</span>
+    <span class="s1">self.error_counts[suite_name] = </span><span class="s4">0</span>
+
+  <span class="s3">def </span><span class="s1">set_end_time(self</span><span class="s3">, </span><span class="s1">timestamp_in_secs):</span>
+    <span class="s2">&quot;&quot;&quot;Sets the start timestamp of this test suite. 
+ 
+    Args: 
+      timestamp_in_secs: timestamp in seconds since epoch 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.overall_end_time = timestamp_in_secs</span>
+
+  <span class="s3">def </span><span class="s1">set_start_time(self</span><span class="s3">, </span><span class="s1">timestamp_in_secs):</span>
+    <span class="s2">&quot;&quot;&quot;Sets the end timestamp of this test suite. 
+ 
+    Args: 
+      timestamp_in_secs: timestamp in seconds since epoch 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.overall_start_time = timestamp_in_secs</span>
+
+
+<span class="s3">class </span><span class="s1">_TextAndXMLTestResult(_pretty_print_reporter.TextTestResult):</span>
+  <span class="s2">&quot;&quot;&quot;Private TestResult class that produces both formatted text results and XML. 
+ 
+  Used by TextAndXMLTestRunner. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">_TEST_SUITE_RESULT_CLASS = _TestSuiteResult</span>
+  <span class="s1">_TEST_CASE_RESULT_CLASS = _TestCaseResult</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">xml_stream</span><span class="s3">, </span><span class="s1">stream</span><span class="s3">, </span><span class="s1">descriptions</span><span class="s3">, </span><span class="s1">verbosity</span><span class="s3">,</span>
+               <span class="s1">time_getter=_time_copy</span><span class="s3">, </span><span class="s1">testsuites_properties=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).__init__(stream</span><span class="s3">, </span><span class="s1">descriptions</span><span class="s3">, </span><span class="s1">verbosity)</span>
+    <span class="s1">self.xml_stream = xml_stream</span>
+    <span class="s1">self.pending_test_case_results = {}</span>
+    <span class="s1">self.suite = self._TEST_SUITE_RESULT_CLASS()</span>
+    <span class="s3">if </span><span class="s1">testsuites_properties:</span>
+      <span class="s1">self.suite._testsuites_properties = testsuites_properties</span>
+    <span class="s1">self.time_getter = time_getter</span>
+
+    <span class="s0"># This lock guards any mutations on pending_test_case_results.</span>
+    <span class="s1">self._pending_test_case_results_lock = threading.RLock()</span>
+
+  <span class="s3">def </span><span class="s1">startTest(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s1">self.start_time = self.time_getter()</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).startTest(test)</span>
+
+  <span class="s3">def </span><span class="s1">stopTest(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s0"># Grabbing the write lock to avoid conflicting with stopTestRun.</span>
+    <span class="s3">with </span><span class="s1">self._pending_test_case_results_lock:</span>
+      <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).stopTest(test)</span>
+      <span class="s1">result = self.get_pending_test_case_result(test)</span>
+      <span class="s3">if not </span><span class="s1">result:</span>
+        <span class="s1">test_name = test.id() </span><span class="s3">or </span><span class="s1">str(test)</span>
+        <span class="s1">sys.stderr.write(</span><span class="s5">'No pending test case: %s</span><span class="s3">\n</span><span class="s5">' </span><span class="s1">% test_name)</span>
+        <span class="s3">return</span>
+      <span class="s1">test_id = id(test)</span>
+      <span class="s1">run_time = self.time_getter() - self.start_time</span>
+      <span class="s1">result.set_run_time(run_time)</span>
+      <span class="s1">result.set_start_time(self.start_time)</span>
+      <span class="s1">self.suite.add_test_case_result(result)</span>
+      <span class="s3">del </span><span class="s1">self.pending_test_case_results[test_id]</span>
+
+  <span class="s3">def </span><span class="s1">startTestRun(self):</span>
+    <span class="s1">self.suite.set_start_time(self.time_getter())</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).startTestRun()</span>
+
+  <span class="s3">def </span><span class="s1">stopTestRun(self):</span>
+    <span class="s1">self.suite.set_end_time(self.time_getter())</span>
+    <span class="s0"># All pending_test_case_results will be added to the suite and removed from</span>
+    <span class="s0"># the pending_test_case_results dictionary. Grabbing the write lock to avoid</span>
+    <span class="s0"># results from being added during this process to avoid duplicating adds or</span>
+    <span class="s0"># accidentally erasing newly appended pending results.</span>
+    <span class="s3">with </span><span class="s1">self._pending_test_case_results_lock:</span>
+      <span class="s0"># Errors in the test fixture (setUpModule, tearDownModule,</span>
+      <span class="s0"># setUpClass, tearDownClass) can leave a pending result which</span>
+      <span class="s0"># never gets added to the suite.  The runner calls stopTestRun</span>
+      <span class="s0"># which gives us an opportunity to add these errors for</span>
+      <span class="s0"># reporting here.</span>
+      <span class="s3">for </span><span class="s1">test_id </span><span class="s3">in </span><span class="s1">self.pending_test_case_results:</span>
+        <span class="s1">result = self.pending_test_case_results[test_id]</span>
+        <span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s5">'start_time'</span><span class="s1">):</span>
+          <span class="s1">run_time = self.suite.overall_end_time - self.start_time</span>
+          <span class="s1">result.set_run_time(run_time)</span>
+          <span class="s1">result.set_start_time(self.start_time)</span>
+        <span class="s1">self.suite.add_test_case_result(result)</span>
+      <span class="s1">self.pending_test_case_results.clear()</span>
+
+  <span class="s3">def </span><span class="s1">_exc_info_to_string(self</span><span class="s3">, </span><span class="s1">err</span><span class="s3">, </span><span class="s1">test=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Converts a sys.exc_info()-style tuple of values into a string. 
+ 
+    This method must be overridden because the method signature in 
+    unittest.TestResult changed between Python 2.2 and 2.4. 
+ 
+    Args: 
+      err: A sys.exc_info() tuple of values for an error. 
+      test: The test method. 
+ 
+    Returns: 
+      A formatted exception string. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">test:</span>
+      <span class="s3">return </span><span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self)._exc_info_to_string(err</span><span class="s3">, </span><span class="s1">test)</span>
+    <span class="s3">return </span><span class="s5">''</span><span class="s1">.join(traceback.format_exception(*err))</span>
+
+  <span class="s3">def </span><span class="s1">add_pending_test_case_result(self</span><span class="s3">, </span><span class="s1">test</span><span class="s3">, </span><span class="s1">error_summary=</span><span class="s3">None,</span>
+                                   <span class="s1">skip_reason=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Adds result information to a test case result which may still be running. 
+ 
+    If a result entry for the test already exists, add_pending_test_case_result 
+    will add error summary tuples and/or overwrite skip_reason for the result. 
+    If it does not yet exist, a result entry will be created. 
+    Note that a test result is considered to have been run and passed 
+    only if there are no errors or skip_reason. 
+ 
+    Args: 
+      test: A test method as defined by unittest 
+      error_summary: A 4-tuple with the following entries: 
+          1) a string identifier of either &quot;failure&quot; or &quot;error&quot; 
+          2) an exception_type 
+          3) an exception_message 
+          4) a string version of a sys.exc_info()-style tuple of values 
+             ('error', err[0], err[1], self._exc_info_to_string(err)) 
+             If the length of errors is 0, then the test is either passed or 
+             skipped. 
+      skip_reason: a string explaining why the test was skipped 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">self._pending_test_case_results_lock:</span>
+      <span class="s1">test_id = id(test)</span>
+      <span class="s3">if </span><span class="s1">test_id </span><span class="s3">not in </span><span class="s1">self.pending_test_case_results:</span>
+        <span class="s1">self.pending_test_case_results[test_id] = self._TEST_CASE_RESULT_CLASS(</span>
+            <span class="s1">test)</span>
+      <span class="s3">if </span><span class="s1">error_summary:</span>
+        <span class="s1">self.pending_test_case_results[test_id].errors.append(error_summary)</span>
+      <span class="s3">if </span><span class="s1">skip_reason:</span>
+        <span class="s1">self.pending_test_case_results[test_id].skip_reason = skip_reason</span>
+
+  <span class="s3">def </span><span class="s1">delete_pending_test_case_result(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s3">with </span><span class="s1">self._pending_test_case_results_lock:</span>
+      <span class="s1">test_id = id(test)</span>
+      <span class="s3">del </span><span class="s1">self.pending_test_case_results[test_id]</span>
+
+  <span class="s3">def </span><span class="s1">get_pending_test_case_result(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s1">test_id = id(test)</span>
+    <span class="s3">return </span><span class="s1">self.pending_test_case_results.get(test_id</span><span class="s3">, None</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">addSuccess(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addSuccess(test)</span>
+    <span class="s1">self.add_pending_test_case_result(test)</span>
+
+  <span class="s3">def </span><span class="s1">addError(self</span><span class="s3">, </span><span class="s1">test</span><span class="s3">, </span><span class="s1">err):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addError(test</span><span class="s3">, </span><span class="s1">err)</span>
+    <span class="s1">error_summary = (</span><span class="s5">'error'</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">1</span><span class="s1">]</span><span class="s3">,</span>
+                     <span class="s1">self._exc_info_to_string(err</span><span class="s3">, </span><span class="s1">test=test))</span>
+    <span class="s1">self.add_pending_test_case_result(test</span><span class="s3">, </span><span class="s1">error_summary=error_summary)</span>
+
+  <span class="s3">def </span><span class="s1">addFailure(self</span><span class="s3">, </span><span class="s1">test</span><span class="s3">, </span><span class="s1">err):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addFailure(test</span><span class="s3">, </span><span class="s1">err)</span>
+    <span class="s1">error_summary = (</span><span class="s5">'failure'</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">1</span><span class="s1">]</span><span class="s3">,</span>
+                     <span class="s1">self._exc_info_to_string(err</span><span class="s3">, </span><span class="s1">test=test))</span>
+    <span class="s1">self.add_pending_test_case_result(test</span><span class="s3">, </span><span class="s1">error_summary=error_summary)</span>
+
+  <span class="s3">def </span><span class="s1">addSkip(self</span><span class="s3">, </span><span class="s1">test</span><span class="s3">, </span><span class="s1">reason):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addSkip(test</span><span class="s3">, </span><span class="s1">reason)</span>
+    <span class="s1">self.add_pending_test_case_result(test</span><span class="s3">, </span><span class="s1">skip_reason=reason)</span>
+
+  <span class="s3">def </span><span class="s1">addExpectedFailure(self</span><span class="s3">, </span><span class="s1">test</span><span class="s3">, </span><span class="s1">err):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addExpectedFailure(test</span><span class="s3">, </span><span class="s1">err)</span>
+    <span class="s3">if </span><span class="s1">callable(getattr(test</span><span class="s3">, </span><span class="s5">'recordProperty'</span><span class="s3">, None</span><span class="s1">)):</span>
+      <span class="s1">test.recordProperty(</span><span class="s5">'EXPECTED_FAILURE'</span><span class="s3">,</span>
+                          <span class="s1">self._exc_info_to_string(err</span><span class="s3">, </span><span class="s1">test=test))</span>
+    <span class="s1">self.add_pending_test_case_result(test)</span>
+
+  <span class="s3">def </span><span class="s1">addUnexpectedSuccess(self</span><span class="s3">, </span><span class="s1">test):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addUnexpectedSuccess(test)</span>
+    <span class="s1">test_name = test.id() </span><span class="s3">or </span><span class="s1">str(test)</span>
+    <span class="s1">error_summary = (</span><span class="s5">'error'</span><span class="s3">, </span><span class="s5">''</span><span class="s3">, </span><span class="s5">''</span><span class="s3">,</span>
+                     <span class="s5">'Test case %s should have failed, but passed.'</span>
+                     <span class="s1">% (test_name))</span>
+    <span class="s1">self.add_pending_test_case_result(test</span><span class="s3">, </span><span class="s1">error_summary=error_summary)</span>
+
+  <span class="s3">def </span><span class="s1">addSubTest(self</span><span class="s3">, </span><span class="s1">test</span><span class="s3">, </span><span class="s1">subtest</span><span class="s3">, </span><span class="s1">err):  </span><span class="s0"># pylint: disable=invalid-name</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).addSubTest(test</span><span class="s3">, </span><span class="s1">subtest</span><span class="s3">, </span><span class="s1">err)</span>
+    <span class="s3">if </span><span class="s1">err </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s3">if </span><span class="s1">issubclass(err[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">test.failureException):</span>
+        <span class="s1">error_summary = (</span><span class="s5">'failure'</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">1</span><span class="s1">]</span><span class="s3">,</span>
+                         <span class="s1">self._exc_info_to_string(err</span><span class="s3">, </span><span class="s1">test=test))</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">error_summary = (</span><span class="s5">'error'</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">err[</span><span class="s4">1</span><span class="s1">]</span><span class="s3">,</span>
+                         <span class="s1">self._exc_info_to_string(err</span><span class="s3">, </span><span class="s1">test=test))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">error_summary = </span><span class="s3">None</span>
+    <span class="s1">self.add_pending_test_case_result(subtest</span><span class="s3">, </span><span class="s1">error_summary=error_summary)</span>
+
+  <span class="s3">def </span><span class="s1">printErrors(self):</span>
+    <span class="s1">super(_TextAndXMLTestResult</span><span class="s3">, </span><span class="s1">self).printErrors()</span>
+    <span class="s1">self.xml_stream.write(</span><span class="s5">'&lt;?xml version=&quot;1.0&quot;?&gt;</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+    <span class="s1">self.suite.print_xml_summary(self.xml_stream)</span>
+
+
+<span class="s3">class </span><span class="s1">TextAndXMLTestRunner(unittest.TextTestRunner):</span>
+  <span class="s2">&quot;&quot;&quot;A test runner that produces both formatted text results and XML. 
+ 
+  It prints out the names of tests as they are run, errors as they 
+  occur, and a summary of the results at the end of the test run. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">_TEST_RESULT_CLASS = _TextAndXMLTestResult</span>
+
+  <span class="s1">_xml_stream = </span><span class="s3">None</span>
+  <span class="s1">_testsuites_properties = {}</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">xml_stream=</span><span class="s3">None, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Initialize a TextAndXMLTestRunner. 
+ 
+    Args: 
+      xml_stream: file-like or None; XML-formatted test results are output 
+          via this object's write() method.  If None (the default), the 
+          new instance behaves as described in the set_default_xml_stream method 
+          documentation below. 
+      *args: passed unmodified to unittest.TextTestRunner.__init__. 
+      **kwargs: passed unmodified to unittest.TextTestRunner.__init__. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">super(TextAndXMLTestRunner</span><span class="s3">, </span><span class="s1">self).__init__(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s3">if </span><span class="s1">xml_stream </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">self._xml_stream = xml_stream</span>
+    <span class="s0"># else, do not set self._xml_stream to None -- this allows implicit fallback</span>
+    <span class="s0"># to the class attribute's value.</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">set_default_xml_stream(cls</span><span class="s3">, </span><span class="s1">xml_stream):</span>
+    <span class="s2">&quot;&quot;&quot;Sets the default XML stream for the class. 
+ 
+    Args: 
+      xml_stream: file-like or None; used for instances when xml_stream is None 
+          or not passed to their constructors.  If None is passed, instances 
+          created with xml_stream=None will act as ordinary TextTestRunner 
+          instances; this is the default state before any calls to this method 
+          have been made. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">cls._xml_stream = xml_stream</span>
+
+  <span class="s3">def </span><span class="s1">_makeResult(self):</span>
+    <span class="s3">if </span><span class="s1">self._xml_stream </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">super(TextAndXMLTestRunner</span><span class="s3">, </span><span class="s1">self)._makeResult()</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">self._TEST_RESULT_CLASS(</span>
+          <span class="s1">self._xml_stream</span><span class="s3">, </span><span class="s1">self.stream</span><span class="s3">, </span><span class="s1">self.descriptions</span><span class="s3">, </span><span class="s1">self.verbosity</span><span class="s3">,</span>
+          <span class="s1">testsuites_properties=self._testsuites_properties)</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">set_testsuites_property(cls</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s1">cls._testsuites_properties[key] = value</span>
+</pre>
+</body>
+</html>

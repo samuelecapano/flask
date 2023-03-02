@@ -1,0 +1,1836 @@
+<html>
+<head>
+<title>glifLib.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+glifLib.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+glifLib.py -- Generic module for reading and writing the .glif format. 
+ 
+More info about the .glif format (GLyphInterchangeFormat) can be found here: 
+ 
+    http://unifiedfontobject.org 
+ 
+The main class in this module is GlyphSet. It manages a set of .glif files 
+in a folder. It offers two ways to read glyph data, and one way to write 
+glyph data. See the class doc string for details. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">annotations</span>
+
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">enum</span>
+<span class="s2">from </span><span class="s1">warnings </span><span class="s2">import </span><span class="s1">warn</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">OrderedDict</span>
+<span class="s2">import </span><span class="s1">fs</span>
+<span class="s2">import </span><span class="s1">fs.base</span>
+<span class="s2">import </span><span class="s1">fs.errors</span>
+<span class="s2">import </span><span class="s1">fs.osfs</span>
+<span class="s2">import </span><span class="s1">fs.path</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.textTools </span><span class="s2">import </span><span class="s1">tobytes</span>
+<span class="s2">from </span><span class="s1">fontTools.misc </span><span class="s2">import </span><span class="s1">plistlib</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.pointPen </span><span class="s2">import </span><span class="s1">AbstractPointPen</span><span class="s2">, </span><span class="s1">PointToSegmentPen</span>
+<span class="s2">from </span><span class="s1">fontTools.ufoLib.errors </span><span class="s2">import </span><span class="s1">GlifLibError</span>
+<span class="s2">from </span><span class="s1">fontTools.ufoLib.filenames </span><span class="s2">import </span><span class="s1">userNameToFileName</span>
+<span class="s2">from </span><span class="s1">fontTools.ufoLib.validators </span><span class="s2">import </span><span class="s1">(</span>
+	<span class="s1">genericTypeValidator</span><span class="s2">,</span>
+	<span class="s1">colorValidator</span><span class="s2">,</span>
+	<span class="s1">guidelinesValidator</span><span class="s2">,</span>
+	<span class="s1">anchorsValidator</span><span class="s2">,</span>
+	<span class="s1">identifierValidator</span><span class="s2">,</span>
+	<span class="s1">imageValidator</span><span class="s2">,</span>
+	<span class="s1">glyphLibValidator</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">fontTools.misc </span><span class="s2">import </span><span class="s1">etree</span>
+<span class="s2">from </span><span class="s1">fontTools.ufoLib </span><span class="s2">import </span><span class="s1">_UFOBaseIO</span><span class="s2">, </span><span class="s1">UFOFormatVersion</span>
+<span class="s2">from </span><span class="s1">fontTools.ufoLib.utils </span><span class="s2">import </span><span class="s1">numberTypes</span><span class="s2">, </span><span class="s1">_VersionTupleEnumMixin</span>
+
+
+<span class="s1">__all__ = [</span>
+	<span class="s3">&quot;GlyphSet&quot;</span><span class="s2">,</span>
+	<span class="s3">&quot;GlifLibError&quot;</span><span class="s2">,</span>
+	<span class="s3">&quot;readGlyphFromString&quot;</span><span class="s2">, </span><span class="s3">&quot;writeGlyphToString&quot;</span><span class="s2">,</span>
+	<span class="s3">&quot;glyphNameToFileName&quot;</span>
+<span class="s1">]</span>
+
+<span class="s1">logger = logging.getLogger(__name__)</span>
+
+
+<span class="s4"># ---------</span>
+<span class="s4"># Constants</span>
+<span class="s4"># ---------</span>
+
+<span class="s1">CONTENTS_FILENAME = </span><span class="s3">&quot;contents.plist&quot;</span>
+<span class="s1">LAYERINFO_FILENAME = </span><span class="s3">&quot;layerinfo.plist&quot;</span>
+
+
+<span class="s2">class </span><span class="s1">GLIFFormatVersion(tuple</span><span class="s2">, </span><span class="s1">_VersionTupleEnumMixin</span><span class="s2">, </span><span class="s1">enum.Enum):</span>
+	<span class="s1">FORMAT_1_0 = (</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+	<span class="s1">FORMAT_2_0 = (</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s2">def </span><span class="s1">default(cls</span><span class="s2">, </span><span class="s1">ufoFormatVersion=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s2">if </span><span class="s1">ufoFormatVersion </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">max(cls.supported_versions(ufoFormatVersion))</span>
+		<span class="s2">return </span><span class="s1">super().default()</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s2">def </span><span class="s1">supported_versions(cls</span><span class="s2">, </span><span class="s1">ufoFormatVersion=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s2">if </span><span class="s1">ufoFormatVersion </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s4"># if ufo format unspecified, return all the supported GLIF formats</span>
+			<span class="s2">return </span><span class="s1">super().supported_versions()</span>
+		<span class="s4"># else only return the GLIF formats supported by the given UFO format</span>
+		<span class="s1">versions = {cls.FORMAT_1_0}</span>
+		<span class="s2">if </span><span class="s1">ufoFormatVersion &gt;= UFOFormatVersion.FORMAT_3_0:</span>
+			<span class="s1">versions.add(cls.FORMAT_2_0)</span>
+		<span class="s2">return </span><span class="s1">frozenset(versions)</span>
+
+<span class="s4"># workaround for py3.11, see https://github.com/fonttools/fonttools/pull/2655</span>
+<span class="s1">GLIFFormatVersion.__str__ = _VersionTupleEnumMixin.__str__</span>
+
+
+<span class="s4"># ------------</span>
+<span class="s4"># Simple Glyph</span>
+<span class="s4"># ------------</span>
+
+<span class="s2">class </span><span class="s1">Glyph:</span>
+
+	<span class="s0">&quot;&quot;&quot; 
+    Minimal glyph object. It has no glyph attributes until either 
+    the draw() or the drawPoints() method has been called. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">glyphSet):</span>
+		<span class="s1">self.glyphName = glyphName</span>
+		<span class="s1">self.glyphSet = glyphSet</span>
+
+	<span class="s2">def </span><span class="s1">draw(self</span><span class="s2">, </span><span class="s1">pen</span><span class="s2">, </span><span class="s1">outputImpliedClosingLine=</span><span class="s2">False</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Draw this glyph onto a *FontTools* Pen. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">pointPen = PointToSegmentPen(pen</span><span class="s2">, </span><span class="s1">outputImpliedClosingLine=outputImpliedClosingLine)</span>
+		<span class="s1">self.drawPoints(pointPen)</span>
+
+	<span class="s2">def </span><span class="s1">drawPoints(self</span><span class="s2">, </span><span class="s1">pointPen):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Draw this glyph onto a PointPen. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">self.glyphSet.readGlyph(self.glyphName</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">pointPen)</span>
+
+
+<span class="s4"># ---------</span>
+<span class="s4"># Glyph Set</span>
+<span class="s4"># ---------</span>
+
+<span class="s2">class </span><span class="s1">GlyphSet(_UFOBaseIO):</span>
+
+	<span class="s0">&quot;&quot;&quot; 
+    GlyphSet manages a set of .glif files inside one directory. 
+ 
+    GlyphSet's constructor takes a path to an existing directory as it's 
+    first argument. Reading glyph data can either be done through the 
+    readGlyph() method, or by using GlyphSet's dictionary interface, where 
+    the keys are glyph names and the values are (very) simple glyph objects. 
+ 
+    To write a glyph to the glyph set, you use the writeGlyph() method. 
+    The simple glyph objects returned through the dict interface do not 
+    support writing, they are just a convenient way to get at the glyph data. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s1">glyphClass = Glyph</span>
+
+	<span class="s2">def </span><span class="s1">__init__(</span>
+		<span class="s1">self</span><span class="s2">,</span>
+		<span class="s1">path</span><span class="s2">,</span>
+		<span class="s1">glyphNameToFileNameFunc=</span><span class="s2">None,</span>
+		<span class="s1">ufoFormatVersion=</span><span class="s2">None,</span>
+		<span class="s1">validateRead=</span><span class="s2">True,</span>
+		<span class="s1">validateWrite=</span><span class="s2">True,</span>
+		<span class="s1">expectContentsFile=</span><span class="s2">False,</span>
+	<span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        'path' should be a path (string) to an existing local directory, or 
+        an instance of fs.base.FS class. 
+ 
+        The optional 'glyphNameToFileNameFunc' argument must be a callback 
+        function that takes two arguments: a glyph name and a list of all 
+        existing filenames (if any exist). It should return a file name 
+        (including the .glif extension). The glyphNameToFileName function 
+        is called whenever a file name is created for a given glyph name. 
+ 
+        ``validateRead`` will validate read operations. Its default is ``True``. 
+        ``validateWrite`` will validate write operations. Its default is ``True``. 
+        ``expectContentsFile`` will raise a GlifLibError if a contents.plist file is 
+        not found on the glyph set file system. This should be set to ``True`` if you 
+        are reading an existing UFO and ``False`` if you create a fresh glyph set. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">ufoFormatVersion = UFOFormatVersion(ufoFormatVersion)</span>
+		<span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+			<span class="s2">from </span><span class="s1">fontTools.ufoLib.errors </span><span class="s2">import </span><span class="s1">UnsupportedUFOFormat</span>
+
+			<span class="s2">raise </span><span class="s1">UnsupportedUFOFormat(</span>
+				<span class="s3">f&quot;Unsupported UFO format: </span><span class="s2">{</span><span class="s1">ufoFormatVersion</span><span class="s2">!r}</span><span class="s3">&quot;</span>
+			<span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+		<span class="s2">if </span><span class="s1">hasattr(path</span><span class="s2">, </span><span class="s3">&quot;__fspath__&quot;</span><span class="s1">):  </span><span class="s4"># support os.PathLike objects</span>
+			<span class="s1">path = path.__fspath__()</span>
+
+		<span class="s2">if </span><span class="s1">isinstance(path</span><span class="s2">, </span><span class="s1">str):</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">filesystem = fs.osfs.OSFS(path)</span>
+			<span class="s2">except </span><span class="s1">fs.errors.CreateFailed:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;No glyphs directory '%s'&quot; </span><span class="s1">% path)</span>
+			<span class="s1">self._shouldClose = </span><span class="s2">True</span>
+		<span class="s2">elif </span><span class="s1">isinstance(path</span><span class="s2">, </span><span class="s1">fs.base.FS):</span>
+			<span class="s1">filesystem = path</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">filesystem.check()</span>
+			<span class="s2">except </span><span class="s1">fs.errors.FilesystemClosed:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;the filesystem '%s' is closed&quot; </span><span class="s1">% filesystem)</span>
+			<span class="s1">self._shouldClose = </span><span class="s2">False</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">TypeError(</span>
+				<span class="s3">&quot;Expected a path string or fs object, found %s&quot;</span>
+				<span class="s1">% type(path).__name__</span>
+			<span class="s1">)</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">path = filesystem.getsyspath(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span>
+		<span class="s2">except </span><span class="s1">fs.errors.NoSysPath:</span>
+			<span class="s4"># network or in-memory FS may not map to the local one</span>
+			<span class="s1">path = str(filesystem)</span>
+		<span class="s4"># 'dirName' is kept for backward compatibility only, but it's DEPRECATED</span>
+		<span class="s4"># as it's not guaranteed that it maps to an existing OSFS directory.</span>
+		<span class="s4"># Client could use the FS api via the `self.fs` attribute instead.</span>
+		<span class="s1">self.dirName = fs.path.parts(path)[-</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s1">self.fs = filesystem</span>
+		<span class="s4"># if glyphSet contains no 'contents.plist', we consider it empty</span>
+		<span class="s1">self._havePreviousFile = filesystem.exists(CONTENTS_FILENAME)</span>
+		<span class="s2">if </span><span class="s1">expectContentsFile </span><span class="s2">and not </span><span class="s1">self._havePreviousFile:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">CONTENTS_FILENAME</span><span class="s2">} </span><span class="s3">is missing.&quot;</span><span class="s1">)</span>
+		<span class="s4"># attribute kept for backward compatibility</span>
+		<span class="s1">self.ufoFormatVersion = ufoFormatVersion.major</span>
+		<span class="s1">self.ufoFormatVersionTuple = ufoFormatVersion</span>
+		<span class="s2">if </span><span class="s1">glyphNameToFileNameFunc </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">glyphNameToFileNameFunc = glyphNameToFileName</span>
+		<span class="s1">self.glyphNameToFileName = glyphNameToFileNameFunc</span>
+		<span class="s1">self._validateRead = validateRead</span>
+		<span class="s1">self._validateWrite = validateWrite</span>
+		<span class="s1">self._existingFileNames: set[str] | </span><span class="s2">None </span><span class="s1">= </span><span class="s2">None</span>
+		<span class="s1">self._reverseContents = </span><span class="s2">None</span>
+
+		<span class="s1">self.rebuildContents()</span>
+
+	<span class="s2">def </span><span class="s1">rebuildContents(self</span><span class="s2">, </span><span class="s1">validateRead=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Rebuild the contents dict by loading contents.plist. 
+ 
+        ``validateRead`` will validate the data, by default it is set to the 
+        class's ``validateRead`` value, can be overridden. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">validateRead </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">validateRead = self._validateRead</span>
+		<span class="s1">contents = self._getPlist(CONTENTS_FILENAME</span><span class="s2">, </span><span class="s1">{})</span>
+		<span class="s4"># validate the contents</span>
+		<span class="s2">if </span><span class="s1">validateRead:</span>
+			<span class="s1">invalidFormat = </span><span class="s2">False</span>
+			<span class="s2">if not </span><span class="s1">isinstance(contents</span><span class="s2">, </span><span class="s1">dict):</span>
+				<span class="s1">invalidFormat = </span><span class="s2">True</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">fileName </span><span class="s2">in </span><span class="s1">contents.items():</span>
+					<span class="s2">if not </span><span class="s1">isinstance(name</span><span class="s2">, </span><span class="s1">str):</span>
+						<span class="s1">invalidFormat = </span><span class="s2">True</span>
+					<span class="s2">if not </span><span class="s1">isinstance(fileName</span><span class="s2">, </span><span class="s1">str):</span>
+						<span class="s1">invalidFormat = </span><span class="s2">True</span>
+					<span class="s2">elif not </span><span class="s1">self.fs.exists(fileName):</span>
+						<span class="s2">raise </span><span class="s1">GlifLibError(</span>
+							<span class="s3">&quot;%s references a file that does not exist: %s&quot;</span>
+							<span class="s1">% (CONTENTS_FILENAME</span><span class="s2">, </span><span class="s1">fileName)</span>
+						<span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">invalidFormat:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;%s is not properly formatted&quot; </span><span class="s1">% CONTENTS_FILENAME)</span>
+		<span class="s1">self.contents = contents</span>
+		<span class="s1">self._existingFileNames = </span><span class="s2">None</span>
+		<span class="s1">self._reverseContents = </span><span class="s2">None</span>
+
+	<span class="s2">def </span><span class="s1">getReverseContents(self):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Return a reversed dict of self.contents, mapping file names to 
+        glyph names. This is primarily an aid for custom glyph name to file 
+        name schemes that want to make sure they don't generate duplicate 
+        file names. The file names are converted to lowercase so we can 
+        reliably check for duplicates that only differ in case, which is 
+        important for case-insensitive file systems. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">self._reverseContents </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">d = {}</span>
+			<span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">self.contents.items():</span>
+				<span class="s1">d[v.lower()] = k</span>
+			<span class="s1">self._reverseContents = d</span>
+		<span class="s2">return </span><span class="s1">self._reverseContents</span>
+
+	<span class="s2">def </span><span class="s1">writeContents(self):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Write the contents.plist file out to disk. Call this method when 
+        you're done writing glyphs. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">self._writePlist(CONTENTS_FILENAME</span><span class="s2">, </span><span class="s1">self.contents)</span>
+
+	<span class="s4"># layer info</span>
+
+	<span class="s2">def </span><span class="s1">readLayerInfo(self</span><span class="s2">, </span><span class="s1">info</span><span class="s2">, </span><span class="s1">validateRead=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        ``validateRead`` will validate the data, by default it is set to the 
+        class's ``validateRead`` value, can be overridden. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">validateRead </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">validateRead = self._validateRead</span>
+		<span class="s1">infoDict = self._getPlist(LAYERINFO_FILENAME</span><span class="s2">, </span><span class="s1">{})</span>
+		<span class="s2">if </span><span class="s1">validateRead:</span>
+			<span class="s2">if not </span><span class="s1">isinstance(infoDict</span><span class="s2">, </span><span class="s1">dict):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;layerinfo.plist is not properly formatted.&quot;</span><span class="s1">)</span>
+			<span class="s1">infoDict = validateLayerInfoVersion3Data(infoDict)</span>
+		<span class="s4"># populate the object</span>
+		<span class="s2">for </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">infoDict.items():</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">setattr(info</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value)</span>
+			<span class="s2">except </span><span class="s1">AttributeError:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The supplied layer info object does not support setting a necessary attribute (%s).&quot; </span><span class="s1">% attr)</span>
+
+	<span class="s2">def </span><span class="s1">writeLayerInfo(self</span><span class="s2">, </span><span class="s1">info</span><span class="s2">, </span><span class="s1">validateWrite=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        ``validateWrite`` will validate the data, by default it is set to the 
+        class's ``validateWrite`` value, can be overridden. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">validateWrite </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">validateWrite = self._validateWrite</span>
+		<span class="s2">if </span><span class="s1">self.ufoFormatVersionTuple.major &lt; </span><span class="s5">3</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span>
+				<span class="s3">&quot;layerinfo.plist is not allowed in UFO %d.&quot; </span><span class="s1">% self.ufoFormatVersionTuple.major</span>
+			<span class="s1">)</span>
+		<span class="s4"># gather data</span>
+		<span class="s1">infoData = {}</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">layerInfoVersion3ValueData.keys():</span>
+			<span class="s2">if </span><span class="s1">hasattr(info</span><span class="s2">, </span><span class="s1">attr):</span>
+				<span class="s2">try</span><span class="s1">:</span>
+					<span class="s1">value = getattr(info</span><span class="s2">, </span><span class="s1">attr)</span>
+				<span class="s2">except </span><span class="s1">AttributeError:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The supplied info object does not support getting a necessary attribute (%s).&quot; </span><span class="s1">% attr)</span>
+				<span class="s2">if </span><span class="s1">value </span><span class="s2">is None or </span><span class="s1">(attr == </span><span class="s3">'lib' </span><span class="s2">and not </span><span class="s1">value):</span>
+					<span class="s2">continue</span>
+				<span class="s1">infoData[attr] = value</span>
+		<span class="s2">if </span><span class="s1">infoData:</span>
+			<span class="s4"># validate</span>
+			<span class="s2">if </span><span class="s1">validateWrite:</span>
+				<span class="s1">infoData = validateLayerInfoVersion3Data(infoData)</span>
+			<span class="s4"># write file</span>
+			<span class="s1">self._writePlist(LAYERINFO_FILENAME</span><span class="s2">, </span><span class="s1">infoData)</span>
+		<span class="s2">elif </span><span class="s1">self._havePreviousFile </span><span class="s2">and </span><span class="s1">self.fs.exists(LAYERINFO_FILENAME):</span>
+			<span class="s4"># data empty, remove existing file</span>
+			<span class="s1">self.fs.remove(LAYERINFO_FILENAME)</span>
+
+	<span class="s2">def </span><span class="s1">getGLIF(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Get the raw GLIF text for a given glyph name. This only works 
+        for GLIF files that are already on disk. 
+ 
+        This method is useful in situations when the raw XML needs to be 
+        read from a glyph set for a particular glyph before fully parsing 
+        it into an object structure via the readGlyph method. 
+ 
+        Raises KeyError if 'glyphName' is not in contents.plist, or 
+        GlifLibError if the file associated with can't be found. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">fileName = self.contents[glyphName]</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">self.fs.readbytes(fileName)</span>
+		<span class="s2">except </span><span class="s1">fs.errors.ResourceNotFound:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span>
+				<span class="s3">&quot;The file '%s' associated with glyph '%s' in contents.plist &quot;</span>
+				<span class="s3">&quot;does not exist on %s&quot; </span><span class="s1">% (fileName</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">self.fs)</span>
+			<span class="s1">)</span>
+
+	<span class="s2">def </span><span class="s1">getGLIFModificationTime(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Returns the modification time for the GLIF file with 'glyphName', as 
+        a floating point number giving the number of seconds since the epoch. 
+        Return None if the associated file does not exist or the underlying 
+        filesystem does not support getting modified times. 
+        Raises KeyError if the glyphName is not in contents.plist. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">fileName = self.contents[glyphName]</span>
+		<span class="s2">return </span><span class="s1">self.getFileModificationTime(fileName)</span>
+
+	<span class="s4"># reading/writing API</span>
+
+	<span class="s2">def </span><span class="s1">readGlyph(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">glyphObject=</span><span class="s2">None, </span><span class="s1">pointPen=</span><span class="s2">None, </span><span class="s1">validate=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Read a .glif file for 'glyphName' from the glyph set. The 
+        'glyphObject' argument can be any kind of object (even None); 
+        the readGlyph() method will attempt to set the following 
+        attributes on it: 
+ 
+        width 
+            the advance width of the glyph 
+        height 
+            the advance height of the glyph 
+        unicodes 
+            a list of unicode values for this glyph 
+        note 
+            a string 
+        lib 
+            a dictionary containing custom data 
+        image 
+            a dictionary containing image data 
+        guidelines 
+            a list of guideline data dictionaries 
+        anchors 
+            a list of anchor data dictionaries 
+ 
+        All attributes are optional, in two ways: 
+ 
+        1) An attribute *won't* be set if the .glif file doesn't 
+           contain data for it. 'glyphObject' will have to deal 
+           with default values itself. 
+        2) If setting the attribute fails with an AttributeError 
+           (for example if the 'glyphObject' attribute is read- 
+           only), readGlyph() will not propagate that exception, 
+           but ignore that attribute. 
+ 
+        To retrieve outline information, you need to pass an object 
+        conforming to the PointPen protocol as the 'pointPen' argument. 
+        This argument may be None if you don't need the outline data. 
+ 
+        readGlyph() will raise KeyError if the glyph is not present in 
+        the glyph set. 
+ 
+        ``validate`` will validate the data, by default it is set to the 
+        class's ``validateRead`` value, can be overridden. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">validate = self._validateRead</span>
+		<span class="s1">text = self.getGLIF(glyphName)</span>
+		<span class="s1">tree = _glifTreeFromString(text)</span>
+		<span class="s1">formatVersions = GLIFFormatVersion.supported_versions(self.ufoFormatVersionTuple)</span>
+		<span class="s1">_readGlyphFromTree(tree</span><span class="s2">, </span><span class="s1">glyphObject</span><span class="s2">, </span><span class="s1">pointPen</span><span class="s2">, </span><span class="s1">formatVersions=formatVersions</span><span class="s2">, </span><span class="s1">validate=validate)</span>
+
+	<span class="s2">def </span><span class="s1">writeGlyph(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">glyphObject=</span><span class="s2">None, </span><span class="s1">drawPointsFunc=</span><span class="s2">None, </span><span class="s1">formatVersion=</span><span class="s2">None, </span><span class="s1">validate=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Write a .glif file for 'glyphName' to the glyph set. The 
+        'glyphObject' argument can be any kind of object (even None); 
+        the writeGlyph() method will attempt to get the following 
+        attributes from it: 
+ 
+        width 
+            the advance width of the glyph 
+        height 
+            the advance height of the glyph 
+        unicodes 
+            a list of unicode values for this glyph 
+        note 
+            a string 
+        lib 
+            a dictionary containing custom data 
+        image 
+            a dictionary containing image data 
+        guidelines 
+            a list of guideline data dictionaries 
+        anchors 
+            a list of anchor data dictionaries 
+ 
+        All attributes are optional: if 'glyphObject' doesn't 
+        have the attribute, it will simply be skipped. 
+ 
+        To write outline data to the .glif file, writeGlyph() needs 
+        a function (any callable object actually) that will take one 
+        argument: an object that conforms to the PointPen protocol. 
+        The function will be called by writeGlyph(); it has to call the 
+        proper PointPen methods to transfer the outline to the .glif file. 
+ 
+        The GLIF format version will be chosen based on the ufoFormatVersion 
+        passed during the creation of this object. If a particular format 
+        version is desired, it can be passed with the formatVersion argument. 
+        The formatVersion argument accepts either a tuple of integers for 
+        (major, minor), or a single integer for the major digit only (with 
+        minor digit implied as 0). 
+ 
+        An UnsupportedGLIFFormat exception is raised if the requested GLIF 
+        formatVersion is not supported. 
+ 
+        ``validate`` will validate the data, by default it is set to the 
+        class's ``validateWrite`` value, can be overridden. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">formatVersion </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">formatVersion = GLIFFormatVersion.default(self.ufoFormatVersionTuple)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">formatVersion = GLIFFormatVersion(formatVersion)</span>
+			<span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+				<span class="s2">from </span><span class="s1">fontTools.ufoLib.errors </span><span class="s2">import </span><span class="s1">UnsupportedGLIFFormat</span>
+
+				<span class="s2">raise </span><span class="s1">UnsupportedGLIFFormat(</span>
+					<span class="s3">f&quot;Unsupported GLIF format version: </span><span class="s2">{</span><span class="s1">formatVersion</span><span class="s2">!r}</span><span class="s3">&quot;</span>
+				<span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+		<span class="s2">if </span><span class="s1">formatVersion </span><span class="s2">not in </span><span class="s1">GLIFFormatVersion.supported_versions(</span>
+			<span class="s1">self.ufoFormatVersionTuple</span>
+		<span class="s1">):</span>
+			<span class="s2">from </span><span class="s1">fontTools.ufoLib.errors </span><span class="s2">import </span><span class="s1">UnsupportedGLIFFormat</span>
+
+			<span class="s2">raise </span><span class="s1">UnsupportedGLIFFormat(</span>
+				<span class="s3">f&quot;Unsupported GLIF format version (</span><span class="s2">{</span><span class="s1">formatVersion</span><span class="s2">!s}</span><span class="s3">) &quot;</span>
+				<span class="s3">f&quot;for UFO format version </span><span class="s2">{</span><span class="s1">self.ufoFormatVersionTuple</span><span class="s2">!s}</span><span class="s3">.&quot;</span>
+			<span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">validate = self._validateWrite</span>
+		<span class="s1">fileName = self.contents.get(glyphName)</span>
+		<span class="s2">if </span><span class="s1">fileName </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self._existingFileNames </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s1">self._existingFileNames = {</span>
+					<span class="s1">fileName.lower() </span><span class="s2">for </span><span class="s1">fileName </span><span class="s2">in </span><span class="s1">self.contents.values()</span>
+				<span class="s1">}</span>
+			<span class="s1">fileName = self.glyphNameToFileName(glyphName</span><span class="s2">, </span><span class="s1">self._existingFileNames)</span>
+			<span class="s1">self.contents[glyphName] = fileName</span>
+			<span class="s1">self._existingFileNames.add(fileName.lower())</span>
+			<span class="s2">if </span><span class="s1">self._reverseContents </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">self._reverseContents[fileName.lower()] = glyphName</span>
+		<span class="s1">data = _writeGlyphToBytes(</span>
+			<span class="s1">glyphName</span><span class="s2">,</span>
+			<span class="s1">glyphObject</span><span class="s2">,</span>
+			<span class="s1">drawPointsFunc</span><span class="s2">,</span>
+			<span class="s1">formatVersion=formatVersion</span><span class="s2">,</span>
+			<span class="s1">validate=validate</span><span class="s2">,</span>
+		<span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">(</span>
+			<span class="s1">self._havePreviousFile</span>
+			<span class="s2">and </span><span class="s1">self.fs.exists(fileName)</span>
+			<span class="s2">and </span><span class="s1">data == self.fs.readbytes(fileName)</span>
+		<span class="s1">):</span>
+			<span class="s2">return</span>
+		<span class="s1">self.fs.writebytes(fileName</span><span class="s2">, </span><span class="s1">data)</span>
+
+	<span class="s2">def </span><span class="s1">deleteGlyph(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s0">&quot;&quot;&quot;Permanently delete the glyph from the glyph set on disk. Will 
+        raise KeyError if the glyph is not present in the glyph set. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">fileName = self.contents[glyphName]</span>
+		<span class="s1">self.fs.remove(fileName)</span>
+		<span class="s2">if </span><span class="s1">self._existingFileNames </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">self._existingFileNames.remove(fileName.lower())</span>
+		<span class="s2">if </span><span class="s1">self._reverseContents </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">del </span><span class="s1">self._reverseContents[fileName.lower()]</span>
+		<span class="s2">del </span><span class="s1">self.contents[glyphName]</span>
+
+	<span class="s4"># dict-like support</span>
+
+	<span class="s2">def </span><span class="s1">keys(self):</span>
+		<span class="s2">return </span><span class="s1">list(self.contents.keys())</span>
+
+	<span class="s2">def </span><span class="s1">has_key(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s2">return </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">self.contents</span>
+
+	<span class="s1">__contains__ = has_key</span>
+
+	<span class="s2">def </span><span class="s1">__len__(self):</span>
+		<span class="s2">return </span><span class="s1">len(self.contents)</span>
+
+	<span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s2">if </span><span class="s1">glyphName </span><span class="s2">not in </span><span class="s1">self.contents:</span>
+			<span class="s2">raise </span><span class="s1">KeyError(glyphName)</span>
+		<span class="s2">return </span><span class="s1">self.glyphClass(glyphName</span><span class="s2">, </span><span class="s1">self)</span>
+
+	<span class="s4"># quickly fetch unicode values</span>
+
+	<span class="s2">def </span><span class="s1">getUnicodes(self</span><span class="s2">, </span><span class="s1">glyphNames=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Return a dictionary that maps glyph names to lists containing 
+        the unicode value[s] for that glyph, if any. This parses the .glif 
+        files partially, so it is a lot faster than parsing all files completely. 
+        By default this checks all glyphs, but a subset can be passed with glyphNames. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">unicodes = {}</span>
+		<span class="s2">if </span><span class="s1">glyphNames </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">glyphNames = self.contents.keys()</span>
+		<span class="s2">for </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">glyphNames:</span>
+			<span class="s1">text = self.getGLIF(glyphName)</span>
+			<span class="s1">unicodes[glyphName] = _fetchUnicodes(text)</span>
+		<span class="s2">return </span><span class="s1">unicodes</span>
+
+	<span class="s2">def </span><span class="s1">getComponentReferences(self</span><span class="s2">, </span><span class="s1">glyphNames=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Return a dictionary that maps glyph names to lists containing the 
+        base glyph name of components in the glyph. This parses the .glif 
+        files partially, so it is a lot faster than parsing all files completely. 
+        By default this checks all glyphs, but a subset can be passed with glyphNames. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">components = {}</span>
+		<span class="s2">if </span><span class="s1">glyphNames </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">glyphNames = self.contents.keys()</span>
+		<span class="s2">for </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">glyphNames:</span>
+			<span class="s1">text = self.getGLIF(glyphName)</span>
+			<span class="s1">components[glyphName] = _fetchComponentBases(text)</span>
+		<span class="s2">return </span><span class="s1">components</span>
+
+	<span class="s2">def </span><span class="s1">getImageReferences(self</span><span class="s2">, </span><span class="s1">glyphNames=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        Return a dictionary that maps glyph names to the file name of the image 
+        referenced by the glyph. This parses the .glif files partially, so it is a 
+        lot faster than parsing all files completely. 
+        By default this checks all glyphs, but a subset can be passed with glyphNames. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">images = {}</span>
+		<span class="s2">if </span><span class="s1">glyphNames </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">glyphNames = self.contents.keys()</span>
+		<span class="s2">for </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">glyphNames:</span>
+			<span class="s1">text = self.getGLIF(glyphName)</span>
+			<span class="s1">images[glyphName] = _fetchImageFileName(text)</span>
+		<span class="s2">return </span><span class="s1">images</span>
+
+	<span class="s2">def </span><span class="s1">close(self):</span>
+		<span class="s2">if </span><span class="s1">self._shouldClose:</span>
+			<span class="s1">self.fs.close()</span>
+
+	<span class="s2">def </span><span class="s1">__enter__(self):</span>
+		<span class="s2">return </span><span class="s1">self</span>
+
+	<span class="s2">def </span><span class="s1">__exit__(self</span><span class="s2">, </span><span class="s1">exc_type</span><span class="s2">, </span><span class="s1">exc_value</span><span class="s2">, </span><span class="s1">exc_tb):</span>
+		<span class="s1">self.close()</span>
+
+
+<span class="s4"># -----------------------</span>
+<span class="s4"># Glyph Name to File Name</span>
+<span class="s4"># -----------------------</span>
+
+<span class="s2">def </span><span class="s1">glyphNameToFileName(glyphName</span><span class="s2">, </span><span class="s1">existingFileNames):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    Wrapper around the userNameToFileName function in filenames.py 
+ 
+    Note that existingFileNames should be a set for large glyphsets 
+    or performance will suffer. 
+    &quot;&quot;&quot;</span>
+	<span class="s2">if </span><span class="s1">existingFileNames </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s1">existingFileNames = set()</span>
+	<span class="s2">return </span><span class="s1">userNameToFileName(glyphName</span><span class="s2">, </span><span class="s1">existing=existingFileNames</span><span class="s2">, </span><span class="s1">suffix=</span><span class="s3">&quot;.glif&quot;</span><span class="s1">)</span>
+
+<span class="s4"># -----------------------</span>
+<span class="s4"># GLIF To and From String</span>
+<span class="s4"># -----------------------</span>
+
+<span class="s2">def </span><span class="s1">readGlyphFromString(</span>
+	<span class="s1">aString</span><span class="s2">,</span>
+	<span class="s1">glyphObject=</span><span class="s2">None,</span>
+	<span class="s1">pointPen=</span><span class="s2">None,</span>
+	<span class="s1">formatVersions=</span><span class="s2">None,</span>
+	<span class="s1">validate=</span><span class="s2">True,</span>
+<span class="s1">):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    Read .glif data from a string into a glyph object. 
+ 
+    The 'glyphObject' argument can be any kind of object (even None); 
+    the readGlyphFromString() method will attempt to set the following 
+    attributes on it: 
+ 
+    width 
+        the advance width of the glyph 
+    height 
+        the advance height of the glyph 
+    unicodes 
+        a list of unicode values for this glyph 
+    note 
+        a string 
+    lib 
+        a dictionary containing custom data 
+    image 
+        a dictionary containing image data 
+    guidelines 
+        a list of guideline data dictionaries 
+    anchors 
+        a list of anchor data dictionaries 
+ 
+    All attributes are optional, in two ways: 
+ 
+    1) An attribute *won't* be set if the .glif file doesn't 
+       contain data for it. 'glyphObject' will have to deal 
+       with default values itself. 
+    2) If setting the attribute fails with an AttributeError 
+       (for example if the 'glyphObject' attribute is read- 
+       only), readGlyphFromString() will not propagate that 
+       exception, but ignore that attribute. 
+ 
+    To retrieve outline information, you need to pass an object 
+    conforming to the PointPen protocol as the 'pointPen' argument. 
+    This argument may be None if you don't need the outline data. 
+ 
+    The formatVersions optional argument define the GLIF format versions 
+    that are allowed to be read. 
+    The type is Optional[Iterable[Tuple[int, int], int]]. It can contain 
+    either integers (for the major versions to be allowed, with minor 
+    digits defaulting to 0), or tuples of integers to specify both 
+    (major, minor) versions. 
+    By default when formatVersions is None all the GLIF format versions 
+    currently defined are allowed to be read. 
+ 
+    ``validate`` will validate the read data. It is set to ``True`` by default. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">tree = _glifTreeFromString(aString)</span>
+
+	<span class="s2">if </span><span class="s1">formatVersions </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s1">validFormatVersions = GLIFFormatVersion.supported_versions()</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">validFormatVersions</span><span class="s2">, </span><span class="s1">invalidFormatVersions = set()</span><span class="s2">, </span><span class="s1">set()</span>
+		<span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">formatVersions:</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">formatVersion = GLIFFormatVersion(v)</span>
+			<span class="s2">except </span><span class="s1">ValueError:</span>
+				<span class="s1">invalidFormatVersions.add(v)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">validFormatVersions.add(formatVersion)</span>
+		<span class="s2">if not </span><span class="s1">validFormatVersions:</span>
+			<span class="s2">raise </span><span class="s1">ValueError(</span>
+				<span class="s3">&quot;None of the requested GLIF formatVersions are supported: &quot;</span>
+				<span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">formatVersions</span><span class="s2">!r}</span><span class="s3">&quot;</span>
+			<span class="s1">)</span>
+
+	<span class="s1">_readGlyphFromTree(</span>
+		<span class="s1">tree</span><span class="s2">, </span><span class="s1">glyphObject</span><span class="s2">, </span><span class="s1">pointPen</span><span class="s2">, </span><span class="s1">formatVersions=validFormatVersions</span><span class="s2">, </span><span class="s1">validate=validate</span>
+	<span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_writeGlyphToBytes(</span>
+		<span class="s1">glyphName</span><span class="s2">,</span>
+		<span class="s1">glyphObject=</span><span class="s2">None,</span>
+		<span class="s1">drawPointsFunc=</span><span class="s2">None,</span>
+		<span class="s1">writer=</span><span class="s2">None,</span>
+		<span class="s1">formatVersion=</span><span class="s2">None,</span>
+		<span class="s1">validate=</span><span class="s2">True,</span>
+<span class="s1">):</span>
+	<span class="s0">&quot;&quot;&quot;Return .glif data for a glyph as a UTF-8 encoded bytes string.&quot;&quot;&quot;</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">formatVersion = GLIFFormatVersion(formatVersion)</span>
+	<span class="s2">except </span><span class="s1">ValueError:</span>
+		<span class="s2">from </span><span class="s1">fontTools.ufoLib.errors </span><span class="s2">import </span><span class="s1">UnsupportedGLIFFormat</span>
+
+		<span class="s2">raise </span><span class="s1">UnsupportedGLIFFormat(</span><span class="s3">&quot;Unsupported GLIF format version: {formatVersion!r}&quot;</span><span class="s1">)</span>
+	<span class="s4"># start</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">isinstance(glyphName</span><span class="s2">, </span><span class="s1">str):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The glyph name is not properly formatted.&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">len(glyphName) == </span><span class="s5">0</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The glyph name is empty.&quot;</span><span class="s1">)</span>
+	<span class="s1">glyphAttrs = OrderedDict([(</span><span class="s3">&quot;name&quot;</span><span class="s2">, </span><span class="s1">glyphName)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">&quot;format&quot;</span><span class="s2">, </span><span class="s1">repr(formatVersion.major))])</span>
+	<span class="s2">if </span><span class="s1">formatVersion.minor != </span><span class="s5">0</span><span class="s1">:</span>
+		<span class="s1">glyphAttrs[</span><span class="s3">&quot;formatMinor&quot;</span><span class="s1">] = repr(formatVersion.minor)</span>
+	<span class="s1">root = etree.Element(</span><span class="s3">&quot;glyph&quot;</span><span class="s2">, </span><span class="s1">glyphAttrs)</span>
+	<span class="s1">identifiers = set()</span>
+	<span class="s4"># advance</span>
+	<span class="s1">_writeAdvance(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># unicodes</span>
+	<span class="s2">if </span><span class="s1">getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;unicodes&quot;</span><span class="s2">, None</span><span class="s1">):</span>
+		<span class="s1">_writeUnicodes(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># note</span>
+	<span class="s2">if </span><span class="s1">getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;note&quot;</span><span class="s2">, None</span><span class="s1">):</span>
+		<span class="s1">_writeNote(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># image</span>
+	<span class="s2">if </span><span class="s1">formatVersion.major &gt;= </span><span class="s5">2 </span><span class="s2">and </span><span class="s1">getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;image&quot;</span><span class="s2">, None</span><span class="s1">):</span>
+		<span class="s1">_writeImage(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># guidelines</span>
+	<span class="s2">if </span><span class="s1">formatVersion.major &gt;= </span><span class="s5">2 </span><span class="s2">and </span><span class="s1">getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;guidelines&quot;</span><span class="s2">, None</span><span class="s1">):</span>
+		<span class="s1">_writeGuidelines(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># anchors</span>
+	<span class="s1">anchors = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;anchors&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">formatVersion.major &gt;= </span><span class="s5">2 </span><span class="s2">and </span><span class="s1">anchors:</span>
+		<span class="s1">_writeAnchors(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># outline</span>
+	<span class="s2">if </span><span class="s1">drawPointsFunc </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">outline = etree.SubElement(root</span><span class="s2">, </span><span class="s3">&quot;outline&quot;</span><span class="s1">)</span>
+		<span class="s1">pen = GLIFPointPen(outline</span><span class="s2">, </span><span class="s1">identifiers=identifiers</span><span class="s2">, </span><span class="s1">validate=validate)</span>
+		<span class="s1">drawPointsFunc(pen)</span>
+		<span class="s2">if </span><span class="s1">formatVersion.major == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">anchors:</span>
+			<span class="s1">_writeAnchorsFormat1(pen</span><span class="s2">, </span><span class="s1">anchors</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s4"># prevent lxml from writing self-closing tags</span>
+		<span class="s2">if not </span><span class="s1">len(outline):</span>
+			<span class="s1">outline.text = </span><span class="s3">&quot;</span><span class="s2">\n  </span><span class="s3">&quot;</span>
+	<span class="s4"># lib</span>
+	<span class="s2">if </span><span class="s1">getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;lib&quot;</span><span class="s2">, None</span><span class="s1">):</span>
+		<span class="s1">_writeLib(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># return the text</span>
+	<span class="s1">data = etree.tostring(</span>
+		<span class="s1">root</span><span class="s2">, </span><span class="s1">encoding=</span><span class="s3">&quot;UTF-8&quot;</span><span class="s2">, </span><span class="s1">xml_declaration=</span><span class="s2">True, </span><span class="s1">pretty_print=</span><span class="s2">True</span>
+	<span class="s1">)</span>
+	<span class="s2">return </span><span class="s1">data</span>
+
+
+<span class="s2">def </span><span class="s1">writeGlyphToString(</span>
+	<span class="s1">glyphName</span><span class="s2">,</span>
+	<span class="s1">glyphObject=</span><span class="s2">None,</span>
+	<span class="s1">drawPointsFunc=</span><span class="s2">None,</span>
+	<span class="s1">formatVersion=</span><span class="s2">None,</span>
+	<span class="s1">validate=</span><span class="s2">True,</span>
+<span class="s1">):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    Return .glif data for a glyph as a string. The XML declaration's 
+    encoding is always set to &quot;UTF-8&quot;. 
+    The 'glyphObject' argument can be any kind of object (even None); 
+    the writeGlyphToString() method will attempt to get the following 
+    attributes from it: 
+ 
+    width 
+        the advance width of the glyph 
+    height 
+        the advance height of the glyph 
+    unicodes 
+        a list of unicode values for this glyph 
+    note 
+        a string 
+    lib 
+        a dictionary containing custom data 
+    image 
+        a dictionary containing image data 
+    guidelines 
+        a list of guideline data dictionaries 
+    anchors 
+        a list of anchor data dictionaries 
+ 
+    All attributes are optional: if 'glyphObject' doesn't 
+    have the attribute, it will simply be skipped. 
+ 
+    To write outline data to the .glif file, writeGlyphToString() needs 
+    a function (any callable object actually) that will take one 
+    argument: an object that conforms to the PointPen protocol. 
+    The function will be called by writeGlyphToString(); it has to call the 
+    proper PointPen methods to transfer the outline to the .glif file. 
+ 
+    The GLIF format version can be specified with the formatVersion argument. 
+    This accepts either a tuple of integers for (major, minor), or a single 
+    integer for the major digit only (with minor digit implied as 0). 
+    By default when formatVesion is None the latest GLIF format version will 
+    be used; currently it's 2.0, which is equivalent to formatVersion=(2, 0). 
+ 
+    An UnsupportedGLIFFormat exception is raised if the requested UFO 
+    formatVersion is not supported. 
+ 
+    ``validate`` will validate the written data. It is set to ``True`` by default. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">data = _writeGlyphToBytes(</span>
+		<span class="s1">glyphName</span><span class="s2">,</span>
+		<span class="s1">glyphObject=glyphObject</span><span class="s2">,</span>
+		<span class="s1">drawPointsFunc=drawPointsFunc</span><span class="s2">,</span>
+		<span class="s1">formatVersion=formatVersion</span><span class="s2">,</span>
+		<span class="s1">validate=validate</span><span class="s2">,</span>
+	<span class="s1">)</span>
+	<span class="s2">return </span><span class="s1">data.decode(</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_writeAdvance(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">width = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;width&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">width </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">isinstance(width</span><span class="s2">, </span><span class="s1">numberTypes):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;width attribute must be int or float&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">width == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">width = </span><span class="s2">None</span>
+	<span class="s1">height = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;height&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">height </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">isinstance(height</span><span class="s2">, </span><span class="s1">numberTypes):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;height attribute must be int or float&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">height == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">height = </span><span class="s2">None</span>
+	<span class="s2">if </span><span class="s1">width </span><span class="s2">is not None and </span><span class="s1">height </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;advance&quot;</span><span class="s2">, </span><span class="s1">OrderedDict([(</span><span class="s3">&quot;height&quot;</span><span class="s2">, </span><span class="s1">repr(height))</span><span class="s2">, </span><span class="s1">(</span><span class="s3">&quot;width&quot;</span><span class="s2">, </span><span class="s1">repr(width))]))</span>
+	<span class="s2">elif </span><span class="s1">width </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;advance&quot;</span><span class="s2">, </span><span class="s1">dict(width=repr(width)))</span>
+	<span class="s2">elif </span><span class="s1">height </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;advance&quot;</span><span class="s2">, </span><span class="s1">dict(height=repr(height)))</span>
+
+<span class="s2">def </span><span class="s1">_writeUnicodes(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">unicodes = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;unicodes&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">isinstance(unicodes</span><span class="s2">, </span><span class="s1">int):</span>
+		<span class="s1">unicodes = [unicodes]</span>
+	<span class="s1">seen = set()</span>
+	<span class="s2">for </span><span class="s1">code </span><span class="s2">in </span><span class="s1">unicodes:</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">isinstance(code</span><span class="s2">, </span><span class="s1">int):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;unicode values must be int&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">code </span><span class="s2">in </span><span class="s1">seen:</span>
+			<span class="s2">continue</span>
+		<span class="s1">seen.add(code)</span>
+		<span class="s1">hexCode = </span><span class="s3">&quot;%04X&quot; </span><span class="s1">% code</span>
+		<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;unicode&quot;</span><span class="s2">, </span><span class="s1">dict(hex=hexCode))</span>
+
+<span class="s2">def </span><span class="s1">_writeNote(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">note = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;note&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">isinstance(note</span><span class="s2">, </span><span class="s1">str):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;note attribute must be str&quot;</span><span class="s1">)</span>
+	<span class="s1">note = note.strip()</span>
+	<span class="s1">note = </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">+ note + </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+	<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;note&quot;</span><span class="s1">).text = note</span>
+
+<span class="s2">def </span><span class="s1">_writeImage(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">image = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;image&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">imageValidator(image):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;image attribute must be a dict or dict-like object with the proper structure.&quot;</span><span class="s1">)</span>
+	<span class="s1">attrs = OrderedDict([(</span><span class="s3">&quot;fileName&quot;</span><span class="s2">, </span><span class="s1">image[</span><span class="s3">&quot;fileName&quot;</span><span class="s1">])])</span>
+	<span class="s2">for </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">default </span><span class="s2">in </span><span class="s1">_transformationInfo:</span>
+		<span class="s1">value = image.get(attr</span><span class="s2">, </span><span class="s1">default)</span>
+		<span class="s2">if </span><span class="s1">value != default:</span>
+			<span class="s1">attrs[attr] = repr(value)</span>
+	<span class="s1">color = image.get(</span><span class="s3">&quot;color&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">color </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">attrs[</span><span class="s3">&quot;color&quot;</span><span class="s1">] = color</span>
+	<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;image&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+<span class="s2">def </span><span class="s1">_writeGuidelines(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">guidelines = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;guidelines&quot;</span><span class="s2">, </span><span class="s1">[])</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">guidelinesValidator(guidelines):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;guidelines attribute does not have the proper structure.&quot;</span><span class="s1">)</span>
+	<span class="s2">for </span><span class="s1">guideline </span><span class="s2">in </span><span class="s1">guidelines:</span>
+		<span class="s1">attrs = OrderedDict()</span>
+		<span class="s1">x = guideline.get(</span><span class="s3">&quot;x&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">x </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;x&quot;</span><span class="s1">] = repr(x)</span>
+		<span class="s1">y = guideline.get(</span><span class="s3">&quot;y&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">y </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;y&quot;</span><span class="s1">] = repr(y)</span>
+		<span class="s1">angle = guideline.get(</span><span class="s3">&quot;angle&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">angle </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;angle&quot;</span><span class="s1">] = repr(angle)</span>
+		<span class="s1">name = guideline.get(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">name </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = name</span>
+		<span class="s1">color = guideline.get(</span><span class="s3">&quot;color&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">color </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;color&quot;</span><span class="s1">] = color</span>
+		<span class="s1">identifier = guideline.get(</span><span class="s3">&quot;identifier&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">identifiers:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier used more than once: %s&quot; </span><span class="s1">% identifier)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] = identifier</span>
+			<span class="s1">identifiers.add(identifier)</span>
+		<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;guideline&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+<span class="s2">def </span><span class="s1">_writeAnchorsFormat1(pen</span><span class="s2">, </span><span class="s1">anchors</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">anchorsValidator(anchors):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;anchors attribute does not have the proper structure.&quot;</span><span class="s1">)</span>
+	<span class="s2">for </span><span class="s1">anchor </span><span class="s2">in </span><span class="s1">anchors:</span>
+		<span class="s1">attrs = {}</span>
+		<span class="s1">x = anchor[</span><span class="s3">&quot;x&quot;</span><span class="s1">]</span>
+		<span class="s1">attrs[</span><span class="s3">&quot;x&quot;</span><span class="s1">] = repr(x)</span>
+		<span class="s1">y = anchor[</span><span class="s3">&quot;y&quot;</span><span class="s1">]</span>
+		<span class="s1">attrs[</span><span class="s3">&quot;y&quot;</span><span class="s1">] = repr(y)</span>
+		<span class="s1">name = anchor.get(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">name </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = name</span>
+		<span class="s1">pen.beginPath()</span>
+		<span class="s1">pen.addPoint((x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">, </span><span class="s1">segmentType=</span><span class="s3">&quot;move&quot;</span><span class="s2">, </span><span class="s1">name=name)</span>
+		<span class="s1">pen.endPath()</span>
+
+<span class="s2">def </span><span class="s1">_writeAnchors(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">anchors = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;anchors&quot;</span><span class="s2">, </span><span class="s1">[])</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">anchorsValidator(anchors):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;anchors attribute does not have the proper structure.&quot;</span><span class="s1">)</span>
+	<span class="s2">for </span><span class="s1">anchor </span><span class="s2">in </span><span class="s1">anchors:</span>
+		<span class="s1">attrs = OrderedDict()</span>
+		<span class="s1">x = anchor[</span><span class="s3">&quot;x&quot;</span><span class="s1">]</span>
+		<span class="s1">attrs[</span><span class="s3">&quot;x&quot;</span><span class="s1">] = repr(x)</span>
+		<span class="s1">y = anchor[</span><span class="s3">&quot;y&quot;</span><span class="s1">]</span>
+		<span class="s1">attrs[</span><span class="s3">&quot;y&quot;</span><span class="s1">] = repr(y)</span>
+		<span class="s1">name = anchor.get(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">name </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = name</span>
+		<span class="s1">color = anchor.get(</span><span class="s3">&quot;color&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">color </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;color&quot;</span><span class="s1">] = color</span>
+		<span class="s1">identifier = anchor.get(</span><span class="s3">&quot;identifier&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">identifiers:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier used more than once: %s&quot; </span><span class="s1">% identifier)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] = identifier</span>
+			<span class="s1">identifiers.add(identifier)</span>
+		<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;anchor&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+<span class="s2">def </span><span class="s1">_writeLib(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">lib = getattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;lib&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s2">if not </span><span class="s1">lib:</span>
+		<span class="s4"># don't write empty lib</span>
+		<span class="s2">return</span>
+	<span class="s2">if </span><span class="s1">validate:</span>
+		<span class="s1">valid</span><span class="s2">, </span><span class="s1">message = glyphLibValidator(lib)</span>
+		<span class="s2">if not </span><span class="s1">valid:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(message)</span>
+	<span class="s2">if not </span><span class="s1">isinstance(lib</span><span class="s2">, </span><span class="s1">dict):</span>
+		<span class="s1">lib = dict(lib)</span>
+	<span class="s4"># plist inside GLIF begins with 2 levels of indentation</span>
+	<span class="s1">e = plistlib.totree(lib</span><span class="s2">, </span><span class="s1">indent_level=</span><span class="s5">2</span><span class="s1">)</span>
+	<span class="s1">etree.SubElement(element</span><span class="s2">, </span><span class="s3">&quot;lib&quot;</span><span class="s1">).append(e)</span>
+
+<span class="s4"># -----------------------</span>
+<span class="s4"># layerinfo.plist Support</span>
+<span class="s4"># -----------------------</span>
+
+<span class="s1">layerInfoVersion3ValueData = {</span>
+	<span class="s3">&quot;color&quot;			</span><span class="s1">: dict(type=str</span><span class="s2">, </span><span class="s1">valueValidator=colorValidator)</span><span class="s2">,</span>
+	<span class="s3">&quot;lib&quot;			</span><span class="s1">: dict(type=dict</span><span class="s2">, </span><span class="s1">valueValidator=genericTypeValidator)</span>
+<span class="s1">}</span>
+
+<span class="s2">def </span><span class="s1">validateLayerInfoVersion3ValueForAttribute(attr</span><span class="s2">, </span><span class="s1">value):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    This performs very basic validation of the value for attribute 
+    following the UFO 3 fontinfo.plist specification. The results 
+    of this should not be interpretted as *correct* for the font 
+    that they are part of. This merely indicates that the value 
+    is of the proper type and, where the specification defines 
+    a set range of possible values for an attribute, that the 
+    value is in the accepted range. 
+    &quot;&quot;&quot;</span>
+	<span class="s2">if </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">layerInfoVersion3ValueData:</span>
+		<span class="s2">return False</span>
+	<span class="s1">dataValidationDict = layerInfoVersion3ValueData[attr]</span>
+	<span class="s1">valueType = dataValidationDict.get(</span><span class="s3">&quot;type&quot;</span><span class="s1">)</span>
+	<span class="s1">validator = dataValidationDict.get(</span><span class="s3">&quot;valueValidator&quot;</span><span class="s1">)</span>
+	<span class="s1">valueOptions = dataValidationDict.get(</span><span class="s3">&quot;valueOptions&quot;</span><span class="s1">)</span>
+	<span class="s4"># have specific options for the validator</span>
+	<span class="s2">if </span><span class="s1">valueOptions </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">isValidValue = validator(value</span><span class="s2">, </span><span class="s1">valueOptions)</span>
+	<span class="s4"># no specific options</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s2">if </span><span class="s1">validator == genericTypeValidator:</span>
+			<span class="s1">isValidValue = validator(value</span><span class="s2">, </span><span class="s1">valueType)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">isValidValue = validator(value)</span>
+	<span class="s2">return </span><span class="s1">isValidValue</span>
+
+<span class="s2">def </span><span class="s1">validateLayerInfoVersion3Data(infoData):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    This performs very basic validation of the value for infoData 
+    following the UFO 3 layerinfo.plist specification. The results 
+    of this should not be interpretted as *correct* for the font 
+    that they are part of. This merely indicates that the values 
+    are of the proper type and, where the specification defines 
+    a set range of possible values for an attribute, that the 
+    value is in the accepted range. 
+    &quot;&quot;&quot;</span>
+	<span class="s2">for </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">infoData.items():</span>
+		<span class="s2">if </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">layerInfoVersion3ValueData:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown attribute %s.&quot; </span><span class="s1">% attr)</span>
+		<span class="s1">isValidValue = validateLayerInfoVersion3ValueForAttribute(attr</span><span class="s2">, </span><span class="s1">value)</span>
+		<span class="s2">if not </span><span class="s1">isValidValue:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">f&quot;Invalid value for attribute </span><span class="s2">{</span><span class="s1">attr</span><span class="s2">} </span><span class="s3">(</span><span class="s2">{</span><span class="s1">value</span><span class="s2">!r}</span><span class="s3">).&quot;</span><span class="s1">)</span>
+	<span class="s2">return </span><span class="s1">infoData</span>
+
+<span class="s4"># -----------------</span>
+<span class="s4"># GLIF Tree Support</span>
+<span class="s4"># -----------------</span>
+
+<span class="s2">def </span><span class="s1">_glifTreeFromFile(aFile):</span>
+	<span class="s2">if </span><span class="s1">etree._have_lxml:</span>
+		<span class="s1">tree = etree.parse(aFile</span><span class="s2">, </span><span class="s1">parser=etree.XMLParser(remove_comments=</span><span class="s2">True</span><span class="s1">))</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">tree = etree.parse(aFile)</span>
+	<span class="s1">root = tree.getroot()</span>
+	<span class="s2">if </span><span class="s1">root.tag != </span><span class="s3">&quot;glyph&quot;</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The GLIF is not properly formatted.&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">root.text </span><span class="s2">and </span><span class="s1">root.text.strip() != </span><span class="s3">''</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Invalid GLIF structure.&quot;</span><span class="s1">)</span>
+	<span class="s2">return </span><span class="s1">root</span>
+
+
+<span class="s2">def </span><span class="s1">_glifTreeFromString(aString):</span>
+	<span class="s1">data = tobytes(aString</span><span class="s2">, </span><span class="s1">encoding=</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">etree._have_lxml:</span>
+		<span class="s1">root = etree.fromstring(data</span><span class="s2">, </span><span class="s1">parser=etree.XMLParser(remove_comments=</span><span class="s2">True</span><span class="s1">))</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">root = etree.fromstring(data)</span>
+	<span class="s2">if </span><span class="s1">root.tag != </span><span class="s3">&quot;glyph&quot;</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The GLIF is not properly formatted.&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">root.text </span><span class="s2">and </span><span class="s1">root.text.strip() != </span><span class="s3">''</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Invalid GLIF structure.&quot;</span><span class="s1">)</span>
+	<span class="s2">return </span><span class="s1">root</span>
+
+
+<span class="s2">def </span><span class="s1">_readGlyphFromTree(</span>
+	<span class="s1">tree</span><span class="s2">,</span>
+	<span class="s1">glyphObject=</span><span class="s2">None,</span>
+	<span class="s1">pointPen=</span><span class="s2">None,</span>
+	<span class="s1">formatVersions=GLIFFormatVersion.supported_versions()</span><span class="s2">,</span>
+	<span class="s1">validate=</span><span class="s2">True,</span>
+<span class="s1">):</span>
+	<span class="s4"># check the format version</span>
+	<span class="s1">formatVersionMajor = tree.get(</span><span class="s3">&quot;format&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">formatVersionMajor </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unspecified format version in GLIF.&quot;</span><span class="s1">)</span>
+	<span class="s1">formatVersionMinor = tree.get(</span><span class="s3">&quot;formatMinor&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">formatVersion = GLIFFormatVersion((int(formatVersionMajor)</span><span class="s2">, </span><span class="s1">int(formatVersionMinor)))</span>
+	<span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+		<span class="s1">msg = </span><span class="s3">&quot;Unsupported GLIF format: %s.%s&quot; </span><span class="s1">% (formatVersionMajor</span><span class="s2">, </span><span class="s1">formatVersionMinor)</span>
+		<span class="s2">if </span><span class="s1">validate:</span>
+			<span class="s2">from </span><span class="s1">fontTools.ufoLib.errors </span><span class="s2">import </span><span class="s1">UnsupportedGLIFFormat</span>
+
+			<span class="s2">raise </span><span class="s1">UnsupportedGLIFFormat(msg) </span><span class="s2">from </span><span class="s1">e</span>
+		<span class="s4"># warn but continue using the latest supported format</span>
+		<span class="s1">formatVersion = GLIFFormatVersion.default()</span>
+		<span class="s1">logger.warning(</span>
+			<span class="s3">&quot;%s. Assuming the latest supported version (%s). &quot;</span>
+			<span class="s3">&quot;Some data may be skipped or parsed incorrectly.&quot;</span><span class="s2">,</span>
+			<span class="s1">msg</span><span class="s2">,</span>
+			<span class="s1">formatVersion</span><span class="s2">,</span>
+		<span class="s1">)</span>
+
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">formatVersion </span><span class="s2">not in </span><span class="s1">formatVersions:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">f&quot;Forbidden GLIF format version: </span><span class="s2">{</span><span class="s1">formatVersion</span><span class="s2">!s}</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">readGlyphFromTree = _READ_GLYPH_FROM_TREE_FUNCS[formatVersion]</span>
+	<span class="s2">except </span><span class="s1">KeyError:</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError(formatVersion)</span>
+
+	<span class="s1">readGlyphFromTree(</span>
+		<span class="s1">tree=tree</span><span class="s2">,</span>
+		<span class="s1">glyphObject=glyphObject</span><span class="s2">,</span>
+		<span class="s1">pointPen=pointPen</span><span class="s2">,</span>
+		<span class="s1">validate=validate</span><span class="s2">,</span>
+		<span class="s1">formatMinor=formatVersion.minor</span><span class="s2">,</span>
+	<span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_readGlyphFromTreeFormat1(tree</span><span class="s2">, </span><span class="s1">glyphObject=</span><span class="s2">None, </span><span class="s1">pointPen=</span><span class="s2">None, </span><span class="s1">validate=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+	<span class="s4"># get the name</span>
+	<span class="s1">_readName(glyphObject</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># populate the sub elements</span>
+	<span class="s1">unicodes = []</span>
+	<span class="s1">haveSeenAdvance = haveSeenOutline = haveSeenLib = haveSeenNote = </span><span class="s2">False</span>
+	<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">tree:</span>
+		<span class="s2">if </span><span class="s1">element.tag == </span><span class="s3">&quot;outline&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate:</span>
+				<span class="s2">if </span><span class="s1">haveSeenOutline:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The outline element occurs more than once.&quot;</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">element.attrib:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The outline element contains unknown attributes.&quot;</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">element.text </span><span class="s2">and </span><span class="s1">element.text.strip() != </span><span class="s3">''</span><span class="s1">:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Invalid outline structure.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenOutline = </span><span class="s2">True</span>
+			<span class="s1">buildOutlineFormat1(glyphObject</span><span class="s2">, </span><span class="s1">pointPen</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">elif </span><span class="s1">glyphObject </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">continue</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;advance&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveSeenAdvance:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The advance element occurs more than once.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenAdvance = </span><span class="s2">True</span>
+			<span class="s1">_readAdvance(glyphObject</span><span class="s2">, </span><span class="s1">element)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;unicode&quot;</span><span class="s1">:</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">v = element.get(</span><span class="s3">&quot;hex&quot;</span><span class="s1">)</span>
+				<span class="s1">v = int(v</span><span class="s2">, </span><span class="s5">16</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">v </span><span class="s2">not in </span><span class="s1">unicodes:</span>
+					<span class="s1">unicodes.append(v)</span>
+			<span class="s2">except </span><span class="s1">ValueError:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Illegal value for hex attribute of unicode element.&quot;</span><span class="s1">)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;note&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveSeenNote:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The note element occurs more than once.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenNote = </span><span class="s2">True</span>
+			<span class="s1">_readNote(glyphObject</span><span class="s2">, </span><span class="s1">element)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;lib&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveSeenLib:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The lib element occurs more than once.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenLib = </span><span class="s2">True</span>
+			<span class="s1">_readLib(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown element in GLIF: %s&quot; </span><span class="s1">% element)</span>
+	<span class="s4"># set the collected unicodes</span>
+	<span class="s2">if </span><span class="s1">unicodes:</span>
+		<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;unicodes&quot;</span><span class="s2">, </span><span class="s1">unicodes)</span>
+
+<span class="s2">def </span><span class="s1">_readGlyphFromTreeFormat2(</span>
+	<span class="s1">tree</span><span class="s2">, </span><span class="s1">glyphObject=</span><span class="s2">None, </span><span class="s1">pointPen=</span><span class="s2">None, </span><span class="s1">validate=</span><span class="s2">None, </span><span class="s1">formatMinor=</span><span class="s5">0</span>
+<span class="s1">):</span>
+	<span class="s4"># get the name</span>
+	<span class="s1">_readName(glyphObject</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s4"># populate the sub elements</span>
+	<span class="s1">unicodes = []</span>
+	<span class="s1">guidelines = []</span>
+	<span class="s1">anchors = []</span>
+	<span class="s1">haveSeenAdvance = haveSeenImage = haveSeenOutline = haveSeenLib = haveSeenNote = </span><span class="s2">False</span>
+	<span class="s1">identifiers = set()</span>
+	<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">tree:</span>
+		<span class="s2">if </span><span class="s1">element.tag == </span><span class="s3">&quot;outline&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate:</span>
+				<span class="s2">if </span><span class="s1">haveSeenOutline:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The outline element occurs more than once.&quot;</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">element.attrib:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The outline element contains unknown attributes.&quot;</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">element.text </span><span class="s2">and </span><span class="s1">element.text.strip() != </span><span class="s3">''</span><span class="s1">:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Invalid outline structure.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenOutline = </span><span class="s2">True</span>
+			<span class="s2">if </span><span class="s1">pointPen </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">buildOutlineFormat2(glyphObject</span><span class="s2">, </span><span class="s1">pointPen</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">elif </span><span class="s1">glyphObject </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">continue</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;advance&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveSeenAdvance:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The advance element occurs more than once.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenAdvance = </span><span class="s2">True</span>
+			<span class="s1">_readAdvance(glyphObject</span><span class="s2">, </span><span class="s1">element)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;unicode&quot;</span><span class="s1">:</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">v = element.get(</span><span class="s3">&quot;hex&quot;</span><span class="s1">)</span>
+				<span class="s1">v = int(v</span><span class="s2">, </span><span class="s5">16</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">v </span><span class="s2">not in </span><span class="s1">unicodes:</span>
+					<span class="s1">unicodes.append(v)</span>
+			<span class="s2">except </span><span class="s1">ValueError:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Illegal value for hex attribute of unicode element.&quot;</span><span class="s1">)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;guideline&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">len(element):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown children in guideline element.&quot;</span><span class="s1">)</span>
+			<span class="s1">attrib = dict(element.attrib)</span>
+			<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">(</span><span class="s3">&quot;x&quot;</span><span class="s2">, </span><span class="s3">&quot;y&quot;</span><span class="s2">, </span><span class="s3">&quot;angle&quot;</span><span class="s1">):</span>
+				<span class="s2">if </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">attrib:</span>
+					<span class="s1">attrib[attr] = _number(attrib[attr])</span>
+			<span class="s1">guidelines.append(attrib)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;anchor&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">len(element):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown children in anchor element.&quot;</span><span class="s1">)</span>
+			<span class="s1">attrib = dict(element.attrib)</span>
+			<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">(</span><span class="s3">&quot;x&quot;</span><span class="s2">, </span><span class="s3">&quot;y&quot;</span><span class="s1">):</span>
+				<span class="s2">if </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">element.attrib:</span>
+					<span class="s1">attrib[attr] = _number(attrib[attr])</span>
+			<span class="s1">anchors.append(attrib)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;image&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate:</span>
+				<span class="s2">if </span><span class="s1">haveSeenImage:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The image element occurs more than once.&quot;</span><span class="s1">)</span>
+				<span class="s2">if </span><span class="s1">len(element):</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown children in image element.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenImage = </span><span class="s2">True</span>
+			<span class="s1">_readImage(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;note&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveSeenNote:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The note element occurs more than once.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenNote = </span><span class="s2">True</span>
+			<span class="s1">_readNote(glyphObject</span><span class="s2">, </span><span class="s1">element)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;lib&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveSeenLib:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The lib element occurs more than once.&quot;</span><span class="s1">)</span>
+			<span class="s1">haveSeenLib = </span><span class="s2">True</span>
+			<span class="s1">_readLib(glyphObject</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown element in GLIF: %s&quot; </span><span class="s1">% element)</span>
+	<span class="s4"># set the collected unicodes</span>
+	<span class="s2">if </span><span class="s1">unicodes:</span>
+		<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;unicodes&quot;</span><span class="s2">, </span><span class="s1">unicodes)</span>
+	<span class="s4"># set the collected guidelines</span>
+	<span class="s2">if </span><span class="s1">guidelines:</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">guidelinesValidator(guidelines</span><span class="s2">, </span><span class="s1">identifiers):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The guidelines are improperly formatted.&quot;</span><span class="s1">)</span>
+		<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;guidelines&quot;</span><span class="s2">, </span><span class="s1">guidelines)</span>
+	<span class="s4"># set the collected anchors</span>
+	<span class="s2">if </span><span class="s1">anchors:</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">anchorsValidator(anchors</span><span class="s2">, </span><span class="s1">identifiers):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The anchors are improperly formatted.&quot;</span><span class="s1">)</span>
+		<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;anchors&quot;</span><span class="s2">, </span><span class="s1">anchors)</span>
+
+
+<span class="s1">_READ_GLYPH_FROM_TREE_FUNCS = {</span>
+	<span class="s1">GLIFFormatVersion.FORMAT_1_0: _readGlyphFromTreeFormat1</span><span class="s2">,</span>
+	<span class="s1">GLIFFormatVersion.FORMAT_2_0: _readGlyphFromTreeFormat2</span><span class="s2">,</span>
+<span class="s1">}</span>
+
+
+<span class="s2">def </span><span class="s1">_readName(glyphObject</span><span class="s2">, </span><span class="s1">root</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">glyphName = root.get(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">glyphName:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Empty glyph name in GLIF.&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">glyphName </span><span class="s2">and </span><span class="s1">glyphObject </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;name&quot;</span><span class="s2">, </span><span class="s1">glyphName)</span>
+
+<span class="s2">def </span><span class="s1">_readAdvance(glyphObject</span><span class="s2">, </span><span class="s1">advance):</span>
+	<span class="s1">width = _number(advance.get(</span><span class="s3">&quot;width&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+	<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;width&quot;</span><span class="s2">, </span><span class="s1">width)</span>
+	<span class="s1">height = _number(advance.get(</span><span class="s3">&quot;height&quot;</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+	<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;height&quot;</span><span class="s2">, </span><span class="s1">height)</span>
+
+<span class="s2">def </span><span class="s1">_readNote(glyphObject</span><span class="s2">, </span><span class="s1">note):</span>
+	<span class="s1">lines = note.text.split(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+	<span class="s1">note = </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(line.strip() </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">lines </span><span class="s2">if </span><span class="s1">line.strip())</span>
+	<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;note&quot;</span><span class="s2">, </span><span class="s1">note)</span>
+
+<span class="s2">def </span><span class="s1">_readLib(glyphObject</span><span class="s2">, </span><span class="s1">lib</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">assert </span><span class="s1">len(lib) == </span><span class="s5">1</span>
+	<span class="s1">child = lib[</span><span class="s5">0</span><span class="s1">]</span>
+	<span class="s1">plist = plistlib.fromtree(child)</span>
+	<span class="s2">if </span><span class="s1">validate:</span>
+		<span class="s1">valid</span><span class="s2">, </span><span class="s1">message = glyphLibValidator(plist)</span>
+		<span class="s2">if not </span><span class="s1">valid:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(message)</span>
+	<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;lib&quot;</span><span class="s2">, </span><span class="s1">plist)</span>
+
+<span class="s2">def </span><span class="s1">_readImage(glyphObject</span><span class="s2">, </span><span class="s1">image</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">imageData = dict(image.attrib)</span>
+	<span class="s2">for </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">default </span><span class="s2">in </span><span class="s1">_transformationInfo:</span>
+		<span class="s1">value = imageData.get(attr</span><span class="s2">, </span><span class="s1">default)</span>
+		<span class="s1">imageData[attr] = _number(value)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">imageValidator(imageData):</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The image element is not properly formatted.&quot;</span><span class="s1">)</span>
+	<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;image&quot;</span><span class="s2">, </span><span class="s1">imageData)</span>
+
+<span class="s4"># ----------------</span>
+<span class="s4"># GLIF to PointPen</span>
+<span class="s4"># ----------------</span>
+
+<span class="s1">contourAttributesFormat2 = {</span><span class="s3">&quot;identifier&quot;</span><span class="s1">}</span>
+<span class="s1">componentAttributesFormat1 = {</span><span class="s3">&quot;base&quot;</span><span class="s2">, </span><span class="s3">&quot;xScale&quot;</span><span class="s2">, </span><span class="s3">&quot;xyScale&quot;</span><span class="s2">, </span><span class="s3">&quot;yxScale&quot;</span><span class="s2">, </span><span class="s3">&quot;yScale&quot;</span><span class="s2">, </span><span class="s3">&quot;xOffset&quot;</span><span class="s2">, </span><span class="s3">&quot;yOffset&quot;</span><span class="s1">}</span>
+<span class="s1">componentAttributesFormat2 = componentAttributesFormat1 | {</span><span class="s3">&quot;identifier&quot;</span><span class="s1">}</span>
+<span class="s1">pointAttributesFormat1 = {</span><span class="s3">&quot;x&quot;</span><span class="s2">, </span><span class="s3">&quot;y&quot;</span><span class="s2">, </span><span class="s3">&quot;type&quot;</span><span class="s2">, </span><span class="s3">&quot;smooth&quot;</span><span class="s2">, </span><span class="s3">&quot;name&quot;</span><span class="s1">}</span>
+<span class="s1">pointAttributesFormat2 = pointAttributesFormat1 | {</span><span class="s3">&quot;identifier&quot;</span><span class="s1">}</span>
+<span class="s1">pointSmoothOptions = {</span><span class="s3">&quot;no&quot;</span><span class="s2">, </span><span class="s3">&quot;yes&quot;</span><span class="s1">}</span>
+<span class="s1">pointTypeOptions = {</span><span class="s3">&quot;move&quot;</span><span class="s2">, </span><span class="s3">&quot;line&quot;</span><span class="s2">, </span><span class="s3">&quot;offcurve&quot;</span><span class="s2">, </span><span class="s3">&quot;curve&quot;</span><span class="s2">, </span><span class="s3">&quot;qcurve&quot;</span><span class="s1">}</span>
+
+<span class="s4"># format 1</span>
+
+<span class="s2">def </span><span class="s1">buildOutlineFormat1(glyphObject</span><span class="s2">, </span><span class="s1">pen</span><span class="s2">, </span><span class="s1">outline</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s1">anchors = []</span>
+	<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">outline:</span>
+		<span class="s2">if </span><span class="s1">element.tag == </span><span class="s3">&quot;contour&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">len(element) == </span><span class="s5">1</span><span class="s1">:</span>
+				<span class="s1">point = element[</span><span class="s5">0</span><span class="s1">]</span>
+				<span class="s2">if </span><span class="s1">point.tag == </span><span class="s3">&quot;point&quot;</span><span class="s1">:</span>
+					<span class="s1">anchor = _buildAnchorFormat1(point</span><span class="s2">, </span><span class="s1">validate)</span>
+					<span class="s2">if </span><span class="s1">anchor </span><span class="s2">is not None</span><span class="s1">:</span>
+						<span class="s1">anchors.append(anchor)</span>
+						<span class="s2">continue</span>
+			<span class="s2">if </span><span class="s1">pen </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">_buildOutlineContourFormat1(pen</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;component&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">pen </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">_buildOutlineComponentFormat1(pen</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown element in outline element: %s&quot; </span><span class="s1">% element)</span>
+	<span class="s2">if </span><span class="s1">glyphObject </span><span class="s2">is not None and </span><span class="s1">anchors:</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">anchorsValidator(anchors):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;GLIF 1 anchors are not properly formatted.&quot;</span><span class="s1">)</span>
+		<span class="s1">_relaxedSetattr(glyphObject</span><span class="s2">, </span><span class="s3">&quot;anchors&quot;</span><span class="s2">, </span><span class="s1">anchors)</span>
+
+<span class="s2">def </span><span class="s1">_buildAnchorFormat1(point</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">if </span><span class="s1">point.get(</span><span class="s3">&quot;type&quot;</span><span class="s1">) != </span><span class="s3">&quot;move&quot;</span><span class="s1">:</span>
+		<span class="s2">return None</span>
+	<span class="s1">name = point.get(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">return None</span>
+	<span class="s1">x = point.get(</span><span class="s3">&quot;x&quot;</span><span class="s1">)</span>
+	<span class="s1">y = point.get(</span><span class="s3">&quot;y&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">x </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Required x attribute is missing in point element.&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">y </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Required y attribute is missing in point element.&quot;</span><span class="s1">)</span>
+	<span class="s1">x = _number(x)</span>
+	<span class="s1">y = _number(y)</span>
+	<span class="s1">anchor = dict(x=x</span><span class="s2">, </span><span class="s1">y=y</span><span class="s2">, </span><span class="s1">name=name)</span>
+	<span class="s2">return </span><span class="s1">anchor</span>
+
+<span class="s2">def </span><span class="s1">_buildOutlineContourFormat1(pen</span><span class="s2">, </span><span class="s1">contour</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">contour.attrib:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown attributes in contour element.&quot;</span><span class="s1">)</span>
+	<span class="s1">pen.beginPath()</span>
+	<span class="s2">if </span><span class="s1">len(contour):</span>
+		<span class="s1">massaged = _validateAndMassagePointStructures(contour</span><span class="s2">, </span><span class="s1">pointAttributesFormat1</span><span class="s2">, </span><span class="s1">openContourOffCurveLeniency=</span><span class="s2">True, </span><span class="s1">validate=validate)</span>
+		<span class="s1">_buildOutlinePointsFormat1(pen</span><span class="s2">, </span><span class="s1">massaged)</span>
+	<span class="s1">pen.endPath()</span>
+
+<span class="s2">def </span><span class="s1">_buildOutlinePointsFormat1(pen</span><span class="s2">, </span><span class="s1">contour):</span>
+	<span class="s2">for </span><span class="s1">point </span><span class="s2">in </span><span class="s1">contour:</span>
+		<span class="s1">x = point[</span><span class="s3">&quot;x&quot;</span><span class="s1">]</span>
+		<span class="s1">y = point[</span><span class="s3">&quot;y&quot;</span><span class="s1">]</span>
+		<span class="s1">segmentType = point[</span><span class="s3">&quot;segmentType&quot;</span><span class="s1">]</span>
+		<span class="s1">smooth = point[</span><span class="s3">&quot;smooth&quot;</span><span class="s1">]</span>
+		<span class="s1">name = point[</span><span class="s3">&quot;name&quot;</span><span class="s1">]</span>
+		<span class="s1">pen.addPoint((x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">, </span><span class="s1">segmentType=segmentType</span><span class="s2">, </span><span class="s1">smooth=smooth</span><span class="s2">, </span><span class="s1">name=name)</span>
+
+<span class="s2">def </span><span class="s1">_buildOutlineComponentFormat1(pen</span><span class="s2">, </span><span class="s1">component</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">if </span><span class="s1">validate:</span>
+		<span class="s2">if </span><span class="s1">len(component):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown child elements of component element.&quot;</span><span class="s1">)</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">component.attrib.keys():</span>
+			<span class="s2">if </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">componentAttributesFormat1:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown attribute in component element: %s&quot; </span><span class="s1">% attr)</span>
+	<span class="s1">baseGlyphName = component.get(</span><span class="s3">&quot;base&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">baseGlyphName </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The base attribute is not defined in the component.&quot;</span><span class="s1">)</span>
+	<span class="s1">transformation = []</span>
+	<span class="s2">for </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">default </span><span class="s2">in </span><span class="s1">_transformationInfo:</span>
+		<span class="s1">value = component.get(attr)</span>
+		<span class="s2">if </span><span class="s1">value </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">value = default</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">value = _number(value)</span>
+		<span class="s1">transformation.append(value)</span>
+	<span class="s1">pen.addComponent(baseGlyphName</span><span class="s2">, </span><span class="s1">tuple(transformation))</span>
+
+<span class="s4"># format 2</span>
+
+<span class="s2">def </span><span class="s1">buildOutlineFormat2(glyphObject</span><span class="s2">, </span><span class="s1">pen</span><span class="s2">, </span><span class="s1">outline</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">outline:</span>
+		<span class="s2">if </span><span class="s1">element.tag == </span><span class="s3">&quot;contour&quot;</span><span class="s1">:</span>
+			<span class="s1">_buildOutlineContourFormat2(pen</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">elif </span><span class="s1">element.tag == </span><span class="s3">&quot;component&quot;</span><span class="s1">:</span>
+			<span class="s1">_buildOutlineComponentFormat2(pen</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown element in outline element: %s&quot; </span><span class="s1">% element.tag)</span>
+
+<span class="s2">def </span><span class="s1">_buildOutlineContourFormat2(pen</span><span class="s2">, </span><span class="s1">contour</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">if </span><span class="s1">validate:</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">contour.attrib.keys():</span>
+			<span class="s2">if </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">contourAttributesFormat2:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown attribute in contour element: %s&quot; </span><span class="s1">% attr)</span>
+	<span class="s1">identifier = contour.get(</span><span class="s3">&quot;identifier&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s2">if </span><span class="s1">validate:</span>
+			<span class="s2">if </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">identifiers:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The identifier %s is used more than once.&quot; </span><span class="s1">% identifier)</span>
+			<span class="s2">if not </span><span class="s1">identifierValidator(identifier):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The contour identifier %s is not valid.&quot; </span><span class="s1">% identifier)</span>
+		<span class="s1">identifiers.add(identifier)</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">pen.beginPath(identifier=identifier)</span>
+	<span class="s2">except </span><span class="s1">TypeError:</span>
+		<span class="s1">pen.beginPath()</span>
+		<span class="s1">warn(</span><span class="s3">&quot;The beginPath method needs an identifier kwarg. The contour's identifier value has been discarded.&quot;</span><span class="s2">, </span><span class="s1">DeprecationWarning)</span>
+	<span class="s2">if </span><span class="s1">len(contour):</span>
+		<span class="s1">massaged = _validateAndMassagePointStructures(contour</span><span class="s2">, </span><span class="s1">pointAttributesFormat2</span><span class="s2">, </span><span class="s1">validate=validate)</span>
+		<span class="s1">_buildOutlinePointsFormat2(pen</span><span class="s2">, </span><span class="s1">massaged</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate)</span>
+	<span class="s1">pen.endPath()</span>
+
+<span class="s2">def </span><span class="s1">_buildOutlinePointsFormat2(pen</span><span class="s2">, </span><span class="s1">contour</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">for </span><span class="s1">point </span><span class="s2">in </span><span class="s1">contour:</span>
+		<span class="s1">x = point[</span><span class="s3">&quot;x&quot;</span><span class="s1">]</span>
+		<span class="s1">y = point[</span><span class="s3">&quot;y&quot;</span><span class="s1">]</span>
+		<span class="s1">segmentType = point[</span><span class="s3">&quot;segmentType&quot;</span><span class="s1">]</span>
+		<span class="s1">smooth = point[</span><span class="s3">&quot;smooth&quot;</span><span class="s1">]</span>
+		<span class="s1">name = point[</span><span class="s3">&quot;name&quot;</span><span class="s1">]</span>
+		<span class="s1">identifier = point.get(</span><span class="s3">&quot;identifier&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">validate:</span>
+				<span class="s2">if </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">identifiers:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The identifier %s is used more than once.&quot; </span><span class="s1">% identifier)</span>
+				<span class="s2">if not </span><span class="s1">identifierValidator(identifier):</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The identifier %s is not valid.&quot; </span><span class="s1">% identifier)</span>
+			<span class="s1">identifiers.add(identifier)</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">pen.addPoint((x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">, </span><span class="s1">segmentType=segmentType</span><span class="s2">, </span><span class="s1">smooth=smooth</span><span class="s2">, </span><span class="s1">name=name</span><span class="s2">, </span><span class="s1">identifier=identifier)</span>
+		<span class="s2">except </span><span class="s1">TypeError:</span>
+			<span class="s1">pen.addPoint((x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">, </span><span class="s1">segmentType=segmentType</span><span class="s2">, </span><span class="s1">smooth=smooth</span><span class="s2">, </span><span class="s1">name=name)</span>
+			<span class="s1">warn(</span><span class="s3">&quot;The addPoint method needs an identifier kwarg. The point's identifier value has been discarded.&quot;</span><span class="s2">, </span><span class="s1">DeprecationWarning)</span>
+
+<span class="s2">def </span><span class="s1">_buildOutlineComponentFormat2(pen</span><span class="s2">, </span><span class="s1">component</span><span class="s2">, </span><span class="s1">identifiers</span><span class="s2">, </span><span class="s1">validate):</span>
+	<span class="s2">if </span><span class="s1">validate:</span>
+		<span class="s2">if </span><span class="s1">len(component):</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown child elements of component element.&quot;</span><span class="s1">)</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">component.attrib.keys():</span>
+			<span class="s2">if </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">componentAttributesFormat2:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown attribute in component element: %s&quot; </span><span class="s1">% attr)</span>
+	<span class="s1">baseGlyphName = component.get(</span><span class="s3">&quot;base&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">baseGlyphName </span><span class="s2">is None</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The base attribute is not defined in the component.&quot;</span><span class="s1">)</span>
+	<span class="s1">transformation = []</span>
+	<span class="s2">for </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">default </span><span class="s2">in </span><span class="s1">_transformationInfo:</span>
+		<span class="s1">value = component.get(attr)</span>
+		<span class="s2">if </span><span class="s1">value </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">value = default</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">value = _number(value)</span>
+		<span class="s1">transformation.append(value)</span>
+	<span class="s1">identifier = component.get(</span><span class="s3">&quot;identifier&quot;</span><span class="s1">)</span>
+	<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s2">if </span><span class="s1">validate:</span>
+			<span class="s2">if </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">identifiers:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The identifier %s is used more than once.&quot; </span><span class="s1">% identifier)</span>
+			<span class="s2">if </span><span class="s1">validate </span><span class="s2">and not </span><span class="s1">identifierValidator(identifier):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;The identifier %s is not valid.&quot; </span><span class="s1">% identifier)</span>
+		<span class="s1">identifiers.add(identifier)</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">pen.addComponent(baseGlyphName</span><span class="s2">, </span><span class="s1">tuple(transformation)</span><span class="s2">, </span><span class="s1">identifier=identifier)</span>
+	<span class="s2">except </span><span class="s1">TypeError:</span>
+		<span class="s1">pen.addComponent(baseGlyphName</span><span class="s2">, </span><span class="s1">tuple(transformation))</span>
+		<span class="s1">warn(</span><span class="s3">&quot;The addComponent method needs an identifier kwarg. The component's identifier value has been discarded.&quot;</span><span class="s2">, </span><span class="s1">DeprecationWarning)</span>
+
+<span class="s4"># all formats</span>
+
+<span class="s2">def </span><span class="s1">_validateAndMassagePointStructures(contour</span><span class="s2">, </span><span class="s1">pointAttributes</span><span class="s2">, </span><span class="s1">openContourOffCurveLeniency=</span><span class="s2">False, </span><span class="s1">validate=</span><span class="s2">True</span><span class="s1">):</span>
+	<span class="s2">if not </span><span class="s1">len(contour):</span>
+		<span class="s2">return</span>
+	<span class="s4"># store some data for later validation</span>
+	<span class="s1">lastOnCurvePoint = </span><span class="s2">None</span>
+	<span class="s1">haveOffCurvePoint = </span><span class="s2">False</span>
+	<span class="s4"># validate and massage the individual point elements</span>
+	<span class="s1">massaged = []</span>
+	<span class="s2">for </span><span class="s1">index</span><span class="s2">, </span><span class="s1">element </span><span class="s2">in </span><span class="s1">enumerate(contour):</span>
+		<span class="s4"># not &lt;point&gt;</span>
+		<span class="s2">if </span><span class="s1">element.tag != </span><span class="s3">&quot;point&quot;</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown child element (%s) of contour element.&quot; </span><span class="s1">% element.tag)</span>
+		<span class="s1">point = dict(element.attrib)</span>
+		<span class="s1">massaged.append(point)</span>
+		<span class="s2">if </span><span class="s1">validate:</span>
+			<span class="s4"># unknown attributes</span>
+			<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">point.keys():</span>
+				<span class="s2">if </span><span class="s1">attr </span><span class="s2">not in </span><span class="s1">pointAttributes:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown attribute in point element: %s&quot; </span><span class="s1">% attr)</span>
+			<span class="s4"># search for unknown children</span>
+			<span class="s2">if </span><span class="s1">len(element):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown child elements in point element.&quot;</span><span class="s1">)</span>
+		<span class="s4"># x and y are required</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">(</span><span class="s3">&quot;x&quot;</span><span class="s2">, </span><span class="s3">&quot;y&quot;</span><span class="s1">):</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">point[attr] = _number(point[attr])</span>
+			<span class="s2">except </span><span class="s1">KeyError </span><span class="s2">as </span><span class="s1">e:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">f&quot;Required </span><span class="s2">{</span><span class="s1">attr</span><span class="s2">} </span><span class="s3">attribute is missing in point element.&quot;</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+		<span class="s4"># segment type</span>
+		<span class="s1">pointType = point.pop(</span><span class="s3">&quot;type&quot;</span><span class="s2">, </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">pointType </span><span class="s2">not in </span><span class="s1">pointTypeOptions:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown point type: %s&quot; </span><span class="s1">% pointType)</span>
+		<span class="s2">if </span><span class="s1">pointType == </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">:</span>
+			<span class="s1">pointType = </span><span class="s2">None</span>
+		<span class="s1">point[</span><span class="s3">&quot;segmentType&quot;</span><span class="s1">] = pointType</span>
+		<span class="s2">if </span><span class="s1">pointType </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">haveOffCurvePoint = </span><span class="s2">True</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">lastOnCurvePoint = index</span>
+		<span class="s4"># move can only occur as the first point</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">pointType == </span><span class="s3">&quot;move&quot; </span><span class="s2">and </span><span class="s1">index != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;A move point occurs after the first point in the contour.&quot;</span><span class="s1">)</span>
+		<span class="s4"># smooth is optional</span>
+		<span class="s1">smooth = point.get(</span><span class="s3">&quot;smooth&quot;</span><span class="s2">, </span><span class="s3">&quot;no&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">smooth </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">smooth </span><span class="s2">not in </span><span class="s1">pointSmoothOptions:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Unknown point smooth value: %s&quot; </span><span class="s1">% smooth)</span>
+		<span class="s1">smooth = smooth == </span><span class="s3">&quot;yes&quot;</span>
+		<span class="s1">point[</span><span class="s3">&quot;smooth&quot;</span><span class="s1">] = smooth</span>
+		<span class="s4"># smooth can only be applied to curve and qcurve</span>
+		<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">smooth </span><span class="s2">and </span><span class="s1">pointType </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;smooth attribute set in an offcurve point.&quot;</span><span class="s1">)</span>
+		<span class="s4"># name is optional</span>
+		<span class="s2">if </span><span class="s3">&quot;name&quot; </span><span class="s2">not in </span><span class="s1">element.attrib:</span>
+			<span class="s1">point[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = </span><span class="s2">None</span>
+	<span class="s2">if </span><span class="s1">openContourOffCurveLeniency:</span>
+		<span class="s4"># remove offcurves that precede a move. this is technically illegal,</span>
+		<span class="s4"># but we let it slide because there are fonts out there in the wild like this.</span>
+		<span class="s2">if </span><span class="s1">massaged[</span><span class="s5">0</span><span class="s1">][</span><span class="s3">&quot;segmentType&quot;</span><span class="s1">] == </span><span class="s3">&quot;move&quot;</span><span class="s1">:</span>
+			<span class="s1">count = </span><span class="s5">0</span>
+			<span class="s2">for </span><span class="s1">point </span><span class="s2">in </span><span class="s1">reversed(massaged):</span>
+				<span class="s2">if </span><span class="s1">point[</span><span class="s3">&quot;segmentType&quot;</span><span class="s1">] </span><span class="s2">is None</span><span class="s1">:</span>
+					<span class="s1">count += </span><span class="s5">1</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s2">break</span>
+			<span class="s2">if </span><span class="s1">count:</span>
+				<span class="s1">massaged = massaged[:-count]</span>
+	<span class="s4"># validate the off-curves in the segments</span>
+	<span class="s2">if </span><span class="s1">validate </span><span class="s2">and </span><span class="s1">haveOffCurvePoint </span><span class="s2">and </span><span class="s1">lastOnCurvePoint </span><span class="s2">is not None</span><span class="s1">:</span>
+		<span class="s4"># we only care about how many offCurves there are before an onCurve</span>
+		<span class="s4"># filter out the trailing offCurves</span>
+		<span class="s1">offCurvesCount = len(massaged) - </span><span class="s5">1 </span><span class="s1">- lastOnCurvePoint</span>
+		<span class="s2">for </span><span class="s1">point </span><span class="s2">in </span><span class="s1">massaged:</span>
+			<span class="s1">segmentType = point[</span><span class="s3">&quot;segmentType&quot;</span><span class="s1">]</span>
+			<span class="s2">if </span><span class="s1">segmentType </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s1">offCurvesCount += </span><span class="s5">1</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">offCurvesCount:</span>
+					<span class="s4"># move and line can't be preceded by off-curves</span>
+					<span class="s2">if </span><span class="s1">segmentType == </span><span class="s3">&quot;move&quot;</span><span class="s1">:</span>
+						<span class="s4"># this will have been filtered out already</span>
+						<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;move can not have an offcurve.&quot;</span><span class="s1">)</span>
+					<span class="s2">elif </span><span class="s1">segmentType == </span><span class="s3">&quot;line&quot;</span><span class="s1">:</span>
+						<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;line can not have an offcurve.&quot;</span><span class="s1">)</span>
+					<span class="s2">elif </span><span class="s1">segmentType == </span><span class="s3">&quot;curve&quot;</span><span class="s1">:</span>
+						<span class="s2">if </span><span class="s1">offCurvesCount &gt; </span><span class="s5">2</span><span class="s1">:</span>
+							<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Too many offcurves defined for curve.&quot;</span><span class="s1">)</span>
+					<span class="s2">elif </span><span class="s1">segmentType == </span><span class="s3">&quot;qcurve&quot;</span><span class="s1">:</span>
+						<span class="s2">pass</span>
+					<span class="s2">else</span><span class="s1">:</span>
+						<span class="s4"># unknown segment type. it'll be caught later.</span>
+						<span class="s2">pass</span>
+				<span class="s1">offCurvesCount = </span><span class="s5">0</span>
+	<span class="s2">return </span><span class="s1">massaged</span>
+
+<span class="s4"># ---------------------</span>
+<span class="s4"># Misc Helper Functions</span>
+<span class="s4"># ---------------------</span>
+
+<span class="s2">def </span><span class="s1">_relaxedSetattr(object</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value):</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">setattr(object</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value)</span>
+	<span class="s2">except </span><span class="s1">AttributeError:</span>
+		<span class="s2">pass</span>
+
+<span class="s2">def </span><span class="s1">_number(s):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    Given a numeric string, return an integer or a float, whichever 
+    the string indicates. _number(&quot;1&quot;) will return the integer 1, 
+    _number(&quot;1.0&quot;) will return the float 1.0. 
+ 
+    &gt;&gt;&gt; _number(&quot;1&quot;) 
+    1 
+    &gt;&gt;&gt; _number(&quot;1.0&quot;) 
+    1.0 
+    &gt;&gt;&gt; _number(&quot;a&quot;)  # doctest: +IGNORE_EXCEPTION_DETAIL 
+    Traceback (most recent call last): 
+        ... 
+    GlifLibError: Could not convert a to an int or float. 
+    &quot;&quot;&quot;</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">n = int(s)</span>
+		<span class="s2">return </span><span class="s1">n</span>
+	<span class="s2">except </span><span class="s1">ValueError:</span>
+		<span class="s2">pass</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">n = float(s)</span>
+		<span class="s2">return </span><span class="s1">n</span>
+	<span class="s2">except </span><span class="s1">ValueError:</span>
+		<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;Could not convert %s to an int or float.&quot; </span><span class="s1">% s)</span>
+
+<span class="s4"># --------------------</span>
+<span class="s4"># Rapid Value Fetching</span>
+<span class="s4"># --------------------</span>
+
+<span class="s4"># base</span>
+
+<span class="s2">class </span><span class="s1">_DoneParsing(Exception): </span><span class="s2">pass</span>
+
+<span class="s2">class </span><span class="s1">_BaseParser:</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self._elementStack = []</span>
+
+	<span class="s2">def </span><span class="s1">parse(self</span><span class="s2">, </span><span class="s1">text):</span>
+		<span class="s2">from </span><span class="s1">xml.parsers.expat </span><span class="s2">import </span><span class="s1">ParserCreate</span>
+		<span class="s1">parser = ParserCreate()</span>
+		<span class="s1">parser.StartElementHandler = self.startElementHandler</span>
+		<span class="s1">parser.EndElementHandler = self.endElementHandler</span>
+		<span class="s1">parser.Parse(text)</span>
+
+	<span class="s2">def </span><span class="s1">startElementHandler(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs):</span>
+		<span class="s1">self._elementStack.append(name)</span>
+
+	<span class="s2">def </span><span class="s1">endElementHandler(self</span><span class="s2">, </span><span class="s1">name):</span>
+		<span class="s1">other = self._elementStack.pop(-</span><span class="s5">1</span><span class="s1">)</span>
+		<span class="s2">assert </span><span class="s1">other == name</span>
+
+
+<span class="s4"># unicodes</span>
+
+<span class="s2">def </span><span class="s1">_fetchUnicodes(glif):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    Get a list of unicodes listed in glif. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">parser = _FetchUnicodesParser()</span>
+	<span class="s1">parser.parse(glif)</span>
+	<span class="s2">return </span><span class="s1">parser.unicodes</span>
+
+<span class="s2">class </span><span class="s1">_FetchUnicodesParser(_BaseParser):</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.unicodes = []</span>
+		<span class="s1">super().__init__()</span>
+
+	<span class="s2">def </span><span class="s1">startElementHandler(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs):</span>
+		<span class="s2">if </span><span class="s1">name == </span><span class="s3">&quot;unicode&quot; </span><span class="s2">and </span><span class="s1">self._elementStack </span><span class="s2">and </span><span class="s1">self._elementStack[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;glyph&quot;</span><span class="s1">:</span>
+			<span class="s1">value = attrs.get(</span><span class="s3">&quot;hex&quot;</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">value </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s2">try</span><span class="s1">:</span>
+					<span class="s1">value = int(value</span><span class="s2">, </span><span class="s5">16</span><span class="s1">)</span>
+					<span class="s2">if </span><span class="s1">value </span><span class="s2">not in </span><span class="s1">self.unicodes:</span>
+						<span class="s1">self.unicodes.append(value)</span>
+				<span class="s2">except </span><span class="s1">ValueError:</span>
+					<span class="s2">pass</span>
+		<span class="s1">super().startElementHandler(name</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+<span class="s4"># image</span>
+
+<span class="s2">def </span><span class="s1">_fetchImageFileName(glif):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    The image file name (if any) from glif. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">parser = _FetchImageFileNameParser()</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">parser.parse(glif)</span>
+	<span class="s2">except </span><span class="s1">_DoneParsing:</span>
+		<span class="s2">pass</span>
+	<span class="s2">return </span><span class="s1">parser.fileName</span>
+
+<span class="s2">class </span><span class="s1">_FetchImageFileNameParser(_BaseParser):</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.fileName = </span><span class="s2">None</span>
+		<span class="s1">super().__init__()</span>
+
+	<span class="s2">def </span><span class="s1">startElementHandler(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs):</span>
+		<span class="s2">if </span><span class="s1">name == </span><span class="s3">&quot;image&quot; </span><span class="s2">and </span><span class="s1">self._elementStack </span><span class="s2">and </span><span class="s1">self._elementStack[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;glyph&quot;</span><span class="s1">:</span>
+			<span class="s1">self.fileName = attrs.get(</span><span class="s3">&quot;fileName&quot;</span><span class="s1">)</span>
+			<span class="s2">raise </span><span class="s1">_DoneParsing</span>
+		<span class="s1">super().startElementHandler(name</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+<span class="s4"># component references</span>
+
+<span class="s2">def </span><span class="s1">_fetchComponentBases(glif):</span>
+	<span class="s0">&quot;&quot;&quot; 
+    Get a list of component base glyphs listed in glif. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">parser = _FetchComponentBasesParser()</span>
+	<span class="s2">try</span><span class="s1">:</span>
+		<span class="s1">parser.parse(glif)</span>
+	<span class="s2">except </span><span class="s1">_DoneParsing:</span>
+		<span class="s2">pass</span>
+	<span class="s2">return </span><span class="s1">list(parser.bases)</span>
+
+<span class="s2">class </span><span class="s1">_FetchComponentBasesParser(_BaseParser):</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.bases = []</span>
+		<span class="s1">super().__init__()</span>
+
+	<span class="s2">def </span><span class="s1">startElementHandler(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs):</span>
+		<span class="s2">if </span><span class="s1">name == </span><span class="s3">&quot;component&quot; </span><span class="s2">and </span><span class="s1">self._elementStack </span><span class="s2">and </span><span class="s1">self._elementStack[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;outline&quot;</span><span class="s1">:</span>
+			<span class="s1">base = attrs.get(</span><span class="s3">&quot;base&quot;</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">base </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">self.bases.append(base)</span>
+		<span class="s1">super().startElementHandler(name</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+	<span class="s2">def </span><span class="s1">endElementHandler(self</span><span class="s2">, </span><span class="s1">name):</span>
+		<span class="s2">if </span><span class="s1">name == </span><span class="s3">&quot;outline&quot;</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">_DoneParsing</span>
+		<span class="s1">super().endElementHandler(name)</span>
+
+<span class="s4"># --------------</span>
+<span class="s4"># GLIF Point Pen</span>
+<span class="s4"># --------------</span>
+
+<span class="s1">_transformationInfo = [</span>
+	<span class="s4"># field name, default value</span>
+	<span class="s1">(</span><span class="s3">&quot;xScale&quot;</span><span class="s2">,    </span><span class="s5">1</span><span class="s1">)</span><span class="s2">,</span>
+	<span class="s1">(</span><span class="s3">&quot;xyScale&quot;</span><span class="s2">,   </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+	<span class="s1">(</span><span class="s3">&quot;yxScale&quot;</span><span class="s2">,   </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+	<span class="s1">(</span><span class="s3">&quot;yScale&quot;</span><span class="s2">,    </span><span class="s5">1</span><span class="s1">)</span><span class="s2">,</span>
+	<span class="s1">(</span><span class="s3">&quot;xOffset&quot;</span><span class="s2">,   </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+	<span class="s1">(</span><span class="s3">&quot;yOffset&quot;</span><span class="s2">,   </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+<span class="s1">]</span>
+
+<span class="s2">class </span><span class="s1">GLIFPointPen(AbstractPointPen):</span>
+
+	<span class="s0">&quot;&quot;&quot; 
+    Helper class using the PointPen protocol to write the &lt;outline&gt; 
+    part of .glif files. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">element</span><span class="s2">, </span><span class="s1">formatVersion=</span><span class="s2">None, </span><span class="s1">identifiers=</span><span class="s2">None, </span><span class="s1">validate=</span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s2">if </span><span class="s1">identifiers </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">identifiers = set()</span>
+		<span class="s1">self.formatVersion = GLIFFormatVersion(formatVersion)</span>
+		<span class="s1">self.identifiers = identifiers</span>
+		<span class="s1">self.outline = element</span>
+		<span class="s1">self.contour = </span><span class="s2">None</span>
+		<span class="s1">self.prevOffCurveCount = </span><span class="s5">0</span>
+		<span class="s1">self.prevPointTypes = []</span>
+		<span class="s1">self.validate = validate</span>
+
+	<span class="s2">def </span><span class="s1">beginPath(self</span><span class="s2">, </span><span class="s1">identifier=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+		<span class="s1">attrs = OrderedDict()</span>
+		<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None and </span><span class="s1">self.formatVersion.major &gt;= </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.validate:</span>
+				<span class="s2">if </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">self.identifiers:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier used more than once: %s&quot; </span><span class="s1">% identifier)</span>
+				<span class="s2">if not </span><span class="s1">identifierValidator(identifier):</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier not formatted properly: %s&quot; </span><span class="s1">% identifier)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] = identifier</span>
+			<span class="s1">self.identifiers.add(identifier)</span>
+		<span class="s1">self.contour = etree.SubElement(self.outline</span><span class="s2">, </span><span class="s3">&quot;contour&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+		<span class="s1">self.prevOffCurveCount = </span><span class="s5">0</span>
+
+	<span class="s2">def </span><span class="s1">endPath(self):</span>
+		<span class="s2">if </span><span class="s1">self.prevPointTypes </span><span class="s2">and </span><span class="s1">self.prevPointTypes[</span><span class="s5">0</span><span class="s1">] == </span><span class="s3">&quot;move&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.validate </span><span class="s2">and </span><span class="s1">self.prevPointTypes[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;open contour has loose offcurve point&quot;</span><span class="s1">)</span>
+		<span class="s4"># prevent lxml from writing self-closing tags</span>
+		<span class="s2">if not </span><span class="s1">len(self.contour):</span>
+			<span class="s1">self.contour.text = </span><span class="s3">&quot;</span><span class="s2">\n  </span><span class="s3">&quot;</span>
+		<span class="s1">self.contour = </span><span class="s2">None</span>
+		<span class="s1">self.prevPointType = </span><span class="s2">None</span>
+		<span class="s1">self.prevOffCurveCount = </span><span class="s5">0</span>
+		<span class="s1">self.prevPointTypes = []</span>
+
+	<span class="s2">def </span><span class="s1">addPoint(self</span><span class="s2">, </span><span class="s1">pt</span><span class="s2">, </span><span class="s1">segmentType=</span><span class="s2">None, </span><span class="s1">smooth=</span><span class="s2">None, </span><span class="s1">name=</span><span class="s2">None, </span><span class="s1">identifier=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+		<span class="s1">attrs = OrderedDict()</span>
+		<span class="s4"># coordinates</span>
+		<span class="s2">if </span><span class="s1">pt </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.validate:</span>
+				<span class="s2">for </span><span class="s1">coord </span><span class="s2">in </span><span class="s1">pt:</span>
+					<span class="s2">if not </span><span class="s1">isinstance(coord</span><span class="s2">, </span><span class="s1">numberTypes):</span>
+						<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;coordinates must be int or float&quot;</span><span class="s1">)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;x&quot;</span><span class="s1">] = repr(pt[</span><span class="s5">0</span><span class="s1">])</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;y&quot;</span><span class="s1">] = repr(pt[</span><span class="s5">1</span><span class="s1">])</span>
+		<span class="s4"># segment type</span>
+		<span class="s2">if </span><span class="s1">segmentType == </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">:</span>
+			<span class="s1">segmentType = </span><span class="s2">None</span>
+		<span class="s2">if </span><span class="s1">self.validate:</span>
+			<span class="s2">if </span><span class="s1">segmentType == </span><span class="s3">&quot;move&quot; </span><span class="s2">and </span><span class="s1">self.prevPointTypes:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;move occurs after a point has already been added to the contour.&quot;</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">segmentType </span><span class="s2">in </span><span class="s1">(</span><span class="s3">&quot;move&quot;</span><span class="s2">, </span><span class="s3">&quot;line&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">self.prevPointTypes </span><span class="s2">and </span><span class="s1">self.prevPointTypes[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;offcurve occurs before %s point.&quot; </span><span class="s1">% segmentType)</span>
+			<span class="s2">if </span><span class="s1">segmentType == </span><span class="s3">&quot;curve&quot; </span><span class="s2">and </span><span class="s1">self.prevOffCurveCount &gt; </span><span class="s5">2</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;too many offcurve points before curve point.&quot;</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">segmentType </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;type&quot;</span><span class="s1">] = segmentType</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">segmentType = </span><span class="s3">&quot;offcurve&quot;</span>
+		<span class="s2">if </span><span class="s1">segmentType == </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">:</span>
+			<span class="s1">self.prevOffCurveCount += </span><span class="s5">1</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">self.prevOffCurveCount = </span><span class="s5">0</span>
+		<span class="s1">self.prevPointTypes.append(segmentType)</span>
+		<span class="s4"># smooth</span>
+		<span class="s2">if </span><span class="s1">smooth:</span>
+			<span class="s2">if </span><span class="s1">self.validate </span><span class="s2">and </span><span class="s1">segmentType == </span><span class="s3">&quot;offcurve&quot;</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;can't set smooth in an offcurve point.&quot;</span><span class="s1">)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;smooth&quot;</span><span class="s1">] = </span><span class="s3">&quot;yes&quot;</span>
+		<span class="s4"># name</span>
+		<span class="s2">if </span><span class="s1">name </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = name</span>
+		<span class="s4"># identifier</span>
+		<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None and </span><span class="s1">self.formatVersion.major &gt;= </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.validate:</span>
+				<span class="s2">if </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">self.identifiers:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier used more than once: %s&quot; </span><span class="s1">% identifier)</span>
+				<span class="s2">if not </span><span class="s1">identifierValidator(identifier):</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier not formatted properly: %s&quot; </span><span class="s1">% identifier)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] = identifier</span>
+			<span class="s1">self.identifiers.add(identifier)</span>
+		<span class="s1">etree.SubElement(self.contour</span><span class="s2">, </span><span class="s3">&quot;point&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+	<span class="s2">def </span><span class="s1">addComponent(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transformation</span><span class="s2">, </span><span class="s1">identifier=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+		<span class="s1">attrs = OrderedDict([(</span><span class="s3">&quot;base&quot;</span><span class="s2">, </span><span class="s1">glyphName)])</span>
+		<span class="s2">for </span><span class="s1">(attr</span><span class="s2">, </span><span class="s1">default)</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">zip(_transformationInfo</span><span class="s2">, </span><span class="s1">transformation):</span>
+			<span class="s2">if </span><span class="s1">self.validate </span><span class="s2">and not </span><span class="s1">isinstance(value</span><span class="s2">, </span><span class="s1">numberTypes):</span>
+				<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;transformation values must be int or float&quot;</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">value != default:</span>
+				<span class="s1">attrs[attr] = repr(value)</span>
+		<span class="s2">if </span><span class="s1">identifier </span><span class="s2">is not None and </span><span class="s1">self.formatVersion.major &gt;= </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.validate:</span>
+				<span class="s2">if </span><span class="s1">identifier </span><span class="s2">in </span><span class="s1">self.identifiers:</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier used more than once: %s&quot; </span><span class="s1">% identifier)</span>
+				<span class="s2">if </span><span class="s1">self.validate </span><span class="s2">and not </span><span class="s1">identifierValidator(identifier):</span>
+					<span class="s2">raise </span><span class="s1">GlifLibError(</span><span class="s3">&quot;identifier not formatted properly: %s&quot; </span><span class="s1">% identifier)</span>
+			<span class="s1">attrs[</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] = identifier</span>
+			<span class="s1">self.identifiers.add(identifier)</span>
+		<span class="s1">etree.SubElement(self.outline</span><span class="s2">, </span><span class="s3">&quot;component&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s2">import </span><span class="s1">doctest</span>
+	<span class="s1">doctest.testmod()</span>
+</pre>
+</body>
+</html>

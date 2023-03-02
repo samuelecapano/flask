@@ -1,0 +1,473 @@
+<html>
+<head>
+<title>gpos.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+gpos.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">defaultdict</span><span class="s0">, </span><span class="s1">namedtuple</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">reduce</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">chain</span>
+<span class="s0">from </span><span class="s1">math </span><span class="s0">import </span><span class="s1">log2</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">DefaultDict</span><span class="s0">, </span><span class="s1">Dict</span><span class="s0">, </span><span class="s1">Iterable</span><span class="s0">, </span><span class="s1">List</span><span class="s0">, </span><span class="s1">Sequence</span><span class="s0">, </span><span class="s1">Tuple</span>
+
+<span class="s0">from </span><span class="s1">fontTools.config </span><span class="s0">import </span><span class="s1">OPTIONS</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.intTools </span><span class="s0">import </span><span class="s1">bit_count</span><span class="s0">, </span><span class="s1">bit_indices</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib </span><span class="s0">import </span><span class="s1">TTFont</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s0">import </span><span class="s1">otBase</span><span class="s0">, </span><span class="s1">otTables</span>
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s1">COMPRESSION_LEVEL = OPTIONS[</span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">__name__</span><span class="s0">}</span><span class="s2">:COMPRESSION_LEVEL&quot;</span><span class="s1">]</span>
+
+<span class="s3"># Kept because ufo2ft depends on it, to be removed once ufo2ft uses the config instead</span>
+<span class="s3"># https://github.com/fonttools/fonttools/issues/2592</span>
+<span class="s1">GPOS_COMPACT_MODE_ENV_KEY = </span><span class="s2">&quot;FONTTOOLS_GPOS_COMPACT_MODE&quot;</span>
+<span class="s1">GPOS_COMPACT_MODE_DEFAULT = str(COMPRESSION_LEVEL.default)</span>
+
+
+<span class="s0">def </span><span class="s1">_compression_level_from_env() -&gt; int:</span>
+    <span class="s1">env_level = GPOS_COMPACT_MODE_DEFAULT</span>
+    <span class="s0">if </span><span class="s1">GPOS_COMPACT_MODE_ENV_KEY </span><span class="s0">in </span><span class="s1">os.environ:</span>
+        <span class="s0">import </span><span class="s1">warnings</span>
+
+        <span class="s1">warnings.warn(</span>
+            <span class="s2">f&quot;'</span><span class="s0">{</span><span class="s1">GPOS_COMPACT_MODE_ENV_KEY</span><span class="s0">}</span><span class="s2">' environment variable is deprecated. &quot;</span>
+            <span class="s2">&quot;Please set the 'fontTools.otlLib.optimize.gpos:COMPRESSION_LEVEL' option &quot;</span>
+            <span class="s2">&quot;in TTFont.cfg.&quot;</span><span class="s0">,</span>
+            <span class="s1">DeprecationWarning</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s1">env_level = os.environ[GPOS_COMPACT_MODE_ENV_KEY]</span>
+    <span class="s0">if </span><span class="s1">len(env_level) == </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">env_level </span><span class="s0">in </span><span class="s2">&quot;0123456789&quot;</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">int(env_level)</span>
+    <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;Bad </span><span class="s0">{</span><span class="s1">GPOS_COMPACT_MODE_ENV_KEY</span><span class="s0">}</span><span class="s2">=</span><span class="s0">{</span><span class="s1">env_level</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">compact(font: TTFont</span><span class="s0">, </span><span class="s1">level: int) -&gt; TTFont:</span>
+    <span class="s3"># Ideal plan:</span>
+    <span class="s3">#  1. Find lookups of Lookup Type 2: Pair Adjustment Positioning Subtable</span>
+    <span class="s3">#     https://docs.microsoft.com/en-us/typography/opentype/spec/gpos#lookup-type-2-pair-adjustment-positioning-subtable</span>
+    <span class="s3">#  2. Extract glyph-glyph kerning and class-kerning from all present subtables</span>
+    <span class="s3">#  3. Regroup into different subtable arrangements</span>
+    <span class="s3">#  4. Put back into the lookup</span>
+    <span class="s3">#</span>
+    <span class="s3"># Actual implementation:</span>
+    <span class="s3">#  2. Only class kerning is optimized currently</span>
+    <span class="s3">#  3. If the input kerning is already in several subtables, the subtables</span>
+    <span class="s3">#     are not grouped together first; instead each subtable is treated</span>
+    <span class="s3">#     independently, so currently this step is:</span>
+    <span class="s3">#     Split existing subtables into more smaller subtables</span>
+    <span class="s1">gpos = font[</span><span class="s2">&quot;GPOS&quot;</span><span class="s1">]</span>
+    <span class="s0">for </span><span class="s1">lookup </span><span class="s0">in </span><span class="s1">gpos.table.LookupList.Lookup:</span>
+        <span class="s0">if </span><span class="s1">lookup.LookupType == </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s1">compact_lookup(font</span><span class="s0">, </span><span class="s1">level</span><span class="s0">, </span><span class="s1">lookup)</span>
+        <span class="s0">elif </span><span class="s1">lookup.LookupType == </span><span class="s4">9 </span><span class="s0">and </span><span class="s1">lookup.SubTable[</span><span class="s4">0</span><span class="s1">].ExtensionLookupType == </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s1">compact_ext_lookup(font</span><span class="s0">, </span><span class="s1">level</span><span class="s0">, </span><span class="s1">lookup)</span>
+    <span class="s0">return </span><span class="s1">font</span>
+
+
+<span class="s0">def </span><span class="s1">compact_lookup(font: TTFont</span><span class="s0">, </span><span class="s1">level: int</span><span class="s0">, </span><span class="s1">lookup: otTables.Lookup) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+    <span class="s1">new_subtables = compact_pair_pos(font</span><span class="s0">, </span><span class="s1">level</span><span class="s0">, </span><span class="s1">lookup.SubTable)</span>
+    <span class="s1">lookup.SubTable = new_subtables</span>
+    <span class="s1">lookup.SubTableCount = len(new_subtables)</span>
+
+
+<span class="s0">def </span><span class="s1">compact_ext_lookup(font: TTFont</span><span class="s0">, </span><span class="s1">level: int</span><span class="s0">, </span><span class="s1">lookup: otTables.Lookup) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+    <span class="s1">new_subtables = compact_pair_pos(</span>
+        <span class="s1">font</span><span class="s0">, </span><span class="s1">level</span><span class="s0">, </span><span class="s1">[ext_subtable.ExtSubTable </span><span class="s0">for </span><span class="s1">ext_subtable </span><span class="s0">in </span><span class="s1">lookup.SubTable]</span>
+    <span class="s1">)</span>
+    <span class="s1">new_ext_subtables = []</span>
+    <span class="s0">for </span><span class="s1">subtable </span><span class="s0">in </span><span class="s1">new_subtables:</span>
+        <span class="s1">ext_subtable = otTables.ExtensionPos()</span>
+        <span class="s1">ext_subtable.Format = </span><span class="s4">1</span>
+        <span class="s1">ext_subtable.ExtSubTable = subtable</span>
+        <span class="s1">new_ext_subtables.append(ext_subtable)</span>
+    <span class="s1">lookup.SubTable = new_ext_subtables</span>
+    <span class="s1">lookup.SubTableCount = len(new_ext_subtables)</span>
+
+
+<span class="s0">def </span><span class="s1">compact_pair_pos(</span>
+    <span class="s1">font: TTFont</span><span class="s0">, </span><span class="s1">level: int</span><span class="s0">, </span><span class="s1">subtables: Sequence[otTables.PairPos]</span>
+<span class="s1">) -&gt; Sequence[otTables.PairPos]:</span>
+    <span class="s1">new_subtables = []</span>
+    <span class="s0">for </span><span class="s1">subtable </span><span class="s0">in </span><span class="s1">subtables:</span>
+        <span class="s0">if </span><span class="s1">subtable.Format == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s3"># Not doing anything to Format 1 (yet?)</span>
+            <span class="s1">new_subtables.append(subtable)</span>
+        <span class="s0">elif </span><span class="s1">subtable.Format == </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s1">new_subtables.extend(compact_class_pairs(font</span><span class="s0">, </span><span class="s1">level</span><span class="s0">, </span><span class="s1">subtable))</span>
+    <span class="s0">return </span><span class="s1">new_subtables</span>
+
+
+<span class="s0">def </span><span class="s1">compact_class_pairs(</span>
+    <span class="s1">font: TTFont</span><span class="s0">, </span><span class="s1">level: int</span><span class="s0">, </span><span class="s1">subtable: otTables.PairPos</span>
+<span class="s1">) -&gt; List[otTables.PairPos]:</span>
+    <span class="s0">from </span><span class="s1">fontTools.otlLib.builder </span><span class="s0">import </span><span class="s1">buildPairPosClassesSubtable</span>
+
+    <span class="s1">subtables = []</span>
+    <span class="s1">classes1: DefaultDict[int</span><span class="s0">, </span><span class="s1">List[str]] = defaultdict(list)</span>
+    <span class="s0">for </span><span class="s1">g </span><span class="s0">in </span><span class="s1">subtable.Coverage.glyphs:</span>
+        <span class="s1">classes1[subtable.ClassDef1.classDefs.get(g</span><span class="s0">, </span><span class="s4">0</span><span class="s1">)].append(g)</span>
+    <span class="s1">classes2: DefaultDict[int</span><span class="s0">, </span><span class="s1">List[str]] = defaultdict(list)</span>
+    <span class="s0">for </span><span class="s1">g</span><span class="s0">, </span><span class="s1">i </span><span class="s0">in </span><span class="s1">subtable.ClassDef2.classDefs.items():</span>
+        <span class="s1">classes2[i].append(g)</span>
+    <span class="s1">all_pairs = {}</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">class1 </span><span class="s0">in </span><span class="s1">enumerate(subtable.Class1Record):</span>
+        <span class="s0">for </span><span class="s1">j</span><span class="s0">, </span><span class="s1">class2 </span><span class="s0">in </span><span class="s1">enumerate(class1.Class2Record):</span>
+            <span class="s0">if </span><span class="s1">is_really_zero(class2):</span>
+                <span class="s0">continue</span>
+            <span class="s1">all_pairs[(tuple(sorted(classes1[i]))</span><span class="s0">, </span><span class="s1">tuple(sorted(classes2[j])))] = (</span>
+                <span class="s1">getattr(class2</span><span class="s0">, </span><span class="s2">&quot;Value1&quot;</span><span class="s0">, None</span><span class="s1">)</span><span class="s0">,</span>
+                <span class="s1">getattr(class2</span><span class="s0">, </span><span class="s2">&quot;Value2&quot;</span><span class="s0">, None</span><span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">)</span>
+    <span class="s1">grouped_pairs = cluster_pairs_by_class2_coverage_custom_cost(font</span><span class="s0">, </span><span class="s1">all_pairs</span><span class="s0">, </span><span class="s1">level)</span>
+    <span class="s0">for </span><span class="s1">pairs </span><span class="s0">in </span><span class="s1">grouped_pairs:</span>
+        <span class="s1">subtables.append(buildPairPosClassesSubtable(pairs</span><span class="s0">, </span><span class="s1">font.getReverseGlyphMap()))</span>
+    <span class="s0">return </span><span class="s1">subtables</span>
+
+
+<span class="s0">def </span><span class="s1">is_really_zero(class2: otTables.Class2Record) -&gt; bool:</span>
+    <span class="s1">v1 = getattr(class2</span><span class="s0">, </span><span class="s2">&quot;Value1&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">v2 = getattr(class2</span><span class="s0">, </span><span class="s2">&quot;Value2&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">(v1 </span><span class="s0">is None or </span><span class="s1">v1.getEffectiveFormat() == </span><span class="s4">0</span><span class="s1">) </span><span class="s0">and </span><span class="s1">(</span>
+        <span class="s1">v2 </span><span class="s0">is None or </span><span class="s1">v2.getEffectiveFormat() == </span><span class="s4">0</span>
+    <span class="s1">)</span>
+
+
+<span class="s1">Pairs = Dict[</span>
+    <span class="s1">Tuple[Tuple[str</span><span class="s0">, </span><span class="s1">...]</span><span class="s0">, </span><span class="s1">Tuple[str</span><span class="s0">, </span><span class="s1">...]]</span><span class="s0">,</span>
+    <span class="s1">Tuple[otBase.ValueRecord</span><span class="s0">, </span><span class="s1">otBase.ValueRecord]</span><span class="s0">,</span>
+<span class="s1">]</span>
+
+<span class="s3"># Adapted from https://github.com/fonttools/fonttools/blob/f64f0b42f2d1163b2d85194e0979def539f5dca3/Lib/fontTools/ttLib/tables/otTables.py#L935-L958</span>
+<span class="s0">def </span><span class="s1">_getClassRanges(glyphIDs: Iterable[int]):</span>
+    <span class="s1">glyphIDs = sorted(glyphIDs)</span>
+    <span class="s1">last = glyphIDs[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">ranges = [[last]]</span>
+    <span class="s0">for </span><span class="s1">glyphID </span><span class="s0">in </span><span class="s1">glyphIDs[</span><span class="s4">1</span><span class="s1">:]:</span>
+        <span class="s0">if </span><span class="s1">glyphID != last + </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">ranges[-</span><span class="s4">1</span><span class="s1">].append(last)</span>
+            <span class="s1">ranges.append([glyphID])</span>
+        <span class="s1">last = glyphID</span>
+    <span class="s1">ranges[-</span><span class="s4">1</span><span class="s1">].append(last)</span>
+    <span class="s0">return </span><span class="s1">ranges</span><span class="s0">, </span><span class="s1">glyphIDs[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">glyphIDs[-</span><span class="s4">1</span><span class="s1">]</span>
+
+
+<span class="s3"># Adapted from https://github.com/fonttools/fonttools/blob/f64f0b42f2d1163b2d85194e0979def539f5dca3/Lib/fontTools/ttLib/tables/otTables.py#L960-L989</span>
+<span class="s0">def </span><span class="s1">_classDef_bytes(</span>
+    <span class="s1">class_data: List[Tuple[List[Tuple[int</span><span class="s0">, </span><span class="s1">int]]</span><span class="s0">, </span><span class="s1">int</span><span class="s0">, </span><span class="s1">int]]</span><span class="s0">,</span>
+    <span class="s1">class_ids: List[int]</span><span class="s0">,</span>
+    <span class="s1">coverage=</span><span class="s0">False,</span>
+<span class="s1">):</span>
+    <span class="s0">if not </span><span class="s1">class_ids:</span>
+        <span class="s0">return </span><span class="s4">0</span>
+    <span class="s1">first_ranges</span><span class="s0">, </span><span class="s1">min_glyph_id</span><span class="s0">, </span><span class="s1">max_glyph_id = class_data[class_ids[</span><span class="s4">0</span><span class="s1">]]</span>
+    <span class="s1">range_count = len(first_ranges)</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">class_ids[</span><span class="s4">1</span><span class="s1">:]:</span>
+        <span class="s1">data = class_data[i]</span>
+        <span class="s1">range_count += len(data[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">min_glyph_id = min(min_glyph_id</span><span class="s0">, </span><span class="s1">data[</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s1">max_glyph_id = max(max_glyph_id</span><span class="s0">, </span><span class="s1">data[</span><span class="s4">2</span><span class="s1">])</span>
+    <span class="s1">glyphCount = max_glyph_id - min_glyph_id + </span><span class="s4">1</span>
+    <span class="s3"># https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#class-definition-table-format-1</span>
+    <span class="s1">format1_bytes = </span><span class="s4">6 </span><span class="s1">+ glyphCount * </span><span class="s4">2</span>
+    <span class="s3"># https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#class-definition-table-format-2</span>
+    <span class="s1">format2_bytes = </span><span class="s4">4 </span><span class="s1">+ range_count * </span><span class="s4">6</span>
+    <span class="s0">return </span><span class="s1">min(format1_bytes</span><span class="s0">, </span><span class="s1">format2_bytes)</span>
+
+
+<span class="s1">ClusteringContext = namedtuple(</span>
+    <span class="s2">&quot;ClusteringContext&quot;</span><span class="s0">,</span>
+    <span class="s1">[</span>
+        <span class="s2">&quot;lines&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;all_class1&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;all_class1_data&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;all_class2_data&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;valueFormat1_bytes&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;valueFormat2_bytes&quot;</span><span class="s0">,</span>
+    <span class="s1">]</span><span class="s0">,</span>
+<span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">Cluster:</span>
+    <span class="s3"># TODO(Python 3.7): Turn this into a dataclass</span>
+    <span class="s3"># ctx: ClusteringContext</span>
+    <span class="s3"># indices: int</span>
+    <span class="s3"># Caches</span>
+    <span class="s3"># TODO(Python 3.8): use functools.cached_property instead of the</span>
+    <span class="s3"># manually cached properties, and remove the cache fields listed below.</span>
+    <span class="s3"># _indices: Optional[List[int]] = None</span>
+    <span class="s3"># _column_indices: Optional[List[int]] = None</span>
+    <span class="s3"># _cost: Optional[int] = None</span>
+
+    <span class="s1">__slots__ = </span><span class="s2">&quot;ctx&quot;</span><span class="s0">, </span><span class="s2">&quot;indices_bitmask&quot;</span><span class="s0">, </span><span class="s2">&quot;_indices&quot;</span><span class="s0">, </span><span class="s2">&quot;_column_indices&quot;</span><span class="s0">, </span><span class="s2">&quot;_cost&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">ctx: ClusteringContext</span><span class="s0">, </span><span class="s1">indices_bitmask: int):</span>
+        <span class="s1">self.ctx = ctx</span>
+        <span class="s1">self.indices_bitmask = indices_bitmask</span>
+        <span class="s1">self._indices = </span><span class="s0">None</span>
+        <span class="s1">self._column_indices = </span><span class="s0">None</span>
+        <span class="s1">self._cost = </span><span class="s0">None</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">indices(self):</span>
+        <span class="s0">if </span><span class="s1">self._indices </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self._indices = bit_indices(self.indices_bitmask)</span>
+        <span class="s0">return </span><span class="s1">self._indices</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">column_indices(self):</span>
+        <span class="s0">if </span><span class="s1">self._column_indices </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s3"># Indices of columns that have a 1 in at least 1 line</span>
+            <span class="s3">#   =&gt; binary OR all the lines</span>
+            <span class="s1">bitmask = reduce(int.__or__</span><span class="s0">, </span><span class="s1">(self.ctx.lines[i] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self.indices))</span>
+            <span class="s1">self._column_indices = bit_indices(bitmask)</span>
+        <span class="s0">return </span><span class="s1">self._column_indices</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">width(self):</span>
+        <span class="s3"># Add 1 because Class2=0 cannot be used but needs to be encoded.</span>
+        <span class="s0">return </span><span class="s1">len(self.column_indices) + </span><span class="s4">1</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">cost(self):</span>
+        <span class="s0">if </span><span class="s1">self._cost </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self._cost = (</span>
+                <span class="s3"># 2 bytes to store the offset to this subtable in the Lookup table above</span>
+                <span class="s4">2</span>
+                <span class="s3"># Contents of the subtable</span>
+                <span class="s3"># From: https://docs.microsoft.com/en-us/typography/opentype/spec/gpos#pair-adjustment-positioning-format-2-class-pair-adjustment</span>
+                <span class="s3"># uint16    posFormat   Format identifier: format = 2</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s3"># Offset16  coverageOffset  Offset to Coverage table, from beginning of PairPos subtable.</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s1">+ self.coverage_bytes</span>
+                <span class="s3"># uint16    valueFormat1    ValueRecord definition — for the first glyph of the pair (may be zero).</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s3"># uint16    valueFormat2    ValueRecord definition — for the second glyph of the pair (may be zero).</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s3"># Offset16  classDef1Offset Offset to ClassDef table, from beginning of PairPos subtable — for the first glyph of the pair.</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s1">+ self.classDef1_bytes</span>
+                <span class="s3"># Offset16  classDef2Offset Offset to ClassDef table, from beginning of PairPos subtable — for the second glyph of the pair.</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s1">+ self.classDef2_bytes</span>
+                <span class="s3"># uint16    class1Count Number of classes in classDef1 table — includes Class 0.</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s3"># uint16    class2Count Number of classes in classDef2 table — includes Class 0.</span>
+                <span class="s1">+ </span><span class="s4">2</span>
+                <span class="s3"># Class1Record  class1Records[class1Count]  Array of Class1 records, ordered by classes in classDef1.</span>
+                <span class="s1">+ (self.ctx.valueFormat1_bytes + self.ctx.valueFormat2_bytes)</span>
+                <span class="s1">* len(self.indices)</span>
+                <span class="s1">* self.width</span>
+            <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">self._cost</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">coverage_bytes(self):</span>
+        <span class="s1">format1_bytes = (</span>
+            <span class="s3"># From https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#coverage-format-1</span>
+            <span class="s3"># uint16    coverageFormat  Format identifier — format = 1</span>
+            <span class="s3"># uint16    glyphCount  Number of glyphs in the glyph array</span>
+            <span class="s4">4</span>
+            <span class="s3"># uint16    glyphArray[glyphCount]  Array of glyph IDs — in numerical order</span>
+            <span class="s1">+ sum(len(self.ctx.all_class1[i]) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self.indices) * </span><span class="s4">2</span>
+        <span class="s1">)</span>
+        <span class="s1">ranges = sorted(</span>
+            <span class="s1">chain.from_iterable(self.ctx.all_class1_data[i][</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self.indices)</span>
+        <span class="s1">)</span>
+        <span class="s1">merged_range_count = </span><span class="s4">0</span>
+        <span class="s1">last = </span><span class="s0">None</span>
+        <span class="s0">for </span><span class="s1">(start</span><span class="s0">, </span><span class="s1">end) </span><span class="s0">in </span><span class="s1">ranges:</span>
+            <span class="s0">if </span><span class="s1">last </span><span class="s0">is not None and </span><span class="s1">start != last + </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">merged_range_count += </span><span class="s4">1</span>
+            <span class="s1">last = end</span>
+        <span class="s1">format2_bytes = (</span>
+            <span class="s3"># From https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#coverage-format-2</span>
+            <span class="s3"># uint16    coverageFormat  Format identifier — format = 2</span>
+            <span class="s3"># uint16    rangeCount  Number of RangeRecords</span>
+            <span class="s4">4</span>
+            <span class="s3"># RangeRecord   rangeRecords[rangeCount]    Array of glyph ranges — ordered by startGlyphID.</span>
+            <span class="s3"># uint16    startGlyphID    First glyph ID in the range</span>
+            <span class="s3"># uint16    endGlyphID  Last glyph ID in the range</span>
+            <span class="s3"># uint16    startCoverageIndex  Coverage Index of first glyph ID in range</span>
+            <span class="s1">+ merged_range_count * </span><span class="s4">6</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">min(format1_bytes</span><span class="s0">, </span><span class="s1">format2_bytes)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">classDef1_bytes(self):</span>
+        <span class="s3"># We can skip encoding one of the Class1 definitions, and use</span>
+        <span class="s3"># Class1=0 to represent it instead, because Class1 is gated by the</span>
+        <span class="s3"># Coverage definition. Use Class1=0 for the highest byte savings.</span>
+        <span class="s3"># Going through all options takes too long, pick the biggest class</span>
+        <span class="s3"># = what happens in otlLib.builder.ClassDefBuilder.classes()</span>
+        <span class="s1">biggest_index = max(self.indices</span><span class="s0">, </span><span class="s1">key=</span><span class="s0">lambda </span><span class="s1">i: len(self.ctx.all_class1[i]))</span>
+        <span class="s0">return </span><span class="s1">_classDef_bytes(</span>
+            <span class="s1">self.ctx.all_class1_data</span><span class="s0">, </span><span class="s1">[i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self.indices </span><span class="s0">if </span><span class="s1">i != biggest_index]</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">classDef2_bytes(self):</span>
+        <span class="s3"># All Class2 need to be encoded because we can't use Class2=0</span>
+        <span class="s0">return </span><span class="s1">_classDef_bytes(self.ctx.all_class2_data</span><span class="s0">, </span><span class="s1">self.column_indices)</span>
+
+
+<span class="s0">def </span><span class="s1">cluster_pairs_by_class2_coverage_custom_cost(</span>
+    <span class="s1">font: TTFont</span><span class="s0">,</span>
+    <span class="s1">pairs: Pairs</span><span class="s0">,</span>
+    <span class="s1">compression: int = </span><span class="s4">5</span><span class="s0">,</span>
+<span class="s1">) -&gt; List[Pairs]:</span>
+    <span class="s0">if not </span><span class="s1">pairs:</span>
+        <span class="s3"># The subtable was actually empty?</span>
+        <span class="s0">return </span><span class="s1">[pairs]</span>
+
+    <span class="s3"># Sorted for reproducibility/determinism</span>
+    <span class="s1">all_class1 = sorted(set(pair[</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">pair </span><span class="s0">in </span><span class="s1">pairs))</span>
+    <span class="s1">all_class2 = sorted(set(pair[</span><span class="s4">1</span><span class="s1">] </span><span class="s0">for </span><span class="s1">pair </span><span class="s0">in </span><span class="s1">pairs))</span>
+
+    <span class="s3"># Use Python's big ints for binary vectors representing each line</span>
+    <span class="s1">lines = [</span>
+        <span class="s1">sum(</span>
+            <span class="s4">1 </span><span class="s1">&lt;&lt; i </span><span class="s0">if </span><span class="s1">(class1</span><span class="s0">, </span><span class="s1">class2) </span><span class="s0">in </span><span class="s1">pairs </span><span class="s0">else </span><span class="s4">0</span>
+            <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">class2 </span><span class="s0">in </span><span class="s1">enumerate(all_class2)</span>
+        <span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">class1 </span><span class="s0">in </span><span class="s1">all_class1</span>
+    <span class="s1">]</span>
+
+    <span class="s3"># Map glyph names to ids and work with ints throughout for ClassDef formats</span>
+    <span class="s1">name_to_id = font.getReverseGlyphMap()</span>
+    <span class="s3"># Each entry in the arrays below is (range_count, min_glyph_id, max_glyph_id)</span>
+    <span class="s1">all_class1_data = [</span>
+        <span class="s1">_getClassRanges(name_to_id[name] </span><span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">cls) </span><span class="s0">for </span><span class="s1">cls </span><span class="s0">in </span><span class="s1">all_class1</span>
+    <span class="s1">]</span>
+    <span class="s1">all_class2_data = [</span>
+        <span class="s1">_getClassRanges(name_to_id[name] </span><span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">cls) </span><span class="s0">for </span><span class="s1">cls </span><span class="s0">in </span><span class="s1">all_class2</span>
+    <span class="s1">]</span>
+
+    <span class="s1">format1 = </span><span class="s4">0</span>
+    <span class="s1">format2 = </span><span class="s4">0</span>
+    <span class="s0">for </span><span class="s1">pair</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">pairs.items():</span>
+        <span class="s1">format1 |= value[</span><span class="s4">0</span><span class="s1">].getEffectiveFormat() </span><span class="s0">if </span><span class="s1">value[</span><span class="s4">0</span><span class="s1">] </span><span class="s0">else </span><span class="s4">0</span>
+        <span class="s1">format2 |= value[</span><span class="s4">1</span><span class="s1">].getEffectiveFormat() </span><span class="s0">if </span><span class="s1">value[</span><span class="s4">1</span><span class="s1">] </span><span class="s0">else </span><span class="s4">0</span>
+    <span class="s1">valueFormat1_bytes = bit_count(format1) * </span><span class="s4">2</span>
+    <span class="s1">valueFormat2_bytes = bit_count(format2) * </span><span class="s4">2</span>
+
+    <span class="s1">ctx = ClusteringContext(</span>
+        <span class="s1">lines</span><span class="s0">,</span>
+        <span class="s1">all_class1</span><span class="s0">,</span>
+        <span class="s1">all_class1_data</span><span class="s0">,</span>
+        <span class="s1">all_class2_data</span><span class="s0">,</span>
+        <span class="s1">valueFormat1_bytes</span><span class="s0">,</span>
+        <span class="s1">valueFormat2_bytes</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s1">cluster_cache: Dict[int</span><span class="s0">, </span><span class="s1">Cluster] = {}</span>
+
+    <span class="s0">def </span><span class="s1">make_cluster(indices: int) -&gt; Cluster:</span>
+        <span class="s1">cluster = cluster_cache.get(indices</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">cluster </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">cluster</span>
+        <span class="s1">cluster = Cluster(ctx</span><span class="s0">, </span><span class="s1">indices)</span>
+        <span class="s1">cluster_cache[indices] = cluster</span>
+        <span class="s0">return </span><span class="s1">cluster</span>
+
+    <span class="s0">def </span><span class="s1">merge(cluster: Cluster</span><span class="s0">, </span><span class="s1">other: Cluster) -&gt; Cluster:</span>
+        <span class="s0">return </span><span class="s1">make_cluster(cluster.indices_bitmask | other.indices_bitmask)</span>
+
+    <span class="s3"># Agglomerative clustering by hand, checking the cost gain of the new</span>
+    <span class="s3"># cluster against the previously separate clusters</span>
+    <span class="s3"># Start with 1 cluster per line</span>
+    <span class="s3"># cluster = set of lines = new subtable</span>
+    <span class="s1">clusters = [make_cluster(</span><span class="s4">1 </span><span class="s1">&lt;&lt; i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(lines))]</span>
+
+    <span class="s3"># Cost of 1 cluster with everything</span>
+    <span class="s3"># `(1 &lt;&lt; len) - 1` gives a bitmask full of 1's of length `len`</span>
+    <span class="s1">cost_before_splitting = make_cluster((</span><span class="s4">1 </span><span class="s1">&lt;&lt; len(lines)) - </span><span class="s4">1</span><span class="s1">).cost</span>
+    <span class="s1">log.debug(</span><span class="s2">f&quot;        len(clusters) = </span><span class="s0">{</span><span class="s1">len(clusters)</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+    <span class="s0">while </span><span class="s1">len(clusters) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">lowest_cost_change = </span><span class="s0">None</span>
+        <span class="s1">best_cluster_index = </span><span class="s0">None</span>
+        <span class="s1">best_other_index = </span><span class="s0">None</span>
+        <span class="s1">best_merged = </span><span class="s0">None</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">cluster </span><span class="s0">in </span><span class="s1">enumerate(clusters):</span>
+            <span class="s0">for </span><span class="s1">j</span><span class="s0">, </span><span class="s1">other </span><span class="s0">in </span><span class="s1">enumerate(clusters[i + </span><span class="s4">1 </span><span class="s1">:]):</span>
+                <span class="s1">merged = merge(cluster</span><span class="s0">, </span><span class="s1">other)</span>
+                <span class="s1">cost_change = merged.cost - cluster.cost - other.cost</span>
+                <span class="s0">if </span><span class="s1">lowest_cost_change </span><span class="s0">is None or </span><span class="s1">cost_change &lt; lowest_cost_change:</span>
+                    <span class="s1">lowest_cost_change = cost_change</span>
+                    <span class="s1">best_cluster_index = i</span>
+                    <span class="s1">best_other_index = i + </span><span class="s4">1 </span><span class="s1">+ j</span>
+                    <span class="s1">best_merged = merged</span>
+        <span class="s0">assert </span><span class="s1">lowest_cost_change </span><span class="s0">is not None</span>
+        <span class="s0">assert </span><span class="s1">best_cluster_index </span><span class="s0">is not None</span>
+        <span class="s0">assert </span><span class="s1">best_other_index </span><span class="s0">is not None</span>
+        <span class="s0">assert </span><span class="s1">best_merged </span><span class="s0">is not None</span>
+
+        <span class="s3"># If the best merge we found is still taking down the file size, then</span>
+        <span class="s3"># there's no question: we must do it, because it's beneficial in both</span>
+        <span class="s3"># ways (lower file size and lower number of subtables).  However, if the</span>
+        <span class="s3"># best merge we found is not reducing file size anymore, then we need to</span>
+        <span class="s3"># look at the other stop criteria = the compression factor.</span>
+        <span class="s0">if </span><span class="s1">lowest_cost_change &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3"># Stop critera: check whether we should keep merging.</span>
+            <span class="s3"># Compute size reduction brought by splitting</span>
+            <span class="s1">cost_after_splitting = sum(c.cost </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">clusters)</span>
+            <span class="s3"># size_reduction so that after = before * (1 - size_reduction)</span>
+            <span class="s3"># E.g. before = 1000, after = 800, 1 - 800/1000 = 0.2</span>
+            <span class="s1">size_reduction = </span><span class="s4">1 </span><span class="s1">- cost_after_splitting / cost_before_splitting</span>
+
+            <span class="s3"># Force more merging by taking into account the compression number.</span>
+            <span class="s3"># Target behaviour: compression number = 1 to 9, default 5 like gzip</span>
+            <span class="s3">#   - 1 = accept to add 1 subtable to reduce size by 50%</span>
+            <span class="s3">#   - 5 = accept to add 5 subtables to reduce size by 50%</span>
+            <span class="s3"># See https://github.com/harfbuzz/packtab/blob/master/Lib/packTab/__init__.py#L690-L691</span>
+            <span class="s3"># Given the size reduction we have achieved so far, compute how many</span>
+            <span class="s3"># new subtables are acceptable.</span>
+            <span class="s1">max_new_subtables = -log2(</span><span class="s4">1 </span><span class="s1">- size_reduction) * compression</span>
+            <span class="s1">log.debug(</span>
+                <span class="s2">f&quot;            len(clusters) = </span><span class="s0">{</span><span class="s1">len(clusters)</span><span class="s0">:</span><span class="s2">3d</span><span class="s0">}    </span><span class="s2">size_reduction=</span><span class="s0">{</span><span class="s1">size_reduction</span><span class="s0">:</span><span class="s2">5.2f</span><span class="s0">}    </span><span class="s2">max_new_subtables=</span><span class="s0">{</span><span class="s1">max_new_subtables</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">compression == </span><span class="s4">9</span><span class="s1">:</span>
+                <span class="s3"># Override level 9 to mean: create any number of subtables</span>
+                <span class="s1">max_new_subtables = len(clusters)</span>
+
+            <span class="s3"># If we have managed to take the number of new subtables below the</span>
+            <span class="s3"># threshold, then we can stop.</span>
+            <span class="s0">if </span><span class="s1">len(clusters) &lt;= max_new_subtables + </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s0">break</span>
+
+        <span class="s3"># No reason to stop yet, do the merge and move on to the next.</span>
+        <span class="s0">del </span><span class="s1">clusters[best_other_index]</span>
+        <span class="s1">clusters[best_cluster_index] = best_merged</span>
+
+    <span class="s3"># All clusters are final; turn bitmasks back into the &quot;Pairs&quot; format</span>
+    <span class="s1">pairs_by_class1: Dict[Tuple[str</span><span class="s0">, </span><span class="s1">...]</span><span class="s0">, </span><span class="s1">Pairs] = defaultdict(dict)</span>
+    <span class="s0">for </span><span class="s1">pair</span><span class="s0">, </span><span class="s1">values </span><span class="s0">in </span><span class="s1">pairs.items():</span>
+        <span class="s1">pairs_by_class1[pair[</span><span class="s4">0</span><span class="s1">]][pair] = values</span>
+    <span class="s1">pairs_groups: List[Pairs] = []</span>
+    <span class="s0">for </span><span class="s1">cluster </span><span class="s0">in </span><span class="s1">clusters:</span>
+        <span class="s1">pairs_group: Pairs = dict()</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">cluster.indices:</span>
+            <span class="s1">class1 = all_class1[i]</span>
+            <span class="s1">pairs_group.update(pairs_by_class1[class1])</span>
+        <span class="s1">pairs_groups.append(pairs_group)</span>
+    <span class="s0">return </span><span class="s1">pairs_groups</span>
+</pre>
+</body>
+</html>

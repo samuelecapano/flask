@@ -1,0 +1,1384 @@
+<html>
+<head>
+<title>backend_ps.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_ps.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A PostScript backend, which can produce both PostScript .ps and .eps. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">codecs</span>
+<span class="s2">import </span><span class="s1">datetime</span>
+<span class="s2">from </span><span class="s1">enum </span><span class="s2">import </span><span class="s1">Enum</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">StringIO</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">pathlib</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">shutil</span>
+<span class="s2">from </span><span class="s1">tempfile </span><span class="s2">import </span><span class="s1">TemporaryDirectory</span>
+<span class="s2">import </span><span class="s1">time</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span><span class="s2">, </span><span class="s1">_path</span><span class="s2">, </span><span class="s1">_text_helpers</span>
+<span class="s2">from </span><span class="s1">matplotlib._afm </span><span class="s2">import </span><span class="s1">AFM</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s2">, </span><span class="s1">FigureCanvasBase</span><span class="s2">, </span><span class="s1">FigureManagerBase</span><span class="s2">, </span><span class="s1">RendererBase)</span>
+<span class="s2">from </span><span class="s1">matplotlib.cbook </span><span class="s2">import </span><span class="s1">is_writable_file_like</span><span class="s2">, </span><span class="s1">file_requires_unicode</span>
+<span class="s2">from </span><span class="s1">matplotlib.font_manager </span><span class="s2">import </span><span class="s1">get_font</span>
+<span class="s2">from </span><span class="s1">matplotlib.ft2font </span><span class="s2">import </span><span class="s1">LOAD_NO_SCALE</span><span class="s2">, </span><span class="s1">FT2Font</span>
+<span class="s2">from </span><span class="s1">matplotlib._ttconv </span><span class="s2">import </span><span class="s1">convert_ttf_to_ps</span>
+<span class="s2">from </span><span class="s1">matplotlib._mathtext_data </span><span class="s2">import </span><span class="s1">uni2type1</span>
+<span class="s2">from </span><span class="s1">matplotlib.path </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">from </span><span class="s1">matplotlib.texmanager </span><span class="s2">import </span><span class="s1">TexManager</span>
+<span class="s2">from </span><span class="s1">matplotlib.transforms </span><span class="s2">import </span><span class="s1">Affine2D</span>
+<span class="s2">from </span><span class="s1">matplotlib.backends.backend_mixed </span><span class="s2">import </span><span class="s1">MixedModeRenderer</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">_backend_pdf_ps</span>
+
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+<span class="s1">debugPS = </span><span class="s2">False</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.7&quot;</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">PsBackendHelper:</span>
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._cached = {}</span>
+
+
+<span class="s1">@_api.caching_module_getattr</span>
+<span class="s2">class </span><span class="s1">__getattr__:</span>
+    <span class="s4"># module-level deprecations</span>
+    <span class="s1">ps_backend_helper = _api.deprecated(</span><span class="s3">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">obj_type=</span><span class="s3">&quot;&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: PsBackendHelper()))</span>
+
+
+<span class="s1">papersize = {</span><span class="s3">'letter'</span><span class="s1">: (</span><span class="s5">8.5</span><span class="s2">, </span><span class="s5">11</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'legal'</span><span class="s1">: (</span><span class="s5">8.5</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'ledger'</span><span class="s1">: (</span><span class="s5">11</span><span class="s2">, </span><span class="s5">17</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a0'</span><span class="s1">: (</span><span class="s5">33.11</span><span class="s2">, </span><span class="s5">46.81</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a1'</span><span class="s1">: (</span><span class="s5">23.39</span><span class="s2">, </span><span class="s5">33.11</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a2'</span><span class="s1">: (</span><span class="s5">16.54</span><span class="s2">, </span><span class="s5">23.39</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a3'</span><span class="s1">: (</span><span class="s5">11.69</span><span class="s2">, </span><span class="s5">16.54</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a4'</span><span class="s1">: (</span><span class="s5">8.27</span><span class="s2">, </span><span class="s5">11.69</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a5'</span><span class="s1">: (</span><span class="s5">5.83</span><span class="s2">, </span><span class="s5">8.27</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a6'</span><span class="s1">: (</span><span class="s5">4.13</span><span class="s2">, </span><span class="s5">5.83</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a7'</span><span class="s1">: (</span><span class="s5">2.91</span><span class="s2">, </span><span class="s5">4.13</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a8'</span><span class="s1">: (</span><span class="s5">2.05</span><span class="s2">, </span><span class="s5">2.91</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a9'</span><span class="s1">: (</span><span class="s5">1.46</span><span class="s2">, </span><span class="s5">2.05</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'a10'</span><span class="s1">: (</span><span class="s5">1.02</span><span class="s2">, </span><span class="s5">1.46</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b0'</span><span class="s1">: (</span><span class="s5">40.55</span><span class="s2">, </span><span class="s5">57.32</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b1'</span><span class="s1">: (</span><span class="s5">28.66</span><span class="s2">, </span><span class="s5">40.55</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b2'</span><span class="s1">: (</span><span class="s5">20.27</span><span class="s2">, </span><span class="s5">28.66</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b3'</span><span class="s1">: (</span><span class="s5">14.33</span><span class="s2">, </span><span class="s5">20.27</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b4'</span><span class="s1">: (</span><span class="s5">10.11</span><span class="s2">, </span><span class="s5">14.33</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b5'</span><span class="s1">: (</span><span class="s5">7.16</span><span class="s2">, </span><span class="s5">10.11</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b6'</span><span class="s1">: (</span><span class="s5">5.04</span><span class="s2">, </span><span class="s5">7.16</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b7'</span><span class="s1">: (</span><span class="s5">3.58</span><span class="s2">, </span><span class="s5">5.04</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b8'</span><span class="s1">: (</span><span class="s5">2.51</span><span class="s2">, </span><span class="s5">3.58</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b9'</span><span class="s1">: (</span><span class="s5">1.76</span><span class="s2">, </span><span class="s5">2.51</span><span class="s1">)</span><span class="s2">,</span>
+             <span class="s3">'b10'</span><span class="s1">: (</span><span class="s5">1.26</span><span class="s2">, </span><span class="s5">1.76</span><span class="s1">)}</span>
+
+
+<span class="s2">def </span><span class="s1">_get_papertype(w</span><span class="s2">, </span><span class="s1">h):</span>
+    <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">(pw</span><span class="s2">, </span><span class="s1">ph) </span><span class="s2">in </span><span class="s1">sorted(papersize.items()</span><span class="s2">, </span><span class="s1">reverse=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">key.startswith(</span><span class="s3">'l'</span><span class="s1">):</span>
+            <span class="s2">continue</span>
+        <span class="s2">if </span><span class="s1">w &lt; pw </span><span class="s2">and </span><span class="s1">h &lt; ph:</span>
+            <span class="s2">return </span><span class="s1">key</span>
+    <span class="s2">return </span><span class="s3">'a0'</span>
+
+
+<span class="s2">def </span><span class="s1">_nums_to_str(*args):</span>
+    <span class="s2">return </span><span class="s3">&quot; &quot;</span><span class="s1">.join(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">arg</span><span class="s2">:</span><span class="s3">1.3f</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">.rstrip(</span><span class="s3">&quot;0&quot;</span><span class="s1">).rstrip(</span><span class="s3">&quot;.&quot;</span><span class="s1">) </span><span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">args)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s3">&quot;a vendored copy of this function&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">quote_ps_string(s):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Quote dangerous characters of S for use in a PostScript string constant. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">s = s.replace(</span><span class="s6">b&quot;</span><span class="s2">\\</span><span class="s6">&quot;</span><span class="s2">, </span><span class="s6">b&quot;</span><span class="s2">\\\\</span><span class="s6">&quot;</span><span class="s1">)</span>
+    <span class="s1">s = s.replace(</span><span class="s6">b&quot;(&quot;</span><span class="s2">, </span><span class="s6">b&quot;</span><span class="s2">\\</span><span class="s6">(&quot;</span><span class="s1">)</span>
+    <span class="s1">s = s.replace(</span><span class="s6">b&quot;)&quot;</span><span class="s2">, </span><span class="s6">b&quot;</span><span class="s2">\\</span><span class="s6">)&quot;</span><span class="s1">)</span>
+    <span class="s1">s = s.replace(</span><span class="s6">b&quot;'&quot;</span><span class="s2">, </span><span class="s6">b&quot;</span><span class="s2">\\</span><span class="s6">251&quot;</span><span class="s1">)</span>
+    <span class="s1">s = s.replace(</span><span class="s6">b&quot;`&quot;</span><span class="s2">, </span><span class="s6">b&quot;</span><span class="s2">\\</span><span class="s6">301&quot;</span><span class="s1">)</span>
+    <span class="s1">s = re.sub(</span><span class="s6">br&quot;[^ -~\n]&quot;</span><span class="s2">, lambda </span><span class="s1">x: </span><span class="s6">br&quot;\%03o&quot; </span><span class="s1">% ord(x.group())</span><span class="s2">, </span><span class="s1">s)</span>
+    <span class="s2">return </span><span class="s1">s.decode(</span><span class="s3">'ascii'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_move_path_to_path_or_stream(src</span><span class="s2">, </span><span class="s1">dst):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Move the contents of file at *src* to path-or-filelike *dst*. 
+ 
+    If *dst* is a path, the metadata of *src* are *not* copied. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">is_writable_file_like(dst):</span>
+        <span class="s1">fh = (open(src</span><span class="s2">, </span><span class="s3">'r'</span><span class="s2">, </span><span class="s1">encoding=</span><span class="s3">'latin-1'</span><span class="s1">)</span>
+              <span class="s2">if </span><span class="s1">file_requires_unicode(dst)</span>
+              <span class="s2">else </span><span class="s1">open(src</span><span class="s2">, </span><span class="s3">'rb'</span><span class="s1">))</span>
+        <span class="s2">with </span><span class="s1">fh:</span>
+            <span class="s1">shutil.copyfileobj(fh</span><span class="s2">, </span><span class="s1">dst)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">shutil.move(src</span><span class="s2">, </span><span class="s1">dst</span><span class="s2">, </span><span class="s1">copy_function=shutil.copyfile)</span>
+
+
+<span class="s2">def </span><span class="s1">_font_to_ps_type3(font_path</span><span class="s2">, </span><span class="s1">chars):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Subset *chars* from the font at *font_path* into a Type 3 font. 
+ 
+    Parameters 
+    ---------- 
+    font_path : path-like 
+        Path to the font to be subsetted. 
+    chars : str 
+        The characters to include in the subsetted font. 
+ 
+    Returns 
+    ------- 
+    str 
+        The string representation of a Type 3 font, which can be included 
+        verbatim into a PostScript file. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">font = get_font(font_path</span><span class="s2">, </span><span class="s1">hinting_factor=</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">glyph_ids = [font.get_char_index(c) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">chars]</span>
+
+    <span class="s1">preamble = </span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">%!PS-Adobe-3.0 Resource-Font 
+%%Creator: Converted from TrueType to Type 3 by Matplotlib. 
+10 dict begin 
+/FontName /{font_name} def 
+/PaintType 0 def 
+/FontMatrix [{inv_units_per_em} 0 0 {inv_units_per_em} 0 0] def 
+/FontBBox [{bbox}] def 
+/FontType 3 def 
+/Encoding [{encoding}] def 
+/CharStrings {num_glyphs} dict dup begin 
+/.notdef 0 def 
+&quot;&quot;&quot;</span><span class="s1">.format(font_name=font.postscript_name</span><span class="s2">,</span>
+           <span class="s1">inv_units_per_em=</span><span class="s5">1 </span><span class="s1">/ font.units_per_EM</span><span class="s2">,</span>
+           <span class="s1">bbox=</span><span class="s3">&quot; &quot;</span><span class="s1">.join(map(str</span><span class="s2">, </span><span class="s1">font.bbox))</span><span class="s2">,</span>
+           <span class="s1">encoding=</span><span class="s3">&quot; &quot;</span><span class="s1">.join(</span><span class="s3">&quot;/{}&quot;</span><span class="s1">.format(font.get_glyph_name(glyph_id))</span>
+                             <span class="s2">for </span><span class="s1">glyph_id </span><span class="s2">in </span><span class="s1">glyph_ids)</span><span class="s2">,</span>
+           <span class="s1">num_glyphs=len(glyph_ids) + </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">postamble = </span><span class="s3">&quot;&quot;&quot; 
+end readonly def 
+ 
+/BuildGlyph { 
+ exch begin 
+ CharStrings exch 
+ 2 copy known not {pop /.notdef} if 
+ true 3 1 roll get exec 
+ end 
+} _d 
+ 
+/BuildChar { 
+ 1 index /Encoding get exch get 
+ 1 index /BuildGlyph get exec 
+} _d 
+ 
+FontName currentdict end definefont pop 
+&quot;&quot;&quot;</span>
+
+    <span class="s1">entries = []</span>
+    <span class="s2">for </span><span class="s1">glyph_id </span><span class="s2">in </span><span class="s1">glyph_ids:</span>
+        <span class="s1">g = font.load_glyph(glyph_id</span><span class="s2">, </span><span class="s1">LOAD_NO_SCALE)</span>
+        <span class="s1">v</span><span class="s2">, </span><span class="s1">c = font.get_path()</span>
+        <span class="s1">entries.append(</span>
+            <span class="s3">&quot;/%(name)s{%(bbox)s sc</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">% {</span>
+                <span class="s3">&quot;name&quot;</span><span class="s1">: font.get_glyph_name(glyph_id)</span><span class="s2">,</span>
+                <span class="s3">&quot;bbox&quot;</span><span class="s1">: </span><span class="s3">&quot; &quot;</span><span class="s1">.join(map(str</span><span class="s2">, </span><span class="s1">[g.horiAdvance</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">*g.bbox]))</span><span class="s2">,</span>
+            <span class="s1">}</span>
+            <span class="s1">+ _path.convert_to_string(</span>
+                <span class="s4"># Convert back to TrueType's internal units (1/64's).</span>
+                <span class="s4"># (Other dimensions are already in these units.)</span>
+                <span class="s1">Path(v * </span><span class="s5">64</span><span class="s2">, </span><span class="s1">c)</span><span class="s2">, None, None, False, None, </span><span class="s5">0</span><span class="s2">,</span>
+                <span class="s4"># No code for quad Beziers triggers auto-conversion to cubics.</span>
+                <span class="s4"># Drop intermediate closepolys (relying on the outline</span>
+                <span class="s4"># decomposer always explicitly moving to the closing point</span>
+                <span class="s4"># first).</span>
+                <span class="s1">[</span><span class="s6">b&quot;m&quot;</span><span class="s2">, </span><span class="s6">b&quot;l&quot;</span><span class="s2">, </span><span class="s6">b&quot;&quot;</span><span class="s2">, </span><span class="s6">b&quot;c&quot;</span><span class="s2">, </span><span class="s6">b&quot;&quot;</span><span class="s1">]</span><span class="s2">, True</span><span class="s1">).decode(</span><span class="s3">&quot;ascii&quot;</span><span class="s1">)</span>
+            <span class="s1">+ </span><span class="s3">&quot;ce} _d&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s2">return </span><span class="s1">preamble + </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(entries) + postamble</span>
+
+
+<span class="s2">def </span><span class="s1">_font_to_ps_type42(font_path</span><span class="s2">, </span><span class="s1">chars</span><span class="s2">, </span><span class="s1">fh):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Subset *chars* from the font at *font_path* into a Type 42 font at *fh*. 
+ 
+    Parameters 
+    ---------- 
+    font_path : path-like 
+        Path to the font to be subsetted. 
+    chars : str 
+        The characters to include in the subsetted font. 
+    fh : file-like 
+        Where to write the font. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">subset_str = </span><span class="s3">''</span><span class="s1">.join(chr(c) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">chars)</span>
+    <span class="s1">_log.debug(</span><span class="s3">&quot;SUBSET %s characters: %s&quot;</span><span class="s2">, </span><span class="s1">font_path</span><span class="s2">, </span><span class="s1">subset_str)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">fontdata = _backend_pdf_ps.get_glyphs_subset(font_path</span><span class="s2">, </span><span class="s1">subset_str)</span>
+        <span class="s1">_log.debug(</span><span class="s3">&quot;SUBSET %s %d -&gt; %d&quot;</span><span class="s2">, </span><span class="s1">font_path</span><span class="s2">, </span><span class="s1">os.stat(font_path).st_size</span><span class="s2">,</span>
+                   <span class="s1">fontdata.getbuffer().nbytes)</span>
+
+        <span class="s4"># Give ttconv a subsetted font along with updated glyph_ids.</span>
+        <span class="s1">font = FT2Font(fontdata)</span>
+        <span class="s1">glyph_ids = [font.get_char_index(c) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">chars]</span>
+        <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+            <span class="s1">tmpfile = os.path.join(tmpdir</span><span class="s2">, </span><span class="s3">&quot;tmp.ttf&quot;</span><span class="s1">)</span>
+
+            <span class="s2">with </span><span class="s1">open(tmpfile</span><span class="s2">, </span><span class="s3">'wb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">tmp:</span>
+                <span class="s1">tmp.write(fontdata.getvalue())</span>
+
+            <span class="s4"># TODO: allow convert_ttf_to_ps to input file objects (BytesIO)</span>
+            <span class="s1">convert_ttf_to_ps(os.fsencode(tmpfile)</span><span class="s2">, </span><span class="s1">fh</span><span class="s2">, </span><span class="s5">42</span><span class="s2">, </span><span class="s1">glyph_ids)</span>
+    <span class="s2">except </span><span class="s1">RuntimeError:</span>
+        <span class="s1">_log.warning(</span>
+            <span class="s3">&quot;The PostScript backend does not currently &quot;</span>
+            <span class="s3">&quot;support the selected font.&quot;</span><span class="s1">)</span>
+        <span class="s2">raise</span>
+
+
+<span class="s2">def </span><span class="s1">_log_if_debug_on(meth):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Wrap `RendererPS` method *meth* to emit a PS comment with the method name, 
+    if the global flag `debugPS` is set. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@functools.wraps(meth)</span>
+    <span class="s2">def </span><span class="s1">wrapper(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if </span><span class="s1">debugPS:</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;% </span><span class="s2">{</span><span class="s1">meth.__name__</span><span class="s2">}\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">meth(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">return </span><span class="s1">wrapper</span>
+
+
+<span class="s2">class </span><span class="s1">RendererPS(_backend_pdf_ps.RendererPDFPSBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The renderer handles all the drawing primitives using a graphics 
+    context instance that controls the colors/styles. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_afm_font_dir = cbook._get_data_path(</span><span class="s3">&quot;fonts/afm&quot;</span><span class="s1">)</span>
+    <span class="s1">_use_afm_rc_name = </span><span class="s3">&quot;ps.useafm&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">pswriter</span><span class="s2">, </span><span class="s1">imagedpi=</span><span class="s5">72</span><span class="s1">):</span>
+        <span class="s4"># Although postscript itself is dpi independent, we need to inform the</span>
+        <span class="s4"># image code about a requested dpi to generate high resolution images</span>
+        <span class="s4"># and them scale them before embedding them.</span>
+        <span class="s1">super().__init__(width</span><span class="s2">, </span><span class="s1">height)</span>
+        <span class="s1">self._pswriter = pswriter</span>
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'text.usetex'</span><span class="s1">]:</span>
+            <span class="s1">self.textcnt = </span><span class="s5">0</span>
+            <span class="s1">self.psfrag = []</span>
+        <span class="s1">self.imagedpi = imagedpi</span>
+
+        <span class="s4"># current renderer state (None=uninitialised)</span>
+        <span class="s1">self.color = </span><span class="s2">None</span>
+        <span class="s1">self.linewidth = </span><span class="s2">None</span>
+        <span class="s1">self.linejoin = </span><span class="s2">None</span>
+        <span class="s1">self.linecap = </span><span class="s2">None</span>
+        <span class="s1">self.linedash = </span><span class="s2">None</span>
+        <span class="s1">self.fontname = </span><span class="s2">None</span>
+        <span class="s1">self.fontsize = </span><span class="s2">None</span>
+        <span class="s1">self._hatches = {}</span>
+        <span class="s1">self.image_magnification = imagedpi / </span><span class="s5">72</span>
+        <span class="s1">self._clip_paths = {}</span>
+        <span class="s1">self._path_collection_id = </span><span class="s5">0</span>
+
+        <span class="s1">self._character_tracker = _backend_pdf_ps.CharacterTracker()</span>
+        <span class="s1">self._logwarn_once = functools.lru_cache(</span><span class="s2">None</span><span class="s1">)(_log.warning)</span>
+
+    <span class="s2">def </span><span class="s1">_is_transparent(self</span><span class="s2">, </span><span class="s1">rgb_or_rgba):</span>
+        <span class="s2">if </span><span class="s1">rgb_or_rgba </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return True  </span><span class="s4"># Consistent with rgbFace semantics.</span>
+        <span class="s2">elif </span><span class="s1">len(rgb_or_rgba) == </span><span class="s5">4</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">rgb_or_rgba[</span><span class="s5">3</span><span class="s1">] == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s2">return True</span>
+            <span class="s2">if </span><span class="s1">rgb_or_rgba[</span><span class="s5">3</span><span class="s1">] != </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">self._logwarn_once(</span>
+                    <span class="s3">&quot;The PostScript backend does not support transparency; &quot;</span>
+                    <span class="s3">&quot;partially transparent artists will be rendered opaque.&quot;</span><span class="s1">)</span>
+            <span class="s2">return False</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s4"># len() == 3.</span>
+            <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">set_color(self</span><span class="s2">, </span><span class="s1">r</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">(r</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">b) != self.color:</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">r</span><span class="s2">:</span><span class="s3">1.3f</span><span class="s2">} </span><span class="s3">setgray</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                                 <span class="s2">if </span><span class="s1">r == g == b </span><span class="s2">else</span>
+                                 <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">r</span><span class="s2">:</span><span class="s3">1.3f</span><span class="s2">} {</span><span class="s1">g</span><span class="s2">:</span><span class="s3">1.3f</span><span class="s2">} {</span><span class="s1">b</span><span class="s2">:</span><span class="s3">1.3f</span><span class="s2">} </span><span class="s3">setrgbcolor</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">store:</span>
+                <span class="s1">self.color = (r</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">b)</span>
+
+    <span class="s2">def </span><span class="s1">set_linewidth(self</span><span class="s2">, </span><span class="s1">linewidth</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s1">linewidth = float(linewidth)</span>
+        <span class="s2">if </span><span class="s1">linewidth != self.linewidth:</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">&quot;%1.3f setlinewidth</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">% linewidth)</span>
+            <span class="s2">if </span><span class="s1">store:</span>
+                <span class="s1">self.linewidth = linewidth</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_linejoin_cmd(linejoin):</span>
+        <span class="s4"># Support for directly passing integer values is for backcompat.</span>
+        <span class="s1">linejoin = {</span><span class="s3">'miter'</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s3">'round'</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s3">'bevel'</span><span class="s1">: </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s1">: </span><span class="s5">2</span><span class="s1">}[</span>
+            <span class="s1">linejoin]</span>
+        <span class="s2">return </span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">linejoin</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">setlinejoin</span><span class="s2">\n</span><span class="s3">&quot;</span>
+
+    <span class="s2">def </span><span class="s1">set_linejoin(self</span><span class="s2">, </span><span class="s1">linejoin</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">linejoin != self.linejoin:</span>
+            <span class="s1">self._pswriter.write(self._linejoin_cmd(linejoin))</span>
+            <span class="s2">if </span><span class="s1">store:</span>
+                <span class="s1">self.linejoin = linejoin</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_linecap_cmd(linecap):</span>
+        <span class="s4"># Support for directly passing integer values is for backcompat.</span>
+        <span class="s1">linecap = {</span><span class="s3">'butt'</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s3">'round'</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s3">'projecting'</span><span class="s1">: </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s1">: </span><span class="s5">2</span><span class="s1">}[</span>
+            <span class="s1">linecap]</span>
+        <span class="s2">return </span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">linecap</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">setlinecap</span><span class="s2">\n</span><span class="s3">&quot;</span>
+
+    <span class="s2">def </span><span class="s1">set_linecap(self</span><span class="s2">, </span><span class="s1">linecap</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">linecap != self.linecap:</span>
+            <span class="s1">self._pswriter.write(self._linecap_cmd(linecap))</span>
+            <span class="s2">if </span><span class="s1">store:</span>
+                <span class="s1">self.linecap = linecap</span>
+
+    <span class="s2">def </span><span class="s1">set_linedash(self</span><span class="s2">, </span><span class="s1">offset</span><span class="s2">, </span><span class="s1">seq</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">self.linedash </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">oldo</span><span class="s2">, </span><span class="s1">oldseq = self.linedash</span>
+            <span class="s2">if </span><span class="s1">np.array_equal(seq</span><span class="s2">, </span><span class="s1">oldseq) </span><span class="s2">and </span><span class="s1">oldo == offset:</span>
+                <span class="s2">return</span>
+
+        <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;[</span><span class="s2">{</span><span class="s1">_nums_to_str(*seq)</span><span class="s2">}</span><span class="s3">]&quot;</span>
+                             <span class="s3">f&quot; </span><span class="s2">{</span><span class="s1">_nums_to_str(offset)</span><span class="s2">} </span><span class="s3">setdash</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                             <span class="s2">if </span><span class="s1">seq </span><span class="s2">is not None and </span><span class="s1">len(seq) </span><span class="s2">else</span>
+                             <span class="s3">&quot;[] 0 setdash</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">store:</span>
+            <span class="s1">self.linedash = (offset</span><span class="s2">, </span><span class="s1">seq)</span>
+
+    <span class="s2">def </span><span class="s1">set_font(self</span><span class="s2">, </span><span class="s1">fontname</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">(fontname</span><span class="s2">, </span><span class="s1">fontsize) != (self.fontname</span><span class="s2">, </span><span class="s1">self.fontsize):</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;/</span><span class="s2">{</span><span class="s1">fontname</span><span class="s2">} {</span><span class="s1">fontsize</span><span class="s2">:</span><span class="s3">1.3f</span><span class="s2">} </span><span class="s3">selectfont</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">store:</span>
+                <span class="s1">self.fontname = fontname</span>
+                <span class="s1">self.fontsize = fontsize</span>
+
+    <span class="s2">def </span><span class="s1">create_hatch(self</span><span class="s2">, </span><span class="s1">hatch):</span>
+        <span class="s1">sidelen = </span><span class="s5">72</span>
+        <span class="s2">if </span><span class="s1">hatch </span><span class="s2">in </span><span class="s1">self._hatches:</span>
+            <span class="s2">return </span><span class="s1">self._hatches[hatch]</span>
+        <span class="s1">name = </span><span class="s3">'H%d' </span><span class="s1">% len(self._hatches)</span>
+        <span class="s1">linewidth = mpl.rcParams[</span><span class="s3">'hatch.linewidth'</span><span class="s1">]</span>
+        <span class="s1">pageheight = self.height * </span><span class="s5">72</span>
+        <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+  </span><span class="s3">&lt;&lt; /PatternType 1</span>
+     <span class="s3">/PaintType 2</span>
+     <span class="s3">/TilingType 2</span>
+     <span class="s3">/BBox[0 0 </span><span class="s2">{</span><span class="s1">sidelen</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} {</span><span class="s1">sidelen</span><span class="s2">:</span><span class="s3">d</span><span class="s2">}</span><span class="s3">]</span>
+     <span class="s3">/XStep </span><span class="s2">{</span><span class="s1">sidelen</span><span class="s2">:</span><span class="s3">d</span><span class="s2">}</span>
+     <span class="s3">/YStep </span><span class="s2">{</span><span class="s1">sidelen</span><span class="s2">:</span><span class="s3">d</span><span class="s2">}</span>
+
+     <span class="s3">/PaintProc </span><span class="s2">{{</span>
+        <span class="s3">pop</span>
+        <span class="s2">{</span><span class="s1">linewidth</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">setlinewidth</span>
+<span class="s2">{</span><span class="s1">self._convert_path(</span>
+    <span class="s1">Path.hatch(hatch)</span><span class="s2">, </span><span class="s1">Affine2D().scale(sidelen)</span><span class="s2">, </span><span class="s1">simplify=</span><span class="s2">False</span><span class="s1">)</span><span class="s2">}</span>
+        <span class="s3">gsave</span>
+        <span class="s3">fill</span>
+        <span class="s3">grestore</span>
+        <span class="s3">stroke</span>
+     <span class="s2">}} </span><span class="s3">bind</span>
+   <span class="s3">&gt;&gt;</span>
+   <span class="s3">matrix</span>
+   <span class="s3">0 </span><span class="s2">{</span><span class="s1">pageheight</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">translate</span>
+   <span class="s3">makepattern</span>
+   <span class="s3">/</span><span class="s2">{</span><span class="s1">name</span><span class="s2">} </span><span class="s3">exch def</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">self._hatches[hatch] = name</span>
+        <span class="s2">return </span><span class="s1">name</span>
+
+    <span class="s2">def </span><span class="s1">get_image_magnification(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get the factor by which to magnify images passed to draw_image. 
+        Allows a backend to have images at a different resolution to other 
+        artists. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.image_magnification</span>
+
+    <span class="s2">def </span><span class="s1">_convert_path(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">clip=</span><span class="s2">False, </span><span class="s1">simplify=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">clip:</span>
+            <span class="s1">clip = (</span><span class="s5">0.0</span><span class="s2">, </span><span class="s5">0.0</span><span class="s2">, </span><span class="s1">self.width * </span><span class="s5">72.0</span><span class="s2">, </span><span class="s1">self.height * </span><span class="s5">72.0</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">clip = </span><span class="s2">None</span>
+        <span class="s2">return </span><span class="s1">_path.convert_to_string(</span>
+            <span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">clip</span><span class="s2">, </span><span class="s1">simplify</span><span class="s2">, None,</span>
+            <span class="s5">6</span><span class="s2">, </span><span class="s1">[</span><span class="s6">b&quot;m&quot;</span><span class="s2">, </span><span class="s6">b&quot;l&quot;</span><span class="s2">, </span><span class="s6">b&quot;&quot;</span><span class="s2">, </span><span class="s6">b&quot;c&quot;</span><span class="s2">, </span><span class="s6">b&quot;cl&quot;</span><span class="s1">]</span><span class="s2">, True</span><span class="s1">).decode(</span><span class="s3">&quot;ascii&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_get_clip_cmd(self</span><span class="s2">, </span><span class="s1">gc):</span>
+        <span class="s1">clip = []</span>
+        <span class="s1">rect = gc.get_clip_rectangle()</span>
+        <span class="s2">if </span><span class="s1">rect </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">clip.append(</span><span class="s3">&quot;%s clipbox</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">% _nums_to_str(*rect.size</span><span class="s2">, </span><span class="s1">*rect.p0))</span>
+        <span class="s1">path</span><span class="s2">, </span><span class="s1">trf = gc.get_clip_path()</span>
+        <span class="s2">if </span><span class="s1">path </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">key = (path</span><span class="s2">, </span><span class="s1">id(trf))</span>
+            <span class="s1">custom_clip_cmd = self._clip_paths.get(key)</span>
+            <span class="s2">if </span><span class="s1">custom_clip_cmd </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">custom_clip_cmd = </span><span class="s3">&quot;c%d&quot; </span><span class="s1">% len(self._clip_paths)</span>
+                <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">/</span><span class="s2">{</span><span class="s1">custom_clip_cmd</span><span class="s2">} {{</span>
+<span class="s2">{</span><span class="s1">self._convert_path(path</span><span class="s2">, </span><span class="s1">trf</span><span class="s2">, </span><span class="s1">simplify=</span><span class="s2">False</span><span class="s1">)</span><span class="s2">}</span>
+<span class="s3">clip</span>
+<span class="s3">newpath</span>
+<span class="s2">}} </span><span class="s3">bind def</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+                <span class="s1">self._clip_paths[key] = custom_clip_cmd</span>
+            <span class="s1">clip.append(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">custom_clip_cmd</span><span class="s2">}\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s3">&quot;&quot;</span><span class="s1">.join(clip)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_image(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">im</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s1">h</span><span class="s2">, </span><span class="s1">w = im.shape[:</span><span class="s5">2</span><span class="s1">]</span>
+        <span class="s1">imagecmd = </span><span class="s3">&quot;false 3 colorimage&quot;</span>
+        <span class="s1">data = im[::-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">]  </span><span class="s4"># Vertically flipped rgb values.</span>
+        <span class="s1">hexdata = data.tobytes().hex(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s2">, </span><span class="s1">-</span><span class="s5">64</span><span class="s1">)  </span><span class="s4"># Linewrap to 128 chars.</span>
+
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">matrix = </span><span class="s3">&quot;1 0 0 1 0 0&quot;</span>
+            <span class="s1">xscale = w / self.image_magnification</span>
+            <span class="s1">yscale = h / self.image_magnification</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">matrix = </span><span class="s3">&quot; &quot;</span><span class="s1">.join(map(str</span><span class="s2">, </span><span class="s1">transform.frozen().to_values()))</span>
+            <span class="s1">xscale = </span><span class="s5">1.0</span>
+            <span class="s1">yscale = </span><span class="s5">1.0</span>
+
+        <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">gsave</span>
+<span class="s2">{</span><span class="s1">self._get_clip_cmd(gc)</span><span class="s2">}</span>
+<span class="s2">{</span><span class="s1">x</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">y</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">translate</span>
+<span class="s3">[</span><span class="s2">{</span><span class="s1">matrix</span><span class="s2">}</span><span class="s3">] concat</span>
+<span class="s2">{</span><span class="s1">xscale</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">yscale</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">scale</span>
+<span class="s3">/DataString </span><span class="s2">{</span><span class="s1">w</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">string def</span>
+<span class="s2">{</span><span class="s1">w</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} {</span><span class="s1">h</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">8 [ </span><span class="s2">{</span><span class="s1">w</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">0 0 -</span><span class="s2">{</span><span class="s1">h</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">0 </span><span class="s2">{</span><span class="s1">h</span><span class="s2">:</span><span class="s3">d</span><span class="s2">} </span><span class="s3">]</span>
+<span class="s2">{{</span>
+<span class="s3">currentfile DataString readhexstring pop</span>
+<span class="s2">}} </span><span class="s3">bind </span><span class="s2">{</span><span class="s1">imagecmd</span><span class="s2">}</span>
+<span class="s2">{</span><span class="s1">hexdata</span><span class="s2">}</span>
+<span class="s3">grestore</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_path(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">rgbFace=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s1">clip = rgbFace </span><span class="s2">is None and </span><span class="s1">gc.get_hatch_path() </span><span class="s2">is None</span>
+        <span class="s1">simplify = path.should_simplify </span><span class="s2">and </span><span class="s1">clip</span>
+        <span class="s1">ps = self._convert_path(path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">clip=clip</span><span class="s2">, </span><span class="s1">simplify=simplify)</span>
+        <span class="s1">self._draw_ps(ps</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">rgbFace)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_markers(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">marker_path</span><span class="s2">, </span><span class="s1">marker_trans</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">trans</span><span class="s2">, </span><span class="s1">rgbFace=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s1">ps_color = (</span>
+            <span class="s2">None</span>
+            <span class="s2">if </span><span class="s1">self._is_transparent(rgbFace)</span>
+            <span class="s2">else </span><span class="s3">'%1.3f setgray' </span><span class="s1">% rgbFace[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s1">rgbFace[</span><span class="s5">0</span><span class="s1">] == rgbFace[</span><span class="s5">1</span><span class="s1">] == rgbFace[</span><span class="s5">2</span><span class="s1">]</span>
+            <span class="s2">else </span><span class="s3">'%1.3f %1.3f %1.3f setrgbcolor' </span><span class="s1">% rgbFace[:</span><span class="s5">3</span><span class="s1">])</span>
+
+        <span class="s4"># construct the generic marker command:</span>
+
+        <span class="s4"># don't want the translate to be global</span>
+        <span class="s1">ps_cmd = [</span><span class="s3">'/o {'</span><span class="s2">, </span><span class="s3">'gsave'</span><span class="s2">, </span><span class="s3">'newpath'</span><span class="s2">, </span><span class="s3">'translate'</span><span class="s1">]</span>
+
+        <span class="s1">lw = gc.get_linewidth()</span>
+        <span class="s1">alpha = (gc.get_alpha()</span>
+                 <span class="s2">if </span><span class="s1">gc.get_forced_alpha() </span><span class="s2">or </span><span class="s1">len(gc.get_rgb()) == </span><span class="s5">3</span>
+                 <span class="s2">else </span><span class="s1">gc.get_rgb()[</span><span class="s5">3</span><span class="s1">])</span>
+        <span class="s1">stroke = lw &gt; </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">alpha &gt; </span><span class="s5">0</span>
+        <span class="s2">if </span><span class="s1">stroke:</span>
+            <span class="s1">ps_cmd.append(</span><span class="s3">'%.1f setlinewidth' </span><span class="s1">% lw)</span>
+            <span class="s1">ps_cmd.append(self._linejoin_cmd(gc.get_joinstyle()))</span>
+            <span class="s1">ps_cmd.append(self._linecap_cmd(gc.get_capstyle()))</span>
+
+        <span class="s1">ps_cmd.append(self._convert_path(marker_path</span><span class="s2">, </span><span class="s1">marker_trans</span><span class="s2">,</span>
+                                         <span class="s1">simplify=</span><span class="s2">False</span><span class="s1">))</span>
+
+        <span class="s2">if </span><span class="s1">rgbFace:</span>
+            <span class="s2">if </span><span class="s1">stroke:</span>
+                <span class="s1">ps_cmd.append(</span><span class="s3">'gsave'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">ps_color:</span>
+                <span class="s1">ps_cmd.extend([ps_color</span><span class="s2">, </span><span class="s3">'fill'</span><span class="s1">])</span>
+            <span class="s2">if </span><span class="s1">stroke:</span>
+                <span class="s1">ps_cmd.append(</span><span class="s3">'grestore'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">stroke:</span>
+            <span class="s1">ps_cmd.append(</span><span class="s3">'stroke'</span><span class="s1">)</span>
+        <span class="s1">ps_cmd.extend([</span><span class="s3">'grestore'</span><span class="s2">, </span><span class="s3">'} bind def'</span><span class="s1">])</span>
+
+        <span class="s2">for </span><span class="s1">vertices</span><span class="s2">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">path.iter_segments(</span>
+                <span class="s1">trans</span><span class="s2">,</span>
+                <span class="s1">clip=(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">self.width*</span><span class="s5">72</span><span class="s2">, </span><span class="s1">self.height*</span><span class="s5">72</span><span class="s1">)</span><span class="s2">,</span>
+                <span class="s1">simplify=</span><span class="s2">False</span><span class="s1">):</span>
+            <span class="s2">if </span><span class="s1">len(vertices):</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">y = vertices[-</span><span class="s5">2</span><span class="s1">:]</span>
+                <span class="s1">ps_cmd.append(</span><span class="s3">&quot;%g %g o&quot; </span><span class="s1">% (x</span><span class="s2">, </span><span class="s1">y))</span>
+
+        <span class="s1">ps = </span><span class="s3">'</span><span class="s2">\n</span><span class="s3">'</span><span class="s1">.join(ps_cmd)</span>
+        <span class="s1">self._draw_ps(ps</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">rgbFace</span><span class="s2">, </span><span class="s1">fill=</span><span class="s2">False, </span><span class="s1">stroke=</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_path_collection(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">master_transform</span><span class="s2">, </span><span class="s1">paths</span><span class="s2">, </span><span class="s1">all_transforms</span><span class="s2">,</span>
+                             <span class="s1">offsets</span><span class="s2">, </span><span class="s1">offset_trans</span><span class="s2">, </span><span class="s1">facecolors</span><span class="s2">, </span><span class="s1">edgecolors</span><span class="s2">,</span>
+                             <span class="s1">linewidths</span><span class="s2">, </span><span class="s1">linestyles</span><span class="s2">, </span><span class="s1">antialiaseds</span><span class="s2">, </span><span class="s1">urls</span><span class="s2">,</span>
+                             <span class="s1">offset_position):</span>
+        <span class="s4"># Is the optimization worth it? Rough calculation:</span>
+        <span class="s4"># cost of emitting a path in-line is</span>
+        <span class="s4">#     (len_path + 2) * uses_per_path</span>
+        <span class="s4"># cost of definition+use is</span>
+        <span class="s4">#     (len_path + 3) + 3 * uses_per_path</span>
+        <span class="s1">len_path = len(paths[</span><span class="s5">0</span><span class="s1">].vertices) </span><span class="s2">if </span><span class="s1">len(paths) &gt; </span><span class="s5">0 </span><span class="s2">else </span><span class="s5">0</span>
+        <span class="s1">uses_per_path = self._iter_collection_uses_per_path(</span>
+            <span class="s1">paths</span><span class="s2">, </span><span class="s1">all_transforms</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">facecolors</span><span class="s2">, </span><span class="s1">edgecolors)</span>
+        <span class="s1">should_do_optimization = \</span>
+            <span class="s1">len_path + </span><span class="s5">3 </span><span class="s1">* uses_per_path + </span><span class="s5">3 </span><span class="s1">&lt; (len_path + </span><span class="s5">2</span><span class="s1">) * uses_per_path</span>
+        <span class="s2">if not </span><span class="s1">should_do_optimization:</span>
+            <span class="s2">return </span><span class="s1">RendererBase.draw_path_collection(</span>
+                <span class="s1">self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">master_transform</span><span class="s2">, </span><span class="s1">paths</span><span class="s2">, </span><span class="s1">all_transforms</span><span class="s2">,</span>
+                <span class="s1">offsets</span><span class="s2">, </span><span class="s1">offset_trans</span><span class="s2">, </span><span class="s1">facecolors</span><span class="s2">, </span><span class="s1">edgecolors</span><span class="s2">,</span>
+                <span class="s1">linewidths</span><span class="s2">, </span><span class="s1">linestyles</span><span class="s2">, </span><span class="s1">antialiaseds</span><span class="s2">, </span><span class="s1">urls</span><span class="s2">,</span>
+                <span class="s1">offset_position)</span>
+
+        <span class="s1">path_codes = []</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(path</span><span class="s2">, </span><span class="s1">transform) </span><span class="s2">in </span><span class="s1">enumerate(self._iter_collection_raw_paths(</span>
+                <span class="s1">master_transform</span><span class="s2">, </span><span class="s1">paths</span><span class="s2">, </span><span class="s1">all_transforms)):</span>
+            <span class="s1">name = </span><span class="s3">'p%d_%d' </span><span class="s1">% (self._path_collection_id</span><span class="s2">, </span><span class="s1">i)</span>
+            <span class="s1">path_bytes = self._convert_path(path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">simplify=</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">/</span><span class="s2">{</span><span class="s1">name</span><span class="s2">} {{</span>
+<span class="s3">newpath</span>
+<span class="s3">translate</span>
+<span class="s2">{</span><span class="s1">path_bytes</span><span class="s2">}</span>
+<span class="s2">}} </span><span class="s3">bind def</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">path_codes.append(name)</span>
+
+        <span class="s2">for </span><span class="s1">xo</span><span class="s2">, </span><span class="s1">yo</span><span class="s2">, </span><span class="s1">path_id</span><span class="s2">, </span><span class="s1">gc0</span><span class="s2">, </span><span class="s1">rgbFace </span><span class="s2">in </span><span class="s1">self._iter_collection(</span>
+                <span class="s1">gc</span><span class="s2">, </span><span class="s1">path_codes</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">offset_trans</span><span class="s2">,</span>
+                <span class="s1">facecolors</span><span class="s2">, </span><span class="s1">edgecolors</span><span class="s2">, </span><span class="s1">linewidths</span><span class="s2">, </span><span class="s1">linestyles</span><span class="s2">,</span>
+                <span class="s1">antialiaseds</span><span class="s2">, </span><span class="s1">urls</span><span class="s2">, </span><span class="s1">offset_position):</span>
+            <span class="s1">ps = </span><span class="s3">&quot;%g %g %s&quot; </span><span class="s1">% (xo</span><span class="s2">, </span><span class="s1">yo</span><span class="s2">, </span><span class="s1">path_id)</span>
+            <span class="s1">self._draw_ps(ps</span><span class="s2">, </span><span class="s1">gc0</span><span class="s2">, </span><span class="s1">rgbFace)</span>
+
+        <span class="s1">self._path_collection_id += </span><span class="s5">1</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_tex(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">mtext=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">if </span><span class="s1">self._is_transparent(gc.get_rgb()):</span>
+            <span class="s2">return  </span><span class="s4"># Special handling for fully transparent.</span>
+
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">&quot;psfrag&quot;</span><span class="s1">):</span>
+            <span class="s1">self._logwarn_once(</span>
+                <span class="s3">&quot;The PS backend determines usetex status solely based on &quot;</span>
+                <span class="s3">&quot;rcParams['text.usetex'] and does not support having &quot;</span>
+                <span class="s3">&quot;usetex=True only for some elements; this element will thus &quot;</span>
+                <span class="s3">&quot;be rendered as if usetex=False.&quot;</span><span class="s1">)</span>
+            <span class="s1">self.draw_text(gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, False, </span><span class="s1">mtext)</span>
+            <span class="s2">return</span>
+
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">bl = self.get_text_width_height_descent(s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath=</span><span class="s3">&quot;TeX&quot;</span><span class="s1">)</span>
+        <span class="s1">fontsize = prop.get_size_in_points()</span>
+        <span class="s1">thetext = </span><span class="s3">'psmarker%d' </span><span class="s1">% self.textcnt</span>
+        <span class="s1">color = </span><span class="s3">'%1.3f,%1.3f,%1.3f' </span><span class="s1">% gc.get_rgb()[:</span><span class="s5">3</span><span class="s1">]</span>
+        <span class="s1">fontcmd = {</span><span class="s3">'sans-serif'</span><span class="s1">: </span><span class="s3">r'{\sffamily %s}'</span><span class="s2">,</span>
+                   <span class="s3">'monospace'</span><span class="s1">: </span><span class="s3">r'{\ttfamily %s}'</span><span class="s1">}.get(</span>
+                       <span class="s1">mpl.rcParams[</span><span class="s3">'font.family'</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s3">r'{\rmfamily %s}'</span><span class="s1">)</span>
+        <span class="s1">s = fontcmd % s</span>
+        <span class="s1">tex = </span><span class="s3">r'\color[rgb]{%s} %s' </span><span class="s1">% (color</span><span class="s2">, </span><span class="s1">s)</span>
+
+        <span class="s4"># Stick to the bottom alignment.</span>
+        <span class="s1">pos = _nums_to_str(x</span><span class="s2">, </span><span class="s1">y-bl)</span>
+        <span class="s1">self.psfrag.append(</span>
+            <span class="s3">r'\psfrag{%s}[bl][bl][1][%f]{\fontsize{%f}{%f}%s}' </span><span class="s1">% (</span>
+                <span class="s1">thetext</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">fontsize*</span><span class="s5">1.25</span><span class="s2">, </span><span class="s1">tex))</span>
+
+        <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">gsave</span>
+<span class="s2">{</span><span class="s1">pos</span><span class="s2">} </span><span class="s3">moveto</span>
+<span class="s3">(</span><span class="s2">{</span><span class="s1">thetext</span><span class="s2">}</span><span class="s3">)</span>
+<span class="s3">show</span>
+<span class="s3">grestore</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">self.textcnt += </span><span class="s5">1</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_text(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">ismath=</span><span class="s2">False, </span><span class="s1">mtext=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s2">if </span><span class="s1">self._is_transparent(gc.get_rgb()):</span>
+            <span class="s2">return  </span><span class="s4"># Special handling for fully transparent.</span>
+
+        <span class="s2">if </span><span class="s1">ismath == </span><span class="s3">'TeX'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.draw_tex(gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle)</span>
+
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s2">return </span><span class="s1">self.draw_mathtext(gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle)</span>
+
+        <span class="s1">stream = []  </span><span class="s4"># list of (ps_name, x, char_name)</span>
+
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.useafm'</span><span class="s1">]:</span>
+            <span class="s1">font = self._get_font_afm(prop)</span>
+            <span class="s1">ps_name = (font.postscript_name.encode(</span><span class="s3">&quot;ascii&quot;</span><span class="s2">, </span><span class="s3">&quot;replace&quot;</span><span class="s1">)</span>
+                        <span class="s1">.decode(</span><span class="s3">&quot;ascii&quot;</span><span class="s1">))</span>
+            <span class="s1">scale = </span><span class="s5">0.001 </span><span class="s1">* prop.get_size_in_points()</span>
+            <span class="s1">thisx = </span><span class="s5">0</span>
+            <span class="s1">last_name = </span><span class="s2">None  </span><span class="s4"># kerns returns 0 for None.</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">s:</span>
+                <span class="s1">name = uni2type1.get(ord(c)</span><span class="s2">, </span><span class="s3">f&quot;uni</span><span class="s2">{</span><span class="s1">ord(c)</span><span class="s2">:</span><span class="s3">04X</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    <span class="s1">width = font.get_width_from_char_name(name)</span>
+                <span class="s2">except </span><span class="s1">KeyError:</span>
+                    <span class="s1">name = </span><span class="s3">'question'</span>
+                    <span class="s1">width = font.get_width_char(</span><span class="s3">'?'</span><span class="s1">)</span>
+                <span class="s1">kern = font.get_kern_dist_from_name(last_name</span><span class="s2">, </span><span class="s1">name)</span>
+                <span class="s1">last_name = name</span>
+                <span class="s1">thisx += kern * scale</span>
+                <span class="s1">stream.append((ps_name</span><span class="s2">, </span><span class="s1">thisx</span><span class="s2">, </span><span class="s1">name))</span>
+                <span class="s1">thisx += width * scale</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">font = self._get_font_ttf(prop)</span>
+            <span class="s1">self._character_tracker.track(font</span><span class="s2">, </span><span class="s1">s)</span>
+            <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">_text_helpers.layout(s</span><span class="s2">, </span><span class="s1">font):</span>
+                <span class="s1">ps_name = (item.ft_object.postscript_name</span>
+                           <span class="s1">.encode(</span><span class="s3">&quot;ascii&quot;</span><span class="s2">, </span><span class="s3">&quot;replace&quot;</span><span class="s1">).decode(</span><span class="s3">&quot;ascii&quot;</span><span class="s1">))</span>
+                <span class="s1">glyph_name = item.ft_object.get_glyph_name(item.glyph_idx)</span>
+                <span class="s1">stream.append((ps_name</span><span class="s2">, </span><span class="s1">item.x</span><span class="s2">, </span><span class="s1">glyph_name))</span>
+        <span class="s1">self.set_color(*gc.get_rgb())</span>
+
+        <span class="s2">for </span><span class="s1">ps_name</span><span class="s2">, </span><span class="s1">group </span><span class="s2">in </span><span class="s1">itertools. \</span>
+                <span class="s1">groupby(stream</span><span class="s2">, lambda </span><span class="s1">entry: entry[</span><span class="s5">0</span><span class="s1">]):</span>
+            <span class="s1">self.set_font(ps_name</span><span class="s2">, </span><span class="s1">prop.get_size_in_points()</span><span class="s2">, False</span><span class="s1">)</span>
+            <span class="s1">thetext = </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">x</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">0 m /</span><span class="s2">{</span><span class="s1">name</span><span class="s2">:</span><span class="s3">s</span><span class="s2">} </span><span class="s3">glyphshow&quot;</span>
+                                <span class="s2">for </span><span class="s1">_</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">group)</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">gsave</span>
+<span class="s2">{</span><span class="s1">self._get_clip_cmd(gc)</span><span class="s2">}</span>
+<span class="s2">{</span><span class="s1">x</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">y</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">translate</span>
+<span class="s2">{</span><span class="s1">angle</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">rotate</span>
+<span class="s2">{</span><span class="s1">thetext</span><span class="s2">}</span>
+<span class="s3">grestore</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_mathtext(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle):</span>
+        <span class="s0">&quot;&quot;&quot;Draw the math text using matplotlib.mathtext.&quot;&quot;&quot;</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span><span class="s2">, </span><span class="s1">glyphs</span><span class="s2">, </span><span class="s1">rects = \</span>
+            <span class="s1">self._text2path.mathtext_parser.parse(s</span><span class="s2">, </span><span class="s5">72</span><span class="s2">, </span><span class="s1">prop)</span>
+        <span class="s1">self.set_color(*gc.get_rgb())</span>
+        <span class="s1">self._pswriter.write(</span>
+            <span class="s3">f&quot;gsave</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">x</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">y</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">translate</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">angle</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">rotate</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s1">lastfont = </span><span class="s2">None</span>
+        <span class="s2">for </span><span class="s1">font</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">num</span><span class="s2">, </span><span class="s1">ox</span><span class="s2">, </span><span class="s1">oy </span><span class="s2">in </span><span class="s1">glyphs:</span>
+            <span class="s1">self._character_tracker.track_glyph(font</span><span class="s2">, </span><span class="s1">num)</span>
+            <span class="s2">if </span><span class="s1">(font.postscript_name</span><span class="s2">, </span><span class="s1">fontsize) != lastfont:</span>
+                <span class="s1">lastfont = font.postscript_name</span><span class="s2">, </span><span class="s1">fontsize</span>
+                <span class="s1">self._pswriter.write(</span>
+                    <span class="s3">f&quot;/</span><span class="s2">{</span><span class="s1">font.postscript_name</span><span class="s2">} {</span><span class="s1">fontsize</span><span class="s2">} </span><span class="s3">selectfont</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+            <span class="s1">glyph_name = (</span>
+                <span class="s1">font.get_name_char(chr(num)) </span><span class="s2">if </span><span class="s1">isinstance(font</span><span class="s2">, </span><span class="s1">AFM) </span><span class="s2">else</span>
+                <span class="s1">font.get_glyph_name(font.get_char_index(num)))</span>
+            <span class="s1">self._pswriter.write(</span>
+                <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">ox</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">oy</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">moveto</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                <span class="s3">f&quot;/</span><span class="s2">{</span><span class="s1">glyph_name</span><span class="s2">} </span><span class="s3">glyphshow</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s2">for </span><span class="s1">ox</span><span class="s2">, </span><span class="s1">oy</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h </span><span class="s2">in </span><span class="s1">rects:</span>
+            <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">ox</span><span class="s2">} {</span><span class="s1">oy</span><span class="s2">} {</span><span class="s1">w</span><span class="s2">} {</span><span class="s1">h</span><span class="s2">} </span><span class="s3">rectfill</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s1">self._pswriter.write(</span><span class="s3">&quot;grestore</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_gouraud_triangle(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">points</span><span class="s2">, </span><span class="s1">colors</span><span class="s2">, </span><span class="s1">trans):</span>
+        <span class="s1">self.draw_gouraud_triangles(gc</span><span class="s2">, </span><span class="s1">points.reshape((</span><span class="s5">1</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s1">))</span><span class="s2">,</span>
+                                    <span class="s1">colors.reshape((</span><span class="s5">1</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s5">4</span><span class="s1">))</span><span class="s2">, </span><span class="s1">trans)</span>
+
+    <span class="s1">@_log_if_debug_on</span>
+    <span class="s2">def </span><span class="s1">draw_gouraud_triangles(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">points</span><span class="s2">, </span><span class="s1">colors</span><span class="s2">, </span><span class="s1">trans):</span>
+        <span class="s2">assert </span><span class="s1">len(points) == len(colors)</span>
+        <span class="s2">assert </span><span class="s1">points.ndim == </span><span class="s5">3</span>
+        <span class="s2">assert </span><span class="s1">points.shape[</span><span class="s5">1</span><span class="s1">] == </span><span class="s5">3</span>
+        <span class="s2">assert </span><span class="s1">points.shape[</span><span class="s5">2</span><span class="s1">] == </span><span class="s5">2</span>
+        <span class="s2">assert </span><span class="s1">colors.ndim == </span><span class="s5">3</span>
+        <span class="s2">assert </span><span class="s1">colors.shape[</span><span class="s5">1</span><span class="s1">] == </span><span class="s5">3</span>
+        <span class="s2">assert </span><span class="s1">colors.shape[</span><span class="s5">2</span><span class="s1">] == </span><span class="s5">4</span>
+
+        <span class="s1">shape = points.shape</span>
+        <span class="s1">flat_points = points.reshape((shape[</span><span class="s5">0</span><span class="s1">] * shape[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">2</span><span class="s1">))</span>
+        <span class="s1">flat_points = trans.transform(flat_points)</span>
+        <span class="s1">flat_colors = colors.reshape((shape[</span><span class="s5">0</span><span class="s1">] * shape[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">4</span><span class="s1">))</span>
+        <span class="s1">points_min = np.min(flat_points</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">) - (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">12</span><span class="s1">)</span>
+        <span class="s1">points_max = np.max(flat_points</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">) + (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">12</span><span class="s1">)</span>
+        <span class="s1">factor = np.ceil((</span><span class="s5">2 </span><span class="s1">** </span><span class="s5">32 </span><span class="s1">- </span><span class="s5">1</span><span class="s1">) / (points_max - points_min))</span>
+
+        <span class="s1">xmin</span><span class="s2">, </span><span class="s1">ymin = points_min</span>
+        <span class="s1">xmax</span><span class="s2">, </span><span class="s1">ymax = points_max</span>
+
+        <span class="s1">data = np.empty(</span>
+            <span class="s1">shape[</span><span class="s5">0</span><span class="s1">] * shape[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">dtype=[(</span><span class="s3">'flags'</span><span class="s2">, </span><span class="s3">'u1'</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">'points'</span><span class="s2">, </span><span class="s3">'2&gt;u4'</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">'colors'</span><span class="s2">, </span><span class="s3">'3u1'</span><span class="s1">)])</span>
+        <span class="s1">data[</span><span class="s3">'flags'</span><span class="s1">] = </span><span class="s5">0</span>
+        <span class="s1">data[</span><span class="s3">'points'</span><span class="s1">] = (flat_points - points_min) * factor</span>
+        <span class="s1">data[</span><span class="s3">'colors'</span><span class="s1">] = flat_colors[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] * </span><span class="s5">255.0</span>
+        <span class="s1">hexdata = data.tobytes().hex(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s2">, </span><span class="s1">-</span><span class="s5">64</span><span class="s1">)  </span><span class="s4"># Linewrap to 128 chars.</span>
+
+        <span class="s1">self._pswriter.write(</span><span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">gsave</span>
+<span class="s3">&lt;&lt; /ShadingType 4</span>
+   <span class="s3">/ColorSpace [/DeviceRGB]</span>
+   <span class="s3">/BitsPerCoordinate 32</span>
+   <span class="s3">/BitsPerComponent 8</span>
+   <span class="s3">/BitsPerFlag 8</span>
+   <span class="s3">/AntiAlias true</span>
+   <span class="s3">/Decode [ </span><span class="s2">{</span><span class="s1">xmin</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">xmax</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">ymin</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} {</span><span class="s1">ymax</span><span class="s2">:</span><span class="s3">g</span><span class="s2">} </span><span class="s3">0 1 0 1 0 1 ]</span>
+   <span class="s3">/DataSource &lt;</span>
+<span class="s2">{</span><span class="s1">hexdata</span><span class="s2">}</span>
+<span class="s3">&gt;</span>
+<span class="s3">&gt;&gt;</span>
+<span class="s3">shfill</span>
+<span class="s3">grestore</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_draw_ps(self</span><span class="s2">, </span><span class="s1">ps</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">rgbFace</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">fill=</span><span class="s2">True, </span><span class="s1">stroke=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Emit the PostScript snippet *ps* with all the attributes from *gc* 
+        applied.  *ps* must consist of PostScript commands to construct a path. 
+ 
+        The *fill* and/or *stroke* kwargs can be set to False if the *ps* 
+        string already includes filling and/or stroking, in which case 
+        `_draw_ps` is just supplying properties and clipping. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">write = self._pswriter.write</span>
+        <span class="s1">mightstroke = (gc.get_linewidth() &gt; </span><span class="s5">0</span>
+                       <span class="s2">and not </span><span class="s1">self._is_transparent(gc.get_rgb()))</span>
+        <span class="s2">if not </span><span class="s1">mightstroke:</span>
+            <span class="s1">stroke = </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">self._is_transparent(rgbFace):</span>
+            <span class="s1">fill = </span><span class="s2">False</span>
+        <span class="s1">hatch = gc.get_hatch()</span>
+
+        <span class="s2">if </span><span class="s1">mightstroke:</span>
+            <span class="s1">self.set_linewidth(gc.get_linewidth())</span>
+            <span class="s1">self.set_linejoin(gc.get_joinstyle())</span>
+            <span class="s1">self.set_linecap(gc.get_capstyle())</span>
+            <span class="s1">self.set_linedash(*gc.get_dashes())</span>
+        <span class="s2">if </span><span class="s1">mightstroke </span><span class="s2">or </span><span class="s1">hatch:</span>
+            <span class="s1">self.set_color(*gc.get_rgb()[:</span><span class="s5">3</span><span class="s1">])</span>
+        <span class="s1">write(</span><span class="s3">'gsave</span><span class="s2">\n</span><span class="s3">'</span><span class="s1">)</span>
+
+        <span class="s1">write(self._get_clip_cmd(gc))</span>
+
+        <span class="s1">write(ps.strip())</span>
+        <span class="s1">write(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">fill:</span>
+            <span class="s2">if </span><span class="s1">stroke </span><span class="s2">or </span><span class="s1">hatch:</span>
+                <span class="s1">write(</span><span class="s3">&quot;gsave</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+            <span class="s1">self.set_color(*rgbFace[:</span><span class="s5">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">store=</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">write(</span><span class="s3">&quot;fill</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">stroke </span><span class="s2">or </span><span class="s1">hatch:</span>
+                <span class="s1">write(</span><span class="s3">&quot;grestore</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">hatch:</span>
+            <span class="s1">hatch_name = self.create_hatch(hatch)</span>
+            <span class="s1">write(</span><span class="s3">&quot;gsave</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+            <span class="s1">write(</span><span class="s3">&quot;%f %f %f &quot; </span><span class="s1">% gc.get_hatch_color()[:</span><span class="s5">3</span><span class="s1">])</span>
+            <span class="s1">write(</span><span class="s3">&quot;%s setpattern fill grestore</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">% hatch_name)</span>
+
+        <span class="s2">if </span><span class="s1">stroke:</span>
+            <span class="s1">write(</span><span class="s3">&quot;stroke</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+        <span class="s1">write(</span><span class="s3">&quot;grestore</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">_Orientation(Enum):</span>
+    <span class="s1">portrait</span><span class="s2">, </span><span class="s1">landscape = range(</span><span class="s5">2</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">swap_if_landscape(self</span><span class="s2">, </span><span class="s1">shape):</span>
+        <span class="s2">return </span><span class="s1">shape[::-</span><span class="s5">1</span><span class="s1">] </span><span class="s2">if </span><span class="s1">self.name == </span><span class="s3">&quot;landscape&quot; </span><span class="s2">else </span><span class="s1">shape</span>
+
+
+<span class="s2">class </span><span class="s1">FigureCanvasPS(FigureCanvasBase):</span>
+    <span class="s1">fixed_dpi = </span><span class="s5">72</span>
+    <span class="s1">filetypes = {</span><span class="s3">'ps'</span><span class="s1">: </span><span class="s3">'Postscript'</span><span class="s2">,</span>
+                 <span class="s3">'eps'</span><span class="s1">: </span><span class="s3">'Encapsulated Postscript'</span><span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">get_default_filetype(self):</span>
+        <span class="s2">return </span><span class="s3">'ps'</span>
+
+    <span class="s2">def </span><span class="s1">_print_ps(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">*</span><span class="s2">,</span>
+            <span class="s1">metadata=</span><span class="s2">None, </span><span class="s1">papertype=</span><span class="s2">None, </span><span class="s1">orientation=</span><span class="s3">'portrait'</span><span class="s2">,</span>
+            <span class="s1">bbox_inches_restore=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+
+        <span class="s1">dpi = self.figure.dpi</span>
+        <span class="s1">self.figure.dpi = </span><span class="s5">72  </span><span class="s4"># Override the dpi kwarg</span>
+
+        <span class="s1">dsc_comments = {}</span>
+        <span class="s2">if </span><span class="s1">isinstance(outfile</span><span class="s2">, </span><span class="s1">(str</span><span class="s2">, </span><span class="s1">os.PathLike)):</span>
+            <span class="s1">filename = pathlib.Path(outfile).name</span>
+            <span class="s1">dsc_comments[</span><span class="s3">&quot;Title&quot;</span><span class="s1">] = \</span>
+                <span class="s1">filename.encode(</span><span class="s3">&quot;ascii&quot;</span><span class="s2">, </span><span class="s3">&quot;replace&quot;</span><span class="s1">).decode(</span><span class="s3">&quot;ascii&quot;</span><span class="s1">)</span>
+        <span class="s1">dsc_comments[</span><span class="s3">&quot;Creator&quot;</span><span class="s1">] = (metadata </span><span class="s2">or </span><span class="s1">{}).get(</span>
+            <span class="s3">&quot;Creator&quot;</span><span class="s2">,</span>
+            <span class="s3">f&quot;Matplotlib v</span><span class="s2">{</span><span class="s1">mpl.__version__</span><span class="s2">}</span><span class="s3">, https://matplotlib.org/&quot;</span><span class="s1">)</span>
+        <span class="s4"># See https://reproducible-builds.org/specs/source-date-epoch/</span>
+        <span class="s1">source_date_epoch = os.getenv(</span><span class="s3">&quot;SOURCE_DATE_EPOCH&quot;</span><span class="s1">)</span>
+        <span class="s1">dsc_comments[</span><span class="s3">&quot;CreationDate&quot;</span><span class="s1">] = (</span>
+            <span class="s1">datetime.datetime.utcfromtimestamp(</span>
+                <span class="s1">int(source_date_epoch)).strftime(</span><span class="s3">&quot;%a %b %d %H:%M:%S %Y&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">source_date_epoch</span>
+            <span class="s2">else </span><span class="s1">time.ctime())</span>
+        <span class="s1">dsc_comments = </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(</span>
+            <span class="s3">f&quot;%%</span><span class="s2">{</span><span class="s1">k</span><span class="s2">}</span><span class="s3">: </span><span class="s2">{</span><span class="s1">v</span><span class="s2">}</span><span class="s3">&quot; </span><span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">dsc_comments.items())</span>
+
+        <span class="s2">if </span><span class="s1">papertype </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">papertype = mpl.rcParams[</span><span class="s3">'ps.papersize'</span><span class="s1">]</span>
+        <span class="s1">papertype = papertype.lower()</span>
+        <span class="s1">_api.check_in_list([</span><span class="s3">'auto'</span><span class="s2">, </span><span class="s1">*papersize]</span><span class="s2">, </span><span class="s1">papertype=papertype)</span>
+
+        <span class="s1">orientation = _api.check_getitem(</span>
+            <span class="s1">_Orientation</span><span class="s2">, </span><span class="s1">orientation=orientation.lower())</span>
+
+        <span class="s1">printer = (self._print_figure_tex</span>
+                   <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'text.usetex'</span><span class="s1">] </span><span class="s2">else</span>
+                   <span class="s1">self._print_figure)</span>
+        <span class="s1">printer(fmt</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=dpi</span><span class="s2">, </span><span class="s1">dsc_comments=dsc_comments</span><span class="s2">,</span>
+                <span class="s1">orientation=orientation</span><span class="s2">, </span><span class="s1">papertype=papertype</span><span class="s2">,</span>
+                <span class="s1">bbox_inches_restore=bbox_inches_restore</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_print_figure(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">*</span><span class="s2">,</span>
+            <span class="s1">dpi</span><span class="s2">, </span><span class="s1">dsc_comments</span><span class="s2">, </span><span class="s1">orientation</span><span class="s2">, </span><span class="s1">papertype</span><span class="s2">,</span>
+            <span class="s1">bbox_inches_restore=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Render the figure to a filesystem path or a file-like object. 
+ 
+        Parameters are as for `.print_figure`, except that *dsc_comments* is a 
+        string containing Document Structuring Convention comments, 
+        generated from the *metadata* parameter to `.print_figure`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">is_eps = fmt == </span><span class="s3">'eps'</span>
+        <span class="s2">if not </span><span class="s1">(isinstance(outfile</span><span class="s2">, </span><span class="s1">(str</span><span class="s2">, </span><span class="s1">os.PathLike))</span>
+                <span class="s2">or </span><span class="s1">is_writable_file_like(outfile)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;outfile must be a path or a file-like object&quot;</span><span class="s1">)</span>
+
+        <span class="s4"># find the appropriate papertype</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height = self.figure.get_size_inches()</span>
+        <span class="s2">if </span><span class="s1">papertype == </span><span class="s3">'auto'</span><span class="s1">:</span>
+            <span class="s1">papertype = _get_papertype(</span>
+                <span class="s1">*orientation.swap_if_landscape((width</span><span class="s2">, </span><span class="s1">height)))</span>
+        <span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height = orientation.swap_if_landscape(</span>
+            <span class="s1">papersize[papertype])</span>
+
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.usedistiller'</span><span class="s1">]:</span>
+            <span class="s4"># distillers improperly clip eps files if pagesize is too small</span>
+            <span class="s2">if </span><span class="s1">width &gt; paper_width </span><span class="s2">or </span><span class="s1">height &gt; paper_height:</span>
+                <span class="s1">papertype = _get_papertype(</span>
+                    <span class="s1">*orientation.swap_if_landscape((width</span><span class="s2">, </span><span class="s1">height)))</span>
+                <span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height = orientation.swap_if_landscape(</span>
+                    <span class="s1">papersize[papertype])</span>
+
+        <span class="s4"># center the figure on the paper</span>
+        <span class="s1">xo = </span><span class="s5">72 </span><span class="s1">* </span><span class="s5">0.5 </span><span class="s1">* (paper_width - width)</span>
+        <span class="s1">yo = </span><span class="s5">72 </span><span class="s1">* </span><span class="s5">0.5 </span><span class="s1">* (paper_height - height)</span>
+
+        <span class="s1">llx = xo</span>
+        <span class="s1">lly = yo</span>
+        <span class="s1">urx = llx + self.figure.bbox.width</span>
+        <span class="s1">ury = lly + self.figure.bbox.height</span>
+        <span class="s1">rotation = </span><span class="s5">0</span>
+        <span class="s2">if </span><span class="s1">orientation </span><span class="s2">is </span><span class="s1">_Orientation.landscape:</span>
+            <span class="s1">llx</span><span class="s2">, </span><span class="s1">lly</span><span class="s2">, </span><span class="s1">urx</span><span class="s2">, </span><span class="s1">ury = lly</span><span class="s2">, </span><span class="s1">llx</span><span class="s2">, </span><span class="s1">ury</span><span class="s2">, </span><span class="s1">urx</span>
+            <span class="s1">xo</span><span class="s2">, </span><span class="s1">yo = </span><span class="s5">72 </span><span class="s1">* paper_height - yo</span><span class="s2">, </span><span class="s1">xo</span>
+            <span class="s1">rotation = </span><span class="s5">90</span>
+        <span class="s1">bbox = (llx</span><span class="s2">, </span><span class="s1">lly</span><span class="s2">, </span><span class="s1">urx</span><span class="s2">, </span><span class="s1">ury)</span>
+
+        <span class="s1">self._pswriter = StringIO()</span>
+
+        <span class="s4"># mixed mode rendering</span>
+        <span class="s1">ps_renderer = RendererPS(width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">self._pswriter</span><span class="s2">, </span><span class="s1">imagedpi=dpi)</span>
+        <span class="s1">renderer = MixedModeRenderer(</span>
+            <span class="s1">self.figure</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">ps_renderer</span><span class="s2">,</span>
+            <span class="s1">bbox_inches_restore=bbox_inches_restore)</span>
+
+        <span class="s1">self.figure.draw(renderer)</span>
+
+        <span class="s2">def </span><span class="s1">print_figure_impl(fh):</span>
+            <span class="s4"># write the PostScript headers</span>
+            <span class="s2">if </span><span class="s1">is_eps:</span>
+                <span class="s1">print(</span><span class="s3">&quot;%!PS-Adobe-3.0 EPSF-3.0&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">print(</span><span class="s3">f&quot;%!PS-Adobe-3.0</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                      <span class="s3">f&quot;%%DocumentPaperSizes: </span><span class="s2">{</span><span class="s1">papertype</span><span class="s2">}\n</span><span class="s3">&quot;</span>
+                      <span class="s3">f&quot;%%Pages: 1</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s2">,</span>
+                      <span class="s1">end=</span><span class="s3">&quot;&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">dsc_comments</span><span class="s2">}\n</span><span class="s3">&quot;</span>
+                  <span class="s3">f&quot;%%Orientation: </span><span class="s2">{</span><span class="s1">orientation.name</span><span class="s2">}\n</span><span class="s3">&quot;</span>
+                  <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">get_bbox_header(bbox)[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">}\n</span><span class="s3">&quot;</span>
+                  <span class="s3">f&quot;%%EndComments</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s2">,</span>
+                  <span class="s1">end=</span><span class="s3">&quot;&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+
+            <span class="s1">Ndict = len(psDefs)</span>
+            <span class="s1">print(</span><span class="s3">&quot;%%BeginProlog&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s2">if not </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.useafm'</span><span class="s1">]:</span>
+                <span class="s1">Ndict += len(ps_renderer._character_tracker.used)</span>
+            <span class="s1">print(</span><span class="s3">&quot;/mpldict %d dict def&quot; </span><span class="s1">% Ndict</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;mpldict begin&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(psDefs)</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s2">if not </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.useafm'</span><span class="s1">]:</span>
+                <span class="s2">for </span><span class="s1">font_path</span><span class="s2">, </span><span class="s1">chars \</span>
+                        <span class="s2">in </span><span class="s1">ps_renderer._character_tracker.used.items():</span>
+                    <span class="s2">if not </span><span class="s1">chars:</span>
+                        <span class="s2">continue</span>
+                    <span class="s1">fonttype = mpl.rcParams[</span><span class="s3">'ps.fonttype'</span><span class="s1">]</span>
+                    <span class="s4"># Can't use more than 255 chars from a single Type 3 font.</span>
+                    <span class="s2">if </span><span class="s1">len(chars) &gt; </span><span class="s5">255</span><span class="s1">:</span>
+                        <span class="s1">fonttype = </span><span class="s5">42</span>
+                    <span class="s1">fh.flush()</span>
+                    <span class="s2">if </span><span class="s1">fonttype == </span><span class="s5">3</span><span class="s1">:</span>
+                        <span class="s1">fh.write(_font_to_ps_type3(font_path</span><span class="s2">, </span><span class="s1">chars))</span>
+                    <span class="s2">else</span><span class="s1">:  </span><span class="s4"># Type 42 only.</span>
+                        <span class="s1">_font_to_ps_type42(font_path</span><span class="s2">, </span><span class="s1">chars</span><span class="s2">, </span><span class="s1">fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;end&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;%%EndProlog&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+
+            <span class="s2">if not </span><span class="s1">is_eps:</span>
+                <span class="s1">print(</span><span class="s3">&quot;%%Page: 1 1&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;mpldict begin&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+
+            <span class="s1">print(</span><span class="s3">&quot;%s translate&quot; </span><span class="s1">% _nums_to_str(xo</span><span class="s2">, </span><span class="s1">yo)</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s2">if </span><span class="s1">rotation:</span>
+                <span class="s1">print(</span><span class="s3">&quot;%d rotate&quot; </span><span class="s1">% rotation</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;%s clipbox&quot; </span><span class="s1">% _nums_to_str(width*</span><span class="s5">72</span><span class="s2">, </span><span class="s1">height*</span><span class="s5">72</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+                  <span class="s1">file=fh)</span>
+
+            <span class="s4"># write the figure</span>
+            <span class="s1">print(self._pswriter.getvalue()</span><span class="s2">, </span><span class="s1">file=fh)</span>
+
+            <span class="s4"># write the trailer</span>
+            <span class="s1">print(</span><span class="s3">&quot;end&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">print(</span><span class="s3">&quot;showpage&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s2">if not </span><span class="s1">is_eps:</span>
+                <span class="s1">print(</span><span class="s3">&quot;%%EOF&quot;</span><span class="s2">, </span><span class="s1">file=fh)</span>
+            <span class="s1">fh.flush()</span>
+
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.usedistiller'</span><span class="s1">]:</span>
+            <span class="s4"># We are going to use an external program to process the output.</span>
+            <span class="s4"># Write to a temporary file.</span>
+            <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+                <span class="s1">tmpfile = os.path.join(tmpdir</span><span class="s2">, </span><span class="s3">&quot;tmp.ps&quot;</span><span class="s1">)</span>
+                <span class="s2">with </span><span class="s1">open(tmpfile</span><span class="s2">, </span><span class="s3">'w'</span><span class="s2">, </span><span class="s1">encoding=</span><span class="s3">'latin-1'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">fh:</span>
+                    <span class="s1">print_figure_impl(fh)</span>
+                <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.usedistiller'</span><span class="s1">] == </span><span class="s3">'ghostscript'</span><span class="s1">:</span>
+                    <span class="s1">_try_distill(gs_distill</span><span class="s2">,</span>
+                                 <span class="s1">tmpfile</span><span class="s2">, </span><span class="s1">is_eps</span><span class="s2">, </span><span class="s1">ptype=papertype</span><span class="s2">, </span><span class="s1">bbox=bbox)</span>
+                <span class="s2">elif </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.usedistiller'</span><span class="s1">] == </span><span class="s3">'xpdf'</span><span class="s1">:</span>
+                    <span class="s1">_try_distill(xpdf_distill</span><span class="s2">,</span>
+                                 <span class="s1">tmpfile</span><span class="s2">, </span><span class="s1">is_eps</span><span class="s2">, </span><span class="s1">ptype=papertype</span><span class="s2">, </span><span class="s1">bbox=bbox)</span>
+                <span class="s1">_move_path_to_path_or_stream(tmpfile</span><span class="s2">, </span><span class="s1">outfile)</span>
+
+        <span class="s2">else</span><span class="s1">:  </span><span class="s4"># Write directly to outfile.</span>
+            <span class="s2">with </span><span class="s1">cbook.open_file_cm(outfile</span><span class="s2">, </span><span class="s3">&quot;w&quot;</span><span class="s2">, </span><span class="s1">encoding=</span><span class="s3">&quot;latin-1&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">file:</span>
+                <span class="s2">if not </span><span class="s1">file_requires_unicode(file):</span>
+                    <span class="s1">file = codecs.getwriter(</span><span class="s3">&quot;latin-1&quot;</span><span class="s1">)(file)</span>
+                <span class="s1">print_figure_impl(file)</span>
+
+    <span class="s2">def </span><span class="s1">_print_figure_tex(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">*</span><span class="s2">,</span>
+            <span class="s1">dpi</span><span class="s2">, </span><span class="s1">dsc_comments</span><span class="s2">, </span><span class="s1">orientation</span><span class="s2">, </span><span class="s1">papertype</span><span class="s2">,</span>
+            <span class="s1">bbox_inches_restore=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        If :rc:`text.usetex` is True, a temporary pair of tex/eps files 
+        are created to allow tex to manage the text layout via the PSFrags 
+        package. These files are processed to yield the final ps or eps file. 
+ 
+        The rest of the behavior is as for `._print_figure`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">is_eps = fmt == </span><span class="s3">'eps'</span>
+
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height = self.figure.get_size_inches()</span>
+        <span class="s1">xo = </span><span class="s5">0</span>
+        <span class="s1">yo = </span><span class="s5">0</span>
+
+        <span class="s1">llx = xo</span>
+        <span class="s1">lly = yo</span>
+        <span class="s1">urx = llx + self.figure.bbox.width</span>
+        <span class="s1">ury = lly + self.figure.bbox.height</span>
+        <span class="s1">bbox = (llx</span><span class="s2">, </span><span class="s1">lly</span><span class="s2">, </span><span class="s1">urx</span><span class="s2">, </span><span class="s1">ury)</span>
+
+        <span class="s1">self._pswriter = StringIO()</span>
+
+        <span class="s4"># mixed mode rendering</span>
+        <span class="s1">ps_renderer = RendererPS(width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">self._pswriter</span><span class="s2">, </span><span class="s1">imagedpi=dpi)</span>
+        <span class="s1">renderer = MixedModeRenderer(self.figure</span><span class="s2">,</span>
+                                     <span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">ps_renderer</span><span class="s2">,</span>
+                                     <span class="s1">bbox_inches_restore=bbox_inches_restore)</span>
+
+        <span class="s1">self.figure.draw(renderer)</span>
+
+        <span class="s4"># write to a temp file, we'll move it to outfile when done</span>
+        <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+            <span class="s1">tmppath = pathlib.Path(tmpdir</span><span class="s2">, </span><span class="s3">&quot;tmp.ps&quot;</span><span class="s1">)</span>
+            <span class="s1">tmppath.write_text(</span>
+                <span class="s3">f&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">%!PS-Adobe-3.0 EPSF-3.0</span>
+<span class="s2">{</span><span class="s1">dsc_comments</span><span class="s2">}</span>
+<span class="s2">{</span><span class="s1">get_bbox_header(bbox)[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">}</span>
+<span class="s3">%%EndComments</span>
+<span class="s3">%%BeginProlog</span>
+<span class="s3">/mpldict </span><span class="s2">{</span><span class="s1">len(psDefs)</span><span class="s2">} </span><span class="s3">dict def</span>
+<span class="s3">mpldict begin</span>
+<span class="s2">{</span><span class="s3">&quot;&quot;</span><span class="s1">.join(psDefs)</span><span class="s2">}</span>
+<span class="s3">end</span>
+<span class="s3">%%EndProlog</span>
+<span class="s3">mpldict begin</span>
+<span class="s2">{</span><span class="s1">_nums_to_str(xo</span><span class="s2">, </span><span class="s1">yo)</span><span class="s2">} </span><span class="s3">translate</span>
+<span class="s2">{</span><span class="s1">_nums_to_str(width*</span><span class="s5">72</span><span class="s2">, </span><span class="s1">height*</span><span class="s5">72</span><span class="s1">)</span><span class="s2">} </span><span class="s3">0 0 clipbox</span>
+<span class="s2">{</span><span class="s1">self._pswriter.getvalue()</span><span class="s2">}</span>
+<span class="s3">end</span>
+<span class="s3">showpage</span>
+<span class="s3">&quot;&quot;&quot;</span><span class="s2">,</span>
+                <span class="s1">encoding=</span><span class="s3">&quot;latin-1&quot;</span><span class="s1">)</span>
+
+            <span class="s2">if </span><span class="s1">orientation </span><span class="s2">is </span><span class="s1">_Orientation.landscape:  </span><span class="s4"># now, ready to rotate</span>
+                <span class="s1">width</span><span class="s2">, </span><span class="s1">height = height</span><span class="s2">, </span><span class="s1">width</span>
+                <span class="s1">bbox = (lly</span><span class="s2">, </span><span class="s1">llx</span><span class="s2">, </span><span class="s1">ury</span><span class="s2">, </span><span class="s1">urx)</span>
+
+            <span class="s4"># set the paper size to the figure size if is_eps. The</span>
+            <span class="s4"># resulting ps file has the given size with correct bounding</span>
+            <span class="s4"># box so that there is no need to call 'pstoeps'</span>
+            <span class="s2">if </span><span class="s1">is_eps:</span>
+                <span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height = orientation.swap_if_landscape(</span>
+                    <span class="s1">self.figure.get_size_inches())</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">papertype == </span><span class="s3">'auto'</span><span class="s1">:</span>
+                    <span class="s1">papertype = _get_papertype(width</span><span class="s2">, </span><span class="s1">height)</span>
+                <span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height = papersize[papertype]</span>
+
+            <span class="s1">psfrag_rotated = _convert_psfrags(</span>
+                <span class="s1">tmppath</span><span class="s2">, </span><span class="s1">ps_renderer.psfrag</span><span class="s2">, </span><span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height</span><span class="s2">,</span>
+                <span class="s1">orientation.name)</span>
+
+            <span class="s2">if </span><span class="s1">(mpl.rcParams[</span><span class="s3">'ps.usedistiller'</span><span class="s1">] == </span><span class="s3">'ghostscript'</span>
+                    <span class="s2">or </span><span class="s1">mpl.rcParams[</span><span class="s3">'text.usetex'</span><span class="s1">]):</span>
+                <span class="s1">_try_distill(gs_distill</span><span class="s2">,</span>
+                             <span class="s1">tmppath</span><span class="s2">, </span><span class="s1">is_eps</span><span class="s2">, </span><span class="s1">ptype=papertype</span><span class="s2">, </span><span class="s1">bbox=bbox</span><span class="s2">,</span>
+                             <span class="s1">rotated=psfrag_rotated)</span>
+            <span class="s2">elif </span><span class="s1">mpl.rcParams[</span><span class="s3">'ps.usedistiller'</span><span class="s1">] == </span><span class="s3">'xpdf'</span><span class="s1">:</span>
+                <span class="s1">_try_distill(xpdf_distill</span><span class="s2">,</span>
+                             <span class="s1">tmppath</span><span class="s2">, </span><span class="s1">is_eps</span><span class="s2">, </span><span class="s1">ptype=papertype</span><span class="s2">, </span><span class="s1">bbox=bbox</span><span class="s2">,</span>
+                             <span class="s1">rotated=psfrag_rotated)</span>
+
+            <span class="s1">_move_path_to_path_or_stream(tmppath</span><span class="s2">, </span><span class="s1">outfile)</span>
+
+    <span class="s1">print_ps = functools.partialmethod(_print_ps</span><span class="s2">, </span><span class="s3">&quot;ps&quot;</span><span class="s1">)</span>
+    <span class="s1">print_eps = functools.partialmethod(_print_ps</span><span class="s2">, </span><span class="s3">&quot;eps&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">draw(self):</span>
+        <span class="s1">self.figure.draw_without_rendering()</span>
+        <span class="s2">return </span><span class="s1">super().draw()</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">convert_psfrags(tmpfile</span><span class="s2">, </span><span class="s1">psfrags</span><span class="s2">, </span><span class="s1">font_preamble</span><span class="s2">, </span><span class="s1">custom_preamble</span><span class="s2">,</span>
+                    <span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height</span><span class="s2">, </span><span class="s1">orientation):</span>
+    <span class="s2">return </span><span class="s1">_convert_psfrags(</span>
+        <span class="s1">pathlib.Path(tmpfile)</span><span class="s2">, </span><span class="s1">psfrags</span><span class="s2">, </span><span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height</span><span class="s2">, </span><span class="s1">orientation)</span>
+
+
+<span class="s2">def </span><span class="s1">_convert_psfrags(tmppath</span><span class="s2">, </span><span class="s1">psfrags</span><span class="s2">, </span><span class="s1">paper_width</span><span class="s2">, </span><span class="s1">paper_height</span><span class="s2">, </span><span class="s1">orientation):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    When we want to use the LaTeX backend with postscript, we write PSFrag tags 
+    to a temporary postscript file, each one marking a position for LaTeX to 
+    render some text. convert_psfrags generates a LaTeX document containing the 
+    commands to convert those tags to text. LaTeX/dvips produces the postscript 
+    file that includes the actual text. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">mpl.rc_context({</span>
+            <span class="s3">&quot;text.latex.preamble&quot;</span><span class="s1">:</span>
+            <span class="s1">mpl.rcParams[</span><span class="s3">&quot;text.latex.preamble&quot;</span><span class="s1">] +</span>
+            <span class="s1">mpl.texmanager._usepackage_if_not_loaded(</span><span class="s3">&quot;color&quot;</span><span class="s1">) +</span>
+            <span class="s1">mpl.texmanager._usepackage_if_not_loaded(</span><span class="s3">&quot;graphicx&quot;</span><span class="s1">) +</span>
+            <span class="s1">mpl.texmanager._usepackage_if_not_loaded(</span><span class="s3">&quot;psfrag&quot;</span><span class="s1">) +</span>
+            <span class="s3">r&quot;\geometry{papersize={%(width)sin,%(height)sin},margin=0in}&quot;</span>
+            <span class="s1">% {</span><span class="s3">&quot;width&quot;</span><span class="s1">: paper_width</span><span class="s2">, </span><span class="s3">&quot;height&quot;</span><span class="s1">: paper_height}</span>
+    <span class="s1">}):</span>
+        <span class="s1">dvifile = TexManager().make_dvi(</span>
+            <span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">r&quot;\begin{figure}&quot;&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">r&quot;  \centering\leavevmode&quot;&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">r&quot;  %(psfrags)s&quot;&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">r&quot;  \includegraphics*[angle=%(angle)s]{%(epsfile)s}&quot;&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+            <span class="s3">r&quot;\end{figure}&quot;</span>
+            <span class="s1">% {</span>
+                <span class="s3">&quot;psfrags&quot;</span><span class="s1">: </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(psfrags)</span><span class="s2">,</span>
+                <span class="s3">&quot;angle&quot;</span><span class="s1">: </span><span class="s5">90 </span><span class="s2">if </span><span class="s1">orientation == </span><span class="s3">'landscape' </span><span class="s2">else </span><span class="s5">0</span><span class="s2">,</span>
+                <span class="s3">&quot;epsfile&quot;</span><span class="s1">: tmppath.resolve().as_posix()</span><span class="s2">,</span>
+            <span class="s1">}</span><span class="s2">,</span>
+            <span class="s1">fontsize=</span><span class="s5">10</span><span class="s1">)  </span><span class="s4"># tex's default fontsize.</span>
+
+    <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+        <span class="s1">psfile = os.path.join(tmpdir</span><span class="s2">, </span><span class="s3">&quot;tmp.ps&quot;</span><span class="s1">)</span>
+        <span class="s1">cbook._check_and_log_subprocess(</span>
+            <span class="s1">[</span><span class="s3">'dvips'</span><span class="s2">, </span><span class="s3">'-q'</span><span class="s2">, </span><span class="s3">'-R0'</span><span class="s2">, </span><span class="s3">'-o'</span><span class="s2">, </span><span class="s1">psfile</span><span class="s2">, </span><span class="s1">dvifile]</span><span class="s2">, </span><span class="s1">_log)</span>
+        <span class="s1">shutil.move(psfile</span><span class="s2">, </span><span class="s1">tmppath)</span>
+
+    <span class="s4"># check if the dvips created a ps in landscape paper.  Somehow,</span>
+    <span class="s4"># above latex+dvips results in a ps file in a landscape mode for a</span>
+    <span class="s4"># certain figure sizes (e.g., 8.3in, 5.8in which is a5). And the</span>
+    <span class="s4"># bounding box of the final output got messed up. We check see if</span>
+    <span class="s4"># the generated ps file is in landscape and return this</span>
+    <span class="s4"># information. The return value is used in pstoeps step to recover</span>
+    <span class="s4"># the correct bounding box. 2010-06-05 JJL</span>
+    <span class="s2">with </span><span class="s1">open(tmppath) </span><span class="s2">as </span><span class="s1">fh:</span>
+        <span class="s1">psfrag_rotated = </span><span class="s3">&quot;Landscape&quot; </span><span class="s2">in </span><span class="s1">fh.read(</span><span class="s5">1000</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">psfrag_rotated</span>
+
+
+<span class="s2">def </span><span class="s1">_try_distill(func</span><span class="s2">, </span><span class="s1">tmppath</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">func(str(tmppath)</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+    <span class="s2">except </span><span class="s1">mpl.ExecutableNotFoundError </span><span class="s2">as </span><span class="s1">exc:</span>
+        <span class="s1">_log.warning(</span><span class="s3">&quot;%s.  Distillation step skipped.&quot;</span><span class="s2">, </span><span class="s1">exc)</span>
+
+
+<span class="s2">def </span><span class="s1">gs_distill(tmpfile</span><span class="s2">, </span><span class="s1">eps=</span><span class="s2">False, </span><span class="s1">ptype=</span><span class="s3">'letter'</span><span class="s2">, </span><span class="s1">bbox=</span><span class="s2">None, </span><span class="s1">rotated=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Use ghostscript's pswrite or epswrite device to distill a file. 
+    This yields smaller files without illegal encapsulated postscript 
+    operators. The output is low-level, converting text to outlines. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">eps:</span>
+        <span class="s1">paper_option = </span><span class="s3">&quot;-dEPSCrop&quot;</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">paper_option = </span><span class="s3">&quot;-sPAPERSIZE=%s&quot; </span><span class="s1">% ptype</span>
+
+    <span class="s1">psfile = tmpfile + </span><span class="s3">'.ps'</span>
+    <span class="s1">dpi = mpl.rcParams[</span><span class="s3">'ps.distiller.res'</span><span class="s1">]</span>
+
+    <span class="s1">cbook._check_and_log_subprocess(</span>
+        <span class="s1">[mpl._get_executable_info(</span><span class="s3">&quot;gs&quot;</span><span class="s1">).executable</span><span class="s2">,</span>
+         <span class="s3">&quot;-dBATCH&quot;</span><span class="s2">, </span><span class="s3">&quot;-dNOPAUSE&quot;</span><span class="s2">, </span><span class="s3">&quot;-r%d&quot; </span><span class="s1">% dpi</span><span class="s2">, </span><span class="s3">&quot;-sDEVICE=ps2write&quot;</span><span class="s2">,</span>
+         <span class="s1">paper_option</span><span class="s2">, </span><span class="s3">&quot;-sOutputFile=%s&quot; </span><span class="s1">% psfile</span><span class="s2">, </span><span class="s1">tmpfile]</span><span class="s2">,</span>
+        <span class="s1">_log)</span>
+
+    <span class="s1">os.remove(tmpfile)</span>
+    <span class="s1">shutil.move(psfile</span><span class="s2">, </span><span class="s1">tmpfile)</span>
+
+    <span class="s4"># While it is best if above steps preserve the original bounding</span>
+    <span class="s4"># box, there seem to be cases when it is not. For those cases,</span>
+    <span class="s4"># the original bbox can be restored during the pstoeps step.</span>
+
+    <span class="s2">if </span><span class="s1">eps:</span>
+        <span class="s4"># For some versions of gs, above steps result in a ps file where the</span>
+        <span class="s4"># original bbox is no more correct. Do not adjust bbox for now.</span>
+        <span class="s1">pstoeps(tmpfile</span><span class="s2">, </span><span class="s1">bbox</span><span class="s2">, </span><span class="s1">rotated=rotated)</span>
+
+
+<span class="s2">def </span><span class="s1">xpdf_distill(tmpfile</span><span class="s2">, </span><span class="s1">eps=</span><span class="s2">False, </span><span class="s1">ptype=</span><span class="s3">'letter'</span><span class="s2">, </span><span class="s1">bbox=</span><span class="s2">None, </span><span class="s1">rotated=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Use ghostscript's ps2pdf and xpdf's/poppler's pdftops to distill a file. 
+    This yields smaller files without illegal encapsulated postscript 
+    operators. This distiller is preferred, generating high-level postscript 
+    output that treats text as text. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">mpl._get_executable_info(</span><span class="s3">&quot;gs&quot;</span><span class="s1">)  </span><span class="s4"># Effectively checks for ps2pdf.</span>
+    <span class="s1">mpl._get_executable_info(</span><span class="s3">&quot;pdftops&quot;</span><span class="s1">)</span>
+
+    <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+        <span class="s1">tmppdf = pathlib.Path(tmpdir</span><span class="s2">, </span><span class="s3">&quot;tmp.pdf&quot;</span><span class="s1">)</span>
+        <span class="s1">tmpps = pathlib.Path(tmpdir</span><span class="s2">, </span><span class="s3">&quot;tmp.ps&quot;</span><span class="s1">)</span>
+        <span class="s4"># Pass options as `-foo#bar` instead of `-foo=bar` to keep Windows</span>
+        <span class="s4"># happy (https://ghostscript.com/doc/9.56.1/Use.htm#MS_Windows).</span>
+        <span class="s1">cbook._check_and_log_subprocess(</span>
+            <span class="s1">[</span><span class="s3">&quot;ps2pdf&quot;</span><span class="s2">,</span>
+             <span class="s3">&quot;-dAutoFilterColorImages#false&quot;</span><span class="s2">,</span>
+             <span class="s3">&quot;-dAutoFilterGrayImages#false&quot;</span><span class="s2">,</span>
+             <span class="s3">&quot;-sAutoRotatePages#None&quot;</span><span class="s2">,</span>
+             <span class="s3">&quot;-sGrayImageFilter#FlateEncode&quot;</span><span class="s2">,</span>
+             <span class="s3">&quot;-sColorImageFilter#FlateEncode&quot;</span><span class="s2">,</span>
+             <span class="s3">&quot;-dEPSCrop&quot; </span><span class="s2">if </span><span class="s1">eps </span><span class="s2">else </span><span class="s3">&quot;-sPAPERSIZE#%s&quot; </span><span class="s1">% ptype</span><span class="s2">,</span>
+             <span class="s1">tmpfile</span><span class="s2">, </span><span class="s1">tmppdf]</span><span class="s2">, </span><span class="s1">_log)</span>
+        <span class="s1">cbook._check_and_log_subprocess(</span>
+            <span class="s1">[</span><span class="s3">&quot;pdftops&quot;</span><span class="s2">, </span><span class="s3">&quot;-paper&quot;</span><span class="s2">, </span><span class="s3">&quot;match&quot;</span><span class="s2">, </span><span class="s3">&quot;-level2&quot;</span><span class="s2">, </span><span class="s1">tmppdf</span><span class="s2">, </span><span class="s1">tmpps]</span><span class="s2">, </span><span class="s1">_log)</span>
+        <span class="s1">shutil.move(tmpps</span><span class="s2">, </span><span class="s1">tmpfile)</span>
+    <span class="s2">if </span><span class="s1">eps:</span>
+        <span class="s1">pstoeps(tmpfile)</span>
+
+
+<span class="s2">def </span><span class="s1">get_bbox_header(lbrt</span><span class="s2">, </span><span class="s1">rotated=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return a postscript header string for the given bbox lbrt=(l, b, r, t). 
+    Optionally, return rotate command. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">r</span><span class="s2">, </span><span class="s1">t = lbrt</span>
+    <span class="s2">if </span><span class="s1">rotated:</span>
+        <span class="s1">rotate = </span><span class="s3">&quot;%.2f %.2f translate</span><span class="s2">\n</span><span class="s3">90 rotate&quot; </span><span class="s1">% (l+r</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">rotate = </span><span class="s3">&quot;&quot;</span>
+    <span class="s1">bbox_info = </span><span class="s3">'%%%%BoundingBox: %d %d %d %d' </span><span class="s1">% (l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">np.ceil(r)</span><span class="s2">, </span><span class="s1">np.ceil(t))</span>
+    <span class="s1">hires_bbox_info = </span><span class="s3">'%%%%HiResBoundingBox: %.6f %.6f %.6f %.6f' </span><span class="s1">% (</span>
+        <span class="s1">l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">r</span><span class="s2">, </span><span class="s1">t)</span>
+
+    <span class="s2">return </span><span class="s3">'</span><span class="s2">\n</span><span class="s3">'</span><span class="s1">.join([bbox_info</span><span class="s2">, </span><span class="s1">hires_bbox_info])</span><span class="s2">, </span><span class="s1">rotate</span>
+
+
+<span class="s2">def </span><span class="s1">pstoeps(tmpfile</span><span class="s2">, </span><span class="s1">bbox=</span><span class="s2">None, </span><span class="s1">rotated=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert the postscript to encapsulated postscript.  The bbox of 
+    the eps file will be replaced with the given *bbox* argument. If 
+    None, original bbox will be used. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># if rotated==True, the output eps file need to be rotated</span>
+    <span class="s2">if </span><span class="s1">bbox:</span>
+        <span class="s1">bbox_info</span><span class="s2">, </span><span class="s1">rotate = get_bbox_header(bbox</span><span class="s2">, </span><span class="s1">rotated=rotated)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">bbox_info</span><span class="s2">, </span><span class="s1">rotate = </span><span class="s2">None, None</span>
+
+    <span class="s1">epsfile = tmpfile + </span><span class="s3">'.eps'</span>
+    <span class="s2">with </span><span class="s1">open(epsfile</span><span class="s2">, </span><span class="s3">'wb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">epsh</span><span class="s2">, </span><span class="s1">open(tmpfile</span><span class="s2">, </span><span class="s3">'rb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">tmph:</span>
+        <span class="s1">write = epsh.write</span>
+        <span class="s4"># Modify the header:</span>
+        <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">tmph:</span>
+            <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s6">b'%!PS'</span><span class="s1">):</span>
+                <span class="s1">write(</span><span class="s6">b&quot;%!PS-Adobe-3.0 EPSF-3.0</span><span class="s2">\n</span><span class="s6">&quot;</span><span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">bbox:</span>
+                    <span class="s1">write(bbox_info.encode(</span><span class="s3">'ascii'</span><span class="s1">) + </span><span class="s6">b'</span><span class="s2">\n</span><span class="s6">'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">line.startswith(</span><span class="s6">b'%%EndComments'</span><span class="s1">):</span>
+                <span class="s1">write(line)</span>
+                <span class="s1">write(</span><span class="s6">b'%%BeginProlog</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'save</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'countdictstack</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'mark</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'newpath</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'/showpage {} def</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'/setpagedevice {pop} def</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'%%EndProlog</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'%%Page 1 1</span><span class="s2">\n</span><span class="s6">'</span><span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">rotate:</span>
+                    <span class="s1">write(rotate.encode(</span><span class="s3">'ascii'</span><span class="s1">) + </span><span class="s6">b'</span><span class="s2">\n</span><span class="s6">'</span><span class="s1">)</span>
+                <span class="s2">break</span>
+            <span class="s2">elif </span><span class="s1">bbox </span><span class="s2">and </span><span class="s1">line.startswith((</span><span class="s6">b'%%Bound'</span><span class="s2">, </span><span class="s6">b'%%HiResBound'</span><span class="s2">,</span>
+                                           <span class="s6">b'%%DocumentMedia'</span><span class="s2">, </span><span class="s6">b'%%Pages'</span><span class="s1">)):</span>
+                <span class="s2">pass</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">write(line)</span>
+        <span class="s4"># Now rewrite the rest of the file, and modify the trailer.</span>
+        <span class="s4"># This is done in a second loop such that the header of the embedded</span>
+        <span class="s4"># eps file is not modified.</span>
+        <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">tmph:</span>
+            <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s6">b'%%EOF'</span><span class="s1">):</span>
+                <span class="s1">write(</span><span class="s6">b'cleartomark</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'countdictstack</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'exch sub { end } repeat</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'restore</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'showpage</span><span class="s2">\n</span><span class="s6">'</span>
+                      <span class="s6">b'%%EOF</span><span class="s2">\n</span><span class="s6">'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">line.startswith(</span><span class="s6">b'%%PageBoundingBox'</span><span class="s1">):</span>
+                <span class="s2">pass</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">write(line)</span>
+
+    <span class="s1">os.remove(tmpfile)</span>
+    <span class="s1">shutil.move(epsfile</span><span class="s2">, </span><span class="s1">tmpfile)</span>
+
+
+<span class="s1">FigureManagerPS = FigureManagerBase</span>
+
+
+<span class="s4"># The following Python dictionary psDefs contains the entries for the</span>
+<span class="s4"># PostScript dictionary mpldict.  This dictionary implements most of</span>
+<span class="s4"># the matplotlib primitives and some abbreviations.</span>
+<span class="s4">#</span>
+<span class="s4"># References:</span>
+<span class="s4"># https://www.adobe.com/content/dam/acom/en/devnet/actionscript/articles/PLRM.pdf</span>
+<span class="s4"># http://preserve.mactech.com/articles/mactech/Vol.09/09.04/PostscriptTutorial</span>
+<span class="s4"># http://www.math.ubc.ca/people/faculty/cass/graphics/text/www/</span>
+<span class="s4">#</span>
+
+<span class="s4"># The usage comments use the notation of the operator summary</span>
+<span class="s4"># in the PostScript Language reference manual.</span>
+<span class="s1">psDefs = [</span>
+    <span class="s4"># name proc  *_d*  -</span>
+    <span class="s4"># Note that this cannot be bound to /d, because when embedding a Type3 font</span>
+    <span class="s4"># we may want to define a &quot;d&quot; glyph using &quot;/d{...} d&quot; which would locally</span>
+    <span class="s4"># overwrite the definition.</span>
+    <span class="s3">&quot;/_d { bind def } bind def&quot;</span><span class="s2">,</span>
+    <span class="s4"># x y  *m*  -</span>
+    <span class="s3">&quot;/m { moveto } _d&quot;</span><span class="s2">,</span>
+    <span class="s4"># x y  *l*  -</span>
+    <span class="s3">&quot;/l { lineto } _d&quot;</span><span class="s2">,</span>
+    <span class="s4"># x y  *r*  -</span>
+    <span class="s3">&quot;/r { rlineto } _d&quot;</span><span class="s2">,</span>
+    <span class="s4"># x1 y1 x2 y2 x y *c*  -</span>
+    <span class="s3">&quot;/c { curveto } _d&quot;</span><span class="s2">,</span>
+    <span class="s4"># *cl*  -</span>
+    <span class="s3">&quot;/cl { closepath } _d&quot;</span><span class="s2">,</span>
+    <span class="s4"># *ce*  -</span>
+    <span class="s3">&quot;/ce { closepath eofill } _d&quot;</span><span class="s2">,</span>
+    <span class="s4"># w h x y  *box*  -</span>
+    <span class="s3">&quot;&quot;&quot;/box { 
+      m 
+      1 index 0 r 
+      0 exch r 
+      neg 0 r 
+      cl 
+    } _d&quot;&quot;&quot;</span><span class="s2">,</span>
+    <span class="s4"># w h x y  *clipbox*  -</span>
+    <span class="s3">&quot;&quot;&quot;/clipbox { 
+      box 
+      clip 
+      newpath 
+    } _d&quot;&quot;&quot;</span><span class="s2">,</span>
+    <span class="s4"># wx wy llx lly urx ury  *setcachedevice*  -</span>
+    <span class="s3">&quot;/sc { setcachedevice } _d&quot;</span><span class="s2">,</span>
+<span class="s1">]</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s2">class </span><span class="s1">_BackendPS(_Backend):</span>
+    <span class="s1">backend_version = </span><span class="s3">'Level II'</span>
+    <span class="s1">FigureCanvas = FigureCanvasPS</span>
+</pre>
+</body>
+</html>

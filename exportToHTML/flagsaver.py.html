@@ -1,0 +1,408 @@
+<html>
+<head>
+<title>flagsaver.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+flagsaver.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2017 The Abseil Authors.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;Decorator and context manager for saving and restoring flag values. 
+ 
+There are many ways to save and restore.  Always use the most convenient method 
+for a given use case. 
+ 
+Here are examples of each method.  They all call ``do_stuff()`` while 
+``FLAGS.someflag`` is temporarily set to ``'foo'``:: 
+ 
+    from absl.testing import flagsaver 
+ 
+    # Use a decorator which can optionally override flags via arguments. 
+    @flagsaver.flagsaver(someflag='foo') 
+    def some_func(): 
+      do_stuff() 
+ 
+    # Use a decorator which can optionally override flags with flagholders. 
+    @flagsaver.flagsaver((module.FOO_FLAG, 'foo'), (other_mod.BAR_FLAG, 23)) 
+    def some_func(): 
+      do_stuff() 
+ 
+    # Use a decorator which does not override flags itself. 
+    @flagsaver.flagsaver 
+    def some_func(): 
+      FLAGS.someflag = 'foo' 
+      do_stuff() 
+ 
+    # Use a context manager which can optionally override flags via arguments. 
+    with flagsaver.flagsaver(someflag='foo'): 
+      do_stuff() 
+ 
+    # Save and restore the flag values yourself. 
+    saved_flag_values = flagsaver.save_flag_values() 
+    try: 
+      FLAGS.someflag = 'foo' 
+      do_stuff() 
+    finally: 
+      flagsaver.restore_flag_values(saved_flag_values) 
+ 
+    # Use the parsing version to emulate users providing the flags. 
+    # Note that all flags must be provided as strings (unparsed). 
+    @flagsaver.as_parsed(some_int_flag='123') 
+    def some_func(): 
+      # Because the flag was parsed it is considered &quot;present&quot;. 
+      assert FLAGS.some_int_flag.present 
+      do_stuff() 
+ 
+    # flagsaver.as_parsed() can also be used as a context manager just like 
+    # flagsaver.flagsaver() 
+    with flagsaver.as_parsed(some_int_flag='123'): 
+      do_stuff() 
+ 
+    # The flagsaver.as_parsed() interface also supports FlagHolder objects. 
+    @flagsaver.as_parsed((module.FOO_FLAG, 'foo'), (other_mod.BAR_FLAG, '23')) 
+    def some_func(): 
+      do_stuff() 
+ 
+    # Using as_parsed with a multi_X flag requires a sequence of strings. 
+    @flagsaver.as_parsed(some_multi_int_flag=['123', '456']) 
+    def some_func(): 
+      assert FLAGS.some_multi_int_flag.present 
+      do_stuff() 
+ 
+    # If a flag name includes non-identifier characters it can be specified like 
+    # so: 
+    @flagsaver.as_parsed(**{'i-like-dashes': 'true'}) 
+    def some_func(): 
+      do_stuff() 
+ 
+We save and restore a shallow copy of each Flag object's ``__dict__`` attribute. 
+This preserves all attributes of the flag, such as whether or not it was 
+overridden from its default value. 
+ 
+WARNING: Currently a flag that is saved and then deleted cannot be restored.  An 
+exception will be raised.  However if you *add* a flag after saving flag values, 
+and then restore flag values, the added flag will be deleted with no errors. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">collections</span>
+<span class="s3">import </span><span class="s1">functools</span>
+<span class="s3">import </span><span class="s1">inspect</span>
+<span class="s3">from </span><span class="s1">typing </span><span class="s3">import </span><span class="s1">overload</span><span class="s3">, </span><span class="s1">Any</span><span class="s3">, </span><span class="s1">Callable</span><span class="s3">, </span><span class="s1">Mapping</span><span class="s3">, </span><span class="s1">Tuple</span><span class="s3">, </span><span class="s1">TypeVar</span><span class="s3">, </span><span class="s1">Type</span><span class="s3">, </span><span class="s1">Sequence</span><span class="s3">, </span><span class="s1">Union</span>
+
+<span class="s3">from </span><span class="s1">absl </span><span class="s3">import </span><span class="s1">flags</span>
+
+<span class="s1">FLAGS = flags.FLAGS</span>
+
+
+<span class="s0"># The type of pre/post wrapped functions.</span>
+<span class="s1">_CallableT = TypeVar(</span><span class="s4">'_CallableT'</span><span class="s3">, </span><span class="s1">bound=Callable)</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">flagsaver(*args: Tuple[flags.FlagHolder</span><span class="s3">, </span><span class="s1">Any]</span><span class="s3">,</span>
+              <span class="s1">**kwargs: Any) -&gt; </span><span class="s4">'_FlagOverrider'</span><span class="s1">:</span>
+  <span class="s1">...</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">flagsaver(func: _CallableT) -&gt; _CallableT:</span>
+  <span class="s1">...</span>
+
+
+<span class="s3">def </span><span class="s1">flagsaver(*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+  <span class="s2">&quot;&quot;&quot;The main flagsaver interface. See module doc for usage.&quot;&quot;&quot;</span>
+  <span class="s3">return </span><span class="s1">_construct_overrider(_FlagOverrider</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">as_parsed(*args: Tuple[flags.FlagHolder</span><span class="s3">, </span><span class="s1">Union[str</span><span class="s3">, </span><span class="s1">Sequence[str]]]</span><span class="s3">,</span>
+              <span class="s1">**kwargs: Union[str</span><span class="s3">, </span><span class="s1">Sequence[str]]) -&gt; </span><span class="s4">'_ParsingFlagOverrider'</span><span class="s1">:</span>
+  <span class="s1">...</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">as_parsed(func: _CallableT) -&gt; _CallableT:</span>
+  <span class="s1">...</span>
+
+
+<span class="s3">def </span><span class="s1">as_parsed(*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+  <span class="s2">&quot;&quot;&quot;Overrides flags by parsing strings, saves flag state similar to flagsaver. 
+ 
+  This function can be used as either a decorator or context manager similar to 
+  flagsaver.flagsaver(). However, where flagsaver.flagsaver() directly sets the 
+  flags to new values, this function will parse the provided arguments as if 
+  they were provided on the command line. Among other things, this will cause 
+  `FLAGS['flag_name'].parsed == True`. 
+ 
+  A note on unparsed input: For many flag types, the unparsed version will be 
+  a single string. However for multi_x (multi_string, multi_integer, multi_enum) 
+  the unparsed version will be a Sequence of strings. 
+ 
+  Args: 
+    *args: Tuples of FlagHolders and their unparsed value. 
+    **kwargs: The keyword args are flag names, and the values are unparsed 
+      values. 
+ 
+  Returns: 
+    _ParsingFlagOverrider that serves as a context manager or decorator. Will 
+    save previous flag state and parse new flags, then on cleanup it will 
+    restore the previous flag state. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">return </span><span class="s1">_construct_overrider(_ParsingFlagOverrider</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s0"># NOTE: the order of these overload declarations matters. The type checker will</span>
+<span class="s0"># pick the first match which could be incorrect.</span>
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">_construct_overrider(</span>
+    <span class="s1">flag_overrider_cls: Type[</span><span class="s4">'_ParsingFlagOverrider'</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">*args: Tuple[flags.FlagHolder</span><span class="s3">, </span><span class="s1">Union[str</span><span class="s3">, </span><span class="s1">Sequence[str]]]</span><span class="s3">,</span>
+    <span class="s1">**kwargs: Union[str</span><span class="s3">, </span><span class="s1">Sequence[str]]) -&gt; </span><span class="s4">'_ParsingFlagOverrider'</span><span class="s1">:</span>
+  <span class="s1">...</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">_construct_overrider(flag_overrider_cls: Type[</span><span class="s4">'_FlagOverrider'</span><span class="s1">]</span><span class="s3">,</span>
+                         <span class="s1">*args: Tuple[flags.FlagHolder</span><span class="s3">, </span><span class="s1">Any]</span><span class="s3">,</span>
+                         <span class="s1">**kwargs: Any) -&gt; </span><span class="s4">'_FlagOverrider'</span><span class="s1">:</span>
+  <span class="s1">...</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">_construct_overrider(flag_overrider_cls: Type[</span><span class="s4">'_FlagOverrider'</span><span class="s1">]</span><span class="s3">,</span>
+                         <span class="s1">func: _CallableT) -&gt; _CallableT:</span>
+  <span class="s1">...</span>
+
+
+<span class="s3">def </span><span class="s1">_construct_overrider(flag_overrider_cls</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+  <span class="s2">&quot;&quot;&quot;Handles the args/kwargs returning an instance of flag_overrider_cls. 
+ 
+  If flag_overrider_cls is _FlagOverrider then values should be native python 
+  types matching the python types. Otherwise if flag_overrider_cls is 
+  _ParsingFlagOverrider the values should be strings or sequences of strings. 
+ 
+  Args: 
+    flag_overrider_cls: The class that will do the overriding. 
+    *args: Tuples of FlagHolder and the new flag value. 
+    **kwargs: Keword args mapping flag name to new flag value. 
+ 
+  Returns: 
+    A _FlagOverrider to be used as a decorator or context manager. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">if not </span><span class="s1">args:</span>
+    <span class="s3">return </span><span class="s1">flag_overrider_cls(**kwargs)</span>
+  <span class="s0"># args can be [func] if used as `@flagsaver` instead of `@flagsaver(...)`</span>
+  <span class="s3">if </span><span class="s1">len(args) == </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">callable(args[</span><span class="s5">0</span><span class="s1">]):</span>
+    <span class="s3">if </span><span class="s1">kwargs:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">&quot;It's invalid to specify both positional and keyword parameters.&quot;</span><span class="s1">)</span>
+    <span class="s1">func = args[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s3">if </span><span class="s1">inspect.isclass(func):</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'@flagsaver.flagsaver cannot be applied to a class.'</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">_wrap(flag_overrider_cls</span><span class="s3">, </span><span class="s1">func</span><span class="s3">, </span><span class="s1">{})</span>
+  <span class="s0"># args can be a list of (FlagHolder, value) pairs.</span>
+  <span class="s0"># In which case they augment any specified kwargs.</span>
+  <span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">args:</span>
+    <span class="s3">if not </span><span class="s1">isinstance(arg</span><span class="s3">, </span><span class="s1">tuple) </span><span class="s3">or </span><span class="s1">len(arg) != </span><span class="s5">2</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'Expected (FlagHolder, value) pair, found %r' </span><span class="s1">% (arg</span><span class="s3">,</span><span class="s1">))</span>
+    <span class="s1">holder</span><span class="s3">, </span><span class="s1">value = arg</span>
+    <span class="s3">if not </span><span class="s1">isinstance(holder</span><span class="s3">, </span><span class="s1">flags.FlagHolder):</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'Expected (FlagHolder, value) pair, found %r' </span><span class="s1">% (arg</span><span class="s3">,</span><span class="s1">))</span>
+    <span class="s3">if </span><span class="s1">holder.name </span><span class="s3">in </span><span class="s1">kwargs:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'Cannot set --%s multiple times' </span><span class="s1">% holder.name)</span>
+    <span class="s1">kwargs[holder.name] = value</span>
+  <span class="s3">return </span><span class="s1">flag_overrider_cls(**kwargs)</span>
+
+
+<span class="s3">def </span><span class="s1">save_flag_values(</span>
+    <span class="s1">flag_values: flags.FlagValues = FLAGS) -&gt; Mapping[str</span><span class="s3">, </span><span class="s1">Mapping[str</span><span class="s3">, </span><span class="s1">Any]]:</span>
+  <span class="s2">&quot;&quot;&quot;Returns copy of flag values as a dict. 
+ 
+  Args: 
+    flag_values: FlagValues, the FlagValues instance with which the flag will be 
+      saved. This should almost never need to be overridden. 
+ 
+  Returns: 
+    Dictionary mapping keys to values. Keys are flag names, values are 
+    corresponding ``__dict__`` members. E.g. ``{'key': value_dict, ...}``. 
+  &quot;&quot;&quot;</span>
+  <span class="s3">return </span><span class="s1">{name: _copy_flag_dict(flag_values[name]) </span><span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">flag_values}</span>
+
+
+<span class="s3">def </span><span class="s1">restore_flag_values(saved_flag_values: Mapping[str</span><span class="s3">, </span><span class="s1">Mapping[str</span><span class="s3">, </span><span class="s1">Any]]</span><span class="s3">,</span>
+                        <span class="s1">flag_values: flags.FlagValues = FLAGS):</span>
+  <span class="s2">&quot;&quot;&quot;Restores flag values based on the dictionary of flag values. 
+ 
+  Args: 
+    saved_flag_values: {'flag_name': value_dict, ...} 
+    flag_values: FlagValues, the FlagValues instance from which the flag will be 
+      restored. This should almost never need to be overridden. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">new_flag_names = list(flag_values)</span>
+  <span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">new_flag_names:</span>
+    <span class="s1">saved = saved_flag_values.get(name)</span>
+    <span class="s3">if </span><span class="s1">saved </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s0"># If __dict__ was not saved delete &quot;new&quot; flag.</span>
+      <span class="s1">delattr(flag_values</span><span class="s3">, </span><span class="s1">name)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">if </span><span class="s1">flag_values[name].value != saved[</span><span class="s4">'_value'</span><span class="s1">]:</span>
+        <span class="s1">flag_values[name].value = saved[</span><span class="s4">'_value'</span><span class="s1">]  </span><span class="s0"># Ensure C++ value is set.</span>
+      <span class="s1">flag_values[name].__dict__ = saved</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">_wrap(flag_overrider_cls: Type[</span><span class="s4">'_FlagOverrider'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">func: _CallableT</span><span class="s3">,</span>
+          <span class="s1">overrides: Mapping[str</span><span class="s3">, </span><span class="s1">Any]) -&gt; _CallableT:</span>
+  <span class="s1">...</span>
+
+
+<span class="s1">@overload</span>
+<span class="s3">def </span><span class="s1">_wrap(flag_overrider_cls: Type[</span><span class="s4">'_ParsingFlagOverrider'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">func: _CallableT</span><span class="s3">,</span>
+          <span class="s1">overrides: Mapping[str</span><span class="s3">, </span><span class="s1">Union[str</span><span class="s3">, </span><span class="s1">Sequence[str]]]) -&gt; _CallableT:</span>
+  <span class="s1">...</span>
+
+
+<span class="s3">def </span><span class="s1">_wrap(flag_overrider_cls</span><span class="s3">, </span><span class="s1">func</span><span class="s3">, </span><span class="s1">overrides):</span>
+  <span class="s2">&quot;&quot;&quot;Creates a wrapper function that saves/restores flag values. 
+ 
+  Args: 
+    flag_overrider_cls: The class that will be used as a context manager. 
+    func: This will be called between saving flags and restoring flags. 
+    overrides: Flag names mapped to their values. These flags will be set after 
+      saving the original flag state. The type of the values depends on if 
+      _FlagOverrider or _ParsingFlagOverrider was specified. 
+ 
+  Returns: 
+    A wrapped version of func. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">@functools.wraps(func)</span>
+  <span class="s3">def </span><span class="s1">_flagsaver_wrapper(*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Wrapper function that saves and restores flags.&quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">flag_overrider_cls(**overrides):</span>
+      <span class="s3">return </span><span class="s1">func(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+  <span class="s3">return </span><span class="s1">_flagsaver_wrapper</span>
+
+
+<span class="s3">class </span><span class="s1">_FlagOverrider(object):</span>
+  <span class="s2">&quot;&quot;&quot;Overrides flags for the duration of the decorated function call. 
+ 
+  It also restores all original values of flags after decorated method 
+  completes. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">**overrides: Any):</span>
+    <span class="s1">self._overrides = overrides</span>
+    <span class="s1">self._saved_flag_values = </span><span class="s3">None</span>
+
+  <span class="s3">def </span><span class="s1">__call__(self</span><span class="s3">, </span><span class="s1">func: _CallableT) -&gt; _CallableT:</span>
+    <span class="s3">if </span><span class="s1">inspect.isclass(func):</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'flagsaver cannot be applied to a class.'</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">_wrap(self.__class__</span><span class="s3">, </span><span class="s1">func</span><span class="s3">, </span><span class="s1">self._overrides)</span>
+
+  <span class="s3">def </span><span class="s1">__enter__(self):</span>
+    <span class="s1">self._saved_flag_values = save_flag_values(FLAGS)</span>
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s1">FLAGS._set_attributes(**self._overrides)</span>
+    <span class="s3">except</span><span class="s1">:</span>
+      <span class="s0"># It may fail because of flag validators.</span>
+      <span class="s1">restore_flag_values(self._saved_flag_values</span><span class="s3">, </span><span class="s1">FLAGS)</span>
+      <span class="s3">raise</span>
+
+  <span class="s3">def </span><span class="s1">__exit__(self</span><span class="s3">, </span><span class="s1">exc_type</span><span class="s3">, </span><span class="s1">exc_value</span><span class="s3">, </span><span class="s1">traceback):</span>
+    <span class="s1">restore_flag_values(self._saved_flag_values</span><span class="s3">, </span><span class="s1">FLAGS)</span>
+
+
+<span class="s3">class </span><span class="s1">_ParsingFlagOverrider(_FlagOverrider):</span>
+  <span class="s2">&quot;&quot;&quot;Context manager for overriding flags. 
+ 
+  Simulates command line parsing. 
+ 
+  This is simlar to _FlagOverrider except that all **overrides should be 
+  strings or sequences of strings, and when context is entered this class calls 
+  .parse(value) 
+ 
+  This results in the flags having .present set properly. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">**overrides: Union[str</span><span class="s3">, </span><span class="s1">Sequence[str]]):</span>
+    <span class="s3">for </span><span class="s1">flag_name</span><span class="s3">, </span><span class="s1">new_value </span><span class="s3">in </span><span class="s1">overrides.items():</span>
+      <span class="s3">if </span><span class="s1">isinstance(new_value</span><span class="s3">, </span><span class="s1">str):</span>
+        <span class="s3">continue</span>
+      <span class="s3">if </span><span class="s1">(isinstance(new_value</span><span class="s3">, </span><span class="s1">collections.abc.Sequence) </span><span class="s3">and</span>
+          <span class="s1">all(isinstance(single_value</span><span class="s3">, </span><span class="s1">str) </span><span class="s3">for </span><span class="s1">single_value </span><span class="s3">in </span><span class="s1">new_value)):</span>
+        <span class="s3">continue</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span>
+          <span class="s4">f'flagsaver.as_parsed() cannot parse </span><span class="s3">{</span><span class="s1">flag_name</span><span class="s3">}</span><span class="s4">. Expected a single '</span>
+          <span class="s4">f'string or sequence of strings but </span><span class="s3">{</span><span class="s1">type(new_value)</span><span class="s3">} </span><span class="s4">was provided.'</span><span class="s1">)</span>
+    <span class="s1">super().__init__(**overrides)</span>
+
+  <span class="s3">def </span><span class="s1">__enter__(self):</span>
+    <span class="s1">self._saved_flag_values = save_flag_values(FLAGS)</span>
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s3">for </span><span class="s1">flag_name</span><span class="s3">, </span><span class="s1">unparsed_value </span><span class="s3">in </span><span class="s1">self._overrides.items():</span>
+        <span class="s0"># LINT.IfChange(flag_override_parsing)</span>
+        <span class="s1">FLAGS[flag_name].parse(unparsed_value)</span>
+        <span class="s1">FLAGS[flag_name].using_default_value = </span><span class="s3">False</span>
+        <span class="s0"># LINT.ThenChange()</span>
+
+      <span class="s0"># Perform the validation on all modified flags. This is something that</span>
+      <span class="s0"># FLAGS._set_attributes() does for you in _FlagOverrider.</span>
+      <span class="s3">for </span><span class="s1">flag_name </span><span class="s3">in </span><span class="s1">self._overrides:</span>
+        <span class="s1">FLAGS._assert_validators(FLAGS[flag_name].validators)</span>
+
+    <span class="s3">except </span><span class="s1">KeyError </span><span class="s3">as </span><span class="s1">e:</span>
+      <span class="s0"># If a flag doesn't exist, an UnrecognizedFlagError is more specific.</span>
+      <span class="s1">restore_flag_values(self._saved_flag_values</span><span class="s3">, </span><span class="s1">FLAGS)</span>
+      <span class="s3">raise </span><span class="s1">flags.UnrecognizedFlagError(</span><span class="s4">'Unknown command line flag.'</span><span class="s1">) </span><span class="s3">from </span><span class="s1">e</span>
+
+    <span class="s3">except</span><span class="s1">:</span>
+      <span class="s0"># It may fail because of flag validators or general parsing issues.</span>
+      <span class="s1">restore_flag_values(self._saved_flag_values</span><span class="s3">, </span><span class="s1">FLAGS)</span>
+      <span class="s3">raise</span>
+
+
+<span class="s3">def </span><span class="s1">_copy_flag_dict(flag: flags.Flag) -&gt; Mapping[str</span><span class="s3">, </span><span class="s1">Any]:</span>
+  <span class="s2">&quot;&quot;&quot;Returns a copy of the flag object's ``__dict__``. 
+ 
+  It's mostly a shallow copy of the ``__dict__``, except it also does a shallow 
+  copy of the validator list. 
+ 
+  Args: 
+    flag: flags.Flag, the flag to copy. 
+ 
+  Returns: 
+    A copy of the flag object's ``__dict__``. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">copy = flag.__dict__.copy()</span>
+  <span class="s1">copy[</span><span class="s4">'_value'</span><span class="s1">] = flag.value  </span><span class="s0"># Ensure correct restore for C++ flags.</span>
+  <span class="s1">copy[</span><span class="s4">'validators'</span><span class="s1">] = list(flag.validators)</span>
+  <span class="s3">return </span><span class="s1">copy</span>
+</pre>
+</body>
+</html>

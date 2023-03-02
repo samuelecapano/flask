@@ -1,0 +1,799 @@
+<html>
+<head>
+<title>TupleVariation.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #629755; font-style: italic;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+TupleVariation.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc.fixedTools </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">fixedToFloat </span><span class="s0">as </span><span class="s1">fi2fl</span><span class="s0">,</span>
+    <span class="s1">floatToFixed </span><span class="s0">as </span><span class="s1">fl2fi</span><span class="s0">,</span>
+    <span class="s1">floatToFixedToStr </span><span class="s0">as </span><span class="s1">fl2str</span><span class="s0">,</span>
+    <span class="s1">strToFixedToFloat </span><span class="s0">as </span><span class="s1">str2fl</span><span class="s0">,</span>
+    <span class="s1">otRound</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">safeEval</span>
+<span class="s0">import </span><span class="s1">array</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">Counter</span><span class="s0">, </span><span class="s1">defaultdict</span>
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">import </span><span class="s1">sys</span>
+
+
+<span class="s2"># https://www.microsoft.com/typography/otspec/otvarcommonformats.htm</span>
+
+<span class="s1">EMBEDDED_PEAK_TUPLE = </span><span class="s3">0x8000</span>
+<span class="s1">INTERMEDIATE_REGION = </span><span class="s3">0x4000</span>
+<span class="s1">PRIVATE_POINT_NUMBERS = </span><span class="s3">0x2000</span>
+
+<span class="s1">DELTAS_ARE_ZERO = </span><span class="s3">0x80</span>
+<span class="s1">DELTAS_ARE_WORDS = </span><span class="s3">0x40</span>
+<span class="s1">DELTA_RUN_COUNT_MASK = </span><span class="s3">0x3f</span>
+
+<span class="s1">POINTS_ARE_WORDS = </span><span class="s3">0x80</span>
+<span class="s1">POINT_RUN_COUNT_MASK = </span><span class="s3">0x7f</span>
+
+<span class="s1">TUPLES_SHARE_POINT_NUMBERS = </span><span class="s3">0x8000</span>
+<span class="s1">TUPLE_COUNT_MASK = </span><span class="s3">0x0fff</span>
+<span class="s1">TUPLE_INDEX_MASK = </span><span class="s3">0x0fff</span>
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+
+<span class="s0">class </span><span class="s1">TupleVariation(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">axes</span><span class="s0">, </span><span class="s1">coordinates):</span>
+		<span class="s1">self.axes = axes.copy()</span>
+		<span class="s1">self.coordinates = list(coordinates)</span>
+
+	<span class="s0">def </span><span class="s1">__repr__(self):</span>
+		<span class="s1">axes = </span><span class="s4">&quot;,&quot;</span><span class="s1">.join(sorted([</span><span class="s4">&quot;%s=%s&quot; </span><span class="s1">% (name</span><span class="s0">, </span><span class="s1">value) </span><span class="s0">for </span><span class="s1">(name</span><span class="s0">, </span><span class="s1">value) </span><span class="s0">in </span><span class="s1">self.axes.items()]))</span>
+		<span class="s0">return </span><span class="s4">&quot;&lt;TupleVariation %s %s&gt;&quot; </span><span class="s1">% (axes</span><span class="s0">, </span><span class="s1">self.coordinates)</span>
+
+	<span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">return </span><span class="s1">self.coordinates == other.coordinates </span><span class="s0">and </span><span class="s1">self.axes == other.axes</span>
+
+	<span class="s0">def </span><span class="s1">getUsedPoints(self):</span>
+		<span class="s2"># Empty set means &quot;all points used&quot;.</span>
+		<span class="s0">if None not in </span><span class="s1">self.coordinates:</span>
+			<span class="s0">return </span><span class="s1">frozenset()</span>
+		<span class="s1">used = frozenset([i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">,</span><span class="s1">p </span><span class="s0">in </span><span class="s1">enumerate(self.coordinates) </span><span class="s0">if </span><span class="s1">p </span><span class="s0">is not None</span><span class="s1">])</span>
+		<span class="s2"># Return None if no points used.</span>
+		<span class="s0">return </span><span class="s1">used </span><span class="s0">if </span><span class="s1">used </span><span class="s0">else None</span>
+
+	<span class="s0">def </span><span class="s1">hasImpact(self):</span>
+		<span class="s5">&quot;&quot;&quot;Returns True if this TupleVariation has any visible impact. 
+ 
+        If the result is False, the TupleVariation can be omitted from the font 
+        without making any visible difference. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">any(c </span><span class="s0">is not None for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self.coordinates)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">axisTags):</span>
+		<span class="s1">writer.begintag(</span><span class="s4">&quot;tuple&quot;</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axisTags:</span>
+			<span class="s1">value = self.axes.get(axis)</span>
+			<span class="s0">if </span><span class="s1">value </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">minValue</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">maxValue = value</span>
+				<span class="s1">defaultMinValue = min(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt; -0.3; 0.7 --&gt; 0.0</span>
+				<span class="s1">defaultMaxValue = max(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt;  0.0; 0.7 --&gt; 0.7</span>
+				<span class="s0">if </span><span class="s1">minValue == defaultMinValue </span><span class="s0">and </span><span class="s1">maxValue == defaultMaxValue:</span>
+					<span class="s1">writer.simpletag(</span><span class="s4">&quot;coord&quot;</span><span class="s0">, </span><span class="s1">axis=axis</span><span class="s0">, </span><span class="s1">value=fl2str(value</span><span class="s0">, </span><span class="s3">14</span><span class="s1">))</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">attrs = [</span>
+						<span class="s1">(</span><span class="s4">&quot;axis&quot;</span><span class="s0">, </span><span class="s1">axis)</span><span class="s0">,</span>
+						<span class="s1">(</span><span class="s4">&quot;min&quot;</span><span class="s0">, </span><span class="s1">fl2str(minValue</span><span class="s0">, </span><span class="s3">14</span><span class="s1">))</span><span class="s0">,</span>
+						<span class="s1">(</span><span class="s4">&quot;value&quot;</span><span class="s0">, </span><span class="s1">fl2str(value</span><span class="s0">, </span><span class="s3">14</span><span class="s1">))</span><span class="s0">,</span>
+						<span class="s1">(</span><span class="s4">&quot;max&quot;</span><span class="s0">, </span><span class="s1">fl2str(maxValue</span><span class="s0">, </span><span class="s3">14</span><span class="s1">))</span><span class="s0">,</span>
+				        <span class="s1">]</span>
+					<span class="s1">writer.simpletag(</span><span class="s4">&quot;coord&quot;</span><span class="s0">, </span><span class="s1">attrs)</span>
+				<span class="s1">writer.newline()</span>
+		<span class="s1">wrote_any_deltas = </span><span class="s0">False</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">delta </span><span class="s0">in </span><span class="s1">enumerate(self.coordinates):</span>
+			<span class="s0">if </span><span class="s1">type(delta) == tuple </span><span class="s0">and </span><span class="s1">len(delta) == </span><span class="s3">2</span><span class="s1">:</span>
+				<span class="s1">writer.simpletag(</span><span class="s4">&quot;delta&quot;</span><span class="s0">, </span><span class="s1">pt=i</span><span class="s0">, </span><span class="s1">x=delta[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">y=delta[</span><span class="s3">1</span><span class="s1">])</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">wrote_any_deltas = </span><span class="s0">True</span>
+			<span class="s0">elif </span><span class="s1">type(delta) == int:</span>
+				<span class="s1">writer.simpletag(</span><span class="s4">&quot;delta&quot;</span><span class="s0">, </span><span class="s1">cvt=i</span><span class="s0">, </span><span class="s1">value=delta)</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">wrote_any_deltas = </span><span class="s0">True</span>
+			<span class="s0">elif </span><span class="s1">delta </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">log.error(</span><span class="s4">&quot;bad delta format&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.comment(</span><span class="s4">&quot;bad delta #%d&quot; </span><span class="s1">% i)</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">wrote_any_deltas = </span><span class="s0">True</span>
+		<span class="s0">if not </span><span class="s1">wrote_any_deltas:</span>
+			<span class="s1">writer.comment(</span><span class="s4">&quot;no deltas&quot;</span><span class="s1">)</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">writer.endtag(</span><span class="s4">&quot;tuple&quot;</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">_content):</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s4">&quot;coord&quot;</span><span class="s1">:</span>
+			<span class="s1">axis = attrs[</span><span class="s4">&quot;axis&quot;</span><span class="s1">]</span>
+			<span class="s1">value = str2fl(attrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)</span>
+			<span class="s1">defaultMinValue = min(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt; -0.3; 0.7 --&gt; 0.0</span>
+			<span class="s1">defaultMaxValue = max(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt;  0.0; 0.7 --&gt; 0.7</span>
+			<span class="s1">minValue = str2fl(attrs.get(</span><span class="s4">&quot;min&quot;</span><span class="s0">, </span><span class="s1">defaultMinValue)</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)</span>
+			<span class="s1">maxValue = str2fl(attrs.get(</span><span class="s4">&quot;max&quot;</span><span class="s0">, </span><span class="s1">defaultMaxValue)</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)</span>
+			<span class="s1">self.axes[axis] = (minValue</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">maxValue)</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s4">&quot;delta&quot;</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s4">&quot;pt&quot; </span><span class="s0">in </span><span class="s1">attrs:</span>
+				<span class="s1">point = safeEval(attrs[</span><span class="s4">&quot;pt&quot;</span><span class="s1">])</span>
+				<span class="s1">x = safeEval(attrs[</span><span class="s4">&quot;x&quot;</span><span class="s1">])</span>
+				<span class="s1">y = safeEval(attrs[</span><span class="s4">&quot;y&quot;</span><span class="s1">])</span>
+				<span class="s1">self.coordinates[point] = (x</span><span class="s0">, </span><span class="s1">y)</span>
+			<span class="s0">elif </span><span class="s4">&quot;cvt&quot; </span><span class="s0">in </span><span class="s1">attrs:</span>
+				<span class="s1">cvt = safeEval(attrs[</span><span class="s4">&quot;cvt&quot;</span><span class="s1">])</span>
+				<span class="s1">value = safeEval(attrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+				<span class="s1">self.coordinates[cvt] = value</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">log.warning(</span><span class="s4">&quot;bad delta format: %s&quot; </span><span class="s1">%</span>
+				            <span class="s4">&quot;, &quot;</span><span class="s1">.join(sorted(attrs.keys())))</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedCoordIndices={}</span><span class="s0">, </span><span class="s1">pointData=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">assert </span><span class="s1">set(self.axes.keys()) &lt;= set(axisTags)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">&quot;Unknown axis tag found.&quot;</span><span class="s0">, </span><span class="s1">self.axes.keys()</span><span class="s0">, </span><span class="s1">axisTags)</span>
+
+		<span class="s1">tupleData = []</span>
+		<span class="s1">auxData = []</span>
+
+		<span class="s0">if </span><span class="s1">pointData </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">usedPoints = self.getUsedPoints()</span>
+			<span class="s0">if </span><span class="s1">usedPoints </span><span class="s0">is None</span><span class="s1">: </span><span class="s2"># Nothing to encode</span>
+				<span class="s0">return </span><span class="s6">b''</span><span class="s0">, </span><span class="s6">b''</span>
+			<span class="s1">pointData = self.compilePoints(usedPoints)</span>
+
+		<span class="s1">coord = self.compileCoord(axisTags)</span>
+		<span class="s1">flags = sharedCoordIndices.get(coord)</span>
+		<span class="s0">if </span><span class="s1">flags </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">flags = EMBEDDED_PEAK_TUPLE</span>
+			<span class="s1">tupleData.append(coord)</span>
+
+		<span class="s1">intermediateCoord = self.compileIntermediateCoord(axisTags)</span>
+		<span class="s0">if </span><span class="s1">intermediateCoord </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">flags |= INTERMEDIATE_REGION</span>
+			<span class="s1">tupleData.append(intermediateCoord)</span>
+
+		<span class="s2"># pointData of b'' implies &quot;use shared points&quot;.</span>
+		<span class="s0">if </span><span class="s1">pointData:</span>
+			<span class="s1">flags |= PRIVATE_POINT_NUMBERS</span>
+			<span class="s1">auxData.append(pointData)</span>
+
+		<span class="s1">auxData.append(self.compileDeltas())</span>
+		<span class="s1">auxData = </span><span class="s6">b''</span><span class="s1">.join(auxData)</span>
+
+		<span class="s1">tupleData.insert(</span><span class="s3">0</span><span class="s0">, </span><span class="s1">struct.pack(</span><span class="s4">'&gt;HH'</span><span class="s0">, </span><span class="s1">len(auxData)</span><span class="s0">, </span><span class="s1">flags))</span>
+		<span class="s0">return </span><span class="s6">b''</span><span class="s1">.join(tupleData)</span><span class="s0">, </span><span class="s1">auxData</span>
+
+	<span class="s0">def </span><span class="s1">compileCoord(self</span><span class="s0">, </span><span class="s1">axisTags):</span>
+		<span class="s1">result = bytearray()</span>
+		<span class="s1">axes = self.axes</span>
+		<span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axisTags:</span>
+			<span class="s1">triple = axes.get(axis)</span>
+			<span class="s0">if </span><span class="s1">triple </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s1">result.extend(</span><span class="s6">b'</span><span class="s0">\0\0</span><span class="s6">'</span><span class="s1">)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">result.extend(struct.pack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s0">, </span><span class="s1">fl2fi(triple[</span><span class="s3">1</span><span class="s1">]</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)))</span>
+		<span class="s0">return </span><span class="s1">bytes(result)</span>
+
+	<span class="s0">def </span><span class="s1">compileIntermediateCoord(self</span><span class="s0">, </span><span class="s1">axisTags):</span>
+		<span class="s1">needed = </span><span class="s0">False</span>
+		<span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axisTags:</span>
+			<span class="s1">minValue</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">maxValue = self.axes.get(axis</span><span class="s0">, </span><span class="s1">(</span><span class="s3">0.0</span><span class="s0">, </span><span class="s3">0.0</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">))</span>
+			<span class="s1">defaultMinValue = min(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt; -0.3; 0.7 --&gt; 0.0</span>
+			<span class="s1">defaultMaxValue = max(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt;  0.0; 0.7 --&gt; 0.7</span>
+			<span class="s0">if </span><span class="s1">(minValue != defaultMinValue) </span><span class="s0">or </span><span class="s1">(maxValue != defaultMaxValue):</span>
+				<span class="s1">needed = </span><span class="s0">True</span>
+				<span class="s0">break</span>
+		<span class="s0">if not </span><span class="s1">needed:</span>
+			<span class="s0">return None</span>
+		<span class="s1">minCoords = bytearray()</span>
+		<span class="s1">maxCoords = bytearray()</span>
+		<span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axisTags:</span>
+			<span class="s1">minValue</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">maxValue = self.axes.get(axis</span><span class="s0">, </span><span class="s1">(</span><span class="s3">0.0</span><span class="s0">, </span><span class="s3">0.0</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">))</span>
+			<span class="s1">minCoords.extend(struct.pack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s0">, </span><span class="s1">fl2fi(minValue</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)))</span>
+			<span class="s1">maxCoords.extend(struct.pack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s0">, </span><span class="s1">fl2fi(maxValue</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)))</span>
+		<span class="s0">return </span><span class="s1">minCoords + maxCoords</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">decompileCoord_(axisTags</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset):</span>
+		<span class="s1">coord = {}</span>
+		<span class="s1">pos = offset</span>
+		<span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axisTags:</span>
+			<span class="s1">coord[axis] = fi2fl(struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s0">, </span><span class="s1">data[pos:pos+</span><span class="s3">2</span><span class="s1">])[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s3">14</span><span class="s1">)</span>
+			<span class="s1">pos += </span><span class="s3">2</span>
+		<span class="s0">return </span><span class="s1">coord</span><span class="s0">, </span><span class="s1">pos</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">compilePoints(points):</span>
+		<span class="s2"># If the set consists of all points in the glyph, it gets encoded with</span>
+		<span class="s2"># a special encoding: a single zero byte.</span>
+		<span class="s2">#</span>
+		<span class="s2"># To use this optimization, points passed in must be empty set.</span>
+		<span class="s2"># The following two lines are not strictly necessary as the main code</span>
+		<span class="s2"># below would emit the same. But this is most common and faster.</span>
+		<span class="s0">if not </span><span class="s1">points:</span>
+			<span class="s0">return </span><span class="s6">b'</span><span class="s0">\0</span><span class="s6">'</span>
+
+		<span class="s2"># In the 'gvar' table, the packing of point numbers is a little surprising.</span>
+		<span class="s2"># It consists of multiple runs, each being a delta-encoded list of integers.</span>
+		<span class="s2"># For example, the point set {17, 18, 19, 20, 21, 22, 23} gets encoded as</span>
+		<span class="s2"># [6, 17, 1, 1, 1, 1, 1, 1]. The first value (6) is the run length minus 1.</span>
+		<span class="s2"># There are two types of runs, with values being either 8 or 16 bit unsigned</span>
+		<span class="s2"># integers.</span>
+		<span class="s1">points = list(points)</span>
+		<span class="s1">points.sort()</span>
+		<span class="s1">numPoints = len(points)</span>
+
+		<span class="s1">result = bytearray()</span>
+		<span class="s2"># The binary representation starts with the total number of points in the set,</span>
+		<span class="s2"># encoded into one or two bytes depending on the value.</span>
+		<span class="s0">if </span><span class="s1">numPoints &lt; </span><span class="s3">0x80</span><span class="s1">:</span>
+			<span class="s1">result.append(numPoints)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">result.append((numPoints &gt;&gt; </span><span class="s3">8</span><span class="s1">) | </span><span class="s3">0x80</span><span class="s1">)</span>
+			<span class="s1">result.append(numPoints &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+
+		<span class="s1">MAX_RUN_LENGTH = </span><span class="s3">127</span>
+		<span class="s1">pos = </span><span class="s3">0</span>
+		<span class="s1">lastValue = </span><span class="s3">0</span>
+		<span class="s0">while </span><span class="s1">pos &lt; numPoints:</span>
+			<span class="s1">runLength = </span><span class="s3">0</span>
+
+			<span class="s1">headerPos = len(result)</span>
+			<span class="s1">result.append(</span><span class="s3">0</span><span class="s1">)</span>
+
+			<span class="s1">useByteEncoding = </span><span class="s0">None</span>
+			<span class="s0">while </span><span class="s1">pos &lt; numPoints </span><span class="s0">and </span><span class="s1">runLength &lt;= MAX_RUN_LENGTH:</span>
+				<span class="s1">curValue = points[pos]</span>
+				<span class="s1">delta = curValue - lastValue</span>
+				<span class="s0">if </span><span class="s1">useByteEncoding </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s1">useByteEncoding = </span><span class="s3">0 </span><span class="s1">&lt;= delta &lt;= </span><span class="s3">0xff</span>
+				<span class="s0">if </span><span class="s1">useByteEncoding </span><span class="s0">and </span><span class="s1">(delta &gt; </span><span class="s3">0xff </span><span class="s0">or </span><span class="s1">delta &lt; </span><span class="s3">0</span><span class="s1">):</span>
+					<span class="s2"># we need to start a new run (which will not use byte encoding)</span>
+					<span class="s0">break</span>
+				<span class="s2"># TODO This never switches back to a byte-encoding from a short-encoding.</span>
+				<span class="s2"># That's suboptimal.</span>
+				<span class="s0">if </span><span class="s1">useByteEncoding:</span>
+					<span class="s1">result.append(delta)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">result.append(delta &gt;&gt; </span><span class="s3">8</span><span class="s1">)</span>
+					<span class="s1">result.append(delta &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+				<span class="s1">lastValue = curValue</span>
+				<span class="s1">pos += </span><span class="s3">1</span>
+				<span class="s1">runLength += </span><span class="s3">1</span>
+			<span class="s0">if </span><span class="s1">useByteEncoding:</span>
+				<span class="s1">result[headerPos] = runLength - </span><span class="s3">1</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">result[headerPos] = (runLength - </span><span class="s3">1</span><span class="s1">) | POINTS_ARE_WORDS</span>
+
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">decompilePoints_(numPoints</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">tableTag):</span>
+		<span class="s5">&quot;&quot;&quot;(numPoints, data, offset, tableTag) --&gt; ([point1, point2, ...], newOffset)&quot;&quot;&quot;</span>
+		<span class="s0">assert </span><span class="s1">tableTag </span><span class="s0">in </span><span class="s1">(</span><span class="s4">'cvar'</span><span class="s0">, </span><span class="s4">'gvar'</span><span class="s1">)</span>
+		<span class="s1">pos = offset</span>
+		<span class="s1">numPointsInData = data[pos]</span>
+		<span class="s1">pos += </span><span class="s3">1</span>
+		<span class="s0">if </span><span class="s1">(numPointsInData &amp; POINTS_ARE_WORDS) != </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s1">numPointsInData = (numPointsInData &amp; POINT_RUN_COUNT_MASK) &lt;&lt; </span><span class="s3">8 </span><span class="s1">| data[pos]</span>
+			<span class="s1">pos += </span><span class="s3">1</span>
+		<span class="s0">if </span><span class="s1">numPointsInData == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">(range(numPoints)</span><span class="s0">, </span><span class="s1">pos)</span>
+
+		<span class="s1">result = []</span>
+		<span class="s0">while </span><span class="s1">len(result) &lt; numPointsInData:</span>
+			<span class="s1">runHeader = data[pos]</span>
+			<span class="s1">pos += </span><span class="s3">1</span>
+			<span class="s1">numPointsInRun = (runHeader &amp; POINT_RUN_COUNT_MASK) + </span><span class="s3">1</span>
+			<span class="s1">point = </span><span class="s3">0</span>
+			<span class="s0">if </span><span class="s1">(runHeader &amp; POINTS_ARE_WORDS) != </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s1">points = array.array(</span><span class="s4">&quot;H&quot;</span><span class="s1">)</span>
+				<span class="s1">pointsSize = numPointsInRun * </span><span class="s3">2</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">points = array.array(</span><span class="s4">&quot;B&quot;</span><span class="s1">)</span>
+				<span class="s1">pointsSize = numPointsInRun</span>
+			<span class="s1">points.frombytes(data[pos:pos+pointsSize])</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s4">&quot;big&quot;</span><span class="s1">: points.byteswap()</span>
+
+			<span class="s0">assert </span><span class="s1">len(points) == numPointsInRun</span>
+			<span class="s1">pos += pointsSize</span>
+
+			<span class="s1">result.extend(points)</span>
+
+		<span class="s2"># Convert relative to absolute</span>
+		<span class="s1">absolute = []</span>
+		<span class="s1">current = </span><span class="s3">0</span>
+		<span class="s0">for </span><span class="s1">delta </span><span class="s0">in </span><span class="s1">result:</span>
+			<span class="s1">current += delta</span>
+			<span class="s1">absolute.append(current)</span>
+		<span class="s1">result = absolute</span>
+		<span class="s0">del </span><span class="s1">absolute</span>
+
+		<span class="s1">badPoints = {str(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">result </span><span class="s0">if </span><span class="s1">p &lt; </span><span class="s3">0 </span><span class="s0">or </span><span class="s1">p &gt;= numPoints}</span>
+		<span class="s0">if </span><span class="s1">badPoints:</span>
+			<span class="s1">log.warning(</span><span class="s4">&quot;point %s out of range in '%s' table&quot; </span><span class="s1">%</span>
+			            <span class="s1">(</span><span class="s4">&quot;,&quot;</span><span class="s1">.join(sorted(badPoints))</span><span class="s0">, </span><span class="s1">tableTag))</span>
+		<span class="s0">return </span><span class="s1">(result</span><span class="s0">, </span><span class="s1">pos)</span>
+
+	<span class="s0">def </span><span class="s1">compileDeltas(self):</span>
+		<span class="s1">deltaX = []</span>
+		<span class="s1">deltaY = []</span>
+		<span class="s0">if </span><span class="s1">self.getCoordWidth() == </span><span class="s3">2</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self.coordinates:</span>
+				<span class="s0">if </span><span class="s1">c </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s0">continue</span>
+				<span class="s1">deltaX.append(c[</span><span class="s3">0</span><span class="s1">])</span>
+				<span class="s1">deltaY.append(c[</span><span class="s3">1</span><span class="s1">])</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self.coordinates:</span>
+				<span class="s0">if </span><span class="s1">c </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s0">continue</span>
+				<span class="s1">deltaX.append(c)</span>
+		<span class="s1">bytearr = bytearray()</span>
+		<span class="s1">self.compileDeltaValues_(deltaX</span><span class="s0">, </span><span class="s1">bytearr)</span>
+		<span class="s1">self.compileDeltaValues_(deltaY</span><span class="s0">, </span><span class="s1">bytearr)</span>
+		<span class="s0">return </span><span class="s1">bytearr</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">compileDeltaValues_(deltas</span><span class="s0">, </span><span class="s1">bytearr=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s4">&quot;&quot;&quot;[value1, value2, value3, ...] --&gt; bytearray 
+ 
+        Emits a sequence of runs. Each run starts with a 
+        byte-sized header whose 6 least significant bits 
+        (header &amp; 0x3F) indicate how many values are encoded 
+        in this run. The stored length is the actual length 
+        minus one; run lengths are thus in the range [1..64]. 
+        If the header byte has its most significant bit (0x80) 
+        set, all values in this run are zero, and no data 
+        follows. Otherwise, the header byte is followed by 
+        ((header &amp; 0x3F) + 1) signed values.  If (header &amp; 
+        0x40) is clear, the delta values are stored as signed 
+        bytes; if (header &amp; 0x40) is set, the delta values are 
+        signed 16-bit integers. 
+        &quot;&quot;&quot;  </span><span class="s2"># Explaining the format because the 'gvar' spec is hard to understand.</span>
+		<span class="s0">if </span><span class="s1">bytearr </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">bytearr = bytearray()</span>
+		<span class="s1">pos = </span><span class="s3">0</span>
+		<span class="s1">numDeltas = len(deltas)</span>
+		<span class="s0">while </span><span class="s1">pos &lt; numDeltas:</span>
+			<span class="s1">value = deltas[pos]</span>
+			<span class="s0">if </span><span class="s1">value == </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s1">pos = TupleVariation.encodeDeltaRunAsZeroes_(deltas</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">, </span><span class="s1">bytearr)</span>
+			<span class="s0">elif </span><span class="s1">-</span><span class="s3">128 </span><span class="s1">&lt;= value &lt;= </span><span class="s3">127</span><span class="s1">:</span>
+				<span class="s1">pos = TupleVariation.encodeDeltaRunAsBytes_(deltas</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">, </span><span class="s1">bytearr)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">pos = TupleVariation.encodeDeltaRunAsWords_(deltas</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">, </span><span class="s1">bytearr)</span>
+		<span class="s0">return </span><span class="s1">bytearr</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">encodeDeltaRunAsZeroes_(deltas</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">bytearr):</span>
+		<span class="s1">pos = offset</span>
+		<span class="s1">numDeltas = len(deltas)</span>
+		<span class="s0">while </span><span class="s1">pos &lt; numDeltas </span><span class="s0">and </span><span class="s1">deltas[pos] == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s1">pos += </span><span class="s3">1</span>
+		<span class="s1">runLength = pos - offset</span>
+		<span class="s0">while </span><span class="s1">runLength &gt;= </span><span class="s3">64</span><span class="s1">:</span>
+			<span class="s1">bytearr.append(DELTAS_ARE_ZERO | </span><span class="s3">63</span><span class="s1">)</span>
+			<span class="s1">runLength -= </span><span class="s3">64</span>
+		<span class="s0">if </span><span class="s1">runLength:</span>
+			<span class="s1">bytearr.append(DELTAS_ARE_ZERO | (runLength - </span><span class="s3">1</span><span class="s1">))</span>
+		<span class="s0">return </span><span class="s1">pos</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">encodeDeltaRunAsBytes_(deltas</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">bytearr):</span>
+		<span class="s1">pos = offset</span>
+		<span class="s1">numDeltas = len(deltas)</span>
+		<span class="s0">while </span><span class="s1">pos &lt; numDeltas:</span>
+			<span class="s1">value = deltas[pos]</span>
+			<span class="s0">if not </span><span class="s1">(-</span><span class="s3">128 </span><span class="s1">&lt;= value &lt;= </span><span class="s3">127</span><span class="s1">):</span>
+				<span class="s0">break</span>
+			<span class="s2"># Within a byte-encoded run of deltas, a single zero</span>
+			<span class="s2"># is best stored literally as 0x00 value. However,</span>
+			<span class="s2"># if are two or more zeroes in a sequence, it is</span>
+			<span class="s2"># better to start a new run. For example, the sequence</span>
+			<span class="s2"># of deltas [15, 15, 0, 15, 15] becomes 6 bytes</span>
+			<span class="s2"># (04 0F 0F 00 0F 0F) when storing the zero value</span>
+			<span class="s2"># literally, but 7 bytes (01 0F 0F 80 01 0F 0F)</span>
+			<span class="s2"># when starting a new run.</span>
+			<span class="s0">if </span><span class="s1">value == </span><span class="s3">0 </span><span class="s0">and </span><span class="s1">pos+</span><span class="s3">1 </span><span class="s1">&lt; numDeltas </span><span class="s0">and </span><span class="s1">deltas[pos+</span><span class="s3">1</span><span class="s1">] == </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s0">break</span>
+			<span class="s1">pos += </span><span class="s3">1</span>
+		<span class="s1">runLength = pos - offset</span>
+		<span class="s0">while </span><span class="s1">runLength &gt;= </span><span class="s3">64</span><span class="s1">:</span>
+			<span class="s1">bytearr.append(</span><span class="s3">63</span><span class="s1">)</span>
+			<span class="s1">bytearr.extend(array.array(</span><span class="s4">'b'</span><span class="s0">, </span><span class="s1">deltas[offset:offset+</span><span class="s3">64</span><span class="s1">]))</span>
+			<span class="s1">offset += </span><span class="s3">64</span>
+			<span class="s1">runLength -= </span><span class="s3">64</span>
+		<span class="s0">if </span><span class="s1">runLength:</span>
+			<span class="s1">bytearr.append(runLength - </span><span class="s3">1</span><span class="s1">)</span>
+			<span class="s1">bytearr.extend(array.array(</span><span class="s4">'b'</span><span class="s0">, </span><span class="s1">deltas[offset:pos]))</span>
+		<span class="s0">return </span><span class="s1">pos</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">encodeDeltaRunAsWords_(deltas</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">bytearr):</span>
+		<span class="s1">pos = offset</span>
+		<span class="s1">numDeltas = len(deltas)</span>
+		<span class="s0">while </span><span class="s1">pos &lt; numDeltas:</span>
+			<span class="s1">value = deltas[pos]</span>
+			<span class="s2"># Within a word-encoded run of deltas, it is easiest</span>
+			<span class="s2"># to start a new run (with a different encoding)</span>
+			<span class="s2"># whenever we encounter a zero value. For example,</span>
+			<span class="s2"># the sequence [0x6666, 0, 0x7777] needs 7 bytes when</span>
+			<span class="s2"># storing the zero literally (42 66 66 00 00 77 77),</span>
+			<span class="s2"># and equally 7 bytes when starting a new run</span>
+			<span class="s2"># (40 66 66 80 40 77 77).</span>
+			<span class="s0">if </span><span class="s1">value == </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s0">break</span>
+
+			<span class="s2"># Within a word-encoded run of deltas, a single value</span>
+			<span class="s2"># in the range (-128..127) should be encoded literally</span>
+			<span class="s2"># because it is more compact. For example, the sequence</span>
+			<span class="s2"># [0x6666, 2, 0x7777] becomes 7 bytes when storing</span>
+			<span class="s2"># the value literally (42 66 66 00 02 77 77), but 8 bytes</span>
+			<span class="s2"># when starting a new run (40 66 66 00 02 40 77 77).</span>
+			<span class="s0">if </span><span class="s1">(-</span><span class="s3">128 </span><span class="s1">&lt;= value &lt;= </span><span class="s3">127</span><span class="s1">) </span><span class="s0">and </span><span class="s1">pos+</span><span class="s3">1 </span><span class="s1">&lt; numDeltas </span><span class="s0">and </span><span class="s1">(-</span><span class="s3">128 </span><span class="s1">&lt;= deltas[pos+</span><span class="s3">1</span><span class="s1">] &lt;= </span><span class="s3">127</span><span class="s1">):</span>
+				<span class="s0">break</span>
+			<span class="s1">pos += </span><span class="s3">1</span>
+		<span class="s1">runLength = pos - offset</span>
+		<span class="s0">while </span><span class="s1">runLength &gt;= </span><span class="s3">64</span><span class="s1">:</span>
+			<span class="s1">bytearr.append(DELTAS_ARE_WORDS | </span><span class="s3">63</span><span class="s1">)</span>
+			<span class="s1">a = array.array(</span><span class="s4">'h'</span><span class="s0">, </span><span class="s1">deltas[offset:offset+</span><span class="s3">64</span><span class="s1">])</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s4">&quot;big&quot;</span><span class="s1">: a.byteswap()</span>
+			<span class="s1">bytearr.extend(a)</span>
+			<span class="s1">offset += </span><span class="s3">64</span>
+			<span class="s1">runLength -= </span><span class="s3">64</span>
+		<span class="s0">if </span><span class="s1">runLength:</span>
+			<span class="s1">bytearr.append(DELTAS_ARE_WORDS | (runLength - </span><span class="s3">1</span><span class="s1">))</span>
+			<span class="s1">a = array.array(</span><span class="s4">'h'</span><span class="s0">, </span><span class="s1">deltas[offset:pos])</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s4">&quot;big&quot;</span><span class="s1">: a.byteswap()</span>
+			<span class="s1">bytearr.extend(a)</span>
+		<span class="s0">return </span><span class="s1">pos</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">decompileDeltas_(numDeltas</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset):</span>
+		<span class="s5">&quot;&quot;&quot;(numDeltas, data, offset) --&gt; ([delta, delta, ...], newOffset)&quot;&quot;&quot;</span>
+		<span class="s1">result = []</span>
+		<span class="s1">pos = offset</span>
+		<span class="s0">while </span><span class="s1">len(result) &lt; numDeltas:</span>
+			<span class="s1">runHeader = data[pos]</span>
+			<span class="s1">pos += </span><span class="s3">1</span>
+			<span class="s1">numDeltasInRun = (runHeader &amp; DELTA_RUN_COUNT_MASK) + </span><span class="s3">1</span>
+			<span class="s0">if </span><span class="s1">(runHeader &amp; DELTAS_ARE_ZERO) != </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s1">result.extend([</span><span class="s3">0</span><span class="s1">] * numDeltasInRun)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">(runHeader &amp; DELTAS_ARE_WORDS) != </span><span class="s3">0</span><span class="s1">:</span>
+					<span class="s1">deltas = array.array(</span><span class="s4">&quot;h&quot;</span><span class="s1">)</span>
+					<span class="s1">deltasSize = numDeltasInRun * </span><span class="s3">2</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">deltas = array.array(</span><span class="s4">&quot;b&quot;</span><span class="s1">)</span>
+					<span class="s1">deltasSize = numDeltasInRun</span>
+				<span class="s1">deltas.frombytes(data[pos:pos+deltasSize])</span>
+				<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s4">&quot;big&quot;</span><span class="s1">: deltas.byteswap()</span>
+				<span class="s0">assert </span><span class="s1">len(deltas) == numDeltasInRun</span>
+				<span class="s1">pos += deltasSize</span>
+				<span class="s1">result.extend(deltas)</span>
+		<span class="s0">assert </span><span class="s1">len(result) == numDeltas</span>
+		<span class="s0">return </span><span class="s1">(result</span><span class="s0">, </span><span class="s1">pos)</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">getTupleSize_(flags</span><span class="s0">, </span><span class="s1">axisCount):</span>
+		<span class="s1">size = </span><span class="s3">4</span>
+		<span class="s0">if </span><span class="s1">(flags &amp; EMBEDDED_PEAK_TUPLE) != </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s1">size += axisCount * </span><span class="s3">2</span>
+		<span class="s0">if </span><span class="s1">(flags &amp; INTERMEDIATE_REGION) != </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s1">size += axisCount * </span><span class="s3">4</span>
+		<span class="s0">return </span><span class="s1">size</span>
+
+	<span class="s0">def </span><span class="s1">getCoordWidth(self):</span>
+		<span class="s5">&quot;&quot;&quot; Return 2 if coordinates are (x, y) as in gvar, 1 if single values 
+        as in cvar, or 0 if empty. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">firstDelta = next((c </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self.coordinates </span><span class="s0">if </span><span class="s1">c </span><span class="s0">is not None</span><span class="s1">)</span><span class="s0">, None</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">firstDelta </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s3">0  </span><span class="s2"># empty or has no impact</span>
+		<span class="s0">if </span><span class="s1">type(firstDelta) </span><span class="s0">in </span><span class="s1">(int</span><span class="s0">, </span><span class="s1">float):</span>
+			<span class="s0">return </span><span class="s3">1</span>
+		<span class="s0">if </span><span class="s1">type(firstDelta) </span><span class="s0">is </span><span class="s1">tuple </span><span class="s0">and </span><span class="s1">len(firstDelta) == </span><span class="s3">2</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s3">2</span>
+		<span class="s0">raise </span><span class="s1">TypeError(</span>
+			<span class="s4">&quot;invalid type of delta; expected (int or float) number, or &quot;</span>
+			<span class="s4">&quot;Tuple[number, number]: %r&quot; </span><span class="s1">% firstDelta</span>
+		<span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">scaleDeltas(self</span><span class="s0">, </span><span class="s1">scalar):</span>
+		<span class="s0">if </span><span class="s1">scalar == </span><span class="s3">1.0</span><span class="s1">:</span>
+			<span class="s0">return  </span><span class="s2"># no change</span>
+		<span class="s1">coordWidth = self.getCoordWidth()</span>
+		<span class="s1">self.coordinates = [</span>
+			<span class="s0">None</span>
+			<span class="s0">if </span><span class="s1">d </span><span class="s0">is None</span>
+			<span class="s0">else </span><span class="s1">d * scalar</span>
+			<span class="s0">if </span><span class="s1">coordWidth == </span><span class="s3">1</span>
+			<span class="s0">else </span><span class="s1">(d[</span><span class="s3">0</span><span class="s1">] * scalar</span><span class="s0">, </span><span class="s1">d[</span><span class="s3">1</span><span class="s1">] * scalar)</span>
+			<span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">self.coordinates</span>
+		<span class="s1">]</span>
+
+	<span class="s0">def </span><span class="s1">roundDeltas(self):</span>
+		<span class="s1">coordWidth = self.getCoordWidth()</span>
+		<span class="s1">self.coordinates = [</span>
+			<span class="s0">None</span>
+			<span class="s0">if </span><span class="s1">d </span><span class="s0">is None</span>
+			<span class="s0">else </span><span class="s1">otRound(d)</span>
+			<span class="s0">if </span><span class="s1">coordWidth == </span><span class="s3">1</span>
+			<span class="s0">else </span><span class="s1">(otRound(d[</span><span class="s3">0</span><span class="s1">])</span><span class="s0">, </span><span class="s1">otRound(d[</span><span class="s3">1</span><span class="s1">]))</span>
+			<span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">self.coordinates</span>
+		<span class="s1">]</span>
+
+	<span class="s0">def </span><span class="s1">calcInferredDeltas(self</span><span class="s0">, </span><span class="s1">origCoords</span><span class="s0">, </span><span class="s1">endPts):</span>
+		<span class="s0">from </span><span class="s1">fontTools.varLib.iup </span><span class="s0">import </span><span class="s1">iup_delta</span>
+
+		<span class="s0">if </span><span class="s1">self.getCoordWidth() == </span><span class="s3">1</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TypeError(</span>
+				<span class="s4">&quot;Only 'gvar' TupleVariation can have inferred deltas&quot;</span>
+			<span class="s1">)</span>
+		<span class="s0">if None in </span><span class="s1">self.coordinates:</span>
+			<span class="s0">if </span><span class="s1">len(self.coordinates) != len(origCoords):</span>
+				<span class="s0">raise </span><span class="s1">ValueError(</span>
+					<span class="s4">&quot;Expected len(origCoords) == %d; found %d&quot;</span>
+					<span class="s1">% (len(self.coordinates)</span><span class="s0">, </span><span class="s1">len(origCoords))</span>
+				<span class="s1">)</span>
+			<span class="s1">self.coordinates = iup_delta(self.coordinates</span><span class="s0">, </span><span class="s1">origCoords</span><span class="s0">, </span><span class="s1">endPts)</span>
+
+	<span class="s0">def </span><span class="s1">optimize(self</span><span class="s0">, </span><span class="s1">origCoords</span><span class="s0">, </span><span class="s1">endPts</span><span class="s0">, </span><span class="s1">tolerance=</span><span class="s3">0.5</span><span class="s0">, </span><span class="s1">isComposite=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">from </span><span class="s1">fontTools.varLib.iup </span><span class="s0">import </span><span class="s1">iup_delta_optimize</span>
+
+		<span class="s0">if None in </span><span class="s1">self.coordinates:</span>
+			<span class="s0">return  </span><span class="s2"># already optimized</span>
+
+		<span class="s1">deltaOpt = iup_delta_optimize(</span>
+		    <span class="s1">self.coordinates</span><span class="s0">, </span><span class="s1">origCoords</span><span class="s0">, </span><span class="s1">endPts</span><span class="s0">, </span><span class="s1">tolerance=tolerance</span>
+		<span class="s1">)</span>
+		<span class="s0">if None in </span><span class="s1">deltaOpt:</span>
+			<span class="s0">if </span><span class="s1">isComposite </span><span class="s0">and </span><span class="s1">all(d </span><span class="s0">is None for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">deltaOpt):</span>
+				<span class="s2"># Fix for macOS composites</span>
+				<span class="s2"># https://github.com/fonttools/fonttools/issues/1381</span>
+				<span class="s1">deltaOpt = [(</span><span class="s3">0</span><span class="s0">, </span><span class="s3">0</span><span class="s1">)] + [</span><span class="s0">None</span><span class="s1">] * (len(deltaOpt) - </span><span class="s3">1</span><span class="s1">)</span>
+			<span class="s2"># Use &quot;optimized&quot; version only if smaller...</span>
+			<span class="s1">varOpt = TupleVariation(self.axes</span><span class="s0">, </span><span class="s1">deltaOpt)</span>
+
+			<span class="s2"># Shouldn't matter that this is different from fvar...?</span>
+			<span class="s1">axisTags = sorted(self.axes.keys())</span>
+			<span class="s1">tupleData</span><span class="s0">, </span><span class="s1">auxData = self.compile(axisTags)</span>
+			<span class="s1">unoptimizedLength = len(tupleData) + len(auxData)</span>
+			<span class="s1">tupleData</span><span class="s0">, </span><span class="s1">auxData = varOpt.compile(axisTags)</span>
+			<span class="s1">optimizedLength = len(tupleData) + len(auxData)</span>
+
+			<span class="s0">if </span><span class="s1">optimizedLength &lt; unoptimizedLength:</span>
+				<span class="s1">self.coordinates = varOpt.coordinates</span>
+
+	<span class="s0">def </span><span class="s1">__imul__(self</span><span class="s0">, </span><span class="s1">scalar):</span>
+		<span class="s1">self.scaleDeltas(scalar)</span>
+		<span class="s0">return </span><span class="s1">self</span>
+
+	<span class="s0">def </span><span class="s1">__iadd__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if not </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">TupleVariation):</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+		<span class="s1">deltas1 = self.coordinates</span>
+		<span class="s1">length = len(deltas1)</span>
+		<span class="s1">deltas2 = other.coordinates</span>
+		<span class="s0">if </span><span class="s1">len(deltas2) != length:</span>
+			<span class="s0">raise </span><span class="s1">ValueError(</span>
+				<span class="s4">&quot;cannot sum TupleVariation deltas with different lengths&quot;</span>
+			<span class="s1">)</span>
+		<span class="s2"># 'None' values have different meanings in gvar vs cvar TupleVariations:</span>
+		<span class="s2"># within the gvar, when deltas are not provided explicitly for some points,</span>
+		<span class="s2"># they need to be inferred; whereas for the 'cvar' table, if deltas are not</span>
+		<span class="s2"># provided for some CVT values, then no adjustments are made (i.e. None == 0).</span>
+		<span class="s2"># Thus, we cannot sum deltas for gvar TupleVariations if they contain</span>
+		<span class="s2"># inferred inferred deltas (the latter need to be computed first using</span>
+		<span class="s2"># 'calcInferredDeltas' method), but we can treat 'None' values in cvar</span>
+		<span class="s2"># deltas as if they are zeros.</span>
+		<span class="s0">if </span><span class="s1">self.getCoordWidth() == </span><span class="s3">2</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">d2 </span><span class="s0">in </span><span class="s1">zip(range(length)</span><span class="s0">, </span><span class="s1">deltas2):</span>
+				<span class="s1">d1 = deltas1[i]</span>
+				<span class="s0">try</span><span class="s1">:</span>
+					<span class="s1">deltas1[i] = (d1[</span><span class="s3">0</span><span class="s1">] + d2[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">d1[</span><span class="s3">1</span><span class="s1">] + d2[</span><span class="s3">1</span><span class="s1">])</span>
+				<span class="s0">except </span><span class="s1">TypeError:</span>
+					<span class="s0">raise </span><span class="s1">ValueError(</span>
+						<span class="s4">&quot;cannot sum gvar deltas with inferred points&quot;</span>
+					<span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">d2 </span><span class="s0">in </span><span class="s1">zip(range(length)</span><span class="s0">, </span><span class="s1">deltas2):</span>
+				<span class="s1">d1 = deltas1[i]</span>
+				<span class="s0">if </span><span class="s1">d1 </span><span class="s0">is not None and </span><span class="s1">d2 </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">deltas1[i] = d1 + d2</span>
+				<span class="s0">elif </span><span class="s1">d1 </span><span class="s0">is None and </span><span class="s1">d2 </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">deltas1[i] = d2</span>
+				<span class="s2"># elif d2 is None do nothing</span>
+		<span class="s0">return </span><span class="s1">self</span>
+
+
+<span class="s0">def </span><span class="s1">decompileSharedTuples(axisTags</span><span class="s0">, </span><span class="s1">sharedTupleCount</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset):</span>
+	<span class="s1">result = []</span>
+	<span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(sharedTupleCount):</span>
+		<span class="s1">t</span><span class="s0">, </span><span class="s1">offset = TupleVariation.decompileCoord_(axisTags</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset)</span>
+		<span class="s1">result.append(t)</span>
+	<span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s0">def </span><span class="s1">compileSharedTuples(axisTags</span><span class="s0">, </span><span class="s1">variations</span><span class="s0">,</span>
+			<span class="s1">MAX_NUM_SHARED_COORDS = TUPLE_INDEX_MASK + </span><span class="s3">1</span><span class="s1">):</span>
+	<span class="s1">coordCount = Counter()</span>
+	<span class="s0">for </span><span class="s1">var </span><span class="s0">in </span><span class="s1">variations:</span>
+		<span class="s1">coord = var.compileCoord(axisTags)</span>
+		<span class="s1">coordCount[coord] += </span><span class="s3">1</span>
+	<span class="s2"># In python &lt; 3.7, most_common() ordering is non-deterministic</span>
+	<span class="s2"># so apply a sort to make sure the ordering is consistent.</span>
+	<span class="s1">sharedCoords = sorted(</span>
+		<span class="s1">coordCount.most_common(MAX_NUM_SHARED_COORDS)</span><span class="s0">,</span>
+		<span class="s1">key=</span><span class="s0">lambda </span><span class="s1">item: (-item[</span><span class="s3">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">item[</span><span class="s3">0</span><span class="s1">])</span><span class="s0">,</span>
+	<span class="s1">)</span>
+	<span class="s0">return </span><span class="s1">[c[</span><span class="s3">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">sharedCoords </span><span class="s0">if </span><span class="s1">c[</span><span class="s3">1</span><span class="s1">] &gt; </span><span class="s3">1</span><span class="s1">]</span>
+
+
+<span class="s0">def </span><span class="s1">compileTupleVariationStore(variations</span><span class="s0">, </span><span class="s1">pointCount</span><span class="s0">,</span>
+                               <span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedTupleIndices</span><span class="s0">,</span>
+                               <span class="s1">useSharedPoints=</span><span class="s0">True</span><span class="s1">):</span>
+	<span class="s1">newVariations = []</span>
+	<span class="s1">pointDatas = []</span>
+	<span class="s2"># Compile all points and figure out sharing if desired</span>
+	<span class="s1">sharedPoints = </span><span class="s0">None</span>
+
+	<span class="s2"># Collect, count, and compile point-sets for all variation sets</span>
+	<span class="s1">pointSetCount = defaultdict(int)</span>
+	<span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">variations:</span>
+		<span class="s1">points = v.getUsedPoints()</span>
+		<span class="s0">if </span><span class="s1">points </span><span class="s0">is None</span><span class="s1">: </span><span class="s2"># Empty variations</span>
+			<span class="s0">continue</span>
+		<span class="s1">pointSetCount[points] += </span><span class="s3">1</span>
+		<span class="s1">newVariations.append(v)</span>
+		<span class="s1">pointDatas.append(points)</span>
+	<span class="s1">variations = newVariations</span>
+	<span class="s0">del </span><span class="s1">newVariations</span>
+
+	<span class="s0">if not </span><span class="s1">variations:</span>
+		<span class="s0">return </span><span class="s1">(</span><span class="s3">0</span><span class="s0">, </span><span class="s6">b&quot;&quot;</span><span class="s0">, </span><span class="s6">b&quot;&quot;</span><span class="s1">)</span>
+
+	<span class="s1">n = len(variations[</span><span class="s3">0</span><span class="s1">].coordinates)</span>
+	<span class="s0">assert </span><span class="s1">all(len(v.coordinates) == n </span><span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">variations)</span><span class="s0">, </span><span class="s4">&quot;Variation sets have different sizes&quot;</span>
+
+	<span class="s1">compiledPoints = {pointSet:TupleVariation.compilePoints(pointSet)</span>
+			  <span class="s0">for </span><span class="s1">pointSet </span><span class="s0">in </span><span class="s1">pointSetCount}</span>
+
+	<span class="s1">tupleVariationCount = len(variations)</span>
+	<span class="s1">tuples = []</span>
+	<span class="s1">data = []</span>
+
+	<span class="s0">if </span><span class="s1">useSharedPoints:</span>
+		<span class="s2"># Find point-set which saves most bytes.</span>
+		<span class="s0">def </span><span class="s1">key(pn):</span>
+			<span class="s1">pointSet = pn[</span><span class="s3">0</span><span class="s1">]</span>
+			<span class="s1">count = pn[</span><span class="s3">1</span><span class="s1">]</span>
+			<span class="s0">return </span><span class="s1">len(compiledPoints[pointSet]) * (count - </span><span class="s3">1</span><span class="s1">)</span>
+		<span class="s1">sharedPoints = max(pointSetCount.items()</span><span class="s0">, </span><span class="s1">key=key)[</span><span class="s3">0</span><span class="s1">]</span>
+
+		<span class="s1">data.append(compiledPoints[sharedPoints])</span>
+		<span class="s1">tupleVariationCount |= TUPLES_SHARE_POINT_NUMBERS</span>
+
+	<span class="s2"># b'' implies &quot;use shared points&quot;</span>
+	<span class="s1">pointDatas = [compiledPoints[points] </span><span class="s0">if </span><span class="s1">points != sharedPoints </span><span class="s0">else </span><span class="s6">b''</span>
+		     <span class="s0">for </span><span class="s1">points </span><span class="s0">in </span><span class="s1">pointDatas]</span>
+
+	<span class="s0">for </span><span class="s1">v</span><span class="s0">,</span><span class="s1">p </span><span class="s0">in </span><span class="s1">zip(variations</span><span class="s0">, </span><span class="s1">pointDatas):</span>
+		<span class="s1">thisTuple</span><span class="s0">, </span><span class="s1">thisData = v.compile(axisTags</span><span class="s0">, </span><span class="s1">sharedTupleIndices</span><span class="s0">, </span><span class="s1">pointData=p)</span>
+
+		<span class="s1">tuples.append(thisTuple)</span>
+		<span class="s1">data.append(thisData)</span>
+
+	<span class="s1">tuples = </span><span class="s6">b''</span><span class="s1">.join(tuples)</span>
+	<span class="s1">data = </span><span class="s6">b''</span><span class="s1">.join(data)</span>
+	<span class="s0">return </span><span class="s1">tupleVariationCount</span><span class="s0">, </span><span class="s1">tuples</span><span class="s0">, </span><span class="s1">data</span>
+
+
+<span class="s0">def </span><span class="s1">decompileTupleVariationStore(tableTag</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">,</span>
+                                 <span class="s1">tupleVariationCount</span><span class="s0">, </span><span class="s1">pointCount</span><span class="s0">, </span><span class="s1">sharedTuples</span><span class="s0">,</span>
+							     <span class="s1">data</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">, </span><span class="s1">dataPos):</span>
+	<span class="s1">numAxes = len(axisTags)</span>
+	<span class="s1">result = []</span>
+	<span class="s0">if </span><span class="s1">(tupleVariationCount &amp; TUPLES_SHARE_POINT_NUMBERS) != </span><span class="s3">0</span><span class="s1">:</span>
+		<span class="s1">sharedPoints</span><span class="s0">, </span><span class="s1">dataPos = TupleVariation.decompilePoints_(</span>
+			<span class="s1">pointCount</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">dataPos</span><span class="s0">, </span><span class="s1">tableTag)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">sharedPoints = []</span>
+	<span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(tupleVariationCount &amp; TUPLE_COUNT_MASK):</span>
+		<span class="s1">dataSize</span><span class="s0">, </span><span class="s1">flags = struct.unpack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s0">, </span><span class="s1">data[pos:pos+</span><span class="s3">4</span><span class="s1">])</span>
+		<span class="s1">tupleSize = TupleVariation.getTupleSize_(flags</span><span class="s0">, </span><span class="s1">numAxes)</span>
+		<span class="s1">tupleData = data[pos : pos + tupleSize]</span>
+		<span class="s1">pointDeltaData = data[dataPos : dataPos + dataSize]</span>
+		<span class="s1">result.append(decompileTupleVariation_(</span>
+			<span class="s1">pointCount</span><span class="s0">, </span><span class="s1">sharedTuples</span><span class="s0">, </span><span class="s1">sharedPoints</span><span class="s0">,</span>
+			<span class="s1">tableTag</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">tupleData</span><span class="s0">, </span><span class="s1">pointDeltaData))</span>
+		<span class="s1">pos += tupleSize</span>
+		<span class="s1">dataPos += dataSize</span>
+	<span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s0">def </span><span class="s1">decompileTupleVariation_(pointCount</span><span class="s0">, </span><span class="s1">sharedTuples</span><span class="s0">, </span><span class="s1">sharedPoints</span><span class="s0">,</span>
+							 <span class="s1">tableTag</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">tupleData):</span>
+	<span class="s0">assert </span><span class="s1">tableTag </span><span class="s0">in </span><span class="s1">(</span><span class="s4">&quot;cvar&quot;</span><span class="s0">, </span><span class="s4">&quot;gvar&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">tableTag</span>
+	<span class="s1">flags = struct.unpack(</span><span class="s4">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">data[</span><span class="s3">2</span><span class="s1">:</span><span class="s3">4</span><span class="s1">])[</span><span class="s3">0</span><span class="s1">]</span>
+	<span class="s1">pos = </span><span class="s3">4</span>
+	<span class="s0">if </span><span class="s1">(flags &amp; EMBEDDED_PEAK_TUPLE) == </span><span class="s3">0</span><span class="s1">:</span>
+		<span class="s1">peak = sharedTuples[flags &amp; TUPLE_INDEX_MASK]</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">peak</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompileCoord_(axisTags</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">pos)</span>
+	<span class="s0">if </span><span class="s1">(flags &amp; INTERMEDIATE_REGION) != </span><span class="s3">0</span><span class="s1">:</span>
+		<span class="s1">start</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompileCoord_(axisTags</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">pos)</span>
+		<span class="s1">end</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompileCoord_(axisTags</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">pos)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">start</span><span class="s0">, </span><span class="s1">end = inferRegion_(peak)</span>
+	<span class="s1">axes = {}</span>
+	<span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axisTags:</span>
+		<span class="s1">region = start[axis]</span><span class="s0">, </span><span class="s1">peak[axis]</span><span class="s0">, </span><span class="s1">end[axis]</span>
+		<span class="s0">if </span><span class="s1">region != (</span><span class="s3">0.0</span><span class="s0">, </span><span class="s3">0.0</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">):</span>
+			<span class="s1">axes[axis] = region</span>
+	<span class="s1">pos = </span><span class="s3">0</span>
+	<span class="s0">if </span><span class="s1">(flags &amp; PRIVATE_POINT_NUMBERS) != </span><span class="s3">0</span><span class="s1">:</span>
+		<span class="s1">points</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompilePoints_(</span>
+			<span class="s1">pointCount</span><span class="s0">, </span><span class="s1">tupleData</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">, </span><span class="s1">tableTag)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">points = sharedPoints</span>
+
+	<span class="s1">deltas = [</span><span class="s0">None</span><span class="s1">] * pointCount</span>
+
+	<span class="s0">if </span><span class="s1">tableTag == </span><span class="s4">&quot;cvar&quot;</span><span class="s1">:</span>
+		<span class="s1">deltas_cvt</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompileDeltas_(</span>
+			<span class="s1">len(points)</span><span class="s0">, </span><span class="s1">tupleData</span><span class="s0">, </span><span class="s1">pos)</span>
+		<span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">delta </span><span class="s0">in </span><span class="s1">zip(points</span><span class="s0">, </span><span class="s1">deltas_cvt):</span>
+			<span class="s0">if </span><span class="s3">0 </span><span class="s1">&lt;= p &lt; pointCount:</span>
+				<span class="s1">deltas[p] = delta</span>
+
+	<span class="s0">elif </span><span class="s1">tableTag == </span><span class="s4">&quot;gvar&quot;</span><span class="s1">:</span>
+		<span class="s1">deltas_x</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompileDeltas_(</span>
+			<span class="s1">len(points)</span><span class="s0">, </span><span class="s1">tupleData</span><span class="s0">, </span><span class="s1">pos)</span>
+		<span class="s1">deltas_y</span><span class="s0">, </span><span class="s1">pos = TupleVariation.decompileDeltas_(</span>
+			<span class="s1">len(points)</span><span class="s0">, </span><span class="s1">tupleData</span><span class="s0">, </span><span class="s1">pos)</span>
+		<span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y </span><span class="s0">in </span><span class="s1">zip(points</span><span class="s0">, </span><span class="s1">deltas_x</span><span class="s0">, </span><span class="s1">deltas_y):</span>
+			<span class="s0">if </span><span class="s3">0 </span><span class="s1">&lt;= p &lt; pointCount:</span>
+				<span class="s1">deltas[p] = (x</span><span class="s0">, </span><span class="s1">y)</span>
+
+	<span class="s0">return </span><span class="s1">TupleVariation(axes</span><span class="s0">, </span><span class="s1">deltas)</span>
+
+
+<span class="s0">def </span><span class="s1">inferRegion_(peak):</span>
+	<span class="s5">&quot;&quot;&quot;Infer start and end for a (non-intermediate) region 
+ 
+    This helper function computes the applicability region for 
+    variation tuples whose INTERMEDIATE_REGION flag is not set in the 
+    TupleVariationHeader structure.  Variation tuples apply only to 
+    certain regions of the variation space; outside that region, the 
+    tuple has no effect.  To make the binary encoding more compact, 
+    TupleVariationHeaders can omit the intermediateStartTuple and 
+    intermediateEndTuple fields. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">start</span><span class="s0">, </span><span class="s1">end = {}</span><span class="s0">, </span><span class="s1">{}</span>
+	<span class="s0">for </span><span class="s1">(axis</span><span class="s0">, </span><span class="s1">value) </span><span class="s0">in </span><span class="s1">peak.items():</span>
+		<span class="s1">start[axis] = min(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt; -0.3; 0.7 --&gt; 0.0</span>
+		<span class="s1">end[axis] = max(value</span><span class="s0">, </span><span class="s3">0.0</span><span class="s1">)  </span><span class="s2"># -0.3 --&gt;  0.0; 0.7 --&gt; 0.7</span>
+	<span class="s0">return </span><span class="s1">(start</span><span class="s0">, </span><span class="s1">end)</span>
+</pre>
+</body>
+</html>

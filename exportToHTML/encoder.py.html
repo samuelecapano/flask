@@ -1,0 +1,852 @@
+<html>
+<head>
+<title>encoder.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+encoder.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Protocol Buffers - Google's data interchange format</span>
+<span class="s0"># Copyright 2008 Google Inc.  All rights reserved.</span>
+<span class="s0"># https://developers.google.com/protocol-buffers/</span>
+<span class="s0">#</span>
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are</span>
+<span class="s0"># met:</span>
+<span class="s0">#</span>
+<span class="s0">#     * Redistributions of source code must retain the above copyright</span>
+<span class="s0"># notice, this list of conditions and the following disclaimer.</span>
+<span class="s0">#     * Redistributions in binary form must reproduce the above</span>
+<span class="s0"># copyright notice, this list of conditions and the following disclaimer</span>
+<span class="s0"># in the documentation and/or other materials provided with the</span>
+<span class="s0"># distribution.</span>
+<span class="s0">#     * Neither the name of Google Inc. nor the names of its</span>
+<span class="s0"># contributors may be used to endorse or promote products derived from</span>
+<span class="s0"># this software without specific prior written permission.</span>
+<span class="s0">#</span>
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</span>
+<span class="s0"># &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</span>
+<span class="s0"># A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</span>
+<span class="s0"># OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</span>
+<span class="s0"># SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</span>
+<span class="s0"># DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</span>
+<span class="s0"># THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</span>
+<span class="s0"># (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</span>
+<span class="s0"># OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</span>
+
+<span class="s2">&quot;&quot;&quot;Code for encoding protocol message primitives. 
+ 
+Contains the logic for encoding every logical protocol field type 
+into one of the 5 physical wire types. 
+ 
+This code is designed to push the Python interpreter's performance to the 
+limits. 
+ 
+The basic idea is that at startup time, for every field (i.e. every 
+FieldDescriptor) we construct two functions:  a &quot;sizer&quot; and an &quot;encoder&quot;.  The 
+sizer takes a value of this field's type and computes its byte size.  The 
+encoder takes a writer function and a value.  It encodes the value into byte 
+strings and invokes the writer function to write those strings.  Typically the 
+writer function is the write() method of a BytesIO. 
+ 
+We try to do as much work as possible when constructing the writer and the 
+sizer rather than when calling them.  In particular: 
+* We copy any needed global functions to local variables, so that we do not need 
+  to do costly global table lookups at runtime. 
+* Similarly, we try to do any attribute lookups at startup time if possible. 
+* Every field's tag is encoded to bytes at startup, since it can't change at 
+  runtime. 
+* Whatever component of the field size we can compute at startup, we do. 
+* We *avoid* sharing code if doing so would make the code slower and not sharing 
+  does not burden us too much.  For example, encoders for repeated fields do 
+  not just call the encoders for singular fields in a loop because this would 
+  add an extra function call overhead for every loop iteration; instead, we 
+  manually inline the single-value encoder into the loop. 
+* If a Python function lacks a return statement, Python actually generates 
+  instructions to pop the result of the last statement off the stack, push 
+  None onto the stack, and then return that.  If we really don't care what 
+  value is returned, then we can save two instructions by returning the 
+  result of the last statement.  It looks funny but it helps. 
+* We assume that type and bounds checking has happened at a higher level. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">__author__ = </span><span class="s3">'kenton@google.com (Kenton Varda)'</span>
+
+<span class="s4">import </span><span class="s1">struct</span>
+
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">wire_format</span>
+
+
+<span class="s0"># This will overflow and thus become IEEE-754 &quot;infinity&quot;.  We would use</span>
+<span class="s0"># &quot;float('inf')&quot; but it doesn't work on Windows pre-Python-2.6.</span>
+<span class="s1">_POS_INF = </span><span class="s5">1e10000</span>
+<span class="s1">_NEG_INF = -_POS_INF</span>
+
+
+<span class="s4">def </span><span class="s1">_VarintSize(value):</span>
+  <span class="s2">&quot;&quot;&quot;Compute the size of a varint value.&quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x7f</span><span class="s1">: </span><span class="s4">return </span><span class="s5">1</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x3fff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">2</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x1fffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">3</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0xfffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">4</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x7ffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">5</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x3ffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">6</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x1ffffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">7</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0xffffffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">8</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x7fffffffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">9</span>
+  <span class="s4">return </span><span class="s5">10</span>
+
+
+<span class="s4">def </span><span class="s1">_SignedVarintSize(value):</span>
+  <span class="s2">&quot;&quot;&quot;Compute the size of a signed varint value.&quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">value &lt; </span><span class="s5">0</span><span class="s1">: </span><span class="s4">return </span><span class="s5">10</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x7f</span><span class="s1">: </span><span class="s4">return </span><span class="s5">1</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x3fff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">2</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x1fffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">3</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0xfffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">4</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x7ffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">5</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x3ffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">6</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x1ffffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">7</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0xffffffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">8</span>
+  <span class="s4">if </span><span class="s1">value &lt;= </span><span class="s5">0x7fffffffffffffff</span><span class="s1">: </span><span class="s4">return </span><span class="s5">9</span>
+  <span class="s4">return </span><span class="s5">10</span>
+
+
+<span class="s4">def </span><span class="s1">_TagSize(field_number):</span>
+  <span class="s2">&quot;&quot;&quot;Returns the number of bytes required to serialize a tag with this field 
+  number.&quot;&quot;&quot;</span>
+  <span class="s0"># Just pass in type 0, since the type won't affect the tag+type size.</span>
+  <span class="s4">return </span><span class="s1">_VarintSize(wire_format.PackTag(field_number</span><span class="s4">, </span><span class="s5">0</span><span class="s1">))</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># In this section we define some generic sizers.  Each of these functions</span>
+<span class="s0"># takes parameters specific to a particular field type, e.g. int32 or fixed64.</span>
+<span class="s0"># It returns another function which in turn takes parameters specific to a</span>
+<span class="s0"># particular field, e.g. the field number and whether it is repeated or packed.</span>
+<span class="s0"># Look at the next section to see how these are used.</span>
+
+
+<span class="s4">def </span><span class="s1">_SimpleSizer(compute_value_size):</span>
+  <span class="s2">&quot;&quot;&quot;A sizer which uses the function compute_value_size to compute the size of 
+  each value.  Typically compute_value_size is _VarintSize.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">SpecificSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s1">tag_size = _TagSize(field_number)</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">local_VarintSize = _VarintSize</span>
+      <span class="s4">def </span><span class="s1">PackedFieldSize(value):</span>
+        <span class="s1">result = </span><span class="s5">0</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">result += compute_value_size(element)</span>
+        <span class="s4">return </span><span class="s1">result + local_VarintSize(result) + tag_size</span>
+      <span class="s4">return </span><span class="s1">PackedFieldSize</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+        <span class="s1">result = tag_size * len(value)</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">result += compute_value_size(element)</span>
+        <span class="s4">return </span><span class="s1">result</span>
+      <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+        <span class="s4">return </span><span class="s1">tag_size + compute_value_size(value)</span>
+      <span class="s4">return </span><span class="s1">FieldSize</span>
+
+  <span class="s4">return </span><span class="s1">SpecificSizer</span>
+
+
+<span class="s4">def </span><span class="s1">_ModifiedSizer(compute_value_size</span><span class="s4">, </span><span class="s1">modify_value):</span>
+  <span class="s2">&quot;&quot;&quot;Like SimpleSizer, but modify_value is invoked on each value before it is 
+  passed to compute_value_size.  modify_value is typically ZigZagEncode.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">SpecificSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s1">tag_size = _TagSize(field_number)</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">local_VarintSize = _VarintSize</span>
+      <span class="s4">def </span><span class="s1">PackedFieldSize(value):</span>
+        <span class="s1">result = </span><span class="s5">0</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">result += compute_value_size(modify_value(element))</span>
+        <span class="s4">return </span><span class="s1">result + local_VarintSize(result) + tag_size</span>
+      <span class="s4">return </span><span class="s1">PackedFieldSize</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+        <span class="s1">result = tag_size * len(value)</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">result += compute_value_size(modify_value(element))</span>
+        <span class="s4">return </span><span class="s1">result</span>
+      <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+        <span class="s4">return </span><span class="s1">tag_size + compute_value_size(modify_value(value))</span>
+      <span class="s4">return </span><span class="s1">FieldSize</span>
+
+  <span class="s4">return </span><span class="s1">SpecificSizer</span>
+
+
+<span class="s4">def </span><span class="s1">_FixedSizer(value_size):</span>
+  <span class="s2">&quot;&quot;&quot;Like _SimpleSizer except for a fixed-size field.  The input is the size 
+  of one value.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">SpecificSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s1">tag_size = _TagSize(field_number)</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">local_VarintSize = _VarintSize</span>
+      <span class="s4">def </span><span class="s1">PackedFieldSize(value):</span>
+        <span class="s1">result = len(value) * value_size</span>
+        <span class="s4">return </span><span class="s1">result + local_VarintSize(result) + tag_size</span>
+      <span class="s4">return </span><span class="s1">PackedFieldSize</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s1">element_size = value_size + tag_size</span>
+      <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+        <span class="s4">return </span><span class="s1">len(value) * element_size</span>
+      <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">field_size = value_size + tag_size</span>
+      <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+        <span class="s4">return </span><span class="s1">field_size</span>
+      <span class="s4">return </span><span class="s1">FieldSize</span>
+
+  <span class="s4">return </span><span class="s1">SpecificSizer</span>
+
+
+<span class="s0"># ====================================================================</span>
+<span class="s0"># Here we declare a sizer constructor for each field type.  Each &quot;sizer</span>
+<span class="s0"># constructor&quot; is a function that takes (field_number, is_repeated, is_packed)</span>
+<span class="s0"># as parameters and returns a sizer, which in turn takes a field value as</span>
+<span class="s0"># a parameter and returns its encoded size.</span>
+
+
+<span class="s1">Int32Sizer = Int64Sizer = EnumSizer = _SimpleSizer(_SignedVarintSize)</span>
+
+<span class="s1">UInt32Sizer = UInt64Sizer = _SimpleSizer(_VarintSize)</span>
+
+<span class="s1">SInt32Sizer = SInt64Sizer = _ModifiedSizer(</span>
+    <span class="s1">_SignedVarintSize</span><span class="s4">, </span><span class="s1">wire_format.ZigZagEncode)</span>
+
+<span class="s1">Fixed32Sizer = SFixed32Sizer = FloatSizer  = _FixedSizer(</span><span class="s5">4</span><span class="s1">)</span>
+<span class="s1">Fixed64Sizer = SFixed64Sizer = DoubleSizer = _FixedSizer(</span><span class="s5">8</span><span class="s1">)</span>
+
+<span class="s1">BoolSizer = _FixedSizer(</span><span class="s5">1</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">StringSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a sizer for a string field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag_size = _TagSize(field_number)</span>
+  <span class="s1">local_VarintSize = _VarintSize</span>
+  <span class="s1">local_len = len</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+      <span class="s1">result = tag_size * len(value)</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">l = local_len(element.encode(</span><span class="s3">'utf-8'</span><span class="s1">))</span>
+        <span class="s1">result += local_VarintSize(l) + l</span>
+      <span class="s4">return </span><span class="s1">result</span>
+    <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+      <span class="s1">l = local_len(value.encode(</span><span class="s3">'utf-8'</span><span class="s1">))</span>
+      <span class="s4">return </span><span class="s1">tag_size + local_VarintSize(l) + l</span>
+    <span class="s4">return </span><span class="s1">FieldSize</span>
+
+
+<span class="s4">def </span><span class="s1">BytesSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a sizer for a bytes field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag_size = _TagSize(field_number)</span>
+  <span class="s1">local_VarintSize = _VarintSize</span>
+  <span class="s1">local_len = len</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+      <span class="s1">result = tag_size * len(value)</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">l = local_len(element)</span>
+        <span class="s1">result += local_VarintSize(l) + l</span>
+      <span class="s4">return </span><span class="s1">result</span>
+    <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+      <span class="s1">l = local_len(value)</span>
+      <span class="s4">return </span><span class="s1">tag_size + local_VarintSize(l) + l</span>
+    <span class="s4">return </span><span class="s1">FieldSize</span>
+
+
+<span class="s4">def </span><span class="s1">GroupSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a sizer for a group field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag_size = _TagSize(field_number) * </span><span class="s5">2</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+      <span class="s1">result = tag_size * len(value)</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">result += element.ByteSize()</span>
+      <span class="s4">return </span><span class="s1">result</span>
+    <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+      <span class="s4">return </span><span class="s1">tag_size + value.ByteSize()</span>
+    <span class="s4">return </span><span class="s1">FieldSize</span>
+
+
+<span class="s4">def </span><span class="s1">MessageSizer(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a sizer for a message field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag_size = _TagSize(field_number)</span>
+  <span class="s1">local_VarintSize = _VarintSize</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">RepeatedFieldSize(value):</span>
+      <span class="s1">result = tag_size * len(value)</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">l = element.ByteSize()</span>
+        <span class="s1">result += local_VarintSize(l) + l</span>
+      <span class="s4">return </span><span class="s1">result</span>
+    <span class="s4">return </span><span class="s1">RepeatedFieldSize</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+      <span class="s1">l = value.ByteSize()</span>
+      <span class="s4">return </span><span class="s1">tag_size + local_VarintSize(l) + l</span>
+    <span class="s4">return </span><span class="s1">FieldSize</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># MessageSet is special: it needs custom logic to compute its size properly.</span>
+
+
+<span class="s4">def </span><span class="s1">MessageSetItemSizer(field_number):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a sizer for extensions of MessageSet. 
+ 
+  The message set message looks like this: 
+    message MessageSet { 
+      repeated group Item = 1 { 
+        required int32 type_id = 2; 
+        required string message = 3; 
+      } 
+    } 
+  &quot;&quot;&quot;</span>
+  <span class="s1">static_size = (_TagSize(</span><span class="s5">1</span><span class="s1">) * </span><span class="s5">2 </span><span class="s1">+ _TagSize(</span><span class="s5">2</span><span class="s1">) + _VarintSize(field_number) +</span>
+                 <span class="s1">_TagSize(</span><span class="s5">3</span><span class="s1">))</span>
+  <span class="s1">local_VarintSize = _VarintSize</span>
+
+  <span class="s4">def </span><span class="s1">FieldSize(value):</span>
+    <span class="s1">l = value.ByteSize()</span>
+    <span class="s4">return </span><span class="s1">static_size + local_VarintSize(l) + l</span>
+
+  <span class="s4">return </span><span class="s1">FieldSize</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># Map is special: it needs custom logic to compute its size properly.</span>
+
+
+<span class="s4">def </span><span class="s1">MapSizer(field_descriptor</span><span class="s4">, </span><span class="s1">is_message_map):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a sizer for a map field.&quot;&quot;&quot;</span>
+
+  <span class="s0"># Can't look at field_descriptor.message_type._concrete_class because it may</span>
+  <span class="s0"># not have been initialized yet.</span>
+  <span class="s1">message_type = field_descriptor.message_type</span>
+  <span class="s1">message_sizer = MessageSizer(field_descriptor.number</span><span class="s4">, False, False</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">FieldSize(map_value):</span>
+    <span class="s1">total = </span><span class="s5">0</span>
+    <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">map_value:</span>
+      <span class="s1">value = map_value[key]</span>
+      <span class="s0"># It's wasteful to create the messages and throw them away one second</span>
+      <span class="s0"># later since we'll do the same for the actual encode.  But there's not an</span>
+      <span class="s0"># obvious way to avoid this within the current design without tons of code</span>
+      <span class="s0"># duplication. For message map, value.ByteSize() should be called to</span>
+      <span class="s0"># update the status.</span>
+      <span class="s1">entry_msg = message_type._concrete_class(key=key</span><span class="s4">, </span><span class="s1">value=value)</span>
+      <span class="s1">total += message_sizer(entry_msg)</span>
+      <span class="s4">if </span><span class="s1">is_message_map:</span>
+        <span class="s1">value.ByteSize()</span>
+    <span class="s4">return </span><span class="s1">total</span>
+
+  <span class="s4">return </span><span class="s1">FieldSize</span>
+
+<span class="s0"># ====================================================================</span>
+<span class="s0"># Encoders!</span>
+
+
+<span class="s4">def </span><span class="s1">_VarintEncoder():</span>
+  <span class="s2">&quot;&quot;&quot;Return an encoder for a basic varint value (does not include tag).&quot;&quot;&quot;</span>
+
+  <span class="s1">local_int2byte = struct.Struct(</span><span class="s3">'&gt;B'</span><span class="s1">).pack</span>
+
+  <span class="s4">def </span><span class="s1">EncodeVarint(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s1">bits = value &amp; </span><span class="s5">0x7f</span>
+    <span class="s1">value &gt;&gt;= </span><span class="s5">7</span>
+    <span class="s4">while </span><span class="s1">value:</span>
+      <span class="s1">write(local_int2byte(</span><span class="s5">0x80</span><span class="s1">|bits))</span>
+      <span class="s1">bits = value &amp; </span><span class="s5">0x7f</span>
+      <span class="s1">value &gt;&gt;= </span><span class="s5">7</span>
+    <span class="s4">return </span><span class="s1">write(local_int2byte(bits))</span>
+
+  <span class="s4">return </span><span class="s1">EncodeVarint</span>
+
+
+<span class="s4">def </span><span class="s1">_SignedVarintEncoder():</span>
+  <span class="s2">&quot;&quot;&quot;Return an encoder for a basic signed varint value (does not include 
+  tag).&quot;&quot;&quot;</span>
+
+  <span class="s1">local_int2byte = struct.Struct(</span><span class="s3">'&gt;B'</span><span class="s1">).pack</span>
+
+  <span class="s4">def </span><span class="s1">EncodeSignedVarint(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s4">if </span><span class="s1">value &lt; </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">value += (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">64</span><span class="s1">)</span>
+    <span class="s1">bits = value &amp; </span><span class="s5">0x7f</span>
+    <span class="s1">value &gt;&gt;= </span><span class="s5">7</span>
+    <span class="s4">while </span><span class="s1">value:</span>
+      <span class="s1">write(local_int2byte(</span><span class="s5">0x80</span><span class="s1">|bits))</span>
+      <span class="s1">bits = value &amp; </span><span class="s5">0x7f</span>
+      <span class="s1">value &gt;&gt;= </span><span class="s5">7</span>
+    <span class="s4">return </span><span class="s1">write(local_int2byte(bits))</span>
+
+  <span class="s4">return </span><span class="s1">EncodeSignedVarint</span>
+
+
+<span class="s1">_EncodeVarint = _VarintEncoder()</span>
+<span class="s1">_EncodeSignedVarint = _SignedVarintEncoder()</span>
+
+
+<span class="s4">def </span><span class="s1">_VarintBytes(value):</span>
+  <span class="s2">&quot;&quot;&quot;Encode the given integer as a varint and return the bytes.  This is only 
+  called at startup time so it doesn't need to be fast.&quot;&quot;&quot;</span>
+
+  <span class="s1">pieces = []</span>
+  <span class="s1">_EncodeVarint(pieces.append</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, True</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s6">b&quot;&quot;</span><span class="s1">.join(pieces)</span>
+
+
+<span class="s4">def </span><span class="s1">TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type):</span>
+  <span class="s2">&quot;&quot;&quot;Encode the given tag and return the bytes.  Only called at startup.&quot;&quot;&quot;</span>
+
+  <span class="s4">return </span><span class="s1">bytes(_VarintBytes(wire_format.PackTag(field_number</span><span class="s4">, </span><span class="s1">wire_type)))</span>
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># As with sizers (see above), we have a number of common encoder</span>
+<span class="s0"># implementations.</span>
+
+
+<span class="s4">def </span><span class="s1">_SimpleEncoder(wire_type</span><span class="s4">, </span><span class="s1">encode_value</span><span class="s4">, </span><span class="s1">compute_value_size):</span>
+  <span class="s2">&quot;&quot;&quot;Return a constructor for an encoder for fields of a particular type. 
+ 
+  Args: 
+      wire_type:  The field's wire type, for encoding tags. 
+      encode_value:  A function which encodes an individual value, e.g. 
+        _EncodeVarint(). 
+      compute_value_size:  A function which computes the size of an individual 
+        value, e.g. _VarintSize(). 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">SpecificEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+      <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+      <span class="s4">def </span><span class="s1">EncodePackedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s1">size = </span><span class="s5">0</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">size += compute_value_size(element)</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">encode_value(write</span><span class="s4">, </span><span class="s1">element</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">EncodePackedField</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">write(tag_bytes)</span>
+          <span class="s1">encode_value(write</span><span class="s4">, </span><span class="s1">element</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s4">return </span><span class="s1">encode_value(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">EncodeField</span>
+
+  <span class="s4">return </span><span class="s1">SpecificEncoder</span>
+
+
+<span class="s4">def </span><span class="s1">_ModifiedEncoder(wire_type</span><span class="s4">, </span><span class="s1">encode_value</span><span class="s4">, </span><span class="s1">compute_value_size</span><span class="s4">, </span><span class="s1">modify_value):</span>
+  <span class="s2">&quot;&quot;&quot;Like SimpleEncoder but additionally invokes modify_value on every value 
+  before passing it to encode_value.  Usually modify_value is ZigZagEncode.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">SpecificEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+      <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+      <span class="s4">def </span><span class="s1">EncodePackedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s1">size = </span><span class="s5">0</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">size += compute_value_size(modify_value(element))</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">encode_value(write</span><span class="s4">, </span><span class="s1">modify_value(element)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">EncodePackedField</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">write(tag_bytes)</span>
+          <span class="s1">encode_value(write</span><span class="s4">, </span><span class="s1">modify_value(element)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s4">return </span><span class="s1">encode_value(write</span><span class="s4">, </span><span class="s1">modify_value(value)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">EncodeField</span>
+
+  <span class="s4">return </span><span class="s1">SpecificEncoder</span>
+
+
+<span class="s4">def </span><span class="s1">_StructPackEncoder(wire_type</span><span class="s4">, </span><span class="s1">format):</span>
+  <span class="s2">&quot;&quot;&quot;Return a constructor for an encoder for a fixed-width field. 
+ 
+  Args: 
+      wire_type:  The field's wire type, for encoding tags. 
+      format:  The format string to pass to struct.pack(). 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">value_size = struct.calcsize(format)</span>
+
+  <span class="s4">def </span><span class="s1">SpecificEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s1">local_struct_pack = struct.pack</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+      <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+      <span class="s4">def </span><span class="s1">EncodePackedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">len(value) * value_size</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">write(local_struct_pack(format</span><span class="s4">, </span><span class="s1">element))</span>
+      <span class="s4">return </span><span class="s1">EncodePackedField</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">write(tag_bytes)</span>
+          <span class="s1">write(local_struct_pack(format</span><span class="s4">, </span><span class="s1">element))</span>
+      <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s4">return </span><span class="s1">write(local_struct_pack(format</span><span class="s4">, </span><span class="s1">value))</span>
+      <span class="s4">return </span><span class="s1">EncodeField</span>
+
+  <span class="s4">return </span><span class="s1">SpecificEncoder</span>
+
+
+<span class="s4">def </span><span class="s1">_FloatingPointEncoder(wire_type</span><span class="s4">, </span><span class="s1">format):</span>
+  <span class="s2">&quot;&quot;&quot;Return a constructor for an encoder for float fields. 
+ 
+  This is like StructPackEncoder, but catches errors that may be due to 
+  passing non-finite floating-point values to struct.pack, and makes a 
+  second attempt to encode those values. 
+ 
+  Args: 
+      wire_type:  The field's wire type, for encoding tags. 
+      format:  The format string to pass to struct.pack(). 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">value_size = struct.calcsize(format)</span>
+  <span class="s4">if </span><span class="s1">value_size == </span><span class="s5">4</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">EncodeNonFiniteOrRaise(write</span><span class="s4">, </span><span class="s1">value):</span>
+      <span class="s0"># Remember that the serialized form uses little-endian byte order.</span>
+      <span class="s4">if </span><span class="s1">value == _POS_INF:</span>
+        <span class="s1">write(</span><span class="s6">b'</span><span class="s4">\x00\x00\x80\x7F</span><span class="s6">'</span><span class="s1">)</span>
+      <span class="s4">elif </span><span class="s1">value == _NEG_INF:</span>
+        <span class="s1">write(</span><span class="s6">b'</span><span class="s4">\x00\x00\x80\xFF</span><span class="s6">'</span><span class="s1">)</span>
+      <span class="s4">elif </span><span class="s1">value != value:           </span><span class="s0"># NaN</span>
+        <span class="s1">write(</span><span class="s6">b'</span><span class="s4">\x00\x00\xC0\x7F</span><span class="s6">'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">raise</span>
+  <span class="s4">elif </span><span class="s1">value_size == </span><span class="s5">8</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">EncodeNonFiniteOrRaise(write</span><span class="s4">, </span><span class="s1">value):</span>
+      <span class="s4">if </span><span class="s1">value == _POS_INF:</span>
+        <span class="s1">write(</span><span class="s6">b'</span><span class="s4">\x00\x00\x00\x00\x00\x00\xF0\x7F</span><span class="s6">'</span><span class="s1">)</span>
+      <span class="s4">elif </span><span class="s1">value == _NEG_INF:</span>
+        <span class="s1">write(</span><span class="s6">b'</span><span class="s4">\x00\x00\x00\x00\x00\x00\xF0\xFF</span><span class="s6">'</span><span class="s1">)</span>
+      <span class="s4">elif </span><span class="s1">value != value:                         </span><span class="s0"># NaN</span>
+        <span class="s1">write(</span><span class="s6">b'</span><span class="s4">\x00\x00\x00\x00\x00\x00\xF8\x7F</span><span class="s6">'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">raise</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Can</span><span class="s4">\'</span><span class="s3">t encode floating-point values that are '</span>
+                     <span class="s3">'%d bytes long (only 4 or 8)' </span><span class="s1">% value_size)</span>
+
+  <span class="s4">def </span><span class="s1">SpecificEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+    <span class="s1">local_struct_pack = struct.pack</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+      <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+      <span class="s4">def </span><span class="s1">EncodePackedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">len(value) * value_size</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s0"># This try/except block is going to be faster than any code that</span>
+          <span class="s0"># we could write to check whether element is finite.</span>
+          <span class="s4">try</span><span class="s1">:</span>
+            <span class="s1">write(local_struct_pack(format</span><span class="s4">, </span><span class="s1">element))</span>
+          <span class="s4">except </span><span class="s1">SystemError:</span>
+            <span class="s1">EncodeNonFiniteOrRaise(write</span><span class="s4">, </span><span class="s1">element)</span>
+      <span class="s4">return </span><span class="s1">EncodePackedField</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+        <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+          <span class="s1">write(tag_bytes)</span>
+          <span class="s4">try</span><span class="s1">:</span>
+            <span class="s1">write(local_struct_pack(format</span><span class="s4">, </span><span class="s1">element))</span>
+          <span class="s4">except </span><span class="s1">SystemError:</span>
+            <span class="s1">EncodeNonFiniteOrRaise(write</span><span class="s4">, </span><span class="s1">element)</span>
+      <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s4">try</span><span class="s1">:</span>
+          <span class="s1">write(local_struct_pack(format</span><span class="s4">, </span><span class="s1">value))</span>
+        <span class="s4">except </span><span class="s1">SystemError:</span>
+          <span class="s1">EncodeNonFiniteOrRaise(write</span><span class="s4">, </span><span class="s1">value)</span>
+      <span class="s4">return </span><span class="s1">EncodeField</span>
+
+  <span class="s4">return </span><span class="s1">SpecificEncoder</span>
+
+
+<span class="s0"># ====================================================================</span>
+<span class="s0"># Here we declare an encoder constructor for each field type.  These work</span>
+<span class="s0"># very similarly to sizer constructors, described earlier.</span>
+
+
+<span class="s1">Int32Encoder = Int64Encoder = EnumEncoder = _SimpleEncoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_EncodeSignedVarint</span><span class="s4">, </span><span class="s1">_SignedVarintSize)</span>
+
+<span class="s1">UInt32Encoder = UInt64Encoder = _SimpleEncoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_EncodeVarint</span><span class="s4">, </span><span class="s1">_VarintSize)</span>
+
+<span class="s1">SInt32Encoder = SInt64Encoder = _ModifiedEncoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_EncodeVarint</span><span class="s4">, </span><span class="s1">_VarintSize</span><span class="s4">,</span>
+    <span class="s1">wire_format.ZigZagEncode)</span>
+
+<span class="s0"># Note that Python conveniently guarantees that when using the '&lt;' prefix on</span>
+<span class="s0"># formats, they will also have the same size across all platforms (as opposed</span>
+<span class="s0"># to without the prefix, where their sizes depend on the C compiler's basic</span>
+<span class="s0"># type sizes).</span>
+<span class="s1">Fixed32Encoder  = _StructPackEncoder(wire_format.WIRETYPE_FIXED32</span><span class="s4">, </span><span class="s3">'&lt;I'</span><span class="s1">)</span>
+<span class="s1">Fixed64Encoder  = _StructPackEncoder(wire_format.WIRETYPE_FIXED64</span><span class="s4">, </span><span class="s3">'&lt;Q'</span><span class="s1">)</span>
+<span class="s1">SFixed32Encoder = _StructPackEncoder(wire_format.WIRETYPE_FIXED32</span><span class="s4">, </span><span class="s3">'&lt;i'</span><span class="s1">)</span>
+<span class="s1">SFixed64Encoder = _StructPackEncoder(wire_format.WIRETYPE_FIXED64</span><span class="s4">, </span><span class="s3">'&lt;q'</span><span class="s1">)</span>
+<span class="s1">FloatEncoder    = _FloatingPointEncoder(wire_format.WIRETYPE_FIXED32</span><span class="s4">, </span><span class="s3">'&lt;f'</span><span class="s1">)</span>
+<span class="s1">DoubleEncoder   = _FloatingPointEncoder(wire_format.WIRETYPE_FIXED64</span><span class="s4">, </span><span class="s3">'&lt;d'</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">BoolEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns an encoder for a boolean field.&quot;&quot;&quot;</span>
+
+  <span class="s1">false_byte = </span><span class="s6">b'</span><span class="s4">\x00</span><span class="s6">'</span>
+  <span class="s1">true_byte = </span><span class="s6">b'</span><span class="s4">\x01</span><span class="s6">'</span>
+  <span class="s4">if </span><span class="s1">is_packed:</span>
+    <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+    <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+    <span class="s4">def </span><span class="s1">EncodePackedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s1">write(tag_bytes)</span>
+      <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">len(value)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s4">if </span><span class="s1">element:</span>
+          <span class="s1">write(true_byte)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">write(false_byte)</span>
+    <span class="s4">return </span><span class="s1">EncodePackedField</span>
+  <span class="s4">elif </span><span class="s1">is_repeated:</span>
+    <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT)</span>
+    <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">write(tag_bytes)</span>
+        <span class="s4">if </span><span class="s1">element:</span>
+          <span class="s1">write(true_byte)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">write(false_byte)</span>
+    <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s1">tag_bytes = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT)</span>
+    <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">unused_deterministic=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">write(tag_bytes)</span>
+      <span class="s4">if </span><span class="s1">value:</span>
+        <span class="s4">return </span><span class="s1">write(true_byte)</span>
+      <span class="s4">return </span><span class="s1">write(false_byte)</span>
+    <span class="s4">return </span><span class="s1">EncodeField</span>
+
+
+<span class="s4">def </span><span class="s1">StringEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns an encoder for a string field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+  <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+  <span class="s1">local_len = len</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">encoded = element.encode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+        <span class="s1">write(tag)</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">local_len(encoded)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s1">write(encoded)</span>
+    <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s1">encoded = value.encode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+      <span class="s1">write(tag)</span>
+      <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">local_len(encoded)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">write(encoded)</span>
+    <span class="s4">return </span><span class="s1">EncodeField</span>
+
+
+<span class="s4">def </span><span class="s1">BytesEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns an encoder for a bytes field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+  <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+  <span class="s1">local_len = len</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">write(tag)</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">local_len(element)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s1">write(element)</span>
+    <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s1">write(tag)</span>
+      <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">local_len(value)</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">write(value)</span>
+    <span class="s4">return </span><span class="s1">EncodeField</span>
+
+
+<span class="s4">def </span><span class="s1">GroupEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns an encoder for a group field.&quot;&quot;&quot;</span>
+
+  <span class="s1">start_tag = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_START_GROUP)</span>
+  <span class="s1">end_tag = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_END_GROUP)</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">write(start_tag)</span>
+        <span class="s1">element._InternalSerialize(write</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s1">write(end_tag)</span>
+    <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s1">write(start_tag)</span>
+      <span class="s1">value._InternalSerialize(write</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">write(end_tag)</span>
+    <span class="s4">return </span><span class="s1">EncodeField</span>
+
+
+<span class="s4">def </span><span class="s1">MessageEncoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed):</span>
+  <span class="s2">&quot;&quot;&quot;Returns an encoder for a message field.&quot;&quot;&quot;</span>
+
+  <span class="s1">tag = TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+  <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s4">def </span><span class="s1">EncodeRepeatedField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+        <span class="s1">write(tag)</span>
+        <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">element.ByteSize()</span><span class="s4">, </span><span class="s1">deterministic)</span>
+        <span class="s1">element._InternalSerialize(write</span><span class="s4">, </span><span class="s1">deterministic)</span>
+    <span class="s4">return </span><span class="s1">EncodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+      <span class="s1">write(tag)</span>
+      <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">value.ByteSize()</span><span class="s4">, </span><span class="s1">deterministic)</span>
+      <span class="s4">return </span><span class="s1">value._InternalSerialize(write</span><span class="s4">, </span><span class="s1">deterministic)</span>
+    <span class="s4">return </span><span class="s1">EncodeField</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># As before, MessageSet is special.</span>
+
+
+<span class="s4">def </span><span class="s1">MessageSetItemEncoder(field_number):</span>
+  <span class="s2">&quot;&quot;&quot;Encoder for extensions of MessageSet. 
+ 
+  The message set message looks like this: 
+    message MessageSet { 
+      repeated group Item = 1 { 
+        required int32 type_id = 2; 
+        required string message = 3; 
+      } 
+    } 
+  &quot;&quot;&quot;</span>
+  <span class="s1">start_bytes = </span><span class="s6">b&quot;&quot;</span><span class="s1">.join([</span>
+      <span class="s1">TagBytes(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_START_GROUP)</span><span class="s4">,</span>
+      <span class="s1">TagBytes(</span><span class="s5">2</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT)</span><span class="s4">,</span>
+      <span class="s1">_VarintBytes(field_number)</span><span class="s4">,</span>
+      <span class="s1">TagBytes(</span><span class="s5">3</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)])</span>
+  <span class="s1">end_bytes = TagBytes(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_END_GROUP)</span>
+  <span class="s1">local_EncodeVarint = _EncodeVarint</span>
+
+  <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+    <span class="s1">write(start_bytes)</span>
+    <span class="s1">local_EncodeVarint(write</span><span class="s4">, </span><span class="s1">value.ByteSize()</span><span class="s4">, </span><span class="s1">deterministic)</span>
+    <span class="s1">value._InternalSerialize(write</span><span class="s4">, </span><span class="s1">deterministic)</span>
+    <span class="s4">return </span><span class="s1">write(end_bytes)</span>
+
+  <span class="s4">return </span><span class="s1">EncodeField</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># As before, Map is special.</span>
+
+
+<span class="s4">def </span><span class="s1">MapEncoder(field_descriptor):</span>
+  <span class="s2">&quot;&quot;&quot;Encoder for extensions of MessageSet. 
+ 
+  Maps always have a wire format like this: 
+    message MapEntry { 
+      key_type key = 1; 
+      value_type value = 2; 
+    } 
+    repeated MapEntry map = N; 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># Can't look at field_descriptor.message_type._concrete_class because it may</span>
+  <span class="s0"># not have been initialized yet.</span>
+  <span class="s1">message_type = field_descriptor.message_type</span>
+  <span class="s1">encode_message = MessageEncoder(field_descriptor.number</span><span class="s4">, False, False</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">EncodeField(write</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">deterministic):</span>
+    <span class="s1">value_keys = sorted(value.keys()) </span><span class="s4">if </span><span class="s1">deterministic </span><span class="s4">else </span><span class="s1">value</span>
+    <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">value_keys:</span>
+      <span class="s1">entry_msg = message_type._concrete_class(key=key</span><span class="s4">, </span><span class="s1">value=value[key])</span>
+      <span class="s1">encode_message(write</span><span class="s4">, </span><span class="s1">entry_msg</span><span class="s4">, </span><span class="s1">deterministic)</span>
+
+  <span class="s4">return </span><span class="s1">EncodeField</span>
+</pre>
+</body>
+</html>

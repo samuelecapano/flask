@@ -1,0 +1,458 @@
+<html>
+<head>
+<title>type_checkers.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+type_checkers.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Protocol Buffers - Google's data interchange format</span>
+<span class="s0"># Copyright 2008 Google Inc.  All rights reserved.</span>
+<span class="s0"># https://developers.google.com/protocol-buffers/</span>
+<span class="s0">#</span>
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are</span>
+<span class="s0"># met:</span>
+<span class="s0">#</span>
+<span class="s0">#     * Redistributions of source code must retain the above copyright</span>
+<span class="s0"># notice, this list of conditions and the following disclaimer.</span>
+<span class="s0">#     * Redistributions in binary form must reproduce the above</span>
+<span class="s0"># copyright notice, this list of conditions and the following disclaimer</span>
+<span class="s0"># in the documentation and/or other materials provided with the</span>
+<span class="s0"># distribution.</span>
+<span class="s0">#     * Neither the name of Google Inc. nor the names of its</span>
+<span class="s0"># contributors may be used to endorse or promote products derived from</span>
+<span class="s0"># this software without specific prior written permission.</span>
+<span class="s0">#</span>
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</span>
+<span class="s0"># &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</span>
+<span class="s0"># A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</span>
+<span class="s0"># OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</span>
+<span class="s0"># SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</span>
+<span class="s0"># DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</span>
+<span class="s0"># THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</span>
+<span class="s0"># (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</span>
+<span class="s0"># OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</span>
+
+<span class="s2">&quot;&quot;&quot;Provides type checking routines. 
+ 
+This module defines type checking utilities in the forms of dictionaries: 
+ 
+VALUE_CHECKERS: A dictionary of field types and a value validation object. 
+TYPE_TO_BYTE_SIZE_FN: A dictionary with field types and a size computing 
+  function. 
+TYPE_TO_SERIALIZE_METHOD: A dictionary with field types and serialization 
+  function. 
+FIELD_TYPE_TO_WIRE_TYPE: A dictionary with field typed and their 
+  corresponding wire types. 
+TYPE_TO_DESERIALIZE_METHOD: A dictionary with field types and deserialization 
+  function. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">__author__ = </span><span class="s3">'robinson@google.com (Will Robinson)'</span>
+
+<span class="s4">import </span><span class="s1">ctypes</span>
+<span class="s4">import </span><span class="s1">numbers</span>
+
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">decoder</span>
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">encoder</span>
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">wire_format</span>
+<span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor</span>
+
+<span class="s1">_FieldDescriptor = descriptor.FieldDescriptor</span>
+
+
+<span class="s4">def </span><span class="s1">TruncateToFourByteFloat(original):</span>
+  <span class="s4">return </span><span class="s1">ctypes.c_float(original).value</span>
+
+
+<span class="s4">def </span><span class="s1">ToShortestFloat(original):</span>
+  <span class="s2">&quot;&quot;&quot;Returns the shortest float that has same value in wire.&quot;&quot;&quot;</span>
+  <span class="s0"># All 4 byte floats have between 6 and 9 significant digits, so we</span>
+  <span class="s0"># start with 6 as the lower bound.</span>
+  <span class="s0"># It has to be iterative because use '.9g' directly can not get rid</span>
+  <span class="s0"># of the noises for most values. For example if set a float_field=0.9</span>
+  <span class="s0"># use '.9g' will print 0.899999976.</span>
+  <span class="s1">precision = </span><span class="s5">6</span>
+  <span class="s1">rounded = float(</span><span class="s3">'{0:.{1}g}'</span><span class="s1">.format(original</span><span class="s4">, </span><span class="s1">precision))</span>
+  <span class="s4">while </span><span class="s1">TruncateToFourByteFloat(rounded) != original:</span>
+    <span class="s1">precision += </span><span class="s5">1</span>
+    <span class="s1">rounded = float(</span><span class="s3">'{0:.{1}g}'</span><span class="s1">.format(original</span><span class="s4">, </span><span class="s1">precision))</span>
+  <span class="s4">return </span><span class="s1">rounded</span>
+
+
+<span class="s4">def </span><span class="s1">SupportsOpenEnums(field_descriptor):</span>
+  <span class="s4">return </span><span class="s1">field_descriptor.containing_type.syntax == </span><span class="s3">'proto3'</span>
+
+
+<span class="s4">def </span><span class="s1">GetTypeChecker(field):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a type checker for a message field of the specified types. 
+ 
+  Args: 
+    field: FieldDescriptor object for this field. 
+ 
+  Returns: 
+    An instance of TypeChecker which can be used to verify the types 
+    of values assigned to a field of the specified type. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">(field.cpp_type == _FieldDescriptor.CPPTYPE_STRING </span><span class="s4">and</span>
+      <span class="s1">field.type == _FieldDescriptor.TYPE_STRING):</span>
+    <span class="s4">return </span><span class="s1">UnicodeValueChecker()</span>
+  <span class="s4">if </span><span class="s1">field.cpp_type == _FieldDescriptor.CPPTYPE_ENUM:</span>
+    <span class="s4">if </span><span class="s1">SupportsOpenEnums(field):</span>
+      <span class="s0"># When open enums are supported, any int32 can be assigned.</span>
+      <span class="s4">return </span><span class="s1">_VALUE_CHECKERS[_FieldDescriptor.CPPTYPE_INT32]</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">return </span><span class="s1">EnumValueChecker(field.enum_type)</span>
+  <span class="s4">return </span><span class="s1">_VALUE_CHECKERS[field.cpp_type]</span>
+
+
+<span class="s0"># None of the typecheckers below make any attempt to guard against people</span>
+<span class="s0"># subclassing builtin types and doing weird things.  We're not trying to</span>
+<span class="s0"># protect against malicious clients here, just people accidentally shooting</span>
+<span class="s0"># themselves in the foot in obvious ways.</span>
+<span class="s4">class </span><span class="s1">TypeChecker(object):</span>
+
+  <span class="s2">&quot;&quot;&quot;Type checker used to catch type errors as early as possible 
+  when the client is setting scalar fields in protocol messages. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">*acceptable_types):</span>
+    <span class="s1">self._acceptable_types = acceptable_types</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s2">&quot;&quot;&quot;Type check the provided value and return it. 
+ 
+    The returned value might have been normalized to another type. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if not </span><span class="s1">isinstance(proposed_value</span><span class="s4">, </span><span class="s1">self._acceptable_types):</span>
+      <span class="s1">message = (</span><span class="s3">'%.1024r has type %s, but expected one of: %s' </span><span class="s1">%</span>
+                 <span class="s1">(proposed_value</span><span class="s4">, </span><span class="s1">type(proposed_value)</span><span class="s4">, </span><span class="s1">self._acceptable_types))</span>
+      <span class="s4">raise </span><span class="s1">TypeError(message)</span>
+    <span class="s4">return </span><span class="s1">proposed_value</span>
+
+
+<span class="s4">class </span><span class="s1">TypeCheckerWithDefault(TypeChecker):</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">default_value</span><span class="s4">, </span><span class="s1">*acceptable_types):</span>
+    <span class="s1">TypeChecker.__init__(self</span><span class="s4">, </span><span class="s1">*acceptable_types)</span>
+    <span class="s1">self._default_value = default_value</span>
+
+  <span class="s4">def </span><span class="s1">DefaultValue(self):</span>
+    <span class="s4">return </span><span class="s1">self._default_value</span>
+
+
+<span class="s4">class </span><span class="s1">BoolValueChecker(object):</span>
+  <span class="s2">&quot;&quot;&quot;Type checker used for bool fields.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s4">if not </span><span class="s1">hasattr(proposed_value</span><span class="s4">, </span><span class="s3">'__index__'</span><span class="s1">) </span><span class="s4">or </span><span class="s1">(</span>
+        <span class="s1">type(proposed_value).__module__ == </span><span class="s3">'numpy' </span><span class="s4">and</span>
+        <span class="s1">type(proposed_value).__name__ == </span><span class="s3">'ndarray'</span><span class="s1">):</span>
+      <span class="s1">message = (</span><span class="s3">'%.1024r has type %s, but expected one of: %s' </span><span class="s1">%</span>
+                 <span class="s1">(proposed_value</span><span class="s4">, </span><span class="s1">type(proposed_value)</span><span class="s4">, </span><span class="s1">(bool</span><span class="s4">, </span><span class="s1">int)))</span>
+      <span class="s4">raise </span><span class="s1">TypeError(message)</span>
+    <span class="s4">return </span><span class="s1">bool(proposed_value)</span>
+
+  <span class="s4">def </span><span class="s1">DefaultValue(self):</span>
+    <span class="s4">return False</span>
+
+
+<span class="s0"># IntValueChecker and its subclasses perform integer type-checks</span>
+<span class="s0"># and bounds-checks.</span>
+<span class="s4">class </span><span class="s1">IntValueChecker(object):</span>
+
+  <span class="s2">&quot;&quot;&quot;Checker used for integer fields.  Performs type-check and range check.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s4">if not </span><span class="s1">hasattr(proposed_value</span><span class="s4">, </span><span class="s3">'__index__'</span><span class="s1">) </span><span class="s4">or </span><span class="s1">(</span>
+        <span class="s1">type(proposed_value).__module__ == </span><span class="s3">'numpy' </span><span class="s4">and</span>
+        <span class="s1">type(proposed_value).__name__ == </span><span class="s3">'ndarray'</span><span class="s1">):</span>
+      <span class="s1">message = (</span><span class="s3">'%.1024r has type %s, but expected one of: %s' </span><span class="s1">%</span>
+                 <span class="s1">(proposed_value</span><span class="s4">, </span><span class="s1">type(proposed_value)</span><span class="s4">, </span><span class="s1">(int</span><span class="s4">,</span><span class="s1">)))</span>
+      <span class="s4">raise </span><span class="s1">TypeError(message)</span>
+
+    <span class="s4">if not </span><span class="s1">self._MIN &lt;= int(proposed_value) &lt;= self._MAX:</span>
+      <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Value out of range: %d' </span><span class="s1">% proposed_value)</span>
+    <span class="s0"># We force all values to int to make alternate implementations where the</span>
+    <span class="s0"># distinction is more significant (e.g. the C++ implementation) simpler.</span>
+    <span class="s1">proposed_value = int(proposed_value)</span>
+    <span class="s4">return </span><span class="s1">proposed_value</span>
+
+  <span class="s4">def </span><span class="s1">DefaultValue(self):</span>
+    <span class="s4">return </span><span class="s5">0</span>
+
+
+<span class="s4">class </span><span class="s1">EnumValueChecker(object):</span>
+
+  <span class="s2">&quot;&quot;&quot;Checker used for enum fields.  Performs type-check and range check.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">enum_type):</span>
+    <span class="s1">self._enum_type = enum_type</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s4">if not </span><span class="s1">isinstance(proposed_value</span><span class="s4">, </span><span class="s1">numbers.Integral):</span>
+      <span class="s1">message = (</span><span class="s3">'%.1024r has type %s, but expected one of: %s' </span><span class="s1">%</span>
+                 <span class="s1">(proposed_value</span><span class="s4">, </span><span class="s1">type(proposed_value)</span><span class="s4">, </span><span class="s1">(int</span><span class="s4">,</span><span class="s1">)))</span>
+      <span class="s4">raise </span><span class="s1">TypeError(message)</span>
+    <span class="s4">if </span><span class="s1">int(proposed_value) </span><span class="s4">not in </span><span class="s1">self._enum_type.values_by_number:</span>
+      <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Unknown enum value: %d' </span><span class="s1">% proposed_value)</span>
+    <span class="s4">return </span><span class="s1">proposed_value</span>
+
+  <span class="s4">def </span><span class="s1">DefaultValue(self):</span>
+    <span class="s4">return </span><span class="s1">self._enum_type.values[</span><span class="s5">0</span><span class="s1">].number</span>
+
+
+<span class="s4">class </span><span class="s1">UnicodeValueChecker(object):</span>
+
+  <span class="s2">&quot;&quot;&quot;Checker used for string fields. 
+ 
+  Always returns a unicode value, even if the input is of type str. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s4">if not </span><span class="s1">isinstance(proposed_value</span><span class="s4">, </span><span class="s1">(bytes</span><span class="s4">, </span><span class="s1">str)):</span>
+      <span class="s1">message = (</span><span class="s3">'%.1024r has type %s, but expected one of: %s' </span><span class="s1">%</span>
+                 <span class="s1">(proposed_value</span><span class="s4">, </span><span class="s1">type(proposed_value)</span><span class="s4">, </span><span class="s1">(bytes</span><span class="s4">, </span><span class="s1">str)))</span>
+      <span class="s4">raise </span><span class="s1">TypeError(message)</span>
+
+    <span class="s0"># If the value is of type 'bytes' make sure that it is valid UTF-8 data.</span>
+    <span class="s4">if </span><span class="s1">isinstance(proposed_value</span><span class="s4">, </span><span class="s1">bytes):</span>
+      <span class="s4">try</span><span class="s1">:</span>
+        <span class="s1">proposed_value = proposed_value.decode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+      <span class="s4">except </span><span class="s1">UnicodeDecodeError:</span>
+        <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'%.1024r has type bytes, but isn</span><span class="s4">\'</span><span class="s3">t valid UTF-8 '</span>
+                         <span class="s3">'encoding. Non-UTF-8 strings must be converted to '</span>
+                         <span class="s3">'unicode objects before being added.' </span><span class="s1">%</span>
+                         <span class="s1">(proposed_value))</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">try</span><span class="s1">:</span>
+        <span class="s1">proposed_value.encode(</span><span class="s3">'utf8'</span><span class="s1">)</span>
+      <span class="s4">except </span><span class="s1">UnicodeEncodeError:</span>
+        <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'%.1024r isn</span><span class="s4">\'</span><span class="s3">t a valid unicode string and '</span>
+                         <span class="s3">'can</span><span class="s4">\'</span><span class="s3">t be encoded in UTF-8.'</span><span class="s1">%</span>
+                         <span class="s1">(proposed_value))</span>
+
+    <span class="s4">return </span><span class="s1">proposed_value</span>
+
+  <span class="s4">def </span><span class="s1">DefaultValue(self):</span>
+    <span class="s4">return </span><span class="s3">u&quot;&quot;</span>
+
+
+<span class="s4">class </span><span class="s1">Int32ValueChecker(IntValueChecker):</span>
+  <span class="s0"># We're sure to use ints instead of longs here since comparison may be more</span>
+  <span class="s0"># efficient.</span>
+  <span class="s1">_MIN = -</span><span class="s5">2147483648</span>
+  <span class="s1">_MAX = </span><span class="s5">2147483647</span>
+
+
+<span class="s4">class </span><span class="s1">Uint32ValueChecker(IntValueChecker):</span>
+  <span class="s1">_MIN = </span><span class="s5">0</span>
+  <span class="s1">_MAX = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">32</span><span class="s1">) - </span><span class="s5">1</span>
+
+
+<span class="s4">class </span><span class="s1">Int64ValueChecker(IntValueChecker):</span>
+  <span class="s1">_MIN = -(</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">63</span><span class="s1">)</span>
+  <span class="s1">_MAX = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">63</span><span class="s1">) - </span><span class="s5">1</span>
+
+
+<span class="s4">class </span><span class="s1">Uint64ValueChecker(IntValueChecker):</span>
+  <span class="s1">_MIN = </span><span class="s5">0</span>
+  <span class="s1">_MAX = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">64</span><span class="s1">) - </span><span class="s5">1</span>
+
+
+<span class="s0"># The max 4 bytes float is about 3.4028234663852886e+38</span>
+<span class="s1">_FLOAT_MAX = float.fromhex(</span><span class="s3">'0x1.fffffep+127'</span><span class="s1">)</span>
+<span class="s1">_FLOAT_MIN = -_FLOAT_MAX</span>
+<span class="s1">_INF = float(</span><span class="s3">'inf'</span><span class="s1">)</span>
+<span class="s1">_NEG_INF = float(</span><span class="s3">'-inf'</span><span class="s1">)</span>
+
+
+<span class="s4">class </span><span class="s1">DoubleValueChecker(object):</span>
+  <span class="s2">&quot;&quot;&quot;Checker used for double fields. 
+ 
+  Performs type-check and range check. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s2">&quot;&quot;&quot;Check and convert proposed_value to float.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">not </span><span class="s1">hasattr(proposed_value</span><span class="s4">, </span><span class="s3">'__float__'</span><span class="s1">) </span><span class="s4">and</span>
+        <span class="s4">not </span><span class="s1">hasattr(proposed_value</span><span class="s4">, </span><span class="s3">'__index__'</span><span class="s1">)) </span><span class="s4">or </span><span class="s1">(</span>
+            <span class="s1">type(proposed_value).__module__ == </span><span class="s3">'numpy' </span><span class="s4">and</span>
+            <span class="s1">type(proposed_value).__name__ == </span><span class="s3">'ndarray'</span><span class="s1">):</span>
+      <span class="s1">message = (</span><span class="s3">'%.1024r has type %s, but expected one of: int, float' </span><span class="s1">%</span>
+                 <span class="s1">(proposed_value</span><span class="s4">, </span><span class="s1">type(proposed_value)))</span>
+      <span class="s4">raise </span><span class="s1">TypeError(message)</span>
+    <span class="s4">return </span><span class="s1">float(proposed_value)</span>
+
+  <span class="s4">def </span><span class="s1">DefaultValue(self):</span>
+    <span class="s4">return </span><span class="s5">0.0</span>
+
+
+<span class="s4">class </span><span class="s1">FloatValueChecker(DoubleValueChecker):</span>
+  <span class="s2">&quot;&quot;&quot;Checker used for float fields. 
+ 
+  Performs type-check and range check. 
+ 
+  Values exceeding a 32-bit float will be converted to inf/-inf. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">CheckValue(self</span><span class="s4">, </span><span class="s1">proposed_value):</span>
+    <span class="s2">&quot;&quot;&quot;Check and convert proposed_value to float.&quot;&quot;&quot;</span>
+    <span class="s1">converted_value = super().CheckValue(proposed_value)</span>
+    <span class="s0"># This inf rounding matches the C++ proto SafeDoubleToFloat logic.</span>
+    <span class="s4">if </span><span class="s1">converted_value &gt; _FLOAT_MAX:</span>
+      <span class="s4">return </span><span class="s1">_INF</span>
+    <span class="s4">if </span><span class="s1">converted_value &lt; _FLOAT_MIN:</span>
+      <span class="s4">return </span><span class="s1">_NEG_INF</span>
+
+    <span class="s4">return </span><span class="s1">TruncateToFourByteFloat(converted_value)</span>
+
+<span class="s0"># Type-checkers for all scalar CPPTYPEs.</span>
+<span class="s1">_VALUE_CHECKERS = {</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_INT32: Int32ValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_INT64: Int64ValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_UINT32: Uint32ValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_UINT64: Uint64ValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_DOUBLE: DoubleValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_FLOAT: FloatValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_BOOL: BoolValueChecker()</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.CPPTYPE_STRING: TypeCheckerWithDefault(</span><span class="s6">b''</span><span class="s4">, </span><span class="s1">bytes)</span><span class="s4">,</span>
+<span class="s1">}</span>
+
+
+<span class="s0"># Map from field type to a function F, such that F(field_num, value)</span>
+<span class="s0"># gives the total byte size for a value of the given type.  This</span>
+<span class="s0"># byte size includes tag information and any other additional space</span>
+<span class="s0"># associated with serializing &quot;value&quot;.</span>
+<span class="s1">TYPE_TO_BYTE_SIZE_FN = {</span>
+    <span class="s1">_FieldDescriptor.TYPE_DOUBLE: wire_format.DoubleByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FLOAT: wire_format.FloatByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT64: wire_format.Int64ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT64: wire_format.UInt64ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT32: wire_format.Int32ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED64: wire_format.Fixed64ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED32: wire_format.Fixed32ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BOOL: wire_format.BoolByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_STRING: wire_format.StringByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_GROUP: wire_format.GroupByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_MESSAGE: wire_format.MessageByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BYTES: wire_format.BytesByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT32: wire_format.UInt32ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_ENUM: wire_format.EnumByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED32: wire_format.SFixed32ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED64: wire_format.SFixed64ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT32: wire_format.SInt32ByteSize</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT64: wire_format.SInt64ByteSize</span>
+    <span class="s1">}</span>
+
+
+<span class="s0"># Maps from field types to encoder constructors.</span>
+<span class="s1">TYPE_TO_ENCODER = {</span>
+    <span class="s1">_FieldDescriptor.TYPE_DOUBLE: encoder.DoubleEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FLOAT: encoder.FloatEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT64: encoder.Int64Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT64: encoder.UInt64Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT32: encoder.Int32Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED64: encoder.Fixed64Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED32: encoder.Fixed32Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BOOL: encoder.BoolEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_STRING: encoder.StringEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_GROUP: encoder.GroupEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_MESSAGE: encoder.MessageEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BYTES: encoder.BytesEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT32: encoder.UInt32Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_ENUM: encoder.EnumEncoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED32: encoder.SFixed32Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED64: encoder.SFixed64Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT32: encoder.SInt32Encoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT64: encoder.SInt64Encoder</span><span class="s4">,</span>
+    <span class="s1">}</span>
+
+
+<span class="s0"># Maps from field types to sizer constructors.</span>
+<span class="s1">TYPE_TO_SIZER = {</span>
+    <span class="s1">_FieldDescriptor.TYPE_DOUBLE: encoder.DoubleSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FLOAT: encoder.FloatSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT64: encoder.Int64Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT64: encoder.UInt64Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT32: encoder.Int32Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED64: encoder.Fixed64Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED32: encoder.Fixed32Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BOOL: encoder.BoolSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_STRING: encoder.StringSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_GROUP: encoder.GroupSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_MESSAGE: encoder.MessageSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BYTES: encoder.BytesSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT32: encoder.UInt32Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_ENUM: encoder.EnumSizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED32: encoder.SFixed32Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED64: encoder.SFixed64Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT32: encoder.SInt32Sizer</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT64: encoder.SInt64Sizer</span><span class="s4">,</span>
+    <span class="s1">}</span>
+
+
+<span class="s0"># Maps from field type to a decoder constructor.</span>
+<span class="s1">TYPE_TO_DECODER = {</span>
+    <span class="s1">_FieldDescriptor.TYPE_DOUBLE: decoder.DoubleDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FLOAT: decoder.FloatDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT64: decoder.Int64Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT64: decoder.UInt64Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT32: decoder.Int32Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED64: decoder.Fixed64Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED32: decoder.Fixed32Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BOOL: decoder.BoolDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_STRING: decoder.StringDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_GROUP: decoder.GroupDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_MESSAGE: decoder.MessageDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BYTES: decoder.BytesDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT32: decoder.UInt32Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_ENUM: decoder.EnumDecoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED32: decoder.SFixed32Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED64: decoder.SFixed64Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT32: decoder.SInt32Decoder</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT64: decoder.SInt64Decoder</span><span class="s4">,</span>
+    <span class="s1">}</span>
+
+<span class="s0"># Maps from field type to expected wiretype.</span>
+<span class="s1">FIELD_TYPE_TO_WIRE_TYPE = {</span>
+    <span class="s1">_FieldDescriptor.TYPE_DOUBLE: wire_format.WIRETYPE_FIXED64</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FLOAT: wire_format.WIRETYPE_FIXED32</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT64: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT64: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_INT32: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED64: wire_format.WIRETYPE_FIXED64</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_FIXED32: wire_format.WIRETYPE_FIXED32</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BOOL: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_STRING:</span>
+      <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_GROUP: wire_format.WIRETYPE_START_GROUP</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_MESSAGE:</span>
+      <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_BYTES:</span>
+      <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_UINT32: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_ENUM: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED32: wire_format.WIRETYPE_FIXED32</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SFIXED64: wire_format.WIRETYPE_FIXED64</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT32: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">_FieldDescriptor.TYPE_SINT64: wire_format.WIRETYPE_VARINT</span><span class="s4">,</span>
+    <span class="s1">}</span>
+</pre>
+</body>
+</html>

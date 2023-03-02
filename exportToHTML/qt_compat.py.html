@@ -1,0 +1,267 @@
+<html>
+<head>
+<title>qt_compat.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+qt_compat.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Qt binding and backend selector. 
+ 
+The selection logic is as follows: 
+- if any of PyQt6, PySide6, PyQt5, or PySide2 have already been 
+  imported (checked in that order), use it; 
+- otherwise, if the QT_API environment variable (used by Enthought) is set, use 
+  it to determine which binding to use; 
+- otherwise, use whatever the rcParams indicate. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">operator</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">platform</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">signal</span>
+<span class="s2">import </span><span class="s1">socket</span>
+<span class="s2">import </span><span class="s1">contextlib</span>
+
+<span class="s2">from </span><span class="s1">packaging.version </span><span class="s2">import </span><span class="s1">parse </span><span class="s2">as </span><span class="s1">parse_version</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">_QT_FORCE_QT5_BINDING</span>
+
+<span class="s1">QT_API_PYQT6 = </span><span class="s3">&quot;PyQt6&quot;</span>
+<span class="s1">QT_API_PYSIDE6 = </span><span class="s3">&quot;PySide6&quot;</span>
+<span class="s1">QT_API_PYQT5 = </span><span class="s3">&quot;PyQt5&quot;</span>
+<span class="s1">QT_API_PYSIDE2 = </span><span class="s3">&quot;PySide2&quot;</span>
+<span class="s1">QT_API_ENV = os.environ.get(</span><span class="s3">&quot;QT_API&quot;</span><span class="s1">)</span>
+<span class="s2">if </span><span class="s1">QT_API_ENV </span><span class="s2">is not None</span><span class="s1">:</span>
+    <span class="s1">QT_API_ENV = QT_API_ENV.lower()</span>
+<span class="s1">_ETS = {  </span><span class="s4"># Mapping of QT_API_ENV to requested binding.</span>
+    <span class="s3">&quot;pyqt6&quot;</span><span class="s1">: QT_API_PYQT6</span><span class="s2">, </span><span class="s3">&quot;pyside6&quot;</span><span class="s1">: QT_API_PYSIDE6</span><span class="s2">,</span>
+    <span class="s3">&quot;pyqt5&quot;</span><span class="s1">: QT_API_PYQT5</span><span class="s2">, </span><span class="s3">&quot;pyside2&quot;</span><span class="s1">: QT_API_PYSIDE2</span><span class="s2">,</span>
+<span class="s1">}</span>
+<span class="s4"># First, check if anything is already imported.</span>
+<span class="s2">if </span><span class="s1">sys.modules.get(</span><span class="s3">&quot;PyQt6.QtCore&quot;</span><span class="s1">):</span>
+    <span class="s1">QT_API = QT_API_PYQT6</span>
+<span class="s2">elif </span><span class="s1">sys.modules.get(</span><span class="s3">&quot;PySide6.QtCore&quot;</span><span class="s1">):</span>
+    <span class="s1">QT_API = QT_API_PYSIDE6</span>
+<span class="s2">elif </span><span class="s1">sys.modules.get(</span><span class="s3">&quot;PyQt5.QtCore&quot;</span><span class="s1">):</span>
+    <span class="s1">QT_API = QT_API_PYQT5</span>
+<span class="s2">elif </span><span class="s1">sys.modules.get(</span><span class="s3">&quot;PySide2.QtCore&quot;</span><span class="s1">):</span>
+    <span class="s1">QT_API = QT_API_PYSIDE2</span>
+<span class="s4"># Otherwise, check the QT_API environment variable (from Enthought).  This can</span>
+<span class="s4"># only override the binding, not the backend (in other words, we check that the</span>
+<span class="s4"># requested backend actually matches).  Use _get_backend_or_none to avoid</span>
+<span class="s4"># triggering backend resolution (which can result in a partially but</span>
+<span class="s4"># incompletely imported backend_qt5).</span>
+<span class="s2">elif </span><span class="s1">(mpl.rcParams._get_backend_or_none() </span><span class="s2">or </span><span class="s3">&quot;&quot;</span><span class="s1">).lower().startswith(</span><span class="s3">&quot;qt5&quot;</span><span class="s1">):</span>
+    <span class="s2">if </span><span class="s1">QT_API_ENV </span><span class="s2">in </span><span class="s1">[</span><span class="s3">&quot;pyqt5&quot;</span><span class="s2">, </span><span class="s3">&quot;pyside2&quot;</span><span class="s1">]:</span>
+        <span class="s1">QT_API = _ETS[QT_API_ENV]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">_QT_FORCE_QT5_BINDING = </span><span class="s2">True  </span><span class="s4"># noqa</span>
+        <span class="s1">QT_API = </span><span class="s2">None</span>
+<span class="s4"># A non-Qt backend was selected but we still got there (possible, e.g., when</span>
+<span class="s4"># fully manually embedding Matplotlib in a Qt app without using pyplot).</span>
+<span class="s2">elif </span><span class="s1">QT_API_ENV </span><span class="s2">is None</span><span class="s1">:</span>
+    <span class="s1">QT_API = </span><span class="s2">None</span>
+<span class="s2">elif </span><span class="s1">QT_API_ENV </span><span class="s2">in </span><span class="s1">_ETS:</span>
+    <span class="s1">QT_API = _ETS[QT_API_ENV]</span>
+<span class="s2">else</span><span class="s1">:</span>
+    <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+        <span class="s3">&quot;The environment variable QT_API has the unrecognized value {!r}; &quot;</span>
+        <span class="s3">&quot;valid values are {}&quot;</span><span class="s1">.format(QT_API_ENV</span><span class="s2">, </span><span class="s3">&quot;, &quot;</span><span class="s1">.join(_ETS)))</span>
+
+
+<span class="s2">def </span><span class="s1">_setup_pyqt5plus():</span>
+    <span class="s2">global </span><span class="s1">QtCore</span><span class="s2">, </span><span class="s1">QtGui</span><span class="s2">, </span><span class="s1">QtWidgets</span><span class="s2">, </span><span class="s1">__version__</span>
+    <span class="s2">global </span><span class="s1">_getSaveFileName</span><span class="s2">, </span><span class="s1">_isdeleted</span><span class="s2">, </span><span class="s1">_to_int</span>
+
+    <span class="s2">if </span><span class="s1">QT_API == QT_API_PYQT6:</span>
+        <span class="s2">from </span><span class="s1">PyQt6 </span><span class="s2">import </span><span class="s1">QtCore</span><span class="s2">, </span><span class="s1">QtGui</span><span class="s2">, </span><span class="s1">QtWidgets</span><span class="s2">, </span><span class="s1">sip</span>
+        <span class="s1">__version__ = QtCore.PYQT_VERSION_STR</span>
+        <span class="s1">QtCore.Signal = QtCore.pyqtSignal</span>
+        <span class="s1">QtCore.Slot = QtCore.pyqtSlot</span>
+        <span class="s1">QtCore.Property = QtCore.pyqtProperty</span>
+        <span class="s1">_isdeleted = sip.isdeleted</span>
+        <span class="s1">_to_int = operator.attrgetter(</span><span class="s3">'value'</span><span class="s1">)</span>
+    <span class="s2">elif </span><span class="s1">QT_API == QT_API_PYSIDE6:</span>
+        <span class="s2">from </span><span class="s1">PySide6 </span><span class="s2">import </span><span class="s1">QtCore</span><span class="s2">, </span><span class="s1">QtGui</span><span class="s2">, </span><span class="s1">QtWidgets</span><span class="s2">, </span><span class="s1">__version__</span>
+        <span class="s2">import </span><span class="s1">shiboken6</span>
+        <span class="s2">def </span><span class="s1">_isdeleted(obj): </span><span class="s2">return not </span><span class="s1">shiboken6.isValid(obj)</span>
+        <span class="s2">if </span><span class="s1">parse_version(__version__) &gt;= parse_version(</span><span class="s3">'6.4'</span><span class="s1">):</span>
+            <span class="s1">_to_int = operator.attrgetter(</span><span class="s3">'value'</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">_to_int = int</span>
+    <span class="s2">elif </span><span class="s1">QT_API == QT_API_PYQT5:</span>
+        <span class="s2">from </span><span class="s1">PyQt5 </span><span class="s2">import </span><span class="s1">QtCore</span><span class="s2">, </span><span class="s1">QtGui</span><span class="s2">, </span><span class="s1">QtWidgets</span>
+        <span class="s2">import </span><span class="s1">sip</span>
+        <span class="s1">__version__ = QtCore.PYQT_VERSION_STR</span>
+        <span class="s1">QtCore.Signal = QtCore.pyqtSignal</span>
+        <span class="s1">QtCore.Slot = QtCore.pyqtSlot</span>
+        <span class="s1">QtCore.Property = QtCore.pyqtProperty</span>
+        <span class="s1">_isdeleted = sip.isdeleted</span>
+        <span class="s1">_to_int = int</span>
+    <span class="s2">elif </span><span class="s1">QT_API == QT_API_PYSIDE2:</span>
+        <span class="s2">from </span><span class="s1">PySide2 </span><span class="s2">import </span><span class="s1">QtCore</span><span class="s2">, </span><span class="s1">QtGui</span><span class="s2">, </span><span class="s1">QtWidgets</span><span class="s2">, </span><span class="s1">__version__</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">from </span><span class="s1">PySide2 </span><span class="s2">import </span><span class="s1">shiboken2</span>
+        <span class="s2">except </span><span class="s1">ImportError:</span>
+            <span class="s2">import </span><span class="s1">shiboken2</span>
+        <span class="s2">def </span><span class="s1">_isdeleted(obj):</span>
+            <span class="s2">return not </span><span class="s1">shiboken2.isValid(obj)</span>
+        <span class="s1">_to_int = int</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s3">f&quot;Unexpected QT_API: </span><span class="s2">{</span><span class="s1">QT_API</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+    <span class="s1">_getSaveFileName = QtWidgets.QFileDialog.getSaveFileName</span>
+
+
+<span class="s2">if </span><span class="s1">QT_API </span><span class="s2">in </span><span class="s1">[QT_API_PYQT6</span><span class="s2">, </span><span class="s1">QT_API_PYQT5</span><span class="s2">, </span><span class="s1">QT_API_PYSIDE6</span><span class="s2">, </span><span class="s1">QT_API_PYSIDE2]:</span>
+    <span class="s1">_setup_pyqt5plus()</span>
+<span class="s2">elif </span><span class="s1">QT_API </span><span class="s2">is None</span><span class="s1">:  </span><span class="s4"># See above re: dict.__getitem__.</span>
+    <span class="s2">if </span><span class="s1">_QT_FORCE_QT5_BINDING:</span>
+        <span class="s1">_candidates = [</span>
+            <span class="s1">(_setup_pyqt5plus</span><span class="s2">, </span><span class="s1">QT_API_PYQT5)</span><span class="s2">,</span>
+            <span class="s1">(_setup_pyqt5plus</span><span class="s2">, </span><span class="s1">QT_API_PYSIDE2)</span><span class="s2">,</span>
+        <span class="s1">]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">_candidates = [</span>
+            <span class="s1">(_setup_pyqt5plus</span><span class="s2">, </span><span class="s1">QT_API_PYQT6)</span><span class="s2">,</span>
+            <span class="s1">(_setup_pyqt5plus</span><span class="s2">, </span><span class="s1">QT_API_PYSIDE6)</span><span class="s2">,</span>
+            <span class="s1">(_setup_pyqt5plus</span><span class="s2">, </span><span class="s1">QT_API_PYQT5)</span><span class="s2">,</span>
+            <span class="s1">(_setup_pyqt5plus</span><span class="s2">, </span><span class="s1">QT_API_PYSIDE2)</span><span class="s2">,</span>
+        <span class="s1">]</span>
+    <span class="s2">for </span><span class="s1">_setup</span><span class="s2">, </span><span class="s1">QT_API </span><span class="s2">in </span><span class="s1">_candidates:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">_setup()</span>
+        <span class="s2">except </span><span class="s1">ImportError:</span>
+            <span class="s2">continue</span>
+        <span class="s2">break</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ImportError(</span>
+            <span class="s3">&quot;Failed to import any of the following Qt binding modules: {}&quot;</span>
+            <span class="s1">.format(</span><span class="s3">&quot;, &quot;</span><span class="s1">.join(_ETS.values())))</span>
+<span class="s2">else</span><span class="s1">:  </span><span class="s4"># We should not get there.</span>
+    <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s3">f&quot;Unexpected QT_API: </span><span class="s2">{</span><span class="s1">QT_API</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+<span class="s1">_version_info = tuple(QtCore.QLibraryInfo.version().segments())</span>
+
+
+<span class="s2">if </span><span class="s1">_version_info &lt; (</span><span class="s5">5</span><span class="s2">, </span><span class="s5">10</span><span class="s1">):</span>
+    <span class="s2">raise </span><span class="s1">ImportError(</span>
+        <span class="s3">f&quot;The Qt version imported is &quot;</span>
+        <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">QtCore.QLibraryInfo.version().toString()</span><span class="s2">} </span><span class="s3">but Matplotlib requires &quot;</span>
+        <span class="s3">f&quot;Qt&gt;=5.10&quot;</span><span class="s1">)</span>
+
+
+<span class="s4"># Fixes issues with Big Sur</span>
+<span class="s4"># https://bugreports.qt.io/browse/QTBUG-87014, fixed in qt 5.15.2</span>
+<span class="s2">if </span><span class="s1">(sys.platform == </span><span class="s3">'darwin' </span><span class="s2">and</span>
+        <span class="s1">parse_version(platform.mac_ver()[</span><span class="s5">0</span><span class="s1">]) &gt;= parse_version(</span><span class="s3">&quot;10.16&quot;</span><span class="s1">) </span><span class="s2">and</span>
+        <span class="s1">_version_info &lt; (</span><span class="s5">5</span><span class="s2">, </span><span class="s5">15</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)):</span>
+    <span class="s1">os.environ.setdefault(</span><span class="s3">&quot;QT_MAC_WANTS_LAYER&quot;</span><span class="s2">, </span><span class="s3">&quot;1&quot;</span><span class="s1">)</span>
+
+
+<span class="s4"># PyQt6 enum compat helpers.</span>
+
+
+<span class="s1">@functools.lru_cache(</span><span class="s2">None</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">_enum(name):</span>
+    <span class="s4"># foo.bar.Enum.Entry (PyQt6) &lt;=&gt; foo.bar.Entry (non-PyQt6).</span>
+    <span class="s2">return </span><span class="s1">operator.attrgetter(</span>
+        <span class="s1">name </span><span class="s2">if </span><span class="s1">QT_API == </span><span class="s3">'PyQt6' </span><span class="s2">else </span><span class="s1">name.rpartition(</span><span class="s3">&quot;.&quot;</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">)(sys.modules[QtCore.__package__])</span>
+
+
+<span class="s4"># Backports.</span>
+
+
+<span class="s2">def </span><span class="s1">_exec(obj):</span>
+    <span class="s4"># exec on PyQt6, exec_ elsewhere.</span>
+    <span class="s1">obj.exec() </span><span class="s2">if </span><span class="s1">hasattr(obj</span><span class="s2">, </span><span class="s3">&quot;exec&quot;</span><span class="s1">) </span><span class="s2">else </span><span class="s1">obj.exec_()</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s2">def </span><span class="s1">_maybe_allow_interrupt(qapp):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    This manager allows to terminate a plot by sending a SIGINT. It is 
+    necessary because the running Qt backend prevents Python interpreter to 
+    run and process signals (i.e., to raise KeyboardInterrupt exception). To 
+    solve this one needs to somehow wake up the interpreter and make it close 
+    the plot window. We do this by using the signal.set_wakeup_fd() function 
+    which organizes a write of the signal number into a socketpair connected 
+    to the QSocketNotifier (since it is part of the Qt backend, it can react 
+    to that write event). Afterwards, the Qt handler empties the socketpair 
+    by a recv() command to re-arm it (we need this if a signal different from 
+    SIGINT was caught by set_wakeup_fd() and we shall continue waiting). If 
+    the SIGINT was caught indeed, after exiting the on_signal() function the 
+    interpreter reacts to the SIGINT according to the handle() function which 
+    had been set up by a signal.signal() call: it causes the qt_object to 
+    exit by calling its quit() method. Finally, we call the old SIGINT 
+    handler with the same arguments that were given to our custom handle() 
+    handler. 
+ 
+    We do this only if the old handler for SIGINT was not None, which means 
+    that a non-python handler was installed, i.e. in Julia, and not SIG_IGN 
+    which means we should ignore the interrupts. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">old_sigint_handler = signal.getsignal(signal.SIGINT)</span>
+    <span class="s1">handler_args = </span><span class="s2">None</span>
+    <span class="s1">skip = </span><span class="s2">False</span>
+    <span class="s2">if </span><span class="s1">old_sigint_handler </span><span class="s2">in </span><span class="s1">(</span><span class="s2">None, </span><span class="s1">signal.SIG_IGN</span><span class="s2">, </span><span class="s1">signal.SIG_DFL):</span>
+        <span class="s1">skip = </span><span class="s2">True</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">wsock</span><span class="s2">, </span><span class="s1">rsock = socket.socketpair()</span>
+        <span class="s1">wsock.setblocking(</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">old_wakeup_fd = signal.set_wakeup_fd(wsock.fileno())</span>
+        <span class="s1">sn = QtCore.QSocketNotifier(</span>
+            <span class="s1">rsock.fileno()</span><span class="s2">, </span><span class="s1">_enum(</span><span class="s3">'QtCore.QSocketNotifier.Type'</span><span class="s1">).Read</span>
+        <span class="s1">)</span>
+
+        <span class="s4"># We do not actually care about this value other than running some</span>
+        <span class="s4"># Python code to ensure that the interpreter has a chance to handle the</span>
+        <span class="s4"># signal in Python land.  We also need to drain the socket because it</span>
+        <span class="s4"># will be written to as part of the wakeup!  There are some cases where</span>
+        <span class="s4"># this may fire too soon / more than once on Windows so we should be</span>
+        <span class="s4"># forgiving about reading an empty socket.</span>
+        <span class="s1">rsock.setblocking(</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s4"># Clear the socket to re-arm the notifier.</span>
+        <span class="s1">@sn.activated.connect</span>
+        <span class="s2">def </span><span class="s1">_may_clear_sock(*args):</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">rsock.recv(</span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s2">except </span><span class="s1">BlockingIOError:</span>
+                <span class="s2">pass</span>
+
+        <span class="s2">def </span><span class="s1">handle(*args):</span>
+            <span class="s2">nonlocal </span><span class="s1">handler_args</span>
+            <span class="s1">handler_args = args</span>
+            <span class="s1">qapp.quit()</span>
+
+        <span class="s1">signal.signal(signal.SIGINT</span><span class="s2">, </span><span class="s1">handle)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">yield</span>
+    <span class="s2">finally</span><span class="s1">:</span>
+        <span class="s2">if not </span><span class="s1">skip:</span>
+            <span class="s1">wsock.close()</span>
+            <span class="s1">rsock.close()</span>
+            <span class="s1">sn.setEnabled(</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">signal.set_wakeup_fd(old_wakeup_fd)</span>
+            <span class="s1">signal.signal(signal.SIGINT</span><span class="s2">, </span><span class="s1">old_sigint_handler)</span>
+            <span class="s2">if </span><span class="s1">handler_args </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">old_sigint_handler(*handler_args)</span>
+</pre>
+</body>
+</html>

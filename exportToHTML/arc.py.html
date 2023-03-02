@@ -1,0 +1,175 @@
+<html>
+<head>
+<title>arc.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+arc.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Convert SVG Path's elliptical arcs to Bezier curves. 
+ 
+The code is mostly adapted from Blink's SVGPathNormalizer::DecomposeArcToCubic 
+https://github.com/chromium/chromium/blob/93831f2/third_party/ 
+blink/renderer/core/svg/svg_path_parser.cc#L169-L278 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.transform </span><span class="s2">import </span><span class="s1">Identity</span><span class="s2">, </span><span class="s1">Scale</span>
+<span class="s2">from </span><span class="s1">math </span><span class="s2">import </span><span class="s1">atan2</span><span class="s2">, </span><span class="s1">ceil</span><span class="s2">, </span><span class="s1">cos</span><span class="s2">, </span><span class="s1">fabs</span><span class="s2">, </span><span class="s1">isfinite</span><span class="s2">, </span><span class="s1">pi</span><span class="s2">, </span><span class="s1">radians</span><span class="s2">, </span><span class="s1">sin</span><span class="s2">, </span><span class="s1">sqrt</span><span class="s2">, </span><span class="s1">tan</span>
+
+
+<span class="s1">TWO_PI = </span><span class="s3">2 </span><span class="s1">* pi</span>
+<span class="s1">PI_OVER_TWO = </span><span class="s3">0.5 </span><span class="s1">* pi</span>
+
+
+<span class="s2">def </span><span class="s1">_map_point(matrix</span><span class="s2">, </span><span class="s1">pt):</span>
+    <span class="s4"># apply Transform matrix to a point represented as a complex number</span>
+    <span class="s1">r = matrix.transformPoint((pt.real</span><span class="s2">, </span><span class="s1">pt.imag))</span>
+    <span class="s2">return </span><span class="s1">r[</span><span class="s3">0</span><span class="s1">] + r[</span><span class="s3">1</span><span class="s1">] * </span><span class="s3">1j</span>
+
+
+<span class="s2">class </span><span class="s1">EllipticalArc(object):</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">current_point</span><span class="s2">, </span><span class="s1">rx</span><span class="s2">, </span><span class="s1">ry</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">large</span><span class="s2">, </span><span class="s1">sweep</span><span class="s2">, </span><span class="s1">target_point):</span>
+        <span class="s1">self.current_point = current_point</span>
+        <span class="s1">self.rx = rx</span>
+        <span class="s1">self.ry = ry</span>
+        <span class="s1">self.rotation = rotation</span>
+        <span class="s1">self.large = large</span>
+        <span class="s1">self.sweep = sweep</span>
+        <span class="s1">self.target_point = target_point</span>
+
+        <span class="s4"># SVG arc's rotation angle is expressed in degrees, whereas Transform.rotate</span>
+        <span class="s4"># uses radians</span>
+        <span class="s1">self.angle = radians(rotation)</span>
+
+        <span class="s4"># these derived attributes are computed by the _parametrize method</span>
+        <span class="s1">self.center_point = self.theta1 = self.theta2 = self.theta_arc = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_parametrize(self):</span>
+        <span class="s4"># convert from endopoint to center parametrization:</span>
+        <span class="s4"># https://www.w3.org/TR/SVG/implnote.html#ArcConversionEndpointToCenter</span>
+
+        <span class="s4"># If rx = 0 or ry = 0 then this arc is treated as a straight line segment (a</span>
+        <span class="s4"># &quot;lineto&quot;) joining the endpoints.</span>
+        <span class="s4"># http://www.w3.org/TR/SVG/implnote.html#ArcOutOfRangeParameters</span>
+        <span class="s1">rx = fabs(self.rx)</span>
+        <span class="s1">ry = fabs(self.ry)</span>
+        <span class="s2">if not </span><span class="s1">(rx </span><span class="s2">and </span><span class="s1">ry):</span>
+            <span class="s2">return False</span>
+
+        <span class="s4"># If the current point and target point for the arc are identical, it should</span>
+        <span class="s4"># be treated as a zero length path. This ensures continuity in animations.</span>
+        <span class="s2">if </span><span class="s1">self.target_point == self.current_point:</span>
+            <span class="s2">return False</span>
+
+        <span class="s1">mid_point_distance = (self.current_point - self.target_point) * </span><span class="s3">0.5</span>
+
+        <span class="s1">point_transform = Identity.rotate(-self.angle)</span>
+
+        <span class="s1">transformed_mid_point = _map_point(point_transform</span><span class="s2">, </span><span class="s1">mid_point_distance)</span>
+        <span class="s1">square_rx = rx * rx</span>
+        <span class="s1">square_ry = ry * ry</span>
+        <span class="s1">square_x = transformed_mid_point.real * transformed_mid_point.real</span>
+        <span class="s1">square_y = transformed_mid_point.imag * transformed_mid_point.imag</span>
+
+        <span class="s4"># Check if the radii are big enough to draw the arc, scale radii if not.</span>
+        <span class="s4"># http://www.w3.org/TR/SVG/implnote.html#ArcCorrectionOutOfRangeRadii</span>
+        <span class="s1">radii_scale = square_x / square_rx + square_y / square_ry</span>
+        <span class="s2">if </span><span class="s1">radii_scale &gt; </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s1">rx *= sqrt(radii_scale)</span>
+            <span class="s1">ry *= sqrt(radii_scale)</span>
+            <span class="s1">self.rx</span><span class="s2">, </span><span class="s1">self.ry = rx</span><span class="s2">, </span><span class="s1">ry</span>
+
+        <span class="s1">point_transform = Scale(</span><span class="s3">1 </span><span class="s1">/ rx</span><span class="s2">, </span><span class="s3">1 </span><span class="s1">/ ry).rotate(-self.angle)</span>
+
+        <span class="s1">point1 = _map_point(point_transform</span><span class="s2">, </span><span class="s1">self.current_point)</span>
+        <span class="s1">point2 = _map_point(point_transform</span><span class="s2">, </span><span class="s1">self.target_point)</span>
+        <span class="s1">delta = point2 - point1</span>
+
+        <span class="s1">d = delta.real * delta.real + delta.imag * delta.imag</span>
+        <span class="s1">scale_factor_squared = max(</span><span class="s3">1 </span><span class="s1">/ d - </span><span class="s3">0.25</span><span class="s2">, </span><span class="s3">0.0</span><span class="s1">)</span>
+
+        <span class="s1">scale_factor = sqrt(scale_factor_squared)</span>
+        <span class="s2">if </span><span class="s1">self.sweep == self.large:</span>
+            <span class="s1">scale_factor = -scale_factor</span>
+
+        <span class="s1">delta *= scale_factor</span>
+        <span class="s1">center_point = (point1 + point2) * </span><span class="s3">0.5</span>
+        <span class="s1">center_point += complex(-delta.imag</span><span class="s2">, </span><span class="s1">delta.real)</span>
+        <span class="s1">point1 -= center_point</span>
+        <span class="s1">point2 -= center_point</span>
+
+        <span class="s1">theta1 = atan2(point1.imag</span><span class="s2">, </span><span class="s1">point1.real)</span>
+        <span class="s1">theta2 = atan2(point2.imag</span><span class="s2">, </span><span class="s1">point2.real)</span>
+
+        <span class="s1">theta_arc = theta2 - theta1</span>
+        <span class="s2">if </span><span class="s1">theta_arc &lt; </span><span class="s3">0 </span><span class="s2">and </span><span class="s1">self.sweep:</span>
+            <span class="s1">theta_arc += TWO_PI</span>
+        <span class="s2">elif </span><span class="s1">theta_arc &gt; </span><span class="s3">0 </span><span class="s2">and not </span><span class="s1">self.sweep:</span>
+            <span class="s1">theta_arc -= TWO_PI</span>
+
+        <span class="s1">self.theta1 = theta1</span>
+        <span class="s1">self.theta2 = theta1 + theta_arc</span>
+        <span class="s1">self.theta_arc = theta_arc</span>
+        <span class="s1">self.center_point = center_point</span>
+
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">_decompose_to_cubic_curves(self):</span>
+        <span class="s2">if </span><span class="s1">self.center_point </span><span class="s2">is None and not </span><span class="s1">self._parametrize():</span>
+            <span class="s2">return</span>
+
+        <span class="s1">point_transform = Identity.rotate(self.angle).scale(self.rx</span><span class="s2">, </span><span class="s1">self.ry)</span>
+
+        <span class="s4"># Some results of atan2 on some platform implementations are not exact</span>
+        <span class="s4"># enough. So that we get more cubic curves than expected here. Adding 0.001f</span>
+        <span class="s4"># reduces the count of sgements to the correct count.</span>
+        <span class="s1">num_segments = int(ceil(fabs(self.theta_arc / (PI_OVER_TWO + </span><span class="s3">0.001</span><span class="s1">))))</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(num_segments):</span>
+            <span class="s1">start_theta = self.theta1 + i * self.theta_arc / num_segments</span>
+            <span class="s1">end_theta = self.theta1 + (i + </span><span class="s3">1</span><span class="s1">) * self.theta_arc / num_segments</span>
+
+            <span class="s1">t = (</span><span class="s3">4 </span><span class="s1">/ </span><span class="s3">3</span><span class="s1">) * tan(</span><span class="s3">0.25 </span><span class="s1">* (end_theta - start_theta))</span>
+            <span class="s2">if not </span><span class="s1">isfinite(t):</span>
+                <span class="s2">return</span>
+
+            <span class="s1">sin_start_theta = sin(start_theta)</span>
+            <span class="s1">cos_start_theta = cos(start_theta)</span>
+            <span class="s1">sin_end_theta = sin(end_theta)</span>
+            <span class="s1">cos_end_theta = cos(end_theta)</span>
+
+            <span class="s1">point1 = complex(</span>
+                <span class="s1">cos_start_theta - t * sin_start_theta</span><span class="s2">,</span>
+                <span class="s1">sin_start_theta + t * cos_start_theta</span><span class="s2">,</span>
+            <span class="s1">)</span>
+            <span class="s1">point1 += self.center_point</span>
+            <span class="s1">target_point = complex(cos_end_theta</span><span class="s2">, </span><span class="s1">sin_end_theta)</span>
+            <span class="s1">target_point += self.center_point</span>
+            <span class="s1">point2 = target_point</span>
+            <span class="s1">point2 += complex(t * sin_end_theta</span><span class="s2">, </span><span class="s1">-t * cos_end_theta)</span>
+
+            <span class="s1">point1 = _map_point(point_transform</span><span class="s2">, </span><span class="s1">point1)</span>
+            <span class="s1">point2 = _map_point(point_transform</span><span class="s2">, </span><span class="s1">point2)</span>
+            <span class="s1">target_point = _map_point(point_transform</span><span class="s2">, </span><span class="s1">target_point)</span>
+
+            <span class="s2">yield </span><span class="s1">point1</span><span class="s2">, </span><span class="s1">point2</span><span class="s2">, </span><span class="s1">target_point</span>
+
+    <span class="s2">def </span><span class="s1">draw(self</span><span class="s2">, </span><span class="s1">pen):</span>
+        <span class="s2">for </span><span class="s1">point1</span><span class="s2">, </span><span class="s1">point2</span><span class="s2">, </span><span class="s1">target_point </span><span class="s2">in </span><span class="s1">self._decompose_to_cubic_curves():</span>
+            <span class="s1">pen.curveTo(</span>
+                <span class="s1">(point1.real</span><span class="s2">, </span><span class="s1">point1.imag)</span><span class="s2">,</span>
+                <span class="s1">(point2.real</span><span class="s2">, </span><span class="s1">point2.imag)</span><span class="s2">,</span>
+                <span class="s1">(target_point.real</span><span class="s2">, </span><span class="s1">target_point.imag)</span><span class="s2">,</span>
+            <span class="s1">)</span>
+</pre>
+</body>
+</html>

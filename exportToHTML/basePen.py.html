@@ -1,0 +1,433 @@
+<html>
+<head>
+<title>basePen.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+basePen.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;fontTools.pens.basePen.py -- Tools and base classes to build pen objects. 
+ 
+The Pen Protocol 
+ 
+A Pen is a kind of object that standardizes the way how to &quot;draw&quot; outlines: 
+it is a middle man between an outline and a drawing. In other words: 
+it is an abstraction for drawing outlines, making sure that outline objects 
+don't need to know the details about how and where they're being drawn, and 
+that drawings don't need to know the details of how outlines are stored. 
+ 
+The most basic pattern is this:: 
+ 
+    outline.draw(pen)  # 'outline' draws itself onto 'pen' 
+ 
+Pens can be used to render outlines to the screen, but also to construct 
+new outlines. Eg. an outline object can be both a drawable object (it has a 
+draw() method) as well as a pen itself: you *build* an outline using pen 
+methods. 
+ 
+The AbstractPen class defines the Pen protocol. It implements almost 
+nothing (only no-op closePath() and endPath() methods), but is useful 
+for documentation purposes. Subclassing it basically tells the reader: 
+&quot;this class implements the Pen protocol.&quot;. An examples of an AbstractPen 
+subclass is :py:class:`fontTools.pens.transformPen.TransformPen`. 
+ 
+The BasePen class is a base implementation useful for pens that actually 
+draw (for example a pen renders outlines using a native graphics engine). 
+BasePen contains a lot of base functionality, making it very easy to build 
+a pen that fully conforms to the pen protocol. Note that if you subclass 
+BasePen, you *don't* override moveTo(), lineTo(), etc., but _moveTo(), 
+_lineTo(), etc. See the BasePen doc string for details. Examples of 
+BasePen subclasses are fontTools.pens.boundsPen.BoundsPen and 
+fontTools.pens.cocoaPen.CocoaPen. 
+ 
+Coordinates are usually expressed as (x, y) tuples, but generally any 
+sequence of length 2 will do. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">Tuple</span>
+
+<span class="s2">from </span><span class="s1">fontTools.misc.loggingTools </span><span class="s2">import </span><span class="s1">LogMixin</span>
+
+<span class="s1">__all__ =  [</span><span class="s3">&quot;AbstractPen&quot;</span><span class="s2">, </span><span class="s3">&quot;NullPen&quot;</span><span class="s2">, </span><span class="s3">&quot;BasePen&quot;</span><span class="s2">, </span><span class="s3">&quot;PenError&quot;</span><span class="s2">,</span>
+			<span class="s3">&quot;decomposeSuperBezierSegment&quot;</span><span class="s2">, </span><span class="s3">&quot;decomposeQuadraticSegment&quot;</span><span class="s1">]</span>
+
+
+<span class="s2">class </span><span class="s1">PenError(Exception):</span>
+	<span class="s0">&quot;&quot;&quot;Represents an error during penning.&quot;&quot;&quot;</span>
+
+<span class="s2">class </span><span class="s1">OpenContourError(PenError):</span>
+	<span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">AbstractPen:</span>
+
+	<span class="s2">def </span><span class="s1">moveTo(self</span><span class="s2">, </span><span class="s1">pt: Tuple[float</span><span class="s2">, </span><span class="s1">float]) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;Begin a new sub path, set the current point to 'pt'. You must 
+        end each sub path with a call to pen.closePath() or pen.endPath(). 
+        &quot;&quot;&quot;</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s2">def </span><span class="s1">lineTo(self</span><span class="s2">, </span><span class="s1">pt: Tuple[float</span><span class="s2">, </span><span class="s1">float]) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;Draw a straight line from the current point to 'pt'.&quot;&quot;&quot;</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s2">def </span><span class="s1">curveTo(self</span><span class="s2">, </span><span class="s1">*points: Tuple[float</span><span class="s2">, </span><span class="s1">float]) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;Draw a cubic bezier with an arbitrary number of control points. 
+ 
+        The last point specified is on-curve, all others are off-curve 
+        (control) points. If the number of control points is &gt; 2, the 
+        segment is split into multiple bezier segments. This works 
+        like this: 
+ 
+        Let n be the number of control points (which is the number of 
+        arguments to this call minus 1). If n==2, a plain vanilla cubic 
+        bezier is drawn. If n==1, we fall back to a quadratic segment and 
+        if n==0 we draw a straight line. It gets interesting when n&gt;2: 
+        n-1 PostScript-style cubic segments will be drawn as if it were 
+        one curve. See decomposeSuperBezierSegment(). 
+ 
+        The conversion algorithm used for n&gt;2 is inspired by NURB 
+        splines, and is conceptually equivalent to the TrueType &quot;implied 
+        points&quot; principle. See also decomposeQuadraticSegment(). 
+        &quot;&quot;&quot;</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s2">def </span><span class="s1">qCurveTo(self</span><span class="s2">, </span><span class="s1">*points: Tuple[float</span><span class="s2">, </span><span class="s1">float]) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;Draw a whole string of quadratic curve segments. 
+ 
+        The last point specified is on-curve, all others are off-curve 
+        points. 
+ 
+        This method implements TrueType-style curves, breaking up curves 
+        using 'implied points': between each two consequtive off-curve points, 
+        there is one implied point exactly in the middle between them. See 
+        also decomposeQuadraticSegment(). 
+ 
+        The last argument (normally the on-curve point) may be None. 
+        This is to support contours that have NO on-curve points (a rarely 
+        seen feature of TrueType outlines). 
+        &quot;&quot;&quot;</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s2">def </span><span class="s1">closePath(self) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;Close the current sub path. You must call either pen.closePath() 
+        or pen.endPath() after each sub path. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">endPath(self) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;End the current sub path, but don't close it. You must call 
+        either pen.closePath() or pen.endPath() after each sub path. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">addComponent(</span>
+		<span class="s1">self</span><span class="s2">,</span>
+		<span class="s1">glyphName: str</span><span class="s2">,</span>
+		<span class="s1">transformation: Tuple[float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float]</span>
+	<span class="s1">) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+		<span class="s0">&quot;&quot;&quot;Add a sub glyph. The 'transformation' argument must be a 6-tuple 
+        containing an affine transformation, or a Transform object from the 
+        fontTools.misc.transform module. More precisely: it should be a 
+        sequence containing 6 numbers. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s2">class </span><span class="s1">NullPen(AbstractPen):</span>
+
+	<span class="s0">&quot;&quot;&quot;A pen that does nothing. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">moveTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">lineTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">curveTo(self</span><span class="s2">, </span><span class="s1">*points):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">qCurveTo(self</span><span class="s2">, </span><span class="s1">*points):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">closePath(self):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">endPath(self):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">addComponent(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transformation):</span>
+		<span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">LoggingPen(LogMixin</span><span class="s2">, </span><span class="s1">AbstractPen):</span>
+	<span class="s0">&quot;&quot;&quot;A pen with a ``log`` property (see fontTools.misc.loggingTools.LogMixin) 
+    &quot;&quot;&quot;</span>
+	<span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">MissingComponentError(KeyError):</span>
+	<span class="s0">&quot;&quot;&quot;Indicates a component pointing to a non-existent glyph in the glyphset.&quot;&quot;&quot;</span>
+
+
+<span class="s2">class </span><span class="s1">DecomposingPen(LoggingPen):</span>
+
+	<span class="s0">&quot;&quot;&quot; Implements a 'addComponent' method that decomposes components 
+    (i.e. draws them onto self as simple contours). 
+    It can also be used as a mixin class (e.g. see ContourRecordingPen). 
+ 
+    You must override moveTo, lineTo, curveTo and qCurveTo. You may 
+    additionally override closePath, endPath and addComponent. 
+ 
+    By default a warning message is logged when a base glyph is missing; 
+    set the class variable ``skipMissingComponents`` to False if you want 
+    to raise a :class:`MissingComponentError` exception. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s1">skipMissingComponents = </span><span class="s2">True</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">glyphSet):</span>
+		<span class="s0">&quot;&quot;&quot; Takes a single 'glyphSet' argument (dict), in which the glyphs 
+        that are referenced as components are looked up by their name. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">super(DecomposingPen</span><span class="s2">, </span><span class="s1">self).__init__()</span>
+		<span class="s1">self.glyphSet = glyphSet</span>
+
+	<span class="s2">def </span><span class="s1">addComponent(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transformation):</span>
+		<span class="s0">&quot;&quot;&quot; Transform the points of the base glyph and draw it onto self. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">from </span><span class="s1">fontTools.pens.transformPen </span><span class="s2">import </span><span class="s1">TransformPen</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">glyph = self.glyphSet[glyphName]</span>
+		<span class="s2">except </span><span class="s1">KeyError:</span>
+			<span class="s2">if not </span><span class="s1">self.skipMissingComponents:</span>
+				<span class="s2">raise </span><span class="s1">MissingComponentError(glyphName)</span>
+			<span class="s1">self.log.warning(</span>
+				<span class="s3">&quot;glyph '%s' is missing from glyphSet; skipped&quot; </span><span class="s1">% glyphName)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">tPen = TransformPen(self</span><span class="s2">, </span><span class="s1">transformation)</span>
+			<span class="s1">glyph.draw(tPen)</span>
+
+
+<span class="s2">class </span><span class="s1">BasePen(DecomposingPen):</span>
+
+	<span class="s0">&quot;&quot;&quot;Base class for drawing pens. You must override _moveTo, _lineTo and 
+    _curveToOne. You may additionally override _closePath, _endPath, 
+    addComponent and/or _qCurveToOne. You should not override any other 
+    methods. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">glyphSet=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s1">super(BasePen</span><span class="s2">, </span><span class="s1">self).__init__(glyphSet)</span>
+		<span class="s1">self.__currentPoint = </span><span class="s2">None</span>
+
+	<span class="s4"># must override</span>
+
+	<span class="s2">def </span><span class="s1">_moveTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s2">def </span><span class="s1">_lineTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s2">def </span><span class="s1">_curveToOne(self</span><span class="s2">, </span><span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3):</span>
+		<span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+	<span class="s4"># may override</span>
+
+	<span class="s2">def </span><span class="s1">_closePath(self):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">_endPath(self):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">_qCurveToOne(self</span><span class="s2">, </span><span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2):</span>
+		<span class="s0">&quot;&quot;&quot;This method implements the basic quadratic curve type. The 
+        default implementation delegates the work to the cubic curve 
+        function. Optionally override with a native implementation. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">pt0x</span><span class="s2">, </span><span class="s1">pt0y = self.__currentPoint</span>
+		<span class="s1">pt1x</span><span class="s2">, </span><span class="s1">pt1y = pt1</span>
+		<span class="s1">pt2x</span><span class="s2">, </span><span class="s1">pt2y = pt2</span>
+		<span class="s1">mid1x = pt0x + </span><span class="s5">0.66666666666666667 </span><span class="s1">* (pt1x - pt0x)</span>
+		<span class="s1">mid1y = pt0y + </span><span class="s5">0.66666666666666667 </span><span class="s1">* (pt1y - pt0y)</span>
+		<span class="s1">mid2x = pt2x + </span><span class="s5">0.66666666666666667 </span><span class="s1">* (pt1x - pt2x)</span>
+		<span class="s1">mid2y = pt2y + </span><span class="s5">0.66666666666666667 </span><span class="s1">* (pt1y - pt2y)</span>
+		<span class="s1">self._curveToOne((mid1x</span><span class="s2">, </span><span class="s1">mid1y)</span><span class="s2">, </span><span class="s1">(mid2x</span><span class="s2">, </span><span class="s1">mid2y)</span><span class="s2">, </span><span class="s1">pt2)</span>
+
+	<span class="s4"># don't override</span>
+
+	<span class="s2">def </span><span class="s1">_getCurrentPoint(self):</span>
+		<span class="s0">&quot;&quot;&quot;Return the current point. This is not part of the public 
+        interface, yet is useful for subclasses. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">self.__currentPoint</span>
+
+	<span class="s2">def </span><span class="s1">closePath(self):</span>
+		<span class="s1">self._closePath()</span>
+		<span class="s1">self.__currentPoint = </span><span class="s2">None</span>
+
+	<span class="s2">def </span><span class="s1">endPath(self):</span>
+		<span class="s1">self._endPath()</span>
+		<span class="s1">self.__currentPoint = </span><span class="s2">None</span>
+
+	<span class="s2">def </span><span class="s1">moveTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s1">self._moveTo(pt)</span>
+		<span class="s1">self.__currentPoint = pt</span>
+
+	<span class="s2">def </span><span class="s1">lineTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s1">self._lineTo(pt)</span>
+		<span class="s1">self.__currentPoint = pt</span>
+
+	<span class="s2">def </span><span class="s1">curveTo(self</span><span class="s2">, </span><span class="s1">*points):</span>
+		<span class="s1">n = len(points) - </span><span class="s5">1  </span><span class="s4"># 'n' is the number of control points</span>
+		<span class="s2">assert </span><span class="s1">n &gt;= </span><span class="s5">0</span>
+		<span class="s2">if </span><span class="s1">n == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s4"># The common case, we have exactly two BCP's, so this is a standard</span>
+			<span class="s4"># cubic bezier. Even though decomposeSuperBezierSegment() handles</span>
+			<span class="s4"># this case just fine, we special-case it anyway since it's so</span>
+			<span class="s4"># common.</span>
+			<span class="s1">self._curveToOne(*points)</span>
+			<span class="s1">self.__currentPoint = points[-</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s2">elif </span><span class="s1">n &gt; </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s4"># n is the number of control points; split curve into n-1 cubic</span>
+			<span class="s4"># bezier segments. The algorithm used here is inspired by NURB</span>
+			<span class="s4"># splines and the TrueType &quot;implied point&quot; principle, and ensures</span>
+			<span class="s4"># the smoothest possible connection between two curve segments,</span>
+			<span class="s4"># with no disruption in the curvature. It is practical since it</span>
+			<span class="s4"># allows one to construct multiple bezier segments with a much</span>
+			<span class="s4"># smaller amount of points.</span>
+			<span class="s1">_curveToOne = self._curveToOne</span>
+			<span class="s2">for </span><span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3 </span><span class="s2">in </span><span class="s1">decomposeSuperBezierSegment(points):</span>
+				<span class="s1">_curveToOne(pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3)</span>
+				<span class="s1">self.__currentPoint = pt3</span>
+		<span class="s2">elif </span><span class="s1">n == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">self.qCurveTo(*points)</span>
+		<span class="s2">elif </span><span class="s1">n == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">self.lineTo(points[</span><span class="s5">0</span><span class="s1">])</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s3">&quot;can't get there from here&quot;</span><span class="s1">)</span>
+
+	<span class="s2">def </span><span class="s1">qCurveTo(self</span><span class="s2">, </span><span class="s1">*points):</span>
+		<span class="s1">n = len(points) - </span><span class="s5">1  </span><span class="s4"># 'n' is the number of control points</span>
+		<span class="s2">assert </span><span class="s1">n &gt;= </span><span class="s5">0</span>
+		<span class="s2">if </span><span class="s1">points[-</span><span class="s5">1</span><span class="s1">] </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s4"># Special case for TrueType quadratics: it is possible to</span>
+			<span class="s4"># define a contour with NO on-curve points. BasePen supports</span>
+			<span class="s4"># this by allowing the final argument (the expected on-curve</span>
+			<span class="s4"># point) to be None. We simulate the feature by making the implied</span>
+			<span class="s4"># on-curve point between the last and the first off-curve points</span>
+			<span class="s4"># explicit.</span>
+			<span class="s1">x</span><span class="s2">, </span><span class="s1">y = points[-</span><span class="s5">2</span><span class="s1">]  </span><span class="s4"># last off-curve point</span>
+			<span class="s1">nx</span><span class="s2">, </span><span class="s1">ny = points[</span><span class="s5">0</span><span class="s1">] </span><span class="s4"># first off-curve point</span>
+			<span class="s1">impliedStartPoint = (</span><span class="s5">0.5 </span><span class="s1">* (x + nx)</span><span class="s2">, </span><span class="s5">0.5 </span><span class="s1">* (y + ny))</span>
+			<span class="s1">self.__currentPoint = impliedStartPoint</span>
+			<span class="s1">self._moveTo(impliedStartPoint)</span>
+			<span class="s1">points = points[:-</span><span class="s5">1</span><span class="s1">] + (impliedStartPoint</span><span class="s2">,</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">n &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s4"># Split the string of points into discrete quadratic curve</span>
+			<span class="s4"># segments. Between any two consecutive off-curve points</span>
+			<span class="s4"># there's an implied on-curve point exactly in the middle.</span>
+			<span class="s4"># This is where the segment splits.</span>
+			<span class="s1">_qCurveToOne = self._qCurveToOne</span>
+			<span class="s2">for </span><span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2 </span><span class="s2">in </span><span class="s1">decomposeQuadraticSegment(points):</span>
+				<span class="s1">_qCurveToOne(pt1</span><span class="s2">, </span><span class="s1">pt2)</span>
+				<span class="s1">self.__currentPoint = pt2</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">self.lineTo(points[</span><span class="s5">0</span><span class="s1">])</span>
+
+
+<span class="s2">def </span><span class="s1">decomposeSuperBezierSegment(points):</span>
+	<span class="s0">&quot;&quot;&quot;Split the SuperBezier described by 'points' into a list of regular 
+    bezier segments. The 'points' argument must be a sequence with length 
+    3 or greater, containing (x, y) coordinates. The last point is the 
+    destination on-curve point, the rest of the points are off-curve points. 
+    The start point should not be supplied. 
+ 
+    This function returns a list of (pt1, pt2, pt3) tuples, which each 
+    specify a regular curveto-style bezier segment. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">n = len(points) - </span><span class="s5">1</span>
+	<span class="s2">assert </span><span class="s1">n &gt; </span><span class="s5">1</span>
+	<span class="s1">bezierSegments = []</span>
+	<span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3 = points[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, None, None</span>
+	<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">n+</span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s4"># calculate points in between control points.</span>
+		<span class="s1">nDivisions = min(i</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s1">n-i+</span><span class="s5">2</span><span class="s1">)</span>
+		<span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">nDivisions):</span>
+			<span class="s1">factor = j / nDivisions</span>
+			<span class="s1">temp1 = points[i-</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s1">temp2 = points[i-</span><span class="s5">2</span><span class="s1">]</span>
+			<span class="s1">temp = (temp2[</span><span class="s5">0</span><span class="s1">] + factor * (temp1[</span><span class="s5">0</span><span class="s1">] - temp2[</span><span class="s5">0</span><span class="s1">])</span><span class="s2">,</span>
+					<span class="s1">temp2[</span><span class="s5">1</span><span class="s1">] + factor * (temp1[</span><span class="s5">1</span><span class="s1">] - temp2[</span><span class="s5">1</span><span class="s1">]))</span>
+			<span class="s2">if </span><span class="s1">pt2 </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s1">pt2 = temp</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">pt3 =  (</span><span class="s5">0.5 </span><span class="s1">* (pt2[</span><span class="s5">0</span><span class="s1">] + temp[</span><span class="s5">0</span><span class="s1">])</span><span class="s2">,</span>
+						<span class="s5">0.5 </span><span class="s1">* (pt2[</span><span class="s5">1</span><span class="s1">] + temp[</span><span class="s5">1</span><span class="s1">]))</span>
+				<span class="s1">bezierSegments.append((pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3))</span>
+				<span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3 = temp</span><span class="s2">, None, None</span>
+	<span class="s1">bezierSegments.append((pt1</span><span class="s2">, </span><span class="s1">points[-</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">points[-</span><span class="s5">1</span><span class="s1">]))</span>
+	<span class="s2">return </span><span class="s1">bezierSegments</span>
+
+
+<span class="s2">def </span><span class="s1">decomposeQuadraticSegment(points):</span>
+	<span class="s0">&quot;&quot;&quot;Split the quadratic curve segment described by 'points' into a list 
+    of &quot;atomic&quot; quadratic segments. The 'points' argument must be a sequence 
+    with length 2 or greater, containing (x, y) coordinates. The last point 
+    is the destination on-curve point, the rest of the points are off-curve 
+    points. The start point should not be supplied. 
+ 
+    This function returns a list of (pt1, pt2) tuples, which each specify a 
+    plain quadratic bezier segment. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">n = len(points) - </span><span class="s5">1</span>
+	<span class="s2">assert </span><span class="s1">n &gt; </span><span class="s5">0</span>
+	<span class="s1">quadSegments = []</span>
+	<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n - </span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s1">x</span><span class="s2">, </span><span class="s1">y = points[i]</span>
+		<span class="s1">nx</span><span class="s2">, </span><span class="s1">ny = points[i+</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s1">impliedPt = (</span><span class="s5">0.5 </span><span class="s1">* (x + nx)</span><span class="s2">, </span><span class="s5">0.5 </span><span class="s1">* (y + ny))</span>
+		<span class="s1">quadSegments.append((points[i]</span><span class="s2">, </span><span class="s1">impliedPt))</span>
+	<span class="s1">quadSegments.append((points[-</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">points[-</span><span class="s5">1</span><span class="s1">]))</span>
+	<span class="s2">return </span><span class="s1">quadSegments</span>
+
+
+<span class="s2">class </span><span class="s1">_TestPen(BasePen):</span>
+	<span class="s0">&quot;&quot;&quot;Test class that prints PostScript to stdout.&quot;&quot;&quot;</span>
+	<span class="s2">def </span><span class="s1">_moveTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s1">print(</span><span class="s3">&quot;%s %s moveto&quot; </span><span class="s1">% (pt[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pt[</span><span class="s5">1</span><span class="s1">]))</span>
+	<span class="s2">def </span><span class="s1">_lineTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s1">print(</span><span class="s3">&quot;%s %s lineto&quot; </span><span class="s1">% (pt[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pt[</span><span class="s5">1</span><span class="s1">]))</span>
+	<span class="s2">def </span><span class="s1">_curveToOne(self</span><span class="s2">, </span><span class="s1">bcp1</span><span class="s2">, </span><span class="s1">bcp2</span><span class="s2">, </span><span class="s1">pt):</span>
+		<span class="s1">print(</span><span class="s3">&quot;%s %s %s %s %s %s curveto&quot; </span><span class="s1">% (bcp1[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">bcp1[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">,</span>
+				<span class="s1">bcp2[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">bcp2[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pt[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pt[</span><span class="s5">1</span><span class="s1">]))</span>
+	<span class="s2">def </span><span class="s1">_closePath(self):</span>
+		<span class="s1">print(</span><span class="s3">&quot;closepath&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s1">pen = _TestPen(</span><span class="s2">None</span><span class="s1">)</span>
+	<span class="s1">pen.moveTo((</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+	<span class="s1">pen.lineTo((</span><span class="s5">0</span><span class="s2">, </span><span class="s5">100</span><span class="s1">))</span>
+	<span class="s1">pen.curveTo((</span><span class="s5">50</span><span class="s2">, </span><span class="s5">75</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s5">60</span><span class="s2">, </span><span class="s5">50</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s5">50</span><span class="s2">, </span><span class="s5">25</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+	<span class="s1">pen.closePath()</span>
+
+	<span class="s1">pen = _TestPen(</span><span class="s2">None</span><span class="s1">)</span>
+	<span class="s4"># testing the &quot;no on-curve point&quot; scenario</span>
+	<span class="s1">pen.qCurveTo((</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">100</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s5">100</span><span class="s2">, </span><span class="s5">100</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s5">100</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">)</span>
+	<span class="s1">pen.closePath()</span>
+</pre>
+</body>
+</html>

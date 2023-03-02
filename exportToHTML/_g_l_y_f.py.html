@@ -1,0 +1,1873 @@
+<html>
+<head>
+<title>_g_l_y_f.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_g_l_y_f.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;_g_l_y_f.py -- Converter classes for the 'glyf' table.&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+<span class="s2">from </span><span class="s1">fontTools.misc </span><span class="s2">import </span><span class="s1">sstruct</span>
+<span class="s2">from </span><span class="s1">fontTools </span><span class="s2">import </span><span class="s1">ttLib</span>
+<span class="s2">from </span><span class="s1">fontTools </span><span class="s2">import </span><span class="s1">version</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.textTools </span><span class="s2">import </span><span class="s1">tostr</span><span class="s2">, </span><span class="s1">safeEval</span><span class="s2">, </span><span class="s1">pad</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.arrayTools </span><span class="s2">import </span><span class="s1">calcIntBounds</span><span class="s2">, </span><span class="s1">pointInRect</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.bezierTools </span><span class="s2">import </span><span class="s1">calcQuadraticBounds</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.fixedTools </span><span class="s2">import </span><span class="s1">(</span>
+	<span class="s1">fixedToFloat </span><span class="s2">as </span><span class="s1">fi2fl</span><span class="s2">,</span>
+	<span class="s1">floatToFixed </span><span class="s2">as </span><span class="s1">fl2fi</span><span class="s2">,</span>
+	<span class="s1">floatToFixedToStr </span><span class="s2">as </span><span class="s1">fl2str</span><span class="s2">,</span>
+	<span class="s1">strToFixedToFloat </span><span class="s2">as </span><span class="s1">str2fl</span><span class="s2">,</span>
+	<span class="s1">otRound</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Number</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">DefaultTable</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">ttProgram</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">struct</span>
+<span class="s2">import </span><span class="s1">array</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">from </span><span class="s1">fontTools.misc </span><span class="s2">import </span><span class="s1">xmlWriter</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.filenames </span><span class="s2">import </span><span class="s1">userNameToFileName</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.loggingTools </span><span class="s2">import </span><span class="s1">deprecateFunction</span>
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s3"># We compute the version the same as is computed in ttlib/__init__</span>
+<span class="s3"># so that we can write 'ttLibVersion' attribute of the glyf TTX files</span>
+<span class="s3"># when glyf is written to separate files.</span>
+<span class="s1">version = </span><span class="s4">&quot;.&quot;</span><span class="s1">.join(version.split(</span><span class="s4">'.'</span><span class="s1">)[:</span><span class="s5">2</span><span class="s1">])</span>
+
+<span class="s3">#</span>
+<span class="s3"># The Apple and MS rasterizers behave differently for</span>
+<span class="s3"># scaled composite components: one does scale first and then translate</span>
+<span class="s3"># and the other does it vice versa. MS defined some flags to indicate</span>
+<span class="s3"># the difference, but it seems nobody actually _sets_ those flags.</span>
+<span class="s3">#</span>
+<span class="s3"># Funny thing: Apple seems to _only_ do their thing in the</span>
+<span class="s3"># WE_HAVE_A_SCALE (eg. Chicago) case, and not when it's WE_HAVE_AN_X_AND_Y_SCALE</span>
+<span class="s3"># (eg. Charcoal)...</span>
+<span class="s3">#</span>
+<span class="s1">SCALE_COMPONENT_OFFSET_DEFAULT = </span><span class="s5">0   </span><span class="s3"># 0 == MS, 1 == Apple</span>
+
+
+<span class="s2">class </span><span class="s1">table__g_l_y_f(DefaultTable.DefaultTable):</span>
+	<span class="s0">&quot;&quot;&quot;Glyph Data Table 
+ 
+    This class represents the `glyf &lt;https://docs.microsoft.com/en-us/typography/opentype/spec/glyf&gt;`_ 
+    table, which contains outlines for glyphs in TrueType format. In many cases, 
+    it is easier to access and manipulate glyph outlines through the ``GlyphSet`` 
+    object returned from :py:meth:`fontTools.ttLib.ttFont.getGlyphSet`:: 
+ 
+            &gt;&gt; from fontTools.pens.boundsPen import BoundsPen 
+            &gt;&gt; glyphset = font.getGlyphSet() 
+            &gt;&gt; bp = BoundsPen(glyphset) 
+            &gt;&gt; glyphset[&quot;A&quot;].draw(bp) 
+            &gt;&gt; bp.bounds 
+            (19, 0, 633, 716) 
+ 
+    However, this class can be used for low-level access to the ``glyf`` table data. 
+    Objects of this class support dictionary-like access, mapping glyph names to 
+    :py:class:`Glyph` objects:: 
+ 
+            &gt;&gt; glyf = font[&quot;glyf&quot;] 
+            &gt;&gt; len(glyf[&quot;Aacute&quot;].components) 
+            2 
+ 
+    Note that when adding glyphs to the font via low-level access to the ``glyf`` 
+    table, the new glyphs must also be added to the ``hmtx``/``vmtx`` table:: 
+ 
+            &gt;&gt; font[&quot;glyf&quot;][&quot;divisionslash&quot;] = Glyph() 
+            &gt;&gt; font[&quot;hmtx&quot;][&quot;divisionslash&quot;] = (640, 0) 
+ 
+    &quot;&quot;&quot;</span>
+
+	<span class="s3"># this attribute controls the amount of padding applied to glyph data upon compile.</span>
+	<span class="s3"># Glyph lenghts are aligned to multiples of the specified value. </span>
+	<span class="s3"># Allowed values are (0, 1, 2, 4). '0' means no padding; '1' (default) also means</span>
+	<span class="s3"># no padding, except for when padding would allow to use short loca offsets.</span>
+	<span class="s1">padding = </span><span class="s5">1</span>
+
+	<span class="s2">def </span><span class="s1">decompile(self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s1">loca = ttFont[</span><span class="s4">'loca'</span><span class="s1">]</span>
+		<span class="s1">pos = int(loca[</span><span class="s5">0</span><span class="s1">])</span>
+		<span class="s1">nextPos = </span><span class="s5">0</span>
+		<span class="s1">noname = </span><span class="s5">0</span>
+		<span class="s1">self.glyphs = {}</span>
+		<span class="s1">self.glyphOrder = glyphOrder = ttFont.getGlyphOrder()</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(loca)-</span><span class="s5">1</span><span class="s1">):</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">glyphName = glyphOrder[i]</span>
+			<span class="s2">except </span><span class="s1">IndexError:</span>
+				<span class="s1">noname = noname + </span><span class="s5">1</span>
+				<span class="s1">glyphName = </span><span class="s4">'ttxautoglyph%s' </span><span class="s1">% i</span>
+			<span class="s1">nextPos = int(loca[i+</span><span class="s5">1</span><span class="s1">])</span>
+			<span class="s1">glyphdata = data[pos:nextPos]</span>
+			<span class="s2">if </span><span class="s1">len(glyphdata) != (nextPos - pos):</span>
+				<span class="s2">raise </span><span class="s1">ttLib.TTLibError(</span><span class="s4">&quot;not enough 'glyf' table data&quot;</span><span class="s1">)</span>
+			<span class="s1">glyph = Glyph(glyphdata)</span>
+			<span class="s1">self.glyphs[glyphName] = glyph</span>
+			<span class="s1">pos = nextPos</span>
+		<span class="s2">if </span><span class="s1">len(data) - nextPos &gt;= </span><span class="s5">4</span><span class="s1">:</span>
+			<span class="s1">log.warning(</span>
+				<span class="s4">&quot;too much 'glyf' table data: expected %d, received %d bytes&quot;</span><span class="s2">,</span>
+				<span class="s1">nextPos</span><span class="s2">, </span><span class="s1">len(data))</span>
+		<span class="s2">if </span><span class="s1">noname:</span>
+			<span class="s1">log.warning(</span><span class="s4">'%s glyphs have no name'</span><span class="s2">, </span><span class="s1">noname)</span>
+		<span class="s2">if </span><span class="s1">ttFont.lazy </span><span class="s2">is False</span><span class="s1">: </span><span class="s3"># Be lazy for None and True</span>
+			<span class="s1">self.ensureDecompiled()</span>
+
+	<span class="s2">def </span><span class="s1">ensureDecompiled(self</span><span class="s2">, </span><span class="s1">recurse=</span><span class="s2">False</span><span class="s1">):</span>
+		<span class="s3"># The recurse argument is unused, but part of the signature of</span>
+		<span class="s3"># ensureDecompiled across the library.</span>
+		<span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">self.glyphs.values():</span>
+			<span class="s1">glyph.expand(self)</span>
+
+	<span class="s2">def </span><span class="s1">compile(self</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;glyphOrder&quot;</span><span class="s1">):</span>
+			<span class="s1">self.glyphOrder = ttFont.getGlyphOrder()</span>
+		<span class="s1">padding = self.padding</span>
+		<span class="s2">assert </span><span class="s1">padding </span><span class="s2">in </span><span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s1">locations = []</span>
+		<span class="s1">currentLocation = </span><span class="s5">0</span>
+		<span class="s1">dataList = []</span>
+		<span class="s1">recalcBBoxes = ttFont.recalcBBoxes</span>
+		<span class="s2">for </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">self.glyphOrder:</span>
+			<span class="s1">glyph = self.glyphs[glyphName]</span>
+			<span class="s1">glyphData = glyph.compile(self</span><span class="s2">, </span><span class="s1">recalcBBoxes)</span>
+			<span class="s2">if </span><span class="s1">padding &gt; </span><span class="s5">1</span><span class="s1">:</span>
+				<span class="s1">glyphData = pad(glyphData</span><span class="s2">, </span><span class="s1">size=padding)</span>
+			<span class="s1">locations.append(currentLocation)</span>
+			<span class="s1">currentLocation = currentLocation + len(glyphData)</span>
+			<span class="s1">dataList.append(glyphData)</span>
+		<span class="s1">locations.append(currentLocation)</span>
+
+		<span class="s2">if </span><span class="s1">padding == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">currentLocation &lt; </span><span class="s5">0x20000</span><span class="s1">:</span>
+			<span class="s3"># See if we can pad any odd-lengthed glyphs to allow loca</span>
+			<span class="s3"># table to use the short offsets.</span>
+			<span class="s1">indices = [i </span><span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">glyphData </span><span class="s2">in </span><span class="s1">enumerate(dataList) </span><span class="s2">if </span><span class="s1">len(glyphData) % </span><span class="s5">2 </span><span class="s1">== </span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s2">if </span><span class="s1">indices </span><span class="s2">and </span><span class="s1">currentLocation + len(indices) &lt; </span><span class="s5">0x20000</span><span class="s1">:</span>
+				<span class="s3"># It fits.  Do it.</span>
+				<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">indices:</span>
+					<span class="s1">dataList[i] += </span><span class="s6">b'</span><span class="s2">\0</span><span class="s6">'</span>
+				<span class="s1">currentLocation = </span><span class="s5">0</span>
+				<span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">glyphData </span><span class="s2">in </span><span class="s1">enumerate(dataList):</span>
+					<span class="s1">locations[i] = currentLocation</span>
+					<span class="s1">currentLocation += len(glyphData)</span>
+				<span class="s1">locations[len(dataList)] = currentLocation</span>
+
+		<span class="s1">data = </span><span class="s6">b''</span><span class="s1">.join(dataList)</span>
+		<span class="s2">if </span><span class="s4">'loca' </span><span class="s2">in </span><span class="s1">ttFont:</span>
+			<span class="s1">ttFont[</span><span class="s4">'loca'</span><span class="s1">].set(locations)</span>
+		<span class="s2">if </span><span class="s4">'maxp' </span><span class="s2">in </span><span class="s1">ttFont:</span>
+			<span class="s1">ttFont[</span><span class="s4">'maxp'</span><span class="s1">].numGlyphs = len(self.glyphs)</span>
+		<span class="s2">if not </span><span class="s1">data:</span>
+		<span class="s3"># As a special case when all glyph in the font are empty, add a zero byte</span>
+		<span class="s3"># to the table, so that OTS doesn’t reject it, and to make the table work</span>
+		<span class="s3"># on Windows as well.</span>
+		<span class="s3"># See https://github.com/khaledhosny/ots/issues/52</span>
+			<span class="s1">data = </span><span class="s6">b&quot;</span><span class="s2">\0</span><span class="s6">&quot;</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">toXML(self</span><span class="s2">, </span><span class="s1">writer</span><span class="s2">, </span><span class="s1">ttFont</span><span class="s2">, </span><span class="s1">splitGlyphs=</span><span class="s2">False</span><span class="s1">):</span>
+		<span class="s1">notice = (</span>
+			<span class="s4">&quot;The xMin, yMin, xMax and yMax values</span><span class="s2">\n</span><span class="s4">&quot;</span>
+			<span class="s4">&quot;will be recalculated by the compiler.&quot;</span><span class="s1">)</span>
+		<span class="s1">glyphNames = ttFont.getGlyphNames()</span>
+		<span class="s2">if not </span><span class="s1">splitGlyphs:</span>
+			<span class="s1">writer.newline()</span>
+			<span class="s1">writer.comment(notice)</span>
+			<span class="s1">writer.newline()</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">numGlyphs = len(glyphNames)</span>
+		<span class="s2">if </span><span class="s1">splitGlyphs:</span>
+			<span class="s1">path</span><span class="s2">, </span><span class="s1">ext = os.path.splitext(writer.file.name)</span>
+			<span class="s1">existingGlyphFiles = set()</span>
+		<span class="s2">for </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">glyphNames:</span>
+			<span class="s1">glyph = self.get(glyphName)</span>
+			<span class="s2">if </span><span class="s1">glyph </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s1">log.warning(</span><span class="s4">&quot;glyph '%s' does not exist in glyf table&quot;</span><span class="s2">, </span><span class="s1">glyphName)</span>
+				<span class="s2">continue</span>
+			<span class="s2">if </span><span class="s1">glyph.numberOfContours:</span>
+				<span class="s2">if </span><span class="s1">splitGlyphs:</span>
+					<span class="s1">glyphPath = userNameToFileName(</span>
+						<span class="s1">tostr(glyphName</span><span class="s2">, </span><span class="s4">'utf-8'</span><span class="s1">)</span><span class="s2">,</span>
+						<span class="s1">existingGlyphFiles</span><span class="s2">,</span>
+						<span class="s1">prefix=path + </span><span class="s4">&quot;.&quot;</span><span class="s2">,</span>
+						<span class="s1">suffix=ext)</span>
+					<span class="s1">existingGlyphFiles.add(glyphPath.lower())</span>
+					<span class="s1">glyphWriter = xmlWriter.XMLWriter(</span>
+						<span class="s1">glyphPath</span><span class="s2">, </span><span class="s1">idlefunc=writer.idlefunc</span><span class="s2">,</span>
+						<span class="s1">newlinestr=writer.newlinestr)</span>
+					<span class="s1">glyphWriter.begintag(</span><span class="s4">&quot;ttFont&quot;</span><span class="s2">, </span><span class="s1">ttLibVersion=version)</span>
+					<span class="s1">glyphWriter.newline()</span>
+					<span class="s1">glyphWriter.begintag(</span><span class="s4">&quot;glyf&quot;</span><span class="s1">)</span>
+					<span class="s1">glyphWriter.newline()</span>
+					<span class="s1">glyphWriter.comment(notice)</span>
+					<span class="s1">glyphWriter.newline()</span>
+					<span class="s1">writer.simpletag(</span><span class="s4">&quot;TTGlyph&quot;</span><span class="s2">, </span><span class="s1">src=os.path.basename(glyphPath))</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">glyphWriter = writer</span>
+				<span class="s1">glyphWriter.begintag(</span><span class="s4">'TTGlyph'</span><span class="s2">, </span><span class="s1">[</span>
+							<span class="s1">(</span><span class="s4">&quot;name&quot;</span><span class="s2">, </span><span class="s1">glyphName)</span><span class="s2">,</span>
+							<span class="s1">(</span><span class="s4">&quot;xMin&quot;</span><span class="s2">, </span><span class="s1">glyph.xMin)</span><span class="s2">,</span>
+							<span class="s1">(</span><span class="s4">&quot;yMin&quot;</span><span class="s2">, </span><span class="s1">glyph.yMin)</span><span class="s2">,</span>
+							<span class="s1">(</span><span class="s4">&quot;xMax&quot;</span><span class="s2">, </span><span class="s1">glyph.xMax)</span><span class="s2">,</span>
+							<span class="s1">(</span><span class="s4">&quot;yMax&quot;</span><span class="s2">, </span><span class="s1">glyph.yMax)</span><span class="s2">,</span>
+							<span class="s1">])</span>
+				<span class="s1">glyphWriter.newline()</span>
+				<span class="s1">glyph.toXML(glyphWriter</span><span class="s2">, </span><span class="s1">ttFont)</span>
+				<span class="s1">glyphWriter.endtag(</span><span class="s4">'TTGlyph'</span><span class="s1">)</span>
+				<span class="s1">glyphWriter.newline()</span>
+				<span class="s2">if </span><span class="s1">splitGlyphs:</span>
+					<span class="s1">glyphWriter.endtag(</span><span class="s4">&quot;glyf&quot;</span><span class="s1">)</span>
+					<span class="s1">glyphWriter.newline()</span>
+					<span class="s1">glyphWriter.endtag(</span><span class="s4">&quot;ttFont&quot;</span><span class="s1">)</span>
+					<span class="s1">glyphWriter.newline()</span>
+					<span class="s1">glyphWriter.close()</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">writer.simpletag(</span><span class="s4">'TTGlyph'</span><span class="s2">, </span><span class="s1">name=glyphName)</span>
+				<span class="s1">writer.comment(</span><span class="s4">&quot;contains no outline data&quot;</span><span class="s1">)</span>
+				<span class="s2">if not </span><span class="s1">splitGlyphs:</span>
+					<span class="s1">writer.newline()</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s2">def </span><span class="s1">fromXML(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s2">if </span><span class="s1">name != </span><span class="s4">&quot;TTGlyph&quot;</span><span class="s1">:</span>
+			<span class="s2">return</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;glyphs&quot;</span><span class="s1">):</span>
+			<span class="s1">self.glyphs = {}</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;glyphOrder&quot;</span><span class="s1">):</span>
+			<span class="s1">self.glyphOrder = ttFont.getGlyphOrder()</span>
+		<span class="s1">glyphName = attrs[</span><span class="s4">&quot;name&quot;</span><span class="s1">]</span>
+		<span class="s1">log.debug(</span><span class="s4">&quot;unpacking glyph '%s'&quot;</span><span class="s2">, </span><span class="s1">glyphName)</span>
+		<span class="s1">glyph = Glyph()</span>
+		<span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'xMin'</span><span class="s2">, </span><span class="s4">'yMin'</span><span class="s2">, </span><span class="s4">'xMax'</span><span class="s2">, </span><span class="s4">'yMax'</span><span class="s1">]:</span>
+			<span class="s1">setattr(glyph</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">safeEval(attrs.get(attr</span><span class="s2">, </span><span class="s4">'0'</span><span class="s1">)))</span>
+		<span class="s1">self.glyphs[glyphName] = glyph</span>
+		<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">content:</span>
+			<span class="s2">if not </span><span class="s1">isinstance(element</span><span class="s2">, </span><span class="s1">tuple):</span>
+				<span class="s2">continue</span>
+			<span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content = element</span>
+			<span class="s1">glyph.fromXML(name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont)</span>
+		<span class="s2">if not </span><span class="s1">ttFont.recalcBBoxes:</span>
+			<span class="s1">glyph.compact(self</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s2">def </span><span class="s1">setGlyphOrder(self</span><span class="s2">, </span><span class="s1">glyphOrder):</span>
+		<span class="s0">&quot;&quot;&quot;Sets the glyph order 
+ 
+        Args: 
+            glyphOrder ([str]): List of glyph names in order. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">self.glyphOrder = glyphOrder</span>
+
+	<span class="s2">def </span><span class="s1">getGlyphName(self</span><span class="s2">, </span><span class="s1">glyphID):</span>
+		<span class="s0">&quot;&quot;&quot;Returns the name for the glyph with the given ID. 
+ 
+        Raises a ``KeyError`` if the glyph name is not found in the font. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">self.glyphOrder[glyphID]</span>
+
+	<span class="s2">def </span><span class="s1">getGlyphID(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s0">&quot;&quot;&quot;Returns the ID of the glyph with the given name. 
+ 
+        Raises a ``ValueError`` if the glyph is not found in the font. 
+        &quot;&quot;&quot;</span>
+		<span class="s3"># XXX optimize with reverse dict!!!</span>
+		<span class="s2">return </span><span class="s1">self.glyphOrder.index(glyphName)</span>
+
+	<span class="s2">def </span><span class="s1">removeHinting(self):</span>
+		<span class="s0">&quot;&quot;&quot;Removes TrueType hints from all glyphs in the glyphset. 
+ 
+        See :py:meth:`Glyph.removeHinting`. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">self.glyphs.values():</span>
+			<span class="s1">glyph.removeHinting()</span>
+
+	<span class="s2">def </span><span class="s1">keys(self):</span>
+		<span class="s2">return </span><span class="s1">self.glyphs.keys()</span>
+
+	<span class="s2">def </span><span class="s1">has_key(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s2">return </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">self.glyphs</span>
+
+	<span class="s1">__contains__ = has_key</span>
+
+	<span class="s2">def </span><span class="s1">get(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">default=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s1">glyph = self.glyphs.get(glyphName</span><span class="s2">, </span><span class="s1">default)</span>
+		<span class="s2">if </span><span class="s1">glyph </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">glyph.expand(self)</span>
+		<span class="s2">return </span><span class="s1">glyph</span>
+
+	<span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s1">glyph = self.glyphs[glyphName]</span>
+		<span class="s1">glyph.expand(self)</span>
+		<span class="s2">return </span><span class="s1">glyph</span>
+
+	<span class="s2">def </span><span class="s1">__setitem__(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">glyph):</span>
+		<span class="s1">self.glyphs[glyphName] = glyph</span>
+		<span class="s2">if </span><span class="s1">glyphName </span><span class="s2">not in </span><span class="s1">self.glyphOrder:</span>
+			<span class="s1">self.glyphOrder.append(glyphName)</span>
+
+	<span class="s2">def </span><span class="s1">__delitem__(self</span><span class="s2">, </span><span class="s1">glyphName):</span>
+		<span class="s2">del </span><span class="s1">self.glyphs[glyphName]</span>
+		<span class="s1">self.glyphOrder.remove(glyphName)</span>
+
+	<span class="s2">def </span><span class="s1">__len__(self):</span>
+		<span class="s2">assert </span><span class="s1">len(self.glyphOrder) == len(self.glyphs)</span>
+		<span class="s2">return </span><span class="s1">len(self.glyphs)</span>
+
+	<span class="s2">def </span><span class="s1">_getPhantomPoints(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Compute the four &quot;phantom points&quot; for the given glyph from its bounding box 
+        and the horizontal and vertical advance widths and sidebearings stored in the 
+        ttFont's &quot;hmtx&quot; and &quot;vmtx&quot; tables. 
+ 
+        'hMetrics' should be ttFont['hmtx'].metrics. 
+ 
+        'vMetrics' should be ttFont['vmtx'].metrics if there is &quot;vmtx&quot; or None otherwise. 
+        If there is no vMetrics passed in, vertical phantom points are set to the zero coordinate. 
+ 
+        https://docs.microsoft.com/en-us/typography/opentype/spec/tt_instructing_glyphs#phantoms 
+        &quot;&quot;&quot;</span>
+		<span class="s1">glyph = self[glyphName]</span>
+		<span class="s2">if not </span><span class="s1">hasattr(glyph</span><span class="s2">, </span><span class="s4">'xMin'</span><span class="s1">):</span>
+			<span class="s1">glyph.recalcBounds(self)</span>
+
+		<span class="s1">horizontalAdvanceWidth</span><span class="s2">, </span><span class="s1">leftSideBearing = hMetrics[glyphName]</span>
+		<span class="s1">leftSideX = glyph.xMin - leftSideBearing</span>
+		<span class="s1">rightSideX = leftSideX + horizontalAdvanceWidth</span>
+
+		<span class="s2">if </span><span class="s1">vMetrics:</span>
+			<span class="s1">verticalAdvanceWidth</span><span class="s2">, </span><span class="s1">topSideBearing = vMetrics[glyphName]</span>
+			<span class="s1">topSideY = topSideBearing + glyph.yMax</span>
+			<span class="s1">bottomSideY = topSideY - verticalAdvanceWidth</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">bottomSideY = topSideY = </span><span class="s5">0</span>
+
+		<span class="s2">return </span><span class="s1">[</span>
+			<span class="s1">(leftSideX</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+			<span class="s1">(rightSideX</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+			<span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">topSideY)</span><span class="s2">,</span>
+			<span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">bottomSideY)</span><span class="s2">,</span>
+		<span class="s1">]</span>
+
+	<span class="s2">def </span><span class="s1">_getCoordinatesAndControls(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Return glyph coordinates and controls as expected by &quot;gvar&quot; table. 
+ 
+        The coordinates includes four &quot;phantom points&quot; for the glyph metrics, 
+        as mandated by the &quot;gvar&quot; spec. 
+ 
+        The glyph controls is a namedtuple with the following attributes: 
+            - numberOfContours: -1 for composite glyphs. 
+            - endPts: list of indices of end points for each contour in simple 
+            glyphs, or component indices in composite glyphs (used for IUP 
+            optimization). 
+            - flags: array of contour point flags for simple glyphs (None for 
+            composite glyphs). 
+            - components: list of base glyph names (str) for each component in 
+            composite glyphs (None for simple glyphs). 
+ 
+        The &quot;hMetrics&quot; and vMetrics are used to compute the &quot;phantom points&quot; (see 
+        the &quot;_getPhantomPoints&quot; method). 
+ 
+        Return None if the requested glyphName is not present. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">glyph = self.get(glyphName)</span>
+		<span class="s2">if </span><span class="s1">glyph </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s2">return None</span>
+		<span class="s2">if </span><span class="s1">glyph.isComposite():</span>
+			<span class="s1">coords = GlyphCoordinates(</span>
+				<span class="s1">[(getattr(c</span><span class="s2">, </span><span class="s4">'x'</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">getattr(c</span><span class="s2">, </span><span class="s4">'y'</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">glyph.components]</span>
+			<span class="s1">)</span>
+			<span class="s1">controls = _GlyphControls(</span>
+				<span class="s1">numberOfContours=glyph.numberOfContours</span><span class="s2">,</span>
+				<span class="s1">endPts=list(range(len(glyph.components)))</span><span class="s2">,</span>
+				<span class="s1">flags=</span><span class="s2">None,</span>
+				<span class="s1">components=[(c.glyphName</span><span class="s2">, </span><span class="s1">getattr(c</span><span class="s2">, </span><span class="s4">'transform'</span><span class="s2">, None</span><span class="s1">)) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">glyph.components]</span><span class="s2">,</span>
+			<span class="s1">)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">coords</span><span class="s2">, </span><span class="s1">endPts</span><span class="s2">, </span><span class="s1">flags = glyph.getCoordinates(self)</span>
+			<span class="s1">coords = coords.copy()</span>
+			<span class="s1">controls = _GlyphControls(</span>
+				<span class="s1">numberOfContours=glyph.numberOfContours</span><span class="s2">,</span>
+				<span class="s1">endPts=endPts</span><span class="s2">,</span>
+				<span class="s1">flags=flags</span><span class="s2">,</span>
+				<span class="s1">components=</span><span class="s2">None,</span>
+			<span class="s1">)</span>
+		<span class="s3"># Add phantom points for (left, right, top, bottom) positions.</span>
+		<span class="s1">phantomPoints = self._getPhantomPoints(glyphName</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+		<span class="s1">coords.extend(phantomPoints)</span>
+		<span class="s2">return </span><span class="s1">coords</span><span class="s2">, </span><span class="s1">controls</span>
+
+	<span class="s2">def </span><span class="s1">_setCoordinates(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">coord</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Set coordinates and metrics for the given glyph. 
+ 
+        &quot;coord&quot; is an array of GlyphCoordinates which must include the &quot;phantom 
+        points&quot; as the last four coordinates. 
+ 
+        Both the horizontal/vertical advances and left/top sidebearings in &quot;hmtx&quot; 
+        and &quot;vmtx&quot; tables (if any) are updated from four phantom points and 
+        the glyph's bounding boxes. 
+ 
+        The &quot;hMetrics&quot; and vMetrics are used to propagate &quot;phantom points&quot; 
+        into &quot;hmtx&quot; and &quot;vmtx&quot; tables if desired.  (see the &quot;_getPhantomPoints&quot; 
+        method). 
+        &quot;&quot;&quot;</span>
+		<span class="s1">glyph = self[glyphName]</span>
+
+		<span class="s3"># Handle phantom points for (left, right, top, bottom) positions.</span>
+		<span class="s2">assert </span><span class="s1">len(coord) &gt;= </span><span class="s5">4</span>
+		<span class="s1">leftSideX = coord[-</span><span class="s5">4</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">rightSideX = coord[-</span><span class="s5">3</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">topSideY = coord[-</span><span class="s5">2</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s1">bottomSideY = coord[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span>
+
+		<span class="s1">coord = coord[:-</span><span class="s5">4</span><span class="s1">]</span>
+
+		<span class="s2">if </span><span class="s1">glyph.isComposite():</span>
+			<span class="s2">assert </span><span class="s1">len(coord) == len(glyph.components)</span>
+			<span class="s2">for </span><span class="s1">p</span><span class="s2">, </span><span class="s1">comp </span><span class="s2">in </span><span class="s1">zip(coord</span><span class="s2">, </span><span class="s1">glyph.components):</span>
+				<span class="s2">if </span><span class="s1">hasattr(comp</span><span class="s2">, </span><span class="s4">'x'</span><span class="s1">):</span>
+					<span class="s1">comp.x</span><span class="s2">, </span><span class="s1">comp.y = p</span>
+		<span class="s2">elif </span><span class="s1">glyph.numberOfContours == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">assert </span><span class="s1">len(coord) == </span><span class="s5">0</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">assert </span><span class="s1">len(coord) == len(glyph.coordinates)</span>
+			<span class="s1">glyph.coordinates = GlyphCoordinates(coord)</span>
+
+		<span class="s1">glyph.recalcBounds(self)</span>
+
+		<span class="s1">horizontalAdvanceWidth = otRound(rightSideX - leftSideX)</span>
+		<span class="s2">if </span><span class="s1">horizontalAdvanceWidth &lt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s3"># unlikely, but it can happen, see:</span>
+			<span class="s3"># https://github.com/fonttools/fonttools/pull/1198</span>
+			<span class="s1">horizontalAdvanceWidth = </span><span class="s5">0</span>
+		<span class="s1">leftSideBearing = otRound(glyph.xMin - leftSideX)</span>
+		<span class="s1">hMetrics[glyphName] = horizontalAdvanceWidth</span><span class="s2">, </span><span class="s1">leftSideBearing</span>
+
+		<span class="s2">if </span><span class="s1">vMetrics </span><span class="s2">is not None</span><span class="s1">:</span>
+			<span class="s1">verticalAdvanceWidth = otRound(topSideY - bottomSideY)</span>
+			<span class="s2">if </span><span class="s1">verticalAdvanceWidth &lt; </span><span class="s5">0</span><span class="s1">:  </span><span class="s3"># unlikely but do the same as horizontal</span>
+				<span class="s1">verticalAdvanceWidth = </span><span class="s5">0</span>
+			<span class="s1">topSideBearing = otRound(topSideY - glyph.yMax)</span>
+			<span class="s1">vMetrics[glyphName] = verticalAdvanceWidth</span><span class="s2">, </span><span class="s1">topSideBearing</span>
+
+
+	<span class="s3"># Deprecated</span>
+
+	<span class="s2">def </span><span class="s1">_synthesizeVMetrics(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">ttFont</span><span class="s2">, </span><span class="s1">defaultVerticalOrigin):</span>
+		<span class="s0">&quot;&quot;&quot;This method is wrong and deprecated. 
+        For rationale see: 
+        https://github.com/fonttools/fonttools/pull/2266/files#r613569473 
+        &quot;&quot;&quot;</span>
+		<span class="s1">vMetrics = getattr(ttFont.get(</span><span class="s4">'vmtx'</span><span class="s1">)</span><span class="s2">, </span><span class="s4">'metrics'</span><span class="s2">, None</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">vMetrics </span><span class="s2">is None</span><span class="s1">:</span>
+			<span class="s1">verticalAdvanceWidth = ttFont[</span><span class="s4">&quot;head&quot;</span><span class="s1">].unitsPerEm</span>
+			<span class="s1">topSideY = getattr(ttFont.get(</span><span class="s4">'hhea'</span><span class="s1">)</span><span class="s2">, </span><span class="s4">'ascent'</span><span class="s2">, None</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">topSideY </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">defaultVerticalOrigin </span><span class="s2">is not None</span><span class="s1">:</span>
+					<span class="s1">topSideY = defaultVerticalOrigin</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">topSideY = verticalAdvanceWidth</span>
+			<span class="s1">glyph = self[glyphName]</span>
+			<span class="s1">glyph.recalcBounds(self)</span>
+			<span class="s1">topSideBearing = otRound(topSideY - glyph.yMax)</span>
+			<span class="s1">vMetrics = {glyphName: (verticalAdvanceWidth</span><span class="s2">, </span><span class="s1">topSideBearing)}</span>
+		<span class="s2">return </span><span class="s1">vMetrics</span>
+
+	<span class="s1">@deprecateFunction(</span><span class="s4">&quot;use '_getPhantomPoints' instead&quot;</span><span class="s2">, </span><span class="s1">category=DeprecationWarning)</span>
+	<span class="s2">def </span><span class="s1">getPhantomPoints(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">ttFont</span><span class="s2">, </span><span class="s1">defaultVerticalOrigin=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Old public name for self._getPhantomPoints(). 
+        See: https://github.com/fonttools/fonttools/pull/2266&quot;&quot;&quot;</span>
+		<span class="s1">hMetrics = ttFont[</span><span class="s4">'hmtx'</span><span class="s1">].metrics</span>
+		<span class="s1">vMetrics = self._synthesizeVMetrics(glyphName</span><span class="s2">, </span><span class="s1">ttFont</span><span class="s2">, </span><span class="s1">defaultVerticalOrigin)</span>
+		<span class="s2">return </span><span class="s1">self._getPhantomPoints(glyphName</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+
+	<span class="s1">@deprecateFunction(</span><span class="s4">&quot;use '_getCoordinatesAndControls' instead&quot;</span><span class="s2">, </span><span class="s1">category=DeprecationWarning)</span>
+	<span class="s2">def </span><span class="s1">getCoordinatesAndControls(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">ttFont</span><span class="s2">, </span><span class="s1">defaultVerticalOrigin=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Old public name for self._getCoordinatesAndControls(). 
+        See: https://github.com/fonttools/fonttools/pull/2266&quot;&quot;&quot;</span>
+		<span class="s1">hMetrics = ttFont[</span><span class="s4">'hmtx'</span><span class="s1">].metrics</span>
+		<span class="s1">vMetrics = self._synthesizeVMetrics(glyphName</span><span class="s2">, </span><span class="s1">ttFont</span><span class="s2">, </span><span class="s1">defaultVerticalOrigin)</span>
+		<span class="s2">return </span><span class="s1">self._getCoordinatesAndControls(glyphName</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+
+	<span class="s1">@deprecateFunction(</span><span class="s4">&quot;use '_setCoordinates' instead&quot;</span><span class="s2">, </span><span class="s1">category=DeprecationWarning)</span>
+	<span class="s2">def </span><span class="s1">setCoordinates(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s0">&quot;&quot;&quot;Old public name for self._setCoordinates(). 
+        See: https://github.com/fonttools/fonttools/pull/2266&quot;&quot;&quot;</span>
+		<span class="s1">hMetrics = ttFont[</span><span class="s4">'hmtx'</span><span class="s1">].metrics</span>
+		<span class="s1">vMetrics = getattr(ttFont.get(</span><span class="s4">'vmtx'</span><span class="s1">)</span><span class="s2">, </span><span class="s4">'metrics'</span><span class="s2">, None</span><span class="s1">)</span>
+		<span class="s1">self._setCoordinates(glyphName</span><span class="s2">, </span><span class="s1">hMetrics</span><span class="s2">, </span><span class="s1">vMetrics)</span>
+
+
+<span class="s1">_GlyphControls = namedtuple(</span>
+	<span class="s4">&quot;_GlyphControls&quot;</span><span class="s2">, </span><span class="s4">&quot;numberOfContours endPts flags components&quot;</span>
+<span class="s1">)</span>
+
+
+<span class="s1">glyphHeaderFormat = </span><span class="s4">&quot;&quot;&quot; 
+        &gt;   # big endian 
+        numberOfContours:   h 
+        xMin:               h 
+        yMin:               h 
+        xMax:               h 
+        yMax:               h 
+&quot;&quot;&quot;</span>
+
+<span class="s3"># flags</span>
+<span class="s1">flagOnCurve = </span><span class="s5">0x01</span>
+<span class="s1">flagXShort = </span><span class="s5">0x02</span>
+<span class="s1">flagYShort = </span><span class="s5">0x04</span>
+<span class="s1">flagRepeat = </span><span class="s5">0x08</span>
+<span class="s1">flagXsame =  </span><span class="s5">0x10</span>
+<span class="s1">flagYsame = </span><span class="s5">0x20</span>
+<span class="s1">flagOverlapSimple = </span><span class="s5">0x40</span>
+<span class="s1">flagReserved = </span><span class="s5">0x80</span>
+
+<span class="s3"># These flags are kept for XML output after decompiling the coordinates</span>
+<span class="s1">keepFlags = flagOnCurve + flagOverlapSimple</span>
+
+<span class="s1">_flagSignBytes = {</span>
+	<span class="s5">0</span><span class="s1">: </span><span class="s5">2</span><span class="s2">,</span>
+	<span class="s1">flagXsame: </span><span class="s5">0</span><span class="s2">,</span>
+	<span class="s1">flagXShort|flagXsame: +</span><span class="s5">1</span><span class="s2">,</span>
+	<span class="s1">flagXShort: -</span><span class="s5">1</span><span class="s2">,</span>
+	<span class="s1">flagYsame: </span><span class="s5">0</span><span class="s2">,</span>
+	<span class="s1">flagYShort|flagYsame: +</span><span class="s5">1</span><span class="s2">,</span>
+	<span class="s1">flagYShort: -</span><span class="s5">1</span><span class="s2">,</span>
+<span class="s1">}</span>
+
+<span class="s2">def </span><span class="s1">flagBest(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">onCurve):</span>
+	<span class="s0">&quot;&quot;&quot;For a given x,y delta pair, returns the flag that packs this pair 
+    most efficiently, as well as the number of byte cost of such flag.&quot;&quot;&quot;</span>
+
+	<span class="s1">flag = flagOnCurve </span><span class="s2">if </span><span class="s1">onCurve </span><span class="s2">else </span><span class="s5">0</span>
+	<span class="s1">cost = </span><span class="s5">0</span>
+	<span class="s3"># do x</span>
+	<span class="s2">if </span><span class="s1">x == </span><span class="s5">0</span><span class="s1">:</span>
+		<span class="s1">flag = flag | flagXsame</span>
+	<span class="s2">elif </span><span class="s1">-</span><span class="s5">255 </span><span class="s1">&lt;= x &lt;= </span><span class="s5">255</span><span class="s1">:</span>
+		<span class="s1">flag = flag | flagXShort</span>
+		<span class="s2">if </span><span class="s1">x &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">flag = flag | flagXsame</span>
+		<span class="s1">cost += </span><span class="s5">1</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">cost += </span><span class="s5">2</span>
+	<span class="s3"># do y</span>
+	<span class="s2">if </span><span class="s1">y == </span><span class="s5">0</span><span class="s1">:</span>
+		<span class="s1">flag = flag | flagYsame</span>
+	<span class="s2">elif </span><span class="s1">-</span><span class="s5">255 </span><span class="s1">&lt;= y &lt;= </span><span class="s5">255</span><span class="s1">:</span>
+		<span class="s1">flag = flag | flagYShort</span>
+		<span class="s2">if </span><span class="s1">y &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">flag = flag | flagYsame</span>
+		<span class="s1">cost += </span><span class="s5">1</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s1">cost += </span><span class="s5">2</span>
+	<span class="s2">return </span><span class="s1">flag</span><span class="s2">, </span><span class="s1">cost</span>
+
+<span class="s2">def </span><span class="s1">flagFits(newFlag</span><span class="s2">, </span><span class="s1">oldFlag</span><span class="s2">, </span><span class="s1">mask):</span>
+	<span class="s1">newBytes = _flagSignBytes[newFlag &amp; mask]</span>
+	<span class="s1">oldBytes = _flagSignBytes[oldFlag &amp; mask]</span>
+	<span class="s2">return </span><span class="s1">newBytes == oldBytes </span><span class="s2">or </span><span class="s1">abs(newBytes) &gt; abs(oldBytes)</span>
+
+<span class="s2">def </span><span class="s1">flagSupports(newFlag</span><span class="s2">, </span><span class="s1">oldFlag):</span>
+	<span class="s2">return </span><span class="s1">((oldFlag &amp; flagOnCurve) == (newFlag &amp; flagOnCurve) </span><span class="s2">and</span>
+		<span class="s1">flagFits(newFlag</span><span class="s2">, </span><span class="s1">oldFlag</span><span class="s2">, </span><span class="s1">flagXsame|flagXShort) </span><span class="s2">and</span>
+		<span class="s1">flagFits(newFlag</span><span class="s2">, </span><span class="s1">oldFlag</span><span class="s2">, </span><span class="s1">flagYsame|flagYShort))</span>
+
+<span class="s2">def </span><span class="s1">flagEncodeCoord(flag</span><span class="s2">, </span><span class="s1">mask</span><span class="s2">, </span><span class="s1">coord</span><span class="s2">, </span><span class="s1">coordBytes):</span>
+	<span class="s1">byteCount = _flagSignBytes[flag &amp; mask]</span>
+	<span class="s2">if </span><span class="s1">byteCount == </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">coordBytes.append(coord)</span>
+	<span class="s2">elif </span><span class="s1">byteCount == -</span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s1">coordBytes.append(-coord)</span>
+	<span class="s2">elif </span><span class="s1">byteCount == </span><span class="s5">2</span><span class="s1">:</span>
+		<span class="s1">coordBytes.extend(struct.pack(</span><span class="s4">'&gt;h'</span><span class="s2">, </span><span class="s1">coord))</span>
+
+<span class="s2">def </span><span class="s1">flagEncodeCoords(flag</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">xBytes</span><span class="s2">, </span><span class="s1">yBytes):</span>
+	<span class="s1">flagEncodeCoord(flag</span><span class="s2">, </span><span class="s1">flagXsame|flagXShort</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">xBytes)</span>
+	<span class="s1">flagEncodeCoord(flag</span><span class="s2">, </span><span class="s1">flagYsame|flagYShort</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">yBytes)</span>
+
+
+<span class="s1">ARG_1_AND_2_ARE_WORDS		= </span><span class="s5">0x0001  </span><span class="s3"># if set args are words otherwise they are bytes</span>
+<span class="s1">ARGS_ARE_XY_VALUES		= </span><span class="s5">0x0002  </span><span class="s3"># if set args are xy values, otherwise they are points</span>
+<span class="s1">ROUND_XY_TO_GRID		= </span><span class="s5">0x0004  </span><span class="s3"># for the xy values if above is true</span>
+<span class="s1">WE_HAVE_A_SCALE			= </span><span class="s5">0x0008  </span><span class="s3"># Sx = Sy, otherwise scale == 1.0</span>
+<span class="s1">NON_OVERLAPPING			= </span><span class="s5">0x0010  </span><span class="s3"># set to same value for all components (obsolete!)</span>
+<span class="s1">MORE_COMPONENTS			= </span><span class="s5">0x0020  </span><span class="s3"># indicates at least one more glyph after this one</span>
+<span class="s1">WE_HAVE_AN_X_AND_Y_SCALE	= </span><span class="s5">0x0040  </span><span class="s3"># Sx, Sy</span>
+<span class="s1">WE_HAVE_A_TWO_BY_TWO		= </span><span class="s5">0x0080  </span><span class="s3"># t00, t01, t10, t11</span>
+<span class="s1">WE_HAVE_INSTRUCTIONS		= </span><span class="s5">0x0100  </span><span class="s3"># instructions follow</span>
+<span class="s1">USE_MY_METRICS			= </span><span class="s5">0x0200  </span><span class="s3"># apply these metrics to parent glyph</span>
+<span class="s1">OVERLAP_COMPOUND		= </span><span class="s5">0x0400  </span><span class="s3"># used by Apple in GX fonts</span>
+<span class="s1">SCALED_COMPONENT_OFFSET		= </span><span class="s5">0x0800  </span><span class="s3"># composite designed to have the component offset scaled (designed for Apple)</span>
+<span class="s1">UNSCALED_COMPONENT_OFFSET	= </span><span class="s5">0x1000  </span><span class="s3"># composite designed not to have the component offset scaled (designed for MS)</span>
+
+
+<span class="s1">CompositeMaxpValues = namedtuple(</span><span class="s4">'CompositeMaxpValues'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'nPoints'</span><span class="s2">, </span><span class="s4">'nContours'</span><span class="s2">, </span><span class="s4">'maxComponentDepth'</span><span class="s1">])</span>
+
+
+<span class="s2">class </span><span class="s1">Glyph(object):</span>
+	<span class="s0">&quot;&quot;&quot;This class represents an individual TrueType glyph. 
+ 
+    TrueType glyph objects come in two flavours: simple and composite. Simple 
+    glyph objects contain contours, represented via the ``.coordinates``, 
+    ``.flags``, ``.numberOfContours``, and ``.endPtsOfContours`` attributes; 
+    composite glyphs contain components, available through the ``.components`` 
+    attributes. 
+ 
+    Because the ``.coordinates`` attribute (and other simple glyph attributes mentioned 
+    above) is only set on simple glyphs and the ``.components`` attribute is only 
+    set on composite glyphs, it is necessary to use the :py:meth:`isComposite` 
+    method to test whether a glyph is simple or composite before attempting to 
+    access its data. 
+ 
+    For a composite glyph, the components can also be accessed via array-like access:: 
+ 
+        &gt;&gt; assert(font[&quot;glyf&quot;][&quot;Aacute&quot;].isComposite()) 
+        &gt;&gt; font[&quot;glyf&quot;][&quot;Aacute&quot;][0] 
+        &lt;fontTools.ttLib.tables._g_l_y_f.GlyphComponent at 0x1027b2ee0&gt; 
+ 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">data=</span><span class="s6">b&quot;&quot;</span><span class="s1">):</span>
+		<span class="s2">if not </span><span class="s1">data:</span>
+			<span class="s3"># empty char</span>
+			<span class="s1">self.numberOfContours = </span><span class="s5">0</span>
+			<span class="s2">return</span>
+		<span class="s1">self.data = data</span>
+
+	<span class="s2">def </span><span class="s1">compact(self</span><span class="s2">, </span><span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">recalcBBoxes=</span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s1">data = self.compile(glyfTable</span><span class="s2">, </span><span class="s1">recalcBBoxes)</span>
+		<span class="s1">self.__dict__.clear()</span>
+		<span class="s1">self.data = data</span>
+
+	<span class="s2">def </span><span class="s1">expand(self</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;data&quot;</span><span class="s1">):</span>
+			<span class="s3"># already unpacked</span>
+			<span class="s2">return</span>
+		<span class="s2">if not </span><span class="s1">self.data:</span>
+			<span class="s3"># empty char</span>
+			<span class="s2">del </span><span class="s1">self.data</span>
+			<span class="s1">self.numberOfContours = </span><span class="s5">0</span>
+			<span class="s2">return</span>
+		<span class="s1">dummy</span><span class="s2">, </span><span class="s1">data = sstruct.unpack2(glyphHeaderFormat</span><span class="s2">, </span><span class="s1">self.data</span><span class="s2">, </span><span class="s1">self)</span>
+		<span class="s2">del </span><span class="s1">self.data</span>
+		<span class="s3"># Some fonts (eg. Neirizi.ttf) have a 0 for numberOfContours in</span>
+		<span class="s3"># some glyphs; decompileCoordinates assumes that there's at least</span>
+		<span class="s3"># one, so short-circuit here.</span>
+		<span class="s2">if </span><span class="s1">self.numberOfContours == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">return</span>
+		<span class="s2">if </span><span class="s1">self.isComposite():</span>
+			<span class="s1">self.decompileComponents(data</span><span class="s2">, </span><span class="s1">glyfTable)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">self.decompileCoordinates(data)</span>
+
+	<span class="s2">def </span><span class="s1">compile(self</span><span class="s2">, </span><span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">recalcBBoxes=</span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;data&quot;</span><span class="s1">):</span>
+			<span class="s2">if </span><span class="s1">recalcBBoxes:</span>
+				<span class="s3"># must unpack glyph in order to recalculate bounding box</span>
+				<span class="s1">self.expand(glyfTable)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">return </span><span class="s1">self.data</span>
+		<span class="s2">if </span><span class="s1">self.numberOfContours == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s6">b''</span>
+		<span class="s2">if </span><span class="s1">recalcBBoxes:</span>
+			<span class="s1">self.recalcBounds(glyfTable)</span>
+		<span class="s1">data = sstruct.pack(glyphHeaderFormat</span><span class="s2">, </span><span class="s1">self)</span>
+		<span class="s2">if </span><span class="s1">self.isComposite():</span>
+			<span class="s1">data = data + self.compileComponents(glyfTable)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">data = data + self.compileCoordinates()</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">toXML(self</span><span class="s2">, </span><span class="s1">writer</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s2">if </span><span class="s1">self.isComposite():</span>
+			<span class="s2">for </span><span class="s1">compo </span><span class="s2">in </span><span class="s1">self.components:</span>
+				<span class="s1">compo.toXML(writer</span><span class="s2">, </span><span class="s1">ttFont)</span>
+			<span class="s1">haveInstructions = hasattr(self</span><span class="s2">, </span><span class="s4">&quot;program&quot;</span><span class="s1">)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">last = </span><span class="s5">0</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.numberOfContours):</span>
+				<span class="s1">writer.begintag(</span><span class="s4">&quot;contour&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(last</span><span class="s2">, </span><span class="s1">self.endPtsOfContours[i] + </span><span class="s5">1</span><span class="s1">):</span>
+					<span class="s1">attrs = [</span>
+							<span class="s1">(</span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s1">self.coordinates[j][</span><span class="s5">0</span><span class="s1">])</span><span class="s2">,</span>
+							<span class="s1">(</span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s1">self.coordinates[j][</span><span class="s5">1</span><span class="s1">])</span><span class="s2">,</span>
+							<span class="s1">(</span><span class="s4">&quot;on&quot;</span><span class="s2">, </span><span class="s1">self.flags[j] &amp; flagOnCurve)</span><span class="s2">,</span>
+						<span class="s1">]</span>
+					<span class="s2">if </span><span class="s1">self.flags[j] &amp; flagOverlapSimple:</span>
+						<span class="s3"># Apple's rasterizer uses flagOverlapSimple in the first contour/first pt to flag glyphs that contain overlapping contours</span>
+						<span class="s1">attrs.append((</span><span class="s4">&quot;overlap&quot;</span><span class="s2">, </span><span class="s5">1</span><span class="s1">))</span>
+					<span class="s1">writer.simpletag(</span><span class="s4">&quot;pt&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+					<span class="s1">writer.newline()</span>
+				<span class="s1">last = self.endPtsOfContours[i] + </span><span class="s5">1</span>
+				<span class="s1">writer.endtag(</span><span class="s4">&quot;contour&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+			<span class="s1">haveInstructions = self.numberOfContours &gt; </span><span class="s5">0</span>
+		<span class="s2">if </span><span class="s1">haveInstructions:</span>
+			<span class="s2">if </span><span class="s1">self.program:</span>
+				<span class="s1">writer.begintag(</span><span class="s4">&quot;instructions&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">self.program.toXML(writer</span><span class="s2">, </span><span class="s1">ttFont)</span>
+				<span class="s1">writer.endtag(</span><span class="s4">&quot;instructions&quot;</span><span class="s1">)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">writer.simpletag(</span><span class="s4">&quot;instructions&quot;</span><span class="s1">)</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s2">def </span><span class="s1">fromXML(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s2">if </span><span class="s1">name == </span><span class="s4">&quot;contour&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.numberOfContours &lt; </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">ttLib.TTLibError(</span><span class="s4">&quot;can't mix composites and contours in glyph&quot;</span><span class="s1">)</span>
+			<span class="s1">self.numberOfContours = self.numberOfContours + </span><span class="s5">1</span>
+			<span class="s1">coordinates = GlyphCoordinates()</span>
+			<span class="s1">flags = bytearray()</span>
+			<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">content:</span>
+				<span class="s2">if not </span><span class="s1">isinstance(element</span><span class="s2">, </span><span class="s1">tuple):</span>
+					<span class="s2">continue</span>
+				<span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content = element</span>
+				<span class="s2">if </span><span class="s1">name != </span><span class="s4">&quot;pt&quot;</span><span class="s1">:</span>
+					<span class="s2">continue  </span><span class="s3"># ignore anything but &quot;pt&quot;</span>
+				<span class="s1">coordinates.append((safeEval(attrs[</span><span class="s4">&quot;x&quot;</span><span class="s1">])</span><span class="s2">, </span><span class="s1">safeEval(attrs[</span><span class="s4">&quot;y&quot;</span><span class="s1">])))</span>
+				<span class="s1">flag = bool(safeEval(attrs[</span><span class="s4">&quot;on&quot;</span><span class="s1">]))</span>
+				<span class="s2">if </span><span class="s4">&quot;overlap&quot; </span><span class="s2">in </span><span class="s1">attrs </span><span class="s2">and </span><span class="s1">bool(safeEval(attrs[</span><span class="s4">&quot;overlap&quot;</span><span class="s1">])):</span>
+					<span class="s1">flag |= flagOverlapSimple</span>
+				<span class="s1">flags.append(flag)</span>
+			<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;coordinates&quot;</span><span class="s1">):</span>
+				<span class="s1">self.coordinates = coordinates</span>
+				<span class="s1">self.flags = flags</span>
+				<span class="s1">self.endPtsOfContours = [len(coordinates)-</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">self.coordinates.extend (coordinates)</span>
+				<span class="s1">self.flags.extend(flags)</span>
+				<span class="s1">self.endPtsOfContours.append(len(self.coordinates)-</span><span class="s5">1</span><span class="s1">)</span>
+		<span class="s2">elif </span><span class="s1">name == </span><span class="s4">&quot;component&quot;</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.numberOfContours &gt; </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">ttLib.TTLibError(</span><span class="s4">&quot;can't mix composites and contours in glyph&quot;</span><span class="s1">)</span>
+			<span class="s1">self.numberOfContours = -</span><span class="s5">1</span>
+			<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;components&quot;</span><span class="s1">):</span>
+				<span class="s1">self.components = []</span>
+			<span class="s1">component = GlyphComponent()</span>
+			<span class="s1">self.components.append(component)</span>
+			<span class="s1">component.fromXML(name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont)</span>
+		<span class="s2">elif </span><span class="s1">name == </span><span class="s4">&quot;instructions&quot;</span><span class="s1">:</span>
+			<span class="s1">self.program = ttProgram.Program()</span>
+			<span class="s2">for </span><span class="s1">element </span><span class="s2">in </span><span class="s1">content:</span>
+				<span class="s2">if not </span><span class="s1">isinstance(element</span><span class="s2">, </span><span class="s1">tuple):</span>
+					<span class="s2">continue</span>
+				<span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content = element</span>
+				<span class="s1">self.program.fromXML(name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont)</span>
+
+	<span class="s2">def </span><span class="s1">getCompositeMaxpValues(self</span><span class="s2">, </span><span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">maxComponentDepth=</span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s2">assert </span><span class="s1">self.isComposite()</span>
+		<span class="s1">nContours = </span><span class="s5">0</span>
+		<span class="s1">nPoints = </span><span class="s5">0</span>
+		<span class="s1">initialMaxComponentDepth = maxComponentDepth</span>
+		<span class="s2">for </span><span class="s1">compo </span><span class="s2">in </span><span class="s1">self.components:</span>
+			<span class="s1">baseGlyph = glyfTable[compo.glyphName]</span>
+			<span class="s2">if </span><span class="s1">baseGlyph.numberOfContours == </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s2">continue</span>
+			<span class="s2">elif </span><span class="s1">baseGlyph.numberOfContours &gt; </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s1">nP</span><span class="s2">, </span><span class="s1">nC = baseGlyph.getMaxpValues()</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">nP</span><span class="s2">, </span><span class="s1">nC</span><span class="s2">, </span><span class="s1">componentDepth = baseGlyph.getCompositeMaxpValues(</span>
+						<span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">initialMaxComponentDepth + </span><span class="s5">1</span><span class="s1">)</span>
+				<span class="s1">maxComponentDepth = max(maxComponentDepth</span><span class="s2">, </span><span class="s1">componentDepth)</span>
+			<span class="s1">nPoints = nPoints + nP</span>
+			<span class="s1">nContours = nContours + nC</span>
+		<span class="s2">return </span><span class="s1">CompositeMaxpValues(nPoints</span><span class="s2">, </span><span class="s1">nContours</span><span class="s2">, </span><span class="s1">maxComponentDepth)</span>
+
+	<span class="s2">def </span><span class="s1">getMaxpValues(self):</span>
+		<span class="s2">assert </span><span class="s1">self.numberOfContours &gt; </span><span class="s5">0</span>
+		<span class="s2">return </span><span class="s1">len(self.coordinates)</span><span class="s2">, </span><span class="s1">len(self.endPtsOfContours)</span>
+
+	<span class="s2">def </span><span class="s1">decompileComponents(self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s1">self.components = []</span>
+		<span class="s1">more = </span><span class="s5">1</span>
+		<span class="s1">haveInstructions = </span><span class="s5">0</span>
+		<span class="s2">while </span><span class="s1">more:</span>
+			<span class="s1">component = GlyphComponent()</span>
+			<span class="s1">more</span><span class="s2">, </span><span class="s1">haveInstr</span><span class="s2">, </span><span class="s1">data = component.decompile(data</span><span class="s2">, </span><span class="s1">glyfTable)</span>
+			<span class="s1">haveInstructions = haveInstructions | haveInstr</span>
+			<span class="s1">self.components.append(component)</span>
+		<span class="s2">if </span><span class="s1">haveInstructions:</span>
+			<span class="s1">numInstructions</span><span class="s2">, </span><span class="s1">= struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">2</span><span class="s1">])</span>
+			<span class="s1">data = data[</span><span class="s5">2</span><span class="s1">:]</span>
+			<span class="s1">self.program = ttProgram.Program()</span>
+			<span class="s1">self.program.fromBytecode(data[:numInstructions])</span>
+			<span class="s1">data = data[numInstructions:]</span>
+			<span class="s2">if </span><span class="s1">len(data) &gt;= </span><span class="s5">4</span><span class="s1">:</span>
+				<span class="s1">log.warning(</span>
+					<span class="s4">&quot;too much glyph data at the end of composite glyph: %d excess bytes&quot;</span><span class="s2">,</span>
+					<span class="s1">len(data))</span>
+
+	<span class="s2">def </span><span class="s1">decompileCoordinates(self</span><span class="s2">, </span><span class="s1">data):</span>
+		<span class="s1">endPtsOfContours = array.array(</span><span class="s4">&quot;h&quot;</span><span class="s1">)</span>
+		<span class="s1">endPtsOfContours.frombytes(data[:</span><span class="s5">2</span><span class="s1">*self.numberOfContours])</span>
+		<span class="s2">if </span><span class="s1">sys.byteorder != </span><span class="s4">&quot;big&quot;</span><span class="s1">: endPtsOfContours.byteswap()</span>
+		<span class="s1">self.endPtsOfContours = endPtsOfContours.tolist()</span>
+
+		<span class="s1">pos = </span><span class="s5">2</span><span class="s1">*self.numberOfContours</span>
+		<span class="s1">instructionLength</span><span class="s2">, </span><span class="s1">= struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">data[pos:pos+</span><span class="s5">2</span><span class="s1">])</span>
+		<span class="s1">self.program = ttProgram.Program()</span>
+		<span class="s1">self.program.fromBytecode(data[pos+</span><span class="s5">2</span><span class="s1">:pos+</span><span class="s5">2</span><span class="s1">+instructionLength])</span>
+		<span class="s1">pos += </span><span class="s5">2 </span><span class="s1">+ instructionLength</span>
+		<span class="s1">nCoordinates = self.endPtsOfContours[-</span><span class="s5">1</span><span class="s1">] + </span><span class="s5">1</span>
+		<span class="s1">flags</span><span class="s2">, </span><span class="s1">xCoordinates</span><span class="s2">, </span><span class="s1">yCoordinates = \</span>
+				<span class="s1">self.decompileCoordinatesRaw(nCoordinates</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">pos)</span>
+
+		<span class="s3"># fill in repetitions and apply signs</span>
+		<span class="s1">self.coordinates = coordinates = GlyphCoordinates.zeros(nCoordinates)</span>
+		<span class="s1">xIndex = </span><span class="s5">0</span>
+		<span class="s1">yIndex = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nCoordinates):</span>
+			<span class="s1">flag = flags[i]</span>
+			<span class="s3"># x coordinate</span>
+			<span class="s2">if </span><span class="s1">flag &amp; flagXShort:</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagXsame:</span>
+					<span class="s1">x = xCoordinates[xIndex]</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">x = -xCoordinates[xIndex]</span>
+				<span class="s1">xIndex = xIndex + </span><span class="s5">1</span>
+			<span class="s2">elif </span><span class="s1">flag &amp; flagXsame:</span>
+				<span class="s1">x = </span><span class="s5">0</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">x = xCoordinates[xIndex]</span>
+				<span class="s1">xIndex = xIndex + </span><span class="s5">1</span>
+			<span class="s3"># y coordinate</span>
+			<span class="s2">if </span><span class="s1">flag &amp; flagYShort:</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagYsame:</span>
+					<span class="s1">y = yCoordinates[yIndex]</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">y = -yCoordinates[yIndex]</span>
+				<span class="s1">yIndex = yIndex + </span><span class="s5">1</span>
+			<span class="s2">elif </span><span class="s1">flag &amp; flagYsame:</span>
+				<span class="s1">y = </span><span class="s5">0</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">y = yCoordinates[yIndex]</span>
+				<span class="s1">yIndex = yIndex + </span><span class="s5">1</span>
+			<span class="s1">coordinates[i] = (x</span><span class="s2">, </span><span class="s1">y)</span>
+		<span class="s2">assert </span><span class="s1">xIndex == len(xCoordinates)</span>
+		<span class="s2">assert </span><span class="s1">yIndex == len(yCoordinates)</span>
+		<span class="s1">coordinates.relativeToAbsolute()</span>
+		<span class="s3"># discard all flags except &quot;keepFlags&quot;</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(flags)):</span>
+			<span class="s1">flags[i] &amp;= keepFlags</span>
+		<span class="s1">self.flags = flags</span>
+
+	<span class="s2">def </span><span class="s1">decompileCoordinatesRaw(self</span><span class="s2">, </span><span class="s1">nCoordinates</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">pos=</span><span class="s5">0</span><span class="s1">):</span>
+		<span class="s3"># unpack flags and prepare unpacking of coordinates</span>
+		<span class="s1">flags = bytearray(nCoordinates)</span>
+		<span class="s3"># Warning: deep Python trickery going on. We use the struct module to unpack</span>
+		<span class="s3"># the coordinates. We build a format string based on the flags, so we can</span>
+		<span class="s3"># unpack the coordinates in one struct.unpack() call.</span>
+		<span class="s1">xFormat = </span><span class="s4">&quot;&gt;&quot; </span><span class="s3"># big endian</span>
+		<span class="s1">yFormat = </span><span class="s4">&quot;&gt;&quot; </span><span class="s3"># big endian</span>
+		<span class="s1">j = </span><span class="s5">0</span>
+		<span class="s2">while True</span><span class="s1">:</span>
+			<span class="s1">flag = data[pos]</span>
+			<span class="s1">pos += </span><span class="s5">1</span>
+			<span class="s1">repeat = </span><span class="s5">1</span>
+			<span class="s2">if </span><span class="s1">flag &amp; flagRepeat:</span>
+				<span class="s1">repeat = data[pos] + </span><span class="s5">1</span>
+				<span class="s1">pos += </span><span class="s5">1</span>
+			<span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(repeat):</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagXShort:</span>
+					<span class="s1">xFormat = xFormat + </span><span class="s4">'B'</span>
+				<span class="s2">elif not </span><span class="s1">(flag &amp; flagXsame):</span>
+					<span class="s1">xFormat = xFormat + </span><span class="s4">'h'</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagYShort:</span>
+					<span class="s1">yFormat = yFormat + </span><span class="s4">'B'</span>
+				<span class="s2">elif not </span><span class="s1">(flag &amp; flagYsame):</span>
+					<span class="s1">yFormat = yFormat + </span><span class="s4">'h'</span>
+				<span class="s1">flags[j] = flag</span>
+				<span class="s1">j = j + </span><span class="s5">1</span>
+			<span class="s2">if </span><span class="s1">j &gt;= nCoordinates:</span>
+				<span class="s2">break</span>
+		<span class="s2">assert </span><span class="s1">j == nCoordinates</span><span class="s2">, </span><span class="s4">&quot;bad glyph flags&quot;</span>
+		<span class="s3"># unpack raw coordinates, krrrrrr-tching!</span>
+		<span class="s1">xDataLen = struct.calcsize(xFormat)</span>
+		<span class="s1">yDataLen = struct.calcsize(yFormat)</span>
+		<span class="s2">if </span><span class="s1">len(data) - pos - (xDataLen + yDataLen) &gt;= </span><span class="s5">4</span><span class="s1">:</span>
+			<span class="s1">log.warning(</span>
+				<span class="s4">&quot;too much glyph data: %d excess bytes&quot;</span><span class="s2">, </span><span class="s1">len(data) - pos - (xDataLen + yDataLen))</span>
+		<span class="s1">xCoordinates = struct.unpack(xFormat</span><span class="s2">, </span><span class="s1">data[pos:pos+xDataLen])</span>
+		<span class="s1">yCoordinates = struct.unpack(yFormat</span><span class="s2">, </span><span class="s1">data[pos+xDataLen:pos+xDataLen+yDataLen])</span>
+		<span class="s2">return </span><span class="s1">flags</span><span class="s2">, </span><span class="s1">xCoordinates</span><span class="s2">, </span><span class="s1">yCoordinates</span>
+
+	<span class="s2">def </span><span class="s1">compileComponents(self</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s1">data = </span><span class="s6">b&quot;&quot;</span>
+		<span class="s1">lastcomponent = len(self.components) - </span><span class="s5">1</span>
+		<span class="s1">more = </span><span class="s5">1</span>
+		<span class="s1">haveInstructions = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(self.components)):</span>
+			<span class="s2">if </span><span class="s1">i == lastcomponent:</span>
+				<span class="s1">haveInstructions = hasattr(self</span><span class="s2">, </span><span class="s4">&quot;program&quot;</span><span class="s1">)</span>
+				<span class="s1">more = </span><span class="s5">0</span>
+			<span class="s1">compo = self.components[i]</span>
+			<span class="s1">data = data + compo.compile(more</span><span class="s2">, </span><span class="s1">haveInstructions</span><span class="s2">, </span><span class="s1">glyfTable)</span>
+		<span class="s2">if </span><span class="s1">haveInstructions:</span>
+			<span class="s1">instructions = self.program.getBytecode()</span>
+			<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">len(instructions)) + instructions</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">compileCoordinates(self):</span>
+		<span class="s2">assert </span><span class="s1">len(self.coordinates) == len(self.flags)</span>
+		<span class="s1">data = []</span>
+		<span class="s1">endPtsOfContours = array.array(</span><span class="s4">&quot;h&quot;</span><span class="s2">, </span><span class="s1">self.endPtsOfContours)</span>
+		<span class="s2">if </span><span class="s1">sys.byteorder != </span><span class="s4">&quot;big&quot;</span><span class="s1">: endPtsOfContours.byteswap()</span>
+		<span class="s1">data.append(endPtsOfContours.tobytes())</span>
+		<span class="s1">instructions = self.program.getBytecode()</span>
+		<span class="s1">data.append(struct.pack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">len(instructions)))</span>
+		<span class="s1">data.append(instructions)</span>
+
+		<span class="s1">deltas = self.coordinates.copy()</span>
+		<span class="s1">deltas.toInt()</span>
+		<span class="s1">deltas.absoluteToRelative()</span>
+
+		<span class="s3"># TODO(behdad): Add a configuration option for this?</span>
+		<span class="s1">deltas = self.compileDeltasGreedy(self.flags</span><span class="s2">, </span><span class="s1">deltas)</span>
+		<span class="s3">#deltas = self.compileDeltasOptimal(self.flags, deltas)</span>
+
+		<span class="s1">data.extend(deltas)</span>
+		<span class="s2">return </span><span class="s6">b''</span><span class="s1">.join(data)</span>
+
+	<span class="s2">def </span><span class="s1">compileDeltasGreedy(self</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">, </span><span class="s1">deltas):</span>
+		<span class="s3"># Implements greedy algorithm for packing coordinate deltas:</span>
+		<span class="s3"># uses shortest representation one coordinate at a time.</span>
+		<span class="s1">compressedFlags = bytearray()</span>
+		<span class="s1">compressedXs = bytearray()</span>
+		<span class="s1">compressedYs = bytearray()</span>
+		<span class="s1">lastflag = </span><span class="s2">None</span>
+		<span class="s1">repeat = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">flag</span><span class="s2">,</span><span class="s1">(x</span><span class="s2">,</span><span class="s1">y) </span><span class="s2">in </span><span class="s1">zip(flags</span><span class="s2">, </span><span class="s1">deltas):</span>
+			<span class="s3"># Oh, the horrors of TrueType</span>
+			<span class="s3"># do x</span>
+			<span class="s2">if </span><span class="s1">x == </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s1">flag = flag | flagXsame</span>
+			<span class="s2">elif </span><span class="s1">-</span><span class="s5">255 </span><span class="s1">&lt;= x &lt;= </span><span class="s5">255</span><span class="s1">:</span>
+				<span class="s1">flag = flag | flagXShort</span>
+				<span class="s2">if </span><span class="s1">x &gt; </span><span class="s5">0</span><span class="s1">:</span>
+					<span class="s1">flag = flag | flagXsame</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">x = -x</span>
+				<span class="s1">compressedXs.append(x)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">compressedXs.extend(struct.pack(</span><span class="s4">'&gt;h'</span><span class="s2">, </span><span class="s1">x))</span>
+			<span class="s3"># do y</span>
+			<span class="s2">if </span><span class="s1">y == </span><span class="s5">0</span><span class="s1">:</span>
+				<span class="s1">flag = flag | flagYsame</span>
+			<span class="s2">elif </span><span class="s1">-</span><span class="s5">255 </span><span class="s1">&lt;= y &lt;= </span><span class="s5">255</span><span class="s1">:</span>
+				<span class="s1">flag = flag | flagYShort</span>
+				<span class="s2">if </span><span class="s1">y &gt; </span><span class="s5">0</span><span class="s1">:</span>
+					<span class="s1">flag = flag | flagYsame</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">y = -y</span>
+				<span class="s1">compressedYs.append(y)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">compressedYs.extend(struct.pack(</span><span class="s4">'&gt;h'</span><span class="s2">, </span><span class="s1">y))</span>
+			<span class="s3"># handle repeating flags</span>
+			<span class="s2">if </span><span class="s1">flag == lastflag </span><span class="s2">and </span><span class="s1">repeat != </span><span class="s5">255</span><span class="s1">:</span>
+				<span class="s1">repeat = repeat + </span><span class="s5">1</span>
+				<span class="s2">if </span><span class="s1">repeat == </span><span class="s5">1</span><span class="s1">:</span>
+					<span class="s1">compressedFlags.append(flag)</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">compressedFlags[-</span><span class="s5">2</span><span class="s1">] = flag | flagRepeat</span>
+					<span class="s1">compressedFlags[-</span><span class="s5">1</span><span class="s1">] = repeat</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">repeat = </span><span class="s5">0</span>
+				<span class="s1">compressedFlags.append(flag)</span>
+			<span class="s1">lastflag = flag</span>
+		<span class="s2">return </span><span class="s1">(compressedFlags</span><span class="s2">, </span><span class="s1">compressedXs</span><span class="s2">, </span><span class="s1">compressedYs)</span>
+
+	<span class="s2">def </span><span class="s1">compileDeltasOptimal(self</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">, </span><span class="s1">deltas):</span>
+		<span class="s3"># Implements optimal, dynaic-programming, algorithm for packing coordinate</span>
+		<span class="s3"># deltas.  The savings are negligible :(.</span>
+		<span class="s1">candidates = []</span>
+		<span class="s1">bestTuple = </span><span class="s2">None</span>
+		<span class="s1">bestCost = </span><span class="s5">0</span>
+		<span class="s1">repeat = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">flag</span><span class="s2">,</span><span class="s1">(x</span><span class="s2">,</span><span class="s1">y) </span><span class="s2">in </span><span class="s1">zip(flags</span><span class="s2">, </span><span class="s1">deltas):</span>
+			<span class="s3"># Oh, the horrors of TrueType</span>
+			<span class="s1">flag</span><span class="s2">, </span><span class="s1">coordBytes = flagBest(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">flag)</span>
+			<span class="s1">bestCost += </span><span class="s5">1 </span><span class="s1">+ coordBytes</span>
+			<span class="s1">newCandidates = [(bestCost</span><span class="s2">, </span><span class="s1">bestTuple</span><span class="s2">, </span><span class="s1">flag</span><span class="s2">, </span><span class="s1">coordBytes)</span><span class="s2">,</span>
+							<span class="s1">(bestCost+</span><span class="s5">1</span><span class="s2">, </span><span class="s1">bestTuple</span><span class="s2">, </span><span class="s1">(flag|flagRepeat)</span><span class="s2">, </span><span class="s1">coordBytes)]</span>
+			<span class="s2">for </span><span class="s1">lastCost</span><span class="s2">,</span><span class="s1">lastTuple</span><span class="s2">,</span><span class="s1">lastFlag</span><span class="s2">,</span><span class="s1">coordBytes </span><span class="s2">in </span><span class="s1">candidates:</span>
+				<span class="s2">if </span><span class="s1">lastCost + coordBytes &lt;= bestCost + </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">(lastFlag &amp; flagRepeat) </span><span class="s2">and </span><span class="s1">(lastFlag &lt; </span><span class="s5">0xff00</span><span class="s1">) </span><span class="s2">and </span><span class="s1">flagSupports(lastFlag</span><span class="s2">, </span><span class="s1">flag):</span>
+					<span class="s2">if </span><span class="s1">(lastFlag &amp; </span><span class="s5">0xFF</span><span class="s1">) == (flag|flagRepeat) </span><span class="s2">and </span><span class="s1">lastCost == bestCost + </span><span class="s5">1</span><span class="s1">:</span>
+						<span class="s2">continue</span>
+					<span class="s1">newCandidates.append((lastCost + coordBytes</span><span class="s2">, </span><span class="s1">lastTuple</span><span class="s2">, </span><span class="s1">lastFlag+</span><span class="s5">256</span><span class="s2">, </span><span class="s1">coordBytes))</span>
+			<span class="s1">candidates = newCandidates</span>
+			<span class="s1">bestTuple = min(candidates</span><span class="s2">, </span><span class="s1">key=</span><span class="s2">lambda </span><span class="s1">t:t[</span><span class="s5">0</span><span class="s1">])</span>
+			<span class="s1">bestCost = bestTuple[</span><span class="s5">0</span><span class="s1">]</span>
+
+		<span class="s1">flags = []</span>
+		<span class="s2">while </span><span class="s1">bestTuple:</span>
+			<span class="s1">cost</span><span class="s2">, </span><span class="s1">bestTuple</span><span class="s2">, </span><span class="s1">flag</span><span class="s2">, </span><span class="s1">coordBytes = bestTuple</span>
+			<span class="s1">flags.append(flag)</span>
+		<span class="s1">flags.reverse()</span>
+
+		<span class="s1">compressedFlags = bytearray()</span>
+		<span class="s1">compressedXs = bytearray()</span>
+		<span class="s1">compressedYs = bytearray()</span>
+		<span class="s1">coords = iter(deltas)</span>
+		<span class="s1">ff = []</span>
+		<span class="s2">for </span><span class="s1">flag </span><span class="s2">in </span><span class="s1">flags:</span>
+			<span class="s1">repeatCount</span><span class="s2">, </span><span class="s1">flag = flag &gt;&gt; </span><span class="s5">8</span><span class="s2">, </span><span class="s1">flag &amp; </span><span class="s5">0xFF</span>
+			<span class="s1">compressedFlags.append(flag)</span>
+			<span class="s2">if </span><span class="s1">flag &amp; flagRepeat:</span>
+				<span class="s2">assert</span><span class="s1">(repeatCount &gt; </span><span class="s5">0</span><span class="s1">)</span>
+				<span class="s1">compressedFlags.append(repeatCount)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">assert</span><span class="s1">(repeatCount == </span><span class="s5">0</span><span class="s1">)</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">1 </span><span class="s1">+ repeatCount):</span>
+				<span class="s1">x</span><span class="s2">,</span><span class="s1">y = next(coords)</span>
+				<span class="s1">flagEncodeCoords(flag</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">compressedXs</span><span class="s2">, </span><span class="s1">compressedYs)</span>
+				<span class="s1">ff.append(flag)</span>
+		<span class="s2">try</span><span class="s1">:</span>
+			<span class="s1">next(coords)</span>
+			<span class="s2">raise </span><span class="s1">Exception(</span><span class="s4">&quot;internal error&quot;</span><span class="s1">)</span>
+		<span class="s2">except </span><span class="s1">StopIteration:</span>
+			<span class="s2">pass</span>
+
+		<span class="s2">return </span><span class="s1">(compressedFlags</span><span class="s2">, </span><span class="s1">compressedXs</span><span class="s2">, </span><span class="s1">compressedYs)</span>
+
+	<span class="s2">def </span><span class="s1">recalcBounds(self</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s0">&quot;&quot;&quot;Recalculates the bounds of the glyph. 
+ 
+        Each glyph object stores its bounding box in the 
+        ``xMin``/``yMin``/``xMax``/``yMax`` attributes. These bounds must be 
+        recomputed when the ``coordinates`` change. The ``table__g_l_y_f`` bounds 
+        must be provided to resolve component bounds. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">coords</span><span class="s2">, </span><span class="s1">endPts</span><span class="s2">, </span><span class="s1">flags = self.getCoordinates(glyfTable)</span>
+		<span class="s1">self.xMin</span><span class="s2">, </span><span class="s1">self.yMin</span><span class="s2">, </span><span class="s1">self.xMax</span><span class="s2">, </span><span class="s1">self.yMax = calcIntBounds(coords)</span>
+
+	<span class="s2">def </span><span class="s1">isComposite(self):</span>
+		<span class="s0">&quot;&quot;&quot;Test whether a glyph has components&quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;data&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">self.data:</span>
+			<span class="s2">return </span><span class="s1">struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">self.data[:</span><span class="s5">2</span><span class="s1">])[</span><span class="s5">0</span><span class="s1">] == -</span><span class="s5">1</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">self.numberOfContours == -</span><span class="s5">1</span>
+
+	<span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">componentIndex):</span>
+		<span class="s2">if not </span><span class="s1">self.isComposite():</span>
+			<span class="s2">raise </span><span class="s1">ttLib.TTLibError(</span><span class="s4">&quot;can't use glyph as sequence&quot;</span><span class="s1">)</span>
+		<span class="s2">return </span><span class="s1">self.components[componentIndex]</span>
+
+	<span class="s2">def </span><span class="s1">getCoordinates(self</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s0">&quot;&quot;&quot;Return the coordinates, end points and flags 
+ 
+        This method returns three values: A :py:class:`GlyphCoordinates` object, 
+        a list of the indexes of the final points of each contour (allowing you 
+        to split up the coordinates list into contours) and a list of flags. 
+ 
+        On simple glyphs, this method returns information from the glyph's own 
+        contours; on composite glyphs, it &quot;flattens&quot; all components recursively 
+        to return a list of coordinates representing all the components involved 
+        in the glyph. 
+ 
+        To interpret the flags for each point, see the &quot;Simple Glyph Flags&quot; 
+        section of the `glyf table specification &lt;https://docs.microsoft.com/en-us/typography/opentype/spec/glyf#simple-glyph-description&gt;`. 
+        &quot;&quot;&quot;</span>
+
+		<span class="s2">if </span><span class="s1">self.numberOfContours &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">self.coordinates</span><span class="s2">, </span><span class="s1">self.endPtsOfContours</span><span class="s2">, </span><span class="s1">self.flags</span>
+		<span class="s2">elif </span><span class="s1">self.isComposite():</span>
+			<span class="s3"># it's a composite</span>
+			<span class="s1">allCoords = GlyphCoordinates()</span>
+			<span class="s1">allFlags = bytearray()</span>
+			<span class="s1">allEndPts = []</span>
+			<span class="s2">for </span><span class="s1">compo </span><span class="s2">in </span><span class="s1">self.components:</span>
+				<span class="s1">g = glyfTable[compo.glyphName]</span>
+				<span class="s2">try</span><span class="s1">:</span>
+					<span class="s1">coordinates</span><span class="s2">, </span><span class="s1">endPts</span><span class="s2">, </span><span class="s1">flags = g.getCoordinates(glyfTable)</span>
+				<span class="s2">except </span><span class="s1">RecursionError:</span>
+					<span class="s2">raise </span><span class="s1">ttLib.TTLibError(</span><span class="s4">&quot;glyph '%s' contains a recursive component reference&quot; </span><span class="s1">% compo.glyphName)</span>
+				<span class="s1">coordinates = GlyphCoordinates(coordinates)</span>
+				<span class="s2">if </span><span class="s1">hasattr(compo</span><span class="s2">, </span><span class="s4">&quot;firstPt&quot;</span><span class="s1">):</span>
+					<span class="s3"># component uses two reference points: we apply the transform _before_</span>
+					<span class="s3"># computing the offset between the points</span>
+					<span class="s2">if </span><span class="s1">hasattr(compo</span><span class="s2">, </span><span class="s4">&quot;transform&quot;</span><span class="s1">):</span>
+						<span class="s1">coordinates.transform(compo.transform)</span>
+					<span class="s1">x1</span><span class="s2">,</span><span class="s1">y1 = allCoords[compo.firstPt]</span>
+					<span class="s1">x2</span><span class="s2">,</span><span class="s1">y2 = coordinates[compo.secondPt]</span>
+					<span class="s1">move = x1-x2</span><span class="s2">, </span><span class="s1">y1-y2</span>
+					<span class="s1">coordinates.translate(move)</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s3"># component uses XY offsets</span>
+					<span class="s1">move = compo.x</span><span class="s2">, </span><span class="s1">compo.y</span>
+					<span class="s2">if not </span><span class="s1">hasattr(compo</span><span class="s2">, </span><span class="s4">&quot;transform&quot;</span><span class="s1">):</span>
+						<span class="s1">coordinates.translate(move)</span>
+					<span class="s2">else</span><span class="s1">:</span>
+						<span class="s1">apple_way = compo.flags &amp; SCALED_COMPONENT_OFFSET</span>
+						<span class="s1">ms_way = compo.flags &amp; UNSCALED_COMPONENT_OFFSET</span>
+						<span class="s2">assert not </span><span class="s1">(apple_way </span><span class="s2">and </span><span class="s1">ms_way)</span>
+						<span class="s2">if not </span><span class="s1">(apple_way </span><span class="s2">or </span><span class="s1">ms_way):</span>
+							<span class="s1">scale_component_offset = SCALE_COMPONENT_OFFSET_DEFAULT  </span><span class="s3"># see top of this file</span>
+						<span class="s2">else</span><span class="s1">:</span>
+							<span class="s1">scale_component_offset = apple_way</span>
+						<span class="s2">if </span><span class="s1">scale_component_offset:</span>
+							<span class="s3"># the Apple way: first move, then scale (ie. scale the component offset)</span>
+							<span class="s1">coordinates.translate(move)</span>
+							<span class="s1">coordinates.transform(compo.transform)</span>
+						<span class="s2">else</span><span class="s1">:</span>
+							<span class="s3"># the MS way: first scale, then move</span>
+							<span class="s1">coordinates.transform(compo.transform)</span>
+							<span class="s1">coordinates.translate(move)</span>
+				<span class="s1">offset = len(allCoords)</span>
+				<span class="s1">allEndPts.extend(e + offset </span><span class="s2">for </span><span class="s1">e </span><span class="s2">in </span><span class="s1">endPts)</span>
+				<span class="s1">allCoords.extend(coordinates)</span>
+				<span class="s1">allFlags.extend(flags)</span>
+			<span class="s2">return </span><span class="s1">allCoords</span><span class="s2">, </span><span class="s1">allEndPts</span><span class="s2">, </span><span class="s1">allFlags</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">GlyphCoordinates()</span><span class="s2">, </span><span class="s1">[]</span><span class="s2">, </span><span class="s1">bytearray()</span>
+
+	<span class="s2">def </span><span class="s1">getComponentNames(self</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s0">&quot;&quot;&quot;Returns a list of names of component glyphs used in this glyph 
+ 
+        This method can be used on simple glyphs (in which case it returns an 
+        empty list) or composite glyphs. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;data&quot;</span><span class="s1">):</span>
+			<span class="s2">if </span><span class="s1">self.isComposite():</span>
+				<span class="s2">return </span><span class="s1">[c.glyphName </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">self.components]</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">return </span><span class="s1">[]</span>
+
+		<span class="s3"># Extract components without expanding glyph</span>
+
+		<span class="s2">if not </span><span class="s1">self.data </span><span class="s2">or </span><span class="s1">struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">self.data[:</span><span class="s5">2</span><span class="s1">])[</span><span class="s5">0</span><span class="s1">] &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">[]  </span><span class="s3"># Not composite</span>
+
+		<span class="s1">data = self.data</span>
+		<span class="s1">i = </span><span class="s5">10</span>
+		<span class="s1">components = []</span>
+		<span class="s1">more = </span><span class="s5">1</span>
+		<span class="s2">while </span><span class="s1">more:</span>
+			<span class="s1">flags</span><span class="s2">, </span><span class="s1">glyphID = struct.unpack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s2">, </span><span class="s1">data[i:i+</span><span class="s5">4</span><span class="s1">])</span>
+			<span class="s1">i += </span><span class="s5">4</span>
+			<span class="s1">flags = int(flags)</span>
+			<span class="s1">components.append(glyfTable.getGlyphName(int(glyphID)))</span>
+
+			<span class="s2">if </span><span class="s1">flags &amp; ARG_1_AND_2_ARE_WORDS: i += </span><span class="s5">4</span>
+			<span class="s2">else</span><span class="s1">: i += </span><span class="s5">2</span>
+			<span class="s2">if </span><span class="s1">flags &amp; WE_HAVE_A_SCALE: i += </span><span class="s5">2</span>
+			<span class="s2">elif </span><span class="s1">flags &amp; WE_HAVE_AN_X_AND_Y_SCALE: i += </span><span class="s5">4</span>
+			<span class="s2">elif </span><span class="s1">flags &amp; WE_HAVE_A_TWO_BY_TWO: i += </span><span class="s5">8</span>
+			<span class="s1">more = flags &amp; MORE_COMPONENTS</span>
+
+		<span class="s2">return </span><span class="s1">components</span>
+
+	<span class="s2">def </span><span class="s1">trim(self</span><span class="s2">, </span><span class="s1">remove_hinting=</span><span class="s2">False</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot; Remove padding and, if requested, hinting, from a glyph. 
+            This works on both expanded and compacted glyphs, without 
+            expanding it.&quot;&quot;&quot;</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;data&quot;</span><span class="s1">):</span>
+			<span class="s2">if </span><span class="s1">remove_hinting:</span>
+				<span class="s2">if </span><span class="s1">self.isComposite():</span>
+					<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;program&quot;</span><span class="s1">):</span>
+						<span class="s2">del </span><span class="s1">self.program</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">self.program = ttProgram.Program()</span>
+					<span class="s1">self.program.fromBytecode([])</span>
+			<span class="s3"># No padding to trim.</span>
+			<span class="s2">return</span>
+		<span class="s2">if not </span><span class="s1">self.data:</span>
+			<span class="s2">return</span>
+		<span class="s1">numContours = struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">self.data[:</span><span class="s5">2</span><span class="s1">])[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">data = bytearray(self.data)</span>
+		<span class="s1">i = </span><span class="s5">10</span>
+		<span class="s2">if </span><span class="s1">numContours &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">i += </span><span class="s5">2 </span><span class="s1">* numContours </span><span class="s3"># endPtsOfContours</span>
+			<span class="s1">nCoordinates = ((data[i-</span><span class="s5">2</span><span class="s1">] &lt;&lt; </span><span class="s5">8</span><span class="s1">) | data[i-</span><span class="s5">1</span><span class="s1">]) + </span><span class="s5">1</span>
+			<span class="s1">instructionLen = (data[i] &lt;&lt; </span><span class="s5">8</span><span class="s1">) | data[i+</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s2">if </span><span class="s1">remove_hinting:</span>
+				<span class="s3"># Zero instruction length</span>
+				<span class="s1">data[i] = data [i+</span><span class="s5">1</span><span class="s1">] = </span><span class="s5">0</span>
+				<span class="s1">i += </span><span class="s5">2</span>
+				<span class="s2">if </span><span class="s1">instructionLen:</span>
+					<span class="s3"># Splice it out</span>
+					<span class="s1">data = data[:i] + data[i+instructionLen:]</span>
+				<span class="s1">instructionLen = </span><span class="s5">0</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">i += </span><span class="s5">2 </span><span class="s1">+ instructionLen</span>
+
+			<span class="s1">coordBytes = </span><span class="s5">0</span>
+			<span class="s1">j = </span><span class="s5">0</span>
+			<span class="s2">while True</span><span class="s1">:</span>
+				<span class="s1">flag = data[i]</span>
+				<span class="s1">i = i + </span><span class="s5">1</span>
+				<span class="s1">repeat = </span><span class="s5">1</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagRepeat:</span>
+					<span class="s1">repeat = data[i] + </span><span class="s5">1</span>
+					<span class="s1">i = i + </span><span class="s5">1</span>
+				<span class="s1">xBytes = yBytes = </span><span class="s5">0</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagXShort:</span>
+					<span class="s1">xBytes = </span><span class="s5">1</span>
+				<span class="s2">elif not </span><span class="s1">(flag &amp; flagXsame):</span>
+					<span class="s1">xBytes = </span><span class="s5">2</span>
+				<span class="s2">if </span><span class="s1">flag &amp; flagYShort:</span>
+					<span class="s1">yBytes = </span><span class="s5">1</span>
+				<span class="s2">elif not </span><span class="s1">(flag &amp; flagYsame):</span>
+					<span class="s1">yBytes = </span><span class="s5">2</span>
+				<span class="s1">coordBytes += (xBytes + yBytes) * repeat</span>
+				<span class="s1">j += repeat</span>
+				<span class="s2">if </span><span class="s1">j &gt;= nCoordinates:</span>
+					<span class="s2">break</span>
+			<span class="s2">assert </span><span class="s1">j == nCoordinates</span><span class="s2">, </span><span class="s4">&quot;bad glyph flags&quot;</span>
+			<span class="s1">i += coordBytes</span>
+			<span class="s3"># Remove padding</span>
+			<span class="s1">data = data[:i]</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">more = </span><span class="s5">1</span>
+			<span class="s1">we_have_instructions = </span><span class="s2">False</span>
+			<span class="s2">while </span><span class="s1">more:</span>
+				<span class="s1">flags =(data[i] &lt;&lt; </span><span class="s5">8</span><span class="s1">) | data[i+</span><span class="s5">1</span><span class="s1">]</span>
+				<span class="s2">if </span><span class="s1">remove_hinting:</span>
+					<span class="s1">flags &amp;= ~WE_HAVE_INSTRUCTIONS</span>
+				<span class="s2">if </span><span class="s1">flags &amp; WE_HAVE_INSTRUCTIONS:</span>
+					<span class="s1">we_have_instructions = </span><span class="s2">True</span>
+				<span class="s1">data[i+</span><span class="s5">0</span><span class="s1">] = flags &gt;&gt; </span><span class="s5">8</span>
+				<span class="s1">data[i+</span><span class="s5">1</span><span class="s1">] = flags &amp; </span><span class="s5">0xFF</span>
+				<span class="s1">i += </span><span class="s5">4</span>
+				<span class="s1">flags = int(flags)</span>
+
+				<span class="s2">if </span><span class="s1">flags &amp; ARG_1_AND_2_ARE_WORDS: i += </span><span class="s5">4</span>
+				<span class="s2">else</span><span class="s1">: i += </span><span class="s5">2</span>
+				<span class="s2">if </span><span class="s1">flags &amp; WE_HAVE_A_SCALE: i += </span><span class="s5">2</span>
+				<span class="s2">elif </span><span class="s1">flags &amp; WE_HAVE_AN_X_AND_Y_SCALE: i += </span><span class="s5">4</span>
+				<span class="s2">elif </span><span class="s1">flags &amp; WE_HAVE_A_TWO_BY_TWO: i += </span><span class="s5">8</span>
+				<span class="s1">more = flags &amp; MORE_COMPONENTS</span>
+			<span class="s2">if </span><span class="s1">we_have_instructions:</span>
+				<span class="s1">instructionLen = (data[i] &lt;&lt; </span><span class="s5">8</span><span class="s1">) | data[i+</span><span class="s5">1</span><span class="s1">]</span>
+				<span class="s1">i += </span><span class="s5">2 </span><span class="s1">+ instructionLen</span>
+			<span class="s3"># Remove padding</span>
+			<span class="s1">data = data[:i]</span>
+
+		<span class="s1">self.data = data</span>
+
+	<span class="s2">def </span><span class="s1">removeHinting(self):</span>
+		<span class="s0">&quot;&quot;&quot;Removes TrueType hinting instructions from the glyph.&quot;&quot;&quot;</span>
+		<span class="s1">self.trim (remove_hinting=</span><span class="s2">True</span><span class="s1">)</span>
+
+	<span class="s2">def </span><span class="s1">draw(self</span><span class="s2">, </span><span class="s1">pen</span><span class="s2">, </span><span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">offset=</span><span class="s5">0</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Draws the glyph using the supplied pen object. 
+ 
+        Arguments: 
+            pen: An object conforming to the pen protocol. 
+            glyfTable: A :py:class:`table__g_l_y_f` object, to resolve components. 
+            offset (int): A horizontal offset. If provided, all coordinates are 
+                translated by this offset. 
+        &quot;&quot;&quot;</span>
+
+		<span class="s2">if </span><span class="s1">self.isComposite():</span>
+			<span class="s2">for </span><span class="s1">component </span><span class="s2">in </span><span class="s1">self.components:</span>
+				<span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transform = component.getComponentInfo()</span>
+				<span class="s1">pen.addComponent(glyphName</span><span class="s2">, </span><span class="s1">transform)</span>
+			<span class="s2">return</span>
+
+		<span class="s1">coordinates</span><span class="s2">, </span><span class="s1">endPts</span><span class="s2">, </span><span class="s1">flags = self.getCoordinates(glyfTable)</span>
+		<span class="s2">if </span><span class="s1">offset:</span>
+			<span class="s1">coordinates = coordinates.copy()</span>
+			<span class="s1">coordinates.translate((offset</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+		<span class="s1">start = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">end </span><span class="s2">in </span><span class="s1">endPts:</span>
+			<span class="s1">end = end + </span><span class="s5">1</span>
+			<span class="s1">contour = coordinates[start:end]</span>
+			<span class="s1">cFlags = [flagOnCurve &amp; f </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">flags[start:end]]</span>
+			<span class="s1">start = end</span>
+			<span class="s2">if </span><span class="s5">1 </span><span class="s2">not in </span><span class="s1">cFlags:</span>
+				<span class="s3"># There is not a single on-curve point on the curve,</span>
+				<span class="s3"># use pen.qCurveTo's special case by specifying None</span>
+				<span class="s3"># as the on-curve point.</span>
+				<span class="s1">contour.append(</span><span class="s2">None</span><span class="s1">)</span>
+				<span class="s1">pen.qCurveTo(*contour)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s3"># Shuffle the points so that contour the is guaranteed</span>
+				<span class="s3"># to *end* in an on-curve point, which we'll use for</span>
+				<span class="s3"># the moveTo.</span>
+				<span class="s1">firstOnCurve = cFlags.index(</span><span class="s5">1</span><span class="s1">) + </span><span class="s5">1</span>
+				<span class="s1">contour = contour[firstOnCurve:] + contour[:firstOnCurve]</span>
+				<span class="s1">cFlags = cFlags[firstOnCurve:] + cFlags[:firstOnCurve]</span>
+				<span class="s1">pen.moveTo(contour[-</span><span class="s5">1</span><span class="s1">])</span>
+				<span class="s2">while </span><span class="s1">contour:</span>
+					<span class="s1">nextOnCurve = cFlags.index(</span><span class="s5">1</span><span class="s1">) + </span><span class="s5">1</span>
+					<span class="s2">if </span><span class="s1">nextOnCurve == </span><span class="s5">1</span><span class="s1">:</span>
+						<span class="s3"># Skip a final lineTo(), as it is implied by</span>
+						<span class="s3"># pen.closePath()</span>
+						<span class="s2">if </span><span class="s1">len(contour) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+							<span class="s1">pen.lineTo(contour[</span><span class="s5">0</span><span class="s1">])</span>
+					<span class="s2">else</span><span class="s1">:</span>
+						<span class="s1">pen.qCurveTo(*contour[:nextOnCurve])</span>
+					<span class="s1">contour = contour[nextOnCurve:]</span>
+					<span class="s1">cFlags = cFlags[nextOnCurve:]</span>
+			<span class="s1">pen.closePath()</span>
+
+	<span class="s2">def </span><span class="s1">drawPoints(self</span><span class="s2">, </span><span class="s1">pen</span><span class="s2">, </span><span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">offset=</span><span class="s5">0</span><span class="s1">):</span>
+		<span class="s0">&quot;&quot;&quot;Draw the glyph using the supplied pointPen. As opposed to Glyph.draw(), 
+        this will not change the point indices. 
+        &quot;&quot;&quot;</span>
+
+		<span class="s2">if </span><span class="s1">self.isComposite():</span>
+			<span class="s2">for </span><span class="s1">component </span><span class="s2">in </span><span class="s1">self.components:</span>
+				<span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transform = component.getComponentInfo()</span>
+				<span class="s1">pen.addComponent(glyphName</span><span class="s2">, </span><span class="s1">transform)</span>
+			<span class="s2">return</span>
+
+		<span class="s1">coordinates</span><span class="s2">, </span><span class="s1">endPts</span><span class="s2">, </span><span class="s1">flags = self.getCoordinates(glyfTable)</span>
+		<span class="s2">if </span><span class="s1">offset:</span>
+			<span class="s1">coordinates = coordinates.copy()</span>
+			<span class="s1">coordinates.translate((offset</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+		<span class="s1">start = </span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">end </span><span class="s2">in </span><span class="s1">endPts:</span>
+			<span class="s1">end = end + </span><span class="s5">1</span>
+			<span class="s1">contour = coordinates[start:end]</span>
+			<span class="s1">cFlags = flags[start:end]</span>
+			<span class="s1">start = end</span>
+			<span class="s1">pen.beginPath()</span>
+			<span class="s3"># Start with the appropriate segment type based on the final segment</span>
+			<span class="s1">segmentType = </span><span class="s4">&quot;line&quot; </span><span class="s2">if </span><span class="s1">cFlags[-</span><span class="s5">1</span><span class="s1">] == </span><span class="s5">1 </span><span class="s2">else </span><span class="s4">&quot;qcurve&quot;</span>
+			<span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">pt </span><span class="s2">in </span><span class="s1">enumerate(contour):</span>
+				<span class="s2">if </span><span class="s1">cFlags[i] &amp; flagOnCurve == </span><span class="s5">1</span><span class="s1">:</span>
+					<span class="s1">pen.addPoint(pt</span><span class="s2">, </span><span class="s1">segmentType=segmentType)</span>
+					<span class="s1">segmentType = </span><span class="s4">&quot;line&quot;</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">pen.addPoint(pt)</span>
+					<span class="s1">segmentType = </span><span class="s4">&quot;qcurve&quot;</span>
+			<span class="s1">pen.endPath()</span>
+
+	<span class="s2">def </span><span class="s1">__eq__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s2">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s2">return </span><span class="s1">NotImplemented</span>
+		<span class="s2">return </span><span class="s1">self.__dict__ == other.__dict__</span>
+
+	<span class="s2">def </span><span class="s1">__ne__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s2">return </span><span class="s1">result </span><span class="s2">if </span><span class="s1">result </span><span class="s2">is </span><span class="s1">NotImplemented </span><span class="s2">else not </span><span class="s1">result</span>
+
+<span class="s2">class </span><span class="s1">GlyphComponent(object):</span>
+	<span class="s0">&quot;&quot;&quot;Represents a component within a composite glyph. 
+ 
+    The component is represented internally with four attributes: ``glyphName``, 
+    ``x``, ``y`` and ``transform``. If there is no &quot;two-by-two&quot; matrix (i.e 
+    no scaling, reflection, or rotation; only translation), the ``transform`` 
+    attribute is not present. 
+    &quot;&quot;&quot;</span>
+	<span class="s3"># The above documentation is not *completely* true, but is *true enough* because</span>
+	<span class="s3"># the rare firstPt/lastPt attributes are not totally supported and nobody seems to</span>
+	<span class="s3"># mind - see below.</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">getComponentInfo(self):</span>
+		<span class="s0">&quot;&quot;&quot;Return information about the component 
+ 
+        This method returns a tuple of two values: the glyph name of the component's 
+        base glyph, and a transformation matrix. As opposed to accessing the attributes 
+        directly, ``getComponentInfo`` always returns a six-element tuple of the 
+        component's transformation matrix, even when the two-by-two ``.transform`` 
+        matrix is not present. 
+        &quot;&quot;&quot;</span>
+		<span class="s3"># XXX Ignoring self.firstPt &amp; self.lastpt for now: I need to implement</span>
+		<span class="s3"># something equivalent in fontTools.objects.glyph (I'd rather not</span>
+		<span class="s3"># convert it to an absolute offset, since it is valuable information).</span>
+		<span class="s3"># This method will now raise &quot;AttributeError: x&quot; on glyphs that use</span>
+		<span class="s3"># this TT feature.</span>
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;transform&quot;</span><span class="s1">):</span>
+			<span class="s1">[[xx</span><span class="s2">, </span><span class="s1">xy]</span><span class="s2">, </span><span class="s1">[yx</span><span class="s2">, </span><span class="s1">yy]] = self.transform</span>
+			<span class="s1">trans = (xx</span><span class="s2">, </span><span class="s1">xy</span><span class="s2">, </span><span class="s1">yx</span><span class="s2">, </span><span class="s1">yy</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">trans = (</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y)</span>
+		<span class="s2">return </span><span class="s1">self.glyphName</span><span class="s2">, </span><span class="s1">trans</span>
+
+	<span class="s2">def </span><span class="s1">decompile(self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s1">flags</span><span class="s2">, </span><span class="s1">glyphID = struct.unpack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">4</span><span class="s1">])</span>
+		<span class="s1">self.flags = int(flags)</span>
+		<span class="s1">glyphID = int(glyphID)</span>
+		<span class="s1">self.glyphName = glyfTable.getGlyphName(int(glyphID))</span>
+		<span class="s1">data = data[</span><span class="s5">4</span><span class="s1">:]</span>
+
+		<span class="s2">if </span><span class="s1">self.flags &amp; ARG_1_AND_2_ARE_WORDS:</span>
+			<span class="s2">if </span><span class="s1">self.flags &amp; ARGS_ARE_XY_VALUES:</span>
+				<span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y = struct.unpack(</span><span class="s4">&quot;&gt;hh&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">4</span><span class="s1">])</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">x</span><span class="s2">, </span><span class="s1">y = struct.unpack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">4</span><span class="s1">])</span>
+				<span class="s1">self.firstPt</span><span class="s2">, </span><span class="s1">self.secondPt = int(x)</span><span class="s2">, </span><span class="s1">int(y)</span>
+			<span class="s1">data = data[</span><span class="s5">4</span><span class="s1">:]</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">self.flags &amp; ARGS_ARE_XY_VALUES:</span>
+				<span class="s1">self.x</span><span class="s2">, </span><span class="s1">self.y = struct.unpack(</span><span class="s4">&quot;&gt;bb&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">2</span><span class="s1">])</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">x</span><span class="s2">, </span><span class="s1">y = struct.unpack(</span><span class="s4">&quot;&gt;BB&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">2</span><span class="s1">])</span>
+				<span class="s1">self.firstPt</span><span class="s2">, </span><span class="s1">self.secondPt = int(x)</span><span class="s2">, </span><span class="s1">int(y)</span>
+			<span class="s1">data = data[</span><span class="s5">2</span><span class="s1">:]</span>
+
+		<span class="s2">if </span><span class="s1">self.flags &amp; WE_HAVE_A_SCALE:</span>
+			<span class="s1">scale</span><span class="s2">, </span><span class="s1">= struct.unpack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">2</span><span class="s1">])</span>
+			<span class="s1">self.transform = [[fi2fl(scale</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">fi2fl(scale</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)]]  </span><span class="s3"># fixed 2.14</span>
+			<span class="s1">data = data[</span><span class="s5">2</span><span class="s1">:]</span>
+		<span class="s2">elif </span><span class="s1">self.flags &amp; WE_HAVE_AN_X_AND_Y_SCALE:</span>
+			<span class="s1">xscale</span><span class="s2">, </span><span class="s1">yscale = struct.unpack(</span><span class="s4">&quot;&gt;hh&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">4</span><span class="s1">])</span>
+			<span class="s1">self.transform = [[fi2fl(xscale</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">fi2fl(yscale</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)]]  </span><span class="s3"># fixed 2.14</span>
+			<span class="s1">data = data[</span><span class="s5">4</span><span class="s1">:]</span>
+		<span class="s2">elif </span><span class="s1">self.flags &amp; WE_HAVE_A_TWO_BY_TWO:</span>
+			<span class="s1">(xscale</span><span class="s2">, </span><span class="s1">scale01</span><span class="s2">,</span>
+					<span class="s1">scale10</span><span class="s2">, </span><span class="s1">yscale) = struct.unpack(</span><span class="s4">&quot;&gt;hhhh&quot;</span><span class="s2">, </span><span class="s1">data[:</span><span class="s5">8</span><span class="s1">])</span>
+			<span class="s1">self.transform = [[fi2fl(xscale</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)</span><span class="s2">, </span><span class="s1">fi2fl(scale01</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)]</span><span class="s2">,</span>
+							<span class="s1">[fi2fl(scale10</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)</span><span class="s2">, </span><span class="s1">fi2fl(yscale</span><span class="s2">,</span><span class="s5">14</span><span class="s1">)]] </span><span class="s3"># fixed 2.14</span>
+			<span class="s1">data = data[</span><span class="s5">8</span><span class="s1">:]</span>
+		<span class="s1">more = self.flags &amp; MORE_COMPONENTS</span>
+		<span class="s1">haveInstructions = self.flags &amp; WE_HAVE_INSTRUCTIONS</span>
+		<span class="s1">self.flags = self.flags &amp; (ROUND_XY_TO_GRID | USE_MY_METRICS |</span>
+				<span class="s1">SCALED_COMPONENT_OFFSET | UNSCALED_COMPONENT_OFFSET |</span>
+				<span class="s1">NON_OVERLAPPING | OVERLAP_COMPOUND)</span>
+		<span class="s2">return </span><span class="s1">more</span><span class="s2">, </span><span class="s1">haveInstructions</span><span class="s2">, </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">compile(self</span><span class="s2">, </span><span class="s1">more</span><span class="s2">, </span><span class="s1">haveInstructions</span><span class="s2">, </span><span class="s1">glyfTable):</span>
+		<span class="s1">data = </span><span class="s6">b&quot;&quot;</span>
+
+		<span class="s3"># reset all flags we will calculate ourselves</span>
+		<span class="s1">flags = self.flags &amp; (ROUND_XY_TO_GRID | USE_MY_METRICS |</span>
+				<span class="s1">SCALED_COMPONENT_OFFSET | UNSCALED_COMPONENT_OFFSET |</span>
+				<span class="s1">NON_OVERLAPPING | OVERLAP_COMPOUND)</span>
+		<span class="s2">if </span><span class="s1">more:</span>
+			<span class="s1">flags = flags | MORE_COMPONENTS</span>
+		<span class="s2">if </span><span class="s1">haveInstructions:</span>
+			<span class="s1">flags = flags | WE_HAVE_INSTRUCTIONS</span>
+
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;firstPt&quot;</span><span class="s1">):</span>
+			<span class="s2">if </span><span class="s1">(</span><span class="s5">0 </span><span class="s1">&lt;= self.firstPt &lt;= </span><span class="s5">255</span><span class="s1">) </span><span class="s2">and </span><span class="s1">(</span><span class="s5">0 </span><span class="s1">&lt;= self.secondPt &lt;= </span><span class="s5">255</span><span class="s1">):</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;BB&quot;</span><span class="s2">, </span><span class="s1">self.firstPt</span><span class="s2">, </span><span class="s1">self.secondPt)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s2">, </span><span class="s1">self.firstPt</span><span class="s2">, </span><span class="s1">self.secondPt)</span>
+				<span class="s1">flags = flags | ARG_1_AND_2_ARE_WORDS</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">x = otRound(self.x)</span>
+			<span class="s1">y = otRound(self.y)</span>
+			<span class="s1">flags = flags | ARGS_ARE_XY_VALUES</span>
+			<span class="s2">if </span><span class="s1">(-</span><span class="s5">128 </span><span class="s1">&lt;= x &lt;= </span><span class="s5">127</span><span class="s1">) </span><span class="s2">and </span><span class="s1">(-</span><span class="s5">128 </span><span class="s1">&lt;= y &lt;= </span><span class="s5">127</span><span class="s1">):</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;bb&quot;</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;hh&quot;</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y)</span>
+				<span class="s1">flags = flags | ARG_1_AND_2_ARE_WORDS</span>
+
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;transform&quot;</span><span class="s1">):</span>
+			<span class="s1">transform = [[fl2fi(x</span><span class="s2">,</span><span class="s5">14</span><span class="s1">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">row] </span><span class="s2">for </span><span class="s1">row </span><span class="s2">in </span><span class="s1">self.transform]</span>
+			<span class="s2">if </span><span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">1</span><span class="s1">] </span><span class="s2">or </span><span class="s1">transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]:</span>
+				<span class="s1">flags = flags | WE_HAVE_A_TWO_BY_TWO</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;hhhh&quot;</span><span class="s2">,</span>
+						<span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span><span class="s2">,</span>
+						<span class="s1">transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">])</span>
+			<span class="s2">elif </span><span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] != transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]:</span>
+				<span class="s1">flags = flags | WE_HAVE_AN_X_AND_Y_SCALE</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;hh&quot;</span><span class="s2">,</span>
+						<span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">])</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">flags = flags | WE_HAVE_A_SCALE</span>
+				<span class="s1">data = data + struct.pack(</span><span class="s4">&quot;&gt;h&quot;</span><span class="s2">,</span>
+						<span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">])</span>
+
+		<span class="s1">glyphID = glyfTable.getGlyphID(self.glyphName)</span>
+		<span class="s2">return </span><span class="s1">struct.pack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">, </span><span class="s1">glyphID) + data</span>
+
+	<span class="s2">def </span><span class="s1">toXML(self</span><span class="s2">, </span><span class="s1">writer</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s1">attrs = [(</span><span class="s4">&quot;glyphName&quot;</span><span class="s2">, </span><span class="s1">self.glyphName)]</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;firstPt&quot;</span><span class="s1">):</span>
+			<span class="s1">attrs = attrs + [(</span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s1">self.x)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s1">self.y)]</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">attrs = attrs + [(</span><span class="s4">&quot;firstPt&quot;</span><span class="s2">, </span><span class="s1">self.firstPt)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;secondPt&quot;</span><span class="s2">, </span><span class="s1">self.secondPt)]</span>
+
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;transform&quot;</span><span class="s1">):</span>
+			<span class="s1">transform = self.transform</span>
+			<span class="s2">if </span><span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">1</span><span class="s1">] </span><span class="s2">or </span><span class="s1">transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]:</span>
+				<span class="s1">attrs = attrs + [</span>
+					<span class="s1">(</span><span class="s4">&quot;scalex&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))</span><span class="s2">,</span>
+					<span class="s1">(</span><span class="s4">&quot;scale01&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))</span><span class="s2">,</span>
+					<span class="s1">(</span><span class="s4">&quot;scale10&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))</span><span class="s2">,</span>
+					<span class="s1">(</span><span class="s4">&quot;scaley&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))</span><span class="s2">,</span>
+				<span class="s1">]</span>
+			<span class="s2">elif </span><span class="s1">transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] != transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]:</span>
+				<span class="s1">attrs = attrs + [</span>
+					<span class="s1">(</span><span class="s4">&quot;scalex&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))</span><span class="s2">,</span>
+					<span class="s1">(</span><span class="s4">&quot;scaley&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))</span><span class="s2">,</span>
+				<span class="s1">]</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">attrs = attrs + [(</span><span class="s4">&quot;scale&quot;</span><span class="s2">, </span><span class="s1">fl2str(transform[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">))]</span>
+		<span class="s1">attrs = attrs + [(</span><span class="s4">&quot;flags&quot;</span><span class="s2">, </span><span class="s1">hex(self.flags))]</span>
+		<span class="s1">writer.simpletag(</span><span class="s4">&quot;component&quot;</span><span class="s2">, </span><span class="s1">attrs)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s2">def </span><span class="s1">fromXML(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.glyphName = attrs[</span><span class="s4">&quot;glyphName&quot;</span><span class="s1">]</span>
+		<span class="s2">if </span><span class="s4">&quot;firstPt&quot; </span><span class="s2">in </span><span class="s1">attrs:</span>
+			<span class="s1">self.firstPt = safeEval(attrs[</span><span class="s4">&quot;firstPt&quot;</span><span class="s1">])</span>
+			<span class="s1">self.secondPt = safeEval(attrs[</span><span class="s4">&quot;secondPt&quot;</span><span class="s1">])</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">self.x = safeEval(attrs[</span><span class="s4">&quot;x&quot;</span><span class="s1">])</span>
+			<span class="s1">self.y = safeEval(attrs[</span><span class="s4">&quot;y&quot;</span><span class="s1">])</span>
+		<span class="s2">if </span><span class="s4">&quot;scale01&quot; </span><span class="s2">in </span><span class="s1">attrs:</span>
+			<span class="s1">scalex = str2fl(attrs[</span><span class="s4">&quot;scalex&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">scale01 = str2fl(attrs[</span><span class="s4">&quot;scale01&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">scale10 = str2fl(attrs[</span><span class="s4">&quot;scale10&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">scaley = str2fl(attrs[</span><span class="s4">&quot;scaley&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">self.transform = [[scalex</span><span class="s2">, </span><span class="s1">scale01]</span><span class="s2">, </span><span class="s1">[scale10</span><span class="s2">, </span><span class="s1">scaley]]</span>
+		<span class="s2">elif </span><span class="s4">&quot;scalex&quot; </span><span class="s2">in </span><span class="s1">attrs:</span>
+			<span class="s1">scalex = str2fl(attrs[</span><span class="s4">&quot;scalex&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">scaley = str2fl(attrs[</span><span class="s4">&quot;scaley&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">self.transform = [[scalex</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">scaley]]</span>
+		<span class="s2">elif </span><span class="s4">&quot;scale&quot; </span><span class="s2">in </span><span class="s1">attrs:</span>
+			<span class="s1">scale = str2fl(attrs[</span><span class="s4">&quot;scale&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s5">14</span><span class="s1">)</span>
+			<span class="s1">self.transform = [[scale</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">scale]]</span>
+		<span class="s1">self.flags = safeEval(attrs[</span><span class="s4">&quot;flags&quot;</span><span class="s1">])</span>
+
+	<span class="s2">def </span><span class="s1">__eq__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s2">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s2">return </span><span class="s1">NotImplemented</span>
+		<span class="s2">return </span><span class="s1">self.__dict__ == other.__dict__</span>
+
+	<span class="s2">def </span><span class="s1">__ne__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s2">return </span><span class="s1">result </span><span class="s2">if </span><span class="s1">result </span><span class="s2">is </span><span class="s1">NotImplemented </span><span class="s2">else not </span><span class="s1">result</span>
+
+<span class="s2">class </span><span class="s1">GlyphCoordinates(object):</span>
+	<span class="s0">&quot;&quot;&quot;A list of glyph coordinates. 
+ 
+    Unlike an ordinary list, this is a numpy-like matrix object which supports 
+    matrix addition, scalar multiplication and other operations described below. 
+    &quot;&quot;&quot;</span>
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">iterable=[]):</span>
+		<span class="s1">self._a = array.array(</span><span class="s4">'d'</span><span class="s1">)</span>
+		<span class="s1">self.extend(iterable)</span>
+
+	<span class="s1">@property</span>
+	<span class="s2">def </span><span class="s1">array(self):</span>
+		<span class="s0">&quot;&quot;&quot;Returns the underlying array of coordinates&quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">self._a</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s2">def </span><span class="s1">zeros(count):</span>
+		<span class="s0">&quot;&quot;&quot;Creates a new ``GlyphCoordinates`` object with all coordinates set to (0,0)&quot;&quot;&quot;</span>
+		<span class="s1">g = GlyphCoordinates()</span>
+		<span class="s1">g._a.frombytes(bytes(count * </span><span class="s5">2 </span><span class="s1">* g._a.itemsize))</span>
+		<span class="s2">return </span><span class="s1">g</span>
+
+	<span class="s2">def </span><span class="s1">copy(self):</span>
+		<span class="s0">&quot;&quot;&quot;Creates a new ``GlyphCoordinates`` object which is a copy of the current one.&quot;&quot;&quot;</span>
+		<span class="s1">c = GlyphCoordinates()</span>
+		<span class="s1">c._a.extend(self._a)</span>
+		<span class="s2">return </span><span class="s1">c</span>
+
+	<span class="s2">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">&quot;&quot;&quot;Returns the number of coordinates in the array.&quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">len(self._a) // </span><span class="s5">2</span>
+
+	<span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">k):</span>
+		<span class="s0">&quot;&quot;&quot;Returns a two element tuple (x,y)&quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">isinstance(k</span><span class="s2">, </span><span class="s1">slice):</span>
+			<span class="s1">indices = range(*k.indices(len(self)))</span>
+			<span class="s2">return </span><span class="s1">[self[i] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">indices]</span>
+		<span class="s1">a = self._a</span>
+		<span class="s1">x = a[</span><span class="s5">2</span><span class="s1">*k]</span>
+		<span class="s1">y = a[</span><span class="s5">2</span><span class="s1">*k+</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s2">return </span><span class="s1">(int(x) </span><span class="s2">if </span><span class="s1">x.is_integer() </span><span class="s2">else </span><span class="s1">x</span><span class="s2">,</span>
+			<span class="s1">int(y) </span><span class="s2">if </span><span class="s1">y.is_integer() </span><span class="s2">else </span><span class="s1">y)</span>
+
+	<span class="s2">def </span><span class="s1">__setitem__(self</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v):</span>
+		<span class="s0">&quot;&quot;&quot;Sets a point's coordinates to a two element tuple (x,y)&quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">isinstance(k</span><span class="s2">, </span><span class="s1">slice):</span>
+			<span class="s1">indices = range(*k.indices(len(self)))</span>
+			<span class="s3"># XXX This only works if len(v) == len(indices)</span>
+			<span class="s2">for </span><span class="s1">j</span><span class="s2">,</span><span class="s1">i </span><span class="s2">in </span><span class="s1">enumerate(indices):</span>
+				<span class="s1">self[i] = v[j]</span>
+			<span class="s2">return</span>
+		<span class="s1">self._a[</span><span class="s5">2</span><span class="s1">*k]</span><span class="s2">,</span><span class="s1">self._a[</span><span class="s5">2</span><span class="s1">*k+</span><span class="s5">1</span><span class="s1">] = v</span>
+
+	<span class="s2">def </span><span class="s1">__delitem__(self</span><span class="s2">, </span><span class="s1">i):</span>
+		<span class="s0">&quot;&quot;&quot;Removes a point from the list&quot;&quot;&quot;</span>
+		<span class="s1">i = (</span><span class="s5">2</span><span class="s1">*i) % len(self._a)</span>
+		<span class="s2">del </span><span class="s1">self._a[i]</span>
+		<span class="s2">del </span><span class="s1">self._a[i]</span>
+
+	<span class="s2">def </span><span class="s1">__repr__(self):</span>
+		<span class="s2">return </span><span class="s4">'GlyphCoordinates(['</span><span class="s1">+</span><span class="s4">','</span><span class="s1">.join(str(c) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">self)+</span><span class="s4">'])'</span>
+
+	<span class="s2">def </span><span class="s1">append(self</span><span class="s2">, </span><span class="s1">p):</span>
+		<span class="s1">self._a.extend(tuple(p))</span>
+
+	<span class="s2">def </span><span class="s1">extend(self</span><span class="s2">, </span><span class="s1">iterable):</span>
+		<span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">iterable:</span>
+			<span class="s1">self._a.extend(p)</span>
+
+	<span class="s2">def </span><span class="s1">toInt(self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">round=otRound):</span>
+		<span class="s1">a = self._a</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(a)):</span>
+			<span class="s1">a[i] = round(a[i])</span>
+
+	<span class="s2">def </span><span class="s1">relativeToAbsolute(self):</span>
+		<span class="s1">a = self._a</span>
+		<span class="s1">x</span><span class="s2">,</span><span class="s1">y = </span><span class="s5">0</span><span class="s2">,</span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(a)</span><span class="s2">, </span><span class="s5">2</span><span class="s1">):</span>
+			<span class="s1">a[i  ] = x = a[i  ] + x</span>
+			<span class="s1">a[i+</span><span class="s5">1</span><span class="s1">] = y = a[i+</span><span class="s5">1</span><span class="s1">] + y</span>
+
+	<span class="s2">def </span><span class="s1">absoluteToRelative(self):</span>
+		<span class="s1">a = self._a</span>
+		<span class="s1">x</span><span class="s2">,</span><span class="s1">y = </span><span class="s5">0</span><span class="s2">,</span><span class="s5">0</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(a)</span><span class="s2">, </span><span class="s5">2</span><span class="s1">):</span>
+			<span class="s1">nx = a[i  ]</span>
+			<span class="s1">ny = a[i+</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s1">a[i]   = nx - x</span>
+			<span class="s1">a[i+</span><span class="s5">1</span><span class="s1">] = ny - y</span>
+			<span class="s1">x = nx</span>
+			<span class="s1">y = ny</span>
+
+	<span class="s2">def </span><span class="s1">translate(self</span><span class="s2">, </span><span class="s1">p):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; GlyphCoordinates([(1,2)]).translate((.5,0)) 
+        &quot;&quot;&quot;</span>
+		<span class="s1">x</span><span class="s2">,</span><span class="s1">y = p</span>
+		<span class="s2">if </span><span class="s1">x == </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">y == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s2">return</span>
+		<span class="s1">a = self._a</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(a)</span><span class="s2">, </span><span class="s5">2</span><span class="s1">):</span>
+			<span class="s1">a[i]   += x</span>
+			<span class="s1">a[i+</span><span class="s5">1</span><span class="s1">] += y</span>
+
+	<span class="s2">def </span><span class="s1">scale(self</span><span class="s2">, </span><span class="s1">p):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; GlyphCoordinates([(1,2)]).scale((.5,0)) 
+        &quot;&quot;&quot;</span>
+		<span class="s1">x</span><span class="s2">,</span><span class="s1">y = p</span>
+		<span class="s2">if </span><span class="s1">x == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">y == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s2">return</span>
+		<span class="s1">a = self._a</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(a)</span><span class="s2">, </span><span class="s5">2</span><span class="s1">):</span>
+			<span class="s1">a[i]   *= x</span>
+			<span class="s1">a[i+</span><span class="s5">1</span><span class="s1">] *= y</span>
+
+	<span class="s2">def </span><span class="s1">transform(self</span><span class="s2">, </span><span class="s1">t):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; GlyphCoordinates([(1,2)]).transform(((.5,0),(.2,.5))) 
+        &quot;&quot;&quot;</span>
+		<span class="s1">a = self._a</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(a)</span><span class="s2">, </span><span class="s5">2</span><span class="s1">):</span>
+			<span class="s1">x = a[i  ]</span>
+			<span class="s1">y = a[i+</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s1">px = x * t[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] + y * t[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+			<span class="s1">py = x * t[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">1</span><span class="s1">] + y * t[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s1">a[i]   = px</span>
+			<span class="s1">a[i+</span><span class="s5">1</span><span class="s1">] = py</span>
+
+	<span class="s2">def </span><span class="s1">__eq__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g2 = GlyphCoordinates([(1.0,2)]) 
+        &gt;&gt;&gt; g3 = GlyphCoordinates([(1.5,2)]) 
+        &gt;&gt;&gt; g == g2 
+        True 
+        &gt;&gt;&gt; g == g3 
+        False 
+        &gt;&gt;&gt; g2 == g3 
+        False 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s2">return </span><span class="s1">NotImplemented</span>
+		<span class="s2">return </span><span class="s1">self._a == other._a</span>
+
+	<span class="s2">def </span><span class="s1">__ne__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g2 = GlyphCoordinates([(1.0,2)]) 
+        &gt;&gt;&gt; g3 = GlyphCoordinates([(1.5,2)]) 
+        &gt;&gt;&gt; g != g2 
+        False 
+        &gt;&gt;&gt; g != g3 
+        True 
+        &gt;&gt;&gt; g2 != g3 
+        True 
+        &quot;&quot;&quot;</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s2">return </span><span class="s1">result </span><span class="s2">if </span><span class="s1">result </span><span class="s2">is </span><span class="s1">NotImplemented </span><span class="s2">else not </span><span class="s1">result</span>
+
+	<span class="s3"># Math operations</span>
+
+	<span class="s2">def </span><span class="s1">__pos__(self):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(1, 2)]) 
+        &gt;&gt;&gt; g2 = +g 
+        &gt;&gt;&gt; g2 
+        GlyphCoordinates([(1, 2)]) 
+        &gt;&gt;&gt; g2.translate((1,0)) 
+        &gt;&gt;&gt; g2 
+        GlyphCoordinates([(2, 2)]) 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(1, 2)]) 
+        &quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">self.copy()</span>
+	<span class="s2">def </span><span class="s1">__neg__(self):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(1, 2)]) 
+        &gt;&gt;&gt; g2 = -g 
+        &gt;&gt;&gt; g2 
+        GlyphCoordinates([(-1, -2)]) 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(1, 2)]) 
+        &quot;&quot;&quot;</span>
+		<span class="s1">r = self.copy()</span>
+		<span class="s1">a = r._a</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(a)):</span>
+			<span class="s1">a[i] = -a[i]</span>
+		<span class="s2">return </span><span class="s1">r</span>
+	<span class="s2">def </span><span class="s1">__round__(self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">round=otRound):</span>
+		<span class="s1">r = self.copy()</span>
+		<span class="s1">r.toInt(round=round)</span>
+		<span class="s2">return </span><span class="s1">r</span>
+
+	<span class="s2">def </span><span class="s1">__add__(self</span><span class="s2">, </span><span class="s1">other): </span><span class="s2">return </span><span class="s1">self.copy().__iadd__(other)</span>
+	<span class="s2">def </span><span class="s1">__sub__(self</span><span class="s2">, </span><span class="s1">other): </span><span class="s2">return </span><span class="s1">self.copy().__isub__(other)</span>
+	<span class="s2">def </span><span class="s1">__mul__(self</span><span class="s2">, </span><span class="s1">other): </span><span class="s2">return </span><span class="s1">self.copy().__imul__(other)</span>
+	<span class="s2">def </span><span class="s1">__truediv__(self</span><span class="s2">, </span><span class="s1">other): </span><span class="s2">return </span><span class="s1">self.copy().__itruediv__(other)</span>
+
+	<span class="s1">__radd__ = __add__</span>
+	<span class="s1">__rmul__ = __mul__</span>
+	<span class="s2">def </span><span class="s1">__rsub__(self</span><span class="s2">, </span><span class="s1">other): </span><span class="s2">return </span><span class="s1">other + (-self)</span>
+
+	<span class="s2">def </span><span class="s1">__iadd__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g += (.5,0) 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(1.5, 2)]) 
+        &gt;&gt;&gt; g2 = GlyphCoordinates([(3,4)]) 
+        &gt;&gt;&gt; g += g2 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(4.5, 6)]) 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">tuple):</span>
+			<span class="s2">assert </span><span class="s1">len(other) ==  </span><span class="s5">2</span>
+			<span class="s1">self.translate(other)</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">GlyphCoordinates):</span>
+			<span class="s1">other = other._a</span>
+			<span class="s1">a = self._a</span>
+			<span class="s2">assert </span><span class="s1">len(a) == len(other)</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(a)):</span>
+				<span class="s1">a[i] += other[i]</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">return </span><span class="s1">NotImplemented</span>
+
+	<span class="s2">def </span><span class="s1">__isub__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g -= (.5,0) 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(0.5, 2)]) 
+        &gt;&gt;&gt; g2 = GlyphCoordinates([(3,4)]) 
+        &gt;&gt;&gt; g -= g2 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(-2.5, -2)]) 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">tuple):</span>
+			<span class="s2">assert </span><span class="s1">len(other) ==  </span><span class="s5">2</span>
+			<span class="s1">self.translate((-other[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span><span class="s1">-other[</span><span class="s5">1</span><span class="s1">]))</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">GlyphCoordinates):</span>
+			<span class="s1">other = other._a</span>
+			<span class="s1">a = self._a</span>
+			<span class="s2">assert </span><span class="s1">len(a) == len(other)</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(a)):</span>
+				<span class="s1">a[i] -= other[i]</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">return </span><span class="s1">NotImplemented</span>
+
+	<span class="s2">def </span><span class="s1">__imul__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g *= (2,.5) 
+        &gt;&gt;&gt; g *= 2 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(4, 2)]) 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,2)]) 
+        &gt;&gt;&gt; g *= 2 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(2, 4)]) 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">tuple):</span>
+			<span class="s2">assert </span><span class="s1">len(other) ==  </span><span class="s5">2</span>
+			<span class="s1">self.scale(other)</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">Number):</span>
+			<span class="s2">if </span><span class="s1">other == </span><span class="s5">1</span><span class="s1">:</span>
+				<span class="s2">return </span><span class="s1">self</span>
+			<span class="s1">a = self._a</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(a)):</span>
+				<span class="s1">a[i] *= other</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">return </span><span class="s1">NotImplemented</span>
+
+	<span class="s2">def </span><span class="s1">__itruediv__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([(1,3)]) 
+        &gt;&gt;&gt; g /= (.5,1.5) 
+        &gt;&gt;&gt; g /= 2 
+        &gt;&gt;&gt; g 
+        GlyphCoordinates([(1, 1)]) 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">Number):</span>
+			<span class="s1">other = (other</span><span class="s2">, </span><span class="s1">other)</span>
+		<span class="s2">if </span><span class="s1">isinstance(other</span><span class="s2">, </span><span class="s1">tuple):</span>
+			<span class="s2">if </span><span class="s1">other == (</span><span class="s5">1</span><span class="s2">,</span><span class="s5">1</span><span class="s1">):</span>
+				<span class="s2">return </span><span class="s1">self</span>
+			<span class="s2">assert </span><span class="s1">len(other) ==  </span><span class="s5">2</span>
+			<span class="s1">self.scale((</span><span class="s5">1.</span><span class="s1">/other[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span><span class="s5">1.</span><span class="s1">/other[</span><span class="s5">1</span><span class="s1">]))</span>
+			<span class="s2">return </span><span class="s1">self</span>
+		<span class="s2">return </span><span class="s1">NotImplemented</span>
+
+	<span class="s2">def </span><span class="s1">__bool__(self):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; g = GlyphCoordinates([]) 
+        &gt;&gt;&gt; bool(g) 
+        False 
+        &gt;&gt;&gt; g = GlyphCoordinates([(0,0), (0.,0)]) 
+        &gt;&gt;&gt; bool(g) 
+        True 
+        &gt;&gt;&gt; g = GlyphCoordinates([(0,0), (1,0)]) 
+        &gt;&gt;&gt; bool(g) 
+        True 
+        &gt;&gt;&gt; g = GlyphCoordinates([(0,.5), (0,0)]) 
+        &gt;&gt;&gt; bool(g) 
+        True 
+        &quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">bool(self._a)</span>
+
+	<span class="s1">__nonzero__ = __bool__</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s4">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s2">import </span><span class="s1">doctest</span><span class="s2">, </span><span class="s1">sys</span>
+	<span class="s1">sys.exit(doctest.testmod().failed)</span>
+</pre>
+</body>
+</html>

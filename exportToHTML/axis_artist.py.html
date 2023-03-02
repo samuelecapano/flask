@@ -1,0 +1,1137 @@
+<html>
+<head>
+<title>axis_artist.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+axis_artist.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+The :mod:`.axis_artist` module implements custom artists to draw axis elements 
+(axis lines and labels, tick lines and labels, grid lines). 
+ 
+Axis lines and labels and tick lines and labels are managed by the `AxisArtist` 
+class; grid lines are managed by the `GridlinesCollection` class. 
+ 
+There is one `AxisArtist` per Axis; it can be accessed through 
+the ``axis`` dictionary of the parent Axes (which should be a 
+`mpl_toolkits.axislines.Axes`), e.g. ``ax.axis[&quot;bottom&quot;]``. 
+ 
+Children of the AxisArtist are accessed as attributes: ``.line`` and ``.label`` 
+for the axis line and label, ``.major_ticks``, ``.major_ticklabels``, 
+``.minor_ticks``, ``.minor_ticklabels`` for the tick lines and labels (e.g. 
+``ax.axis[&quot;bottom&quot;].line``). 
+ 
+Children properties (colors, fonts, line widths, etc.) can be set using 
+setters, e.g. :: 
+ 
+  # Make the major ticks of the bottom axis red. 
+  ax.axis[&quot;bottom&quot;].major_ticks.set_color(&quot;red&quot;) 
+ 
+However, things like the locations of ticks, and their ticklabels need to be 
+changed from the side of the grid_helper. 
+ 
+axis_direction 
+-------------- 
+ 
+`AxisArtist`, `AxisLabel`, `TickLabels` have an *axis_direction* attribute, 
+which adjusts the location, angle, etc. The *axis_direction* must be one of 
+&quot;left&quot;, &quot;right&quot;, &quot;bottom&quot;, &quot;top&quot;, and follows the Matplotlib convention for 
+rectangular axis. 
+ 
+For example, for the *bottom* axis (the left and right is relative to the 
+direction of the increasing coordinate), 
+ 
+* ticklabels and axislabel are on the right 
+* ticklabels and axislabel have text angle of 0 
+* ticklabels are baseline, center-aligned 
+* axislabel is top, center-aligned 
+ 
+The text angles are actually relative to (90 + angle of the direction to the 
+ticklabel), which gives 0 for bottom axis. 
+ 
+=================== ====== ======== ====== ======== 
+Property            left   bottom   right  top 
+=================== ====== ======== ====== ======== 
+ticklabel location  left   right    right  left 
+axislabel location  left   right    right  left 
+ticklabel angle     90     0        -90    180 
+axislabel angle     180    0        0      180 
+ticklabel va        center baseline center baseline 
+axislabel va        center top      center bottom 
+ticklabel ha        right  center   right  center 
+axislabel ha        right  center   right  center 
+=================== ====== ======== ====== ======== 
+ 
+Ticks are by default direct opposite side of the ticklabels. To make ticks to 
+the same side of the ticklabels, :: 
+ 
+  ax.axis[&quot;bottom&quot;].major_ticks.set_tick_out(True) 
+ 
+The following attributes can be customized (use the ``set_xxx`` methods): 
+ 
+* `Ticks`: ticksize, tick_out 
+* `TickLabels`: pad 
+* `AxisLabel`: pad 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># FIXME :</span>
+<span class="s2"># angles are given in data coordinate - need to convert it to canvas coordinate</span>
+
+
+<span class="s3">from </span><span class="s1">operator </span><span class="s3">import </span><span class="s1">methodcaller</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">import </span><span class="s1">matplotlib </span><span class="s3">as </span><span class="s1">mpl</span>
+<span class="s3">from </span><span class="s1">matplotlib </span><span class="s3">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">cbook</span>
+<span class="s3">import </span><span class="s1">matplotlib.artist </span><span class="s3">as </span><span class="s1">martist</span>
+<span class="s3">import </span><span class="s1">matplotlib.colors </span><span class="s3">as </span><span class="s1">mcolors</span>
+<span class="s3">import </span><span class="s1">matplotlib.text </span><span class="s3">as </span><span class="s1">mtext</span>
+<span class="s3">from </span><span class="s1">matplotlib.collections </span><span class="s3">import </span><span class="s1">LineCollection</span>
+<span class="s3">from </span><span class="s1">matplotlib.lines </span><span class="s3">import </span><span class="s1">Line2D</span>
+<span class="s3">from </span><span class="s1">matplotlib.patches </span><span class="s3">import </span><span class="s1">PathPatch</span>
+<span class="s3">from </span><span class="s1">matplotlib.path </span><span class="s3">import </span><span class="s1">Path</span>
+<span class="s3">from </span><span class="s1">matplotlib.transforms </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">Affine2D</span><span class="s3">, </span><span class="s1">Bbox</span><span class="s3">, </span><span class="s1">IdentityTransform</span><span class="s3">, </span><span class="s1">ScaledTranslation)</span>
+
+<span class="s3">from </span><span class="s1">.axisline_style </span><span class="s3">import </span><span class="s1">AxislineStyle</span>
+
+
+<span class="s3">class </span><span class="s1">AttributeCopier:</span>
+    <span class="s3">def </span><span class="s1">get_ref_artist(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the underlying artist that actually defines some properties 
+        (e.g., color) of this artist. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">&quot;get_ref_artist must overridden&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_attribute_from_ref_artist(self</span><span class="s3">, </span><span class="s1">attr_name):</span>
+        <span class="s1">getter = methodcaller(</span><span class="s4">&quot;get_&quot; </span><span class="s1">+ attr_name)</span>
+        <span class="s1">prop = getter(super())</span>
+        <span class="s3">return </span><span class="s1">getter(self.get_ref_artist()) </span><span class="s3">if </span><span class="s1">prop == </span><span class="s4">&quot;auto&quot; </span><span class="s3">else </span><span class="s1">prop</span>
+
+
+<span class="s3">class </span><span class="s1">Ticks(AttributeCopier</span><span class="s3">, </span><span class="s1">Line2D):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Ticks are derived from `.Line2D`, and note that ticks themselves 
+    are markers. Thus, you should use set_mec, set_mew, etc. 
+ 
+    To change the tick size (length), you need to use 
+    `set_ticksize`. To change the direction of the ticks (ticks are 
+    in opposite direction of ticklabels by default), use 
+    ``set_tick_out(False)`` 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">ticksize</span><span class="s3">, </span><span class="s1">tick_out=</span><span class="s3">False, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">axis=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._ticksize = ticksize</span>
+        <span class="s1">self.locs_angles_labels = []</span>
+
+        <span class="s1">self.set_tick_out(tick_out)</span>
+
+        <span class="s1">self._axis = axis</span>
+        <span class="s3">if </span><span class="s1">self._axis </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s4">&quot;color&quot; </span><span class="s3">not in </span><span class="s1">kwargs:</span>
+                <span class="s1">kwargs[</span><span class="s4">&quot;color&quot;</span><span class="s1">] = </span><span class="s4">&quot;auto&quot;</span>
+            <span class="s3">if </span><span class="s4">&quot;mew&quot; </span><span class="s3">not in </span><span class="s1">kwargs </span><span class="s3">and </span><span class="s4">&quot;markeredgewidth&quot; </span><span class="s3">not in </span><span class="s1">kwargs:</span>
+                <span class="s1">kwargs[</span><span class="s4">&quot;markeredgewidth&quot;</span><span class="s1">] = </span><span class="s4">&quot;auto&quot;</span>
+
+        <span class="s1">Line2D.__init__(self</span><span class="s3">, </span><span class="s1">[</span><span class="s5">0.</span><span class="s1">]</span><span class="s3">, </span><span class="s1">[</span><span class="s5">0.</span><span class="s1">]</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self.set_snap(</span><span class="s3">True</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_ref_artist(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s3">return </span><span class="s1">self._axis.majorTicks[</span><span class="s5">0</span><span class="s1">].tick1line</span>
+
+    <span class="s3">def </span><span class="s1">set_color(self</span><span class="s3">, </span><span class="s1">color):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s2"># Unlike the base Line2D.set_color, this also supports &quot;auto&quot;.</span>
+        <span class="s3">if not </span><span class="s1">cbook._str_equal(color</span><span class="s3">, </span><span class="s4">&quot;auto&quot;</span><span class="s1">):</span>
+            <span class="s1">mcolors._check_color_like(color=color)</span>
+        <span class="s1">self._color = color</span>
+        <span class="s1">self.stale = </span><span class="s3">True</span>
+
+    <span class="s3">def </span><span class="s1">get_color(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_attribute_from_ref_artist(</span><span class="s4">&quot;color&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_markeredgecolor(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_attribute_from_ref_artist(</span><span class="s4">&quot;markeredgecolor&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_markeredgewidth(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_attribute_from_ref_artist(</span><span class="s4">&quot;markeredgewidth&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_tick_out(self</span><span class="s3">, </span><span class="s1">b):</span>
+        <span class="s0">&quot;&quot;&quot;Set whether ticks are drawn inside or outside the axes.&quot;&quot;&quot;</span>
+        <span class="s1">self._tick_out = b</span>
+
+    <span class="s3">def </span><span class="s1">get_tick_out(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return whether ticks are drawn inside or outside the axes.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._tick_out</span>
+
+    <span class="s3">def </span><span class="s1">set_ticksize(self</span><span class="s3">, </span><span class="s1">ticksize):</span>
+        <span class="s0">&quot;&quot;&quot;Set length of the ticks in points.&quot;&quot;&quot;</span>
+        <span class="s1">self._ticksize = ticksize</span>
+
+    <span class="s3">def </span><span class="s1">get_ticksize(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return length of the ticks in points.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._ticksize</span>
+
+    <span class="s3">def </span><span class="s1">set_locs_angles(self</span><span class="s3">, </span><span class="s1">locs_angles):</span>
+        <span class="s1">self.locs_angles = locs_angles</span>
+
+    <span class="s1">_tickvert_path = Path([[</span><span class="s5">0.</span><span class="s3">, </span><span class="s5">0.</span><span class="s1">]</span><span class="s3">, </span><span class="s1">[</span><span class="s5">1.</span><span class="s3">, </span><span class="s5">0.</span><span class="s1">]])</span>
+
+    <span class="s3">def </span><span class="s1">draw(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s3">return</span>
+
+        <span class="s1">gc = renderer.new_gc()</span>
+        <span class="s1">gc.set_foreground(self.get_markeredgecolor())</span>
+        <span class="s1">gc.set_linewidth(self.get_markeredgewidth())</span>
+        <span class="s1">gc.set_alpha(self._alpha)</span>
+
+        <span class="s1">path_trans = self.get_transform()</span>
+        <span class="s1">marker_transform = (Affine2D()</span>
+                            <span class="s1">.scale(renderer.points_to_pixels(self._ticksize)))</span>
+        <span class="s3">if </span><span class="s1">self.get_tick_out():</span>
+            <span class="s1">marker_transform.rotate_deg(</span><span class="s5">180</span><span class="s1">)</span>
+
+        <span class="s3">for </span><span class="s1">loc</span><span class="s3">, </span><span class="s1">angle </span><span class="s3">in </span><span class="s1">self.locs_angles:</span>
+            <span class="s1">locs = path_trans.transform_non_affine(np.array([loc]))</span>
+            <span class="s3">if </span><span class="s1">self.axes </span><span class="s3">and not </span><span class="s1">self.axes.viewLim.contains(*locs[</span><span class="s5">0</span><span class="s1">]):</span>
+                <span class="s3">continue</span>
+            <span class="s1">renderer.draw_markers(</span>
+                <span class="s1">gc</span><span class="s3">, </span><span class="s1">self._tickvert_path</span><span class="s3">,</span>
+                <span class="s1">marker_transform + Affine2D().rotate_deg(angle)</span><span class="s3">,</span>
+                <span class="s1">Path(locs)</span><span class="s3">, </span><span class="s1">path_trans.get_affine())</span>
+
+        <span class="s1">gc.restore()</span>
+
+
+<span class="s3">class </span><span class="s1">LabelBase(mtext.Text):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A base class for `.AxisLabel` and `.TickLabels`. The position and 
+    angle of the text are calculated by the offset_ref_angle, 
+    text_ref_angle, and offset_radius attributes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.locs_angles_labels = []</span>
+        <span class="s1">self._ref_angle = </span><span class="s5">0</span>
+        <span class="s1">self._offset_radius = </span><span class="s5">0.</span>
+
+        <span class="s1">super().__init__(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s1">self.set_rotation_mode(</span><span class="s4">&quot;anchor&quot;</span><span class="s1">)</span>
+        <span class="s1">self._text_follow_ref_angle = </span><span class="s3">True</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">_text_ref_angle(self):</span>
+        <span class="s3">if </span><span class="s1">self._text_follow_ref_angle:</span>
+            <span class="s3">return </span><span class="s1">self._ref_angle + </span><span class="s5">90</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s5">0</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">_offset_ref_angle(self):</span>
+        <span class="s3">return </span><span class="s1">self._ref_angle</span>
+
+    <span class="s1">_get_opposite_direction = {</span><span class="s4">&quot;left&quot;</span><span class="s1">: </span><span class="s4">&quot;right&quot;</span><span class="s3">,</span>
+                               <span class="s4">&quot;right&quot;</span><span class="s1">: </span><span class="s4">&quot;left&quot;</span><span class="s3">,</span>
+                               <span class="s4">&quot;top&quot;</span><span class="s1">: </span><span class="s4">&quot;bottom&quot;</span><span class="s3">,</span>
+                               <span class="s4">&quot;bottom&quot;</span><span class="s1">: </span><span class="s4">&quot;top&quot;</span><span class="s1">}.__getitem__</span>
+
+    <span class="s3">def </span><span class="s1">draw(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s3">return</span>
+
+        <span class="s2"># save original and adjust some properties</span>
+        <span class="s1">tr = self.get_transform()</span>
+        <span class="s1">angle_orig = self.get_rotation()</span>
+        <span class="s1">theta = np.deg2rad(self._offset_ref_angle)</span>
+        <span class="s1">dd = self._offset_radius</span>
+        <span class="s1">dx</span><span class="s3">, </span><span class="s1">dy = dd * np.cos(theta)</span><span class="s3">, </span><span class="s1">dd * np.sin(theta)</span>
+
+        <span class="s1">self.set_transform(tr + Affine2D().translate(dx</span><span class="s3">, </span><span class="s1">dy))</span>
+        <span class="s1">self.set_rotation(self._text_ref_angle + angle_orig)</span>
+        <span class="s1">super().draw(renderer)</span>
+        <span class="s2"># restore original properties</span>
+        <span class="s1">self.set_transform(tr)</span>
+        <span class="s1">self.set_rotation(angle_orig)</span>
+
+    <span class="s3">def </span><span class="s1">get_window_extent(self</span><span class="s3">, </span><span class="s1">renderer=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">renderer </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">renderer = self.figure._get_renderer()</span>
+
+        <span class="s2"># save original and adjust some properties</span>
+        <span class="s1">tr = self.get_transform()</span>
+        <span class="s1">angle_orig = self.get_rotation()</span>
+        <span class="s1">theta = np.deg2rad(self._offset_ref_angle)</span>
+        <span class="s1">dd = self._offset_radius</span>
+        <span class="s1">dx</span><span class="s3">, </span><span class="s1">dy = dd * np.cos(theta)</span><span class="s3">, </span><span class="s1">dd * np.sin(theta)</span>
+
+        <span class="s1">self.set_transform(tr + Affine2D().translate(dx</span><span class="s3">, </span><span class="s1">dy))</span>
+        <span class="s1">self.set_rotation(self._text_ref_angle + angle_orig)</span>
+        <span class="s1">bbox = super().get_window_extent(renderer).frozen()</span>
+        <span class="s2"># restore original properties</span>
+        <span class="s1">self.set_transform(tr)</span>
+        <span class="s1">self.set_rotation(angle_orig)</span>
+
+        <span class="s3">return </span><span class="s1">bbox</span>
+
+
+<span class="s3">class </span><span class="s1">AxisLabel(AttributeCopier</span><span class="s3">, </span><span class="s1">LabelBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Axis label. Derived from `.Text`. The position of the text is updated 
+    in the fly, so changing text position has no effect. Otherwise, the 
+    properties can be changed as a normal `.Text`. 
+ 
+    To change the pad between tick labels and axis label, use `set_pad`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s1">axis=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._axis = axis</span>
+        <span class="s1">self._pad = </span><span class="s5">5</span>
+        <span class="s1">self._external_pad = </span><span class="s5">0  </span><span class="s2"># in pixels</span>
+        <span class="s1">LabelBase.__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self.set_axis_direction(axis_direction)</span>
+
+    <span class="s3">def </span><span class="s1">set_pad(self</span><span class="s3">, </span><span class="s1">pad):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the internal pad in points. 
+ 
+        The actual pad will be the sum of the internal pad and the 
+        external pad (the latter is set automatically by the `.AxisArtist`). 
+ 
+        Parameters 
+        ---------- 
+        pad : float 
+            The internal pad in points. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._pad = pad</span>
+
+    <span class="s3">def </span><span class="s1">get_pad(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the internal pad in points. 
+ 
+        See `.set_pad` for more details. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._pad</span>
+
+    <span class="s3">def </span><span class="s1">get_ref_artist(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s3">return </span><span class="s1">self._axis.get_label()</span>
+
+    <span class="s3">def </span><span class="s1">get_text(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s1">t = super().get_text()</span>
+        <span class="s3">if </span><span class="s1">t == </span><span class="s4">&quot;__from_axes__&quot;</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">self._axis.get_label().get_text()</span>
+        <span class="s3">return </span><span class="s1">self._text</span>
+
+    <span class="s1">_default_alignments = dict(left=(</span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s4">&quot;center&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                               <span class="s1">right=(</span><span class="s4">&quot;top&quot;</span><span class="s3">, </span><span class="s4">&quot;center&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                               <span class="s1">bottom=(</span><span class="s4">&quot;top&quot;</span><span class="s3">, </span><span class="s4">&quot;center&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                               <span class="s1">top=(</span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s4">&quot;center&quot;</span><span class="s1">))</span>
+
+    <span class="s3">def </span><span class="s1">set_default_alignment(self</span><span class="s3">, </span><span class="s1">d):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the default alignment. See `set_axis_direction` for details. 
+ 
+        Parameters 
+        ---------- 
+        d : {&quot;left&quot;, &quot;bottom&quot;, &quot;right&quot;, &quot;top&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">va</span><span class="s3">, </span><span class="s1">ha = _api.check_getitem(self._default_alignments</span><span class="s3">, </span><span class="s1">d=d)</span>
+        <span class="s1">self.set_va(va)</span>
+        <span class="s1">self.set_ha(ha)</span>
+
+    <span class="s1">_default_angles = dict(left=</span><span class="s5">180</span><span class="s3">,</span>
+                           <span class="s1">right=</span><span class="s5">0</span><span class="s3">,</span>
+                           <span class="s1">bottom=</span><span class="s5">0</span><span class="s3">,</span>
+                           <span class="s1">top=</span><span class="s5">180</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_default_angle(self</span><span class="s3">, </span><span class="s1">d):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the default angle. See `set_axis_direction` for details. 
+ 
+        Parameters 
+        ---------- 
+        d : {&quot;left&quot;, &quot;bottom&quot;, &quot;right&quot;, &quot;top&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.set_rotation(_api.check_getitem(self._default_angles</span><span class="s3">, </span><span class="s1">d=d))</span>
+
+    <span class="s3">def </span><span class="s1">set_axis_direction(self</span><span class="s3">, </span><span class="s1">d):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Adjust the text angle and text alignment of axis label 
+        according to the matplotlib convention. 
+ 
+        =====================    ========== ========= ========== ========== 
+        Property                 left       bottom    right      top 
+        =====================    ========== ========= ========== ========== 
+        axislabel angle          180        0         0          180 
+        axislabel va             center     top       center     bottom 
+        axislabel ha             right      center    right      center 
+        =====================    ========== ========= ========== ========== 
+ 
+        Note that the text angles are actually relative to (90 + angle 
+        of the direction to the ticklabel), which gives 0 for bottom 
+        axis. 
+ 
+        Parameters 
+        ---------- 
+        d : {&quot;left&quot;, &quot;bottom&quot;, &quot;right&quot;, &quot;top&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.set_default_alignment(d)</span>
+        <span class="s1">self.set_default_angle(d)</span>
+
+    <span class="s3">def </span><span class="s1">get_color(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_attribute_from_ref_artist(</span><span class="s4">&quot;color&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">draw(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s3">return</span>
+
+        <span class="s1">self._offset_radius = \</span>
+            <span class="s1">self._external_pad + renderer.points_to_pixels(self.get_pad())</span>
+
+        <span class="s1">super().draw(renderer)</span>
+
+    <span class="s3">def </span><span class="s1">get_window_extent(self</span><span class="s3">, </span><span class="s1">renderer=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">renderer </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">renderer = self.figure._get_renderer()</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s3">return</span>
+
+        <span class="s1">r = self._external_pad + renderer.points_to_pixels(self.get_pad())</span>
+        <span class="s1">self._offset_radius = r</span>
+
+        <span class="s1">bb = super().get_window_extent(renderer)</span>
+
+        <span class="s3">return </span><span class="s1">bb</span>
+
+
+<span class="s3">class </span><span class="s1">TickLabels(AxisLabel):  </span><span class="s2"># mtext.Text</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Tick labels. While derived from `.Text`, this single artist draws all 
+    ticklabels. As in `.AxisLabel`, the position of the text is updated 
+    in the fly, so changing text position has no effect. Otherwise, 
+    the properties can be changed as a normal `.Text`. Unlike the 
+    ticklabels of the mainline Matplotlib, properties of a single 
+    ticklabel alone cannot be modified. 
+ 
+    To change the pad between ticks and ticklabels, use `~.AxisLabel.set_pad`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+        <span class="s1">self.set_axis_direction(axis_direction)</span>
+        <span class="s1">self._axislabel_pad = </span><span class="s5">0</span>
+
+    <span class="s3">def </span><span class="s1">get_ref_artist(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s3">return </span><span class="s1">self._axis.get_ticklabels()[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s3">def </span><span class="s1">set_axis_direction(self</span><span class="s3">, </span><span class="s1">label_direction):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Adjust the text angle and text alignment of ticklabels 
+        according to the Matplotlib convention. 
+ 
+        The *label_direction* must be one of [left, right, bottom, top]. 
+ 
+        =====================    ========== ========= ========== ========== 
+        Property                 left       bottom    right      top 
+        =====================    ========== ========= ========== ========== 
+        ticklabel angle          90         0         -90        180 
+        ticklabel va             center     baseline  center     baseline 
+        ticklabel ha             right      center    right      center 
+        =====================    ========== ========= ========== ========== 
+ 
+        Note that the text angles are actually relative to (90 + angle 
+        of the direction to the ticklabel), which gives 0 for bottom 
+        axis. 
+ 
+        Parameters 
+        ---------- 
+        label_direction : {&quot;left&quot;, &quot;bottom&quot;, &quot;right&quot;, &quot;top&quot;} 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.set_default_alignment(label_direction)</span>
+        <span class="s1">self.set_default_angle(label_direction)</span>
+        <span class="s1">self._axis_direction = label_direction</span>
+
+    <span class="s3">def </span><span class="s1">invert_axis_direction(self):</span>
+        <span class="s1">label_direction = self._get_opposite_direction(self._axis_direction)</span>
+        <span class="s1">self.set_axis_direction(label_direction)</span>
+
+    <span class="s3">def </span><span class="s1">_get_ticklabels_offsets(self</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, </span><span class="s1">label_direction):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Calculate the ticklabel offsets from the tick and their total heights. 
+ 
+        The offset only takes account the offset due to the vertical alignment 
+        of the ticklabels: if axis direction is bottom and va is 'top', it will 
+        return 0; if va is 'baseline', it will return (height-descent). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">whd_list = self.get_texts_widths_heights_descents(renderer)</span>
+
+        <span class="s3">if not </span><span class="s1">whd_list:</span>
+            <span class="s3">return </span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span>
+
+        <span class="s1">r = </span><span class="s5">0</span>
+        <span class="s1">va</span><span class="s3">, </span><span class="s1">ha = self.get_va()</span><span class="s3">, </span><span class="s1">self.get_ha()</span>
+
+        <span class="s3">if </span><span class="s1">label_direction == </span><span class="s4">&quot;left&quot;</span><span class="s1">:</span>
+            <span class="s1">pad = max(w </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+            <span class="s3">if </span><span class="s1">ha == </span><span class="s4">&quot;left&quot;</span><span class="s1">:</span>
+                <span class="s1">r = pad</span>
+            <span class="s3">elif </span><span class="s1">ha == </span><span class="s4">&quot;center&quot;</span><span class="s1">:</span>
+                <span class="s1">r = </span><span class="s5">.5 </span><span class="s1">* pad</span>
+        <span class="s3">elif </span><span class="s1">label_direction == </span><span class="s4">&quot;right&quot;</span><span class="s1">:</span>
+            <span class="s1">pad = max(w </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+            <span class="s3">if </span><span class="s1">ha == </span><span class="s4">&quot;right&quot;</span><span class="s1">:</span>
+                <span class="s1">r = pad</span>
+            <span class="s3">elif </span><span class="s1">ha == </span><span class="s4">&quot;center&quot;</span><span class="s1">:</span>
+                <span class="s1">r = </span><span class="s5">.5 </span><span class="s1">* pad</span>
+        <span class="s3">elif </span><span class="s1">label_direction == </span><span class="s4">&quot;bottom&quot;</span><span class="s1">:</span>
+            <span class="s1">pad = max(h </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+            <span class="s3">if </span><span class="s1">va == </span><span class="s4">&quot;bottom&quot;</span><span class="s1">:</span>
+                <span class="s1">r = pad</span>
+            <span class="s3">elif </span><span class="s1">va == </span><span class="s4">&quot;center&quot;</span><span class="s1">:</span>
+                <span class="s1">r = </span><span class="s5">.5 </span><span class="s1">* pad</span>
+            <span class="s3">elif </span><span class="s1">va == </span><span class="s4">&quot;baseline&quot;</span><span class="s1">:</span>
+                <span class="s1">max_ascent = max(h - d </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+                <span class="s1">max_descent = max(d </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+                <span class="s1">r = max_ascent</span>
+                <span class="s1">pad = max_ascent + max_descent</span>
+        <span class="s3">elif </span><span class="s1">label_direction == </span><span class="s4">&quot;top&quot;</span><span class="s1">:</span>
+            <span class="s1">pad = max(h </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+            <span class="s3">if </span><span class="s1">va == </span><span class="s4">&quot;top&quot;</span><span class="s1">:</span>
+                <span class="s1">r = pad</span>
+            <span class="s3">elif </span><span class="s1">va == </span><span class="s4">&quot;center&quot;</span><span class="s1">:</span>
+                <span class="s1">r = </span><span class="s5">.5 </span><span class="s1">* pad</span>
+            <span class="s3">elif </span><span class="s1">va == </span><span class="s4">&quot;baseline&quot;</span><span class="s1">:</span>
+                <span class="s1">max_ascent = max(h - d </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+                <span class="s1">max_descent = max(d </span><span class="s3">for </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">d </span><span class="s3">in </span><span class="s1">whd_list)</span>
+                <span class="s1">r = max_descent</span>
+                <span class="s1">pad = max_ascent + max_descent</span>
+
+        <span class="s2"># r : offset</span>
+        <span class="s2"># pad : total height of the ticklabels. This will be used to</span>
+        <span class="s2"># calculate the pad for the axislabel.</span>
+        <span class="s3">return </span><span class="s1">r</span><span class="s3">, </span><span class="s1">pad</span>
+
+    <span class="s1">_default_alignments = dict(left=(</span><span class="s4">&quot;center&quot;</span><span class="s3">, </span><span class="s4">&quot;right&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                               <span class="s1">right=(</span><span class="s4">&quot;center&quot;</span><span class="s3">, </span><span class="s4">&quot;left&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                               <span class="s1">bottom=(</span><span class="s4">&quot;baseline&quot;</span><span class="s3">, </span><span class="s4">&quot;center&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                               <span class="s1">top=(</span><span class="s4">&quot;baseline&quot;</span><span class="s3">, </span><span class="s4">&quot;center&quot;</span><span class="s1">))</span>
+
+    <span class="s1">_default_angles = dict(left=</span><span class="s5">90</span><span class="s3">,</span>
+                           <span class="s1">right=-</span><span class="s5">90</span><span class="s3">,</span>
+                           <span class="s1">bottom=</span><span class="s5">0</span><span class="s3">,</span>
+                           <span class="s1">top=</span><span class="s5">180</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">draw(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s1">self._axislabel_pad = self._external_pad</span>
+            <span class="s3">return</span>
+
+        <span class="s1">r</span><span class="s3">, </span><span class="s1">total_width = self._get_ticklabels_offsets(renderer</span><span class="s3">,</span>
+                                                      <span class="s1">self._axis_direction)</span>
+
+        <span class="s1">pad = self._external_pad + renderer.points_to_pixels(self.get_pad())</span>
+        <span class="s1">self._offset_radius = r + pad</span>
+
+        <span class="s3">for </span><span class="s1">(x</span><span class="s3">, </span><span class="s1">y)</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l </span><span class="s3">in </span><span class="s1">self._locs_angles_labels:</span>
+            <span class="s3">if not </span><span class="s1">l.strip():</span>
+                <span class="s3">continue</span>
+            <span class="s1">self._ref_angle = a</span>
+            <span class="s1">self.set_x(x)</span>
+            <span class="s1">self.set_y(y)</span>
+            <span class="s1">self.set_text(l)</span>
+            <span class="s1">LabelBase.draw(self</span><span class="s3">, </span><span class="s1">renderer)</span>
+
+        <span class="s2"># the value saved will be used to draw axislabel.</span>
+        <span class="s1">self._axislabel_pad = total_width + pad</span>
+
+    <span class="s3">def </span><span class="s1">set_locs_angles_labels(self</span><span class="s3">, </span><span class="s1">locs_angles_labels):</span>
+        <span class="s1">self._locs_angles_labels = locs_angles_labels</span>
+
+    <span class="s3">def </span><span class="s1">get_window_extents(self</span><span class="s3">, </span><span class="s1">renderer=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">renderer </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">renderer = self.figure._get_renderer()</span>
+
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s1">self._axislabel_pad = self._external_pad</span>
+            <span class="s3">return </span><span class="s1">[]</span>
+
+        <span class="s1">bboxes = []</span>
+
+        <span class="s1">r</span><span class="s3">, </span><span class="s1">total_width = self._get_ticklabels_offsets(renderer</span><span class="s3">,</span>
+                                                      <span class="s1">self._axis_direction)</span>
+
+        <span class="s1">pad = self._external_pad + renderer.points_to_pixels(self.get_pad())</span>
+        <span class="s1">self._offset_radius = r + pad</span>
+
+        <span class="s3">for </span><span class="s1">(x</span><span class="s3">, </span><span class="s1">y)</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l </span><span class="s3">in </span><span class="s1">self._locs_angles_labels:</span>
+            <span class="s1">self._ref_angle = a</span>
+            <span class="s1">self.set_x(x)</span>
+            <span class="s1">self.set_y(y)</span>
+            <span class="s1">self.set_text(l)</span>
+            <span class="s1">bb = LabelBase.get_window_extent(self</span><span class="s3">, </span><span class="s1">renderer)</span>
+            <span class="s1">bboxes.append(bb)</span>
+
+        <span class="s2"># the value saved will be used to draw axislabel.</span>
+        <span class="s1">self._axislabel_pad = total_width + pad</span>
+
+        <span class="s3">return </span><span class="s1">bboxes</span>
+
+    <span class="s3">def </span><span class="s1">get_texts_widths_heights_descents(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a list of ``(width, height, descent)`` tuples for ticklabels. 
+ 
+        Empty labels are left out. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">whd_list = []</span>
+        <span class="s3">for </span><span class="s1">_loc</span><span class="s3">, </span><span class="s1">_angle</span><span class="s3">, </span><span class="s1">label </span><span class="s3">in </span><span class="s1">self._locs_angles_labels:</span>
+            <span class="s3">if not </span><span class="s1">label.strip():</span>
+                <span class="s3">continue</span>
+            <span class="s1">clean_line</span><span class="s3">, </span><span class="s1">ismath = self._preprocess_math(label)</span>
+            <span class="s1">whd = renderer.get_text_width_height_descent(</span>
+                <span class="s1">clean_line</span><span class="s3">, </span><span class="s1">self._fontproperties</span><span class="s3">, </span><span class="s1">ismath=ismath)</span>
+            <span class="s1">whd_list.append(whd)</span>
+        <span class="s3">return </span><span class="s1">whd_list</span>
+
+
+<span class="s3">class </span><span class="s1">GridlinesCollection(LineCollection):</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">which=</span><span class="s4">&quot;major&quot;</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">&quot;both&quot;</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Collection of grid lines. 
+ 
+        Parameters 
+        ---------- 
+        which : {&quot;major&quot;, &quot;minor&quot;} 
+           Which grid to consider. 
+        axis : {&quot;both&quot;, &quot;x&quot;, &quot;y&quot;} 
+           Which axis to consider. 
+        *args, **kwargs : 
+           Passed to `.LineCollection`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._which = which</span>
+        <span class="s1">self._axis = axis</span>
+        <span class="s1">super().__init__(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self.set_grid_helper(</span><span class="s3">None</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_which(self</span><span class="s3">, </span><span class="s1">which):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Select major or minor grid lines. 
+ 
+        Parameters 
+        ---------- 
+        which : {&quot;major&quot;, &quot;minor&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._which = which</span>
+
+    <span class="s3">def </span><span class="s1">set_axis(self</span><span class="s3">, </span><span class="s1">axis):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Select axis. 
+ 
+        Parameters 
+        ---------- 
+        axis : {&quot;both&quot;, &quot;x&quot;, &quot;y&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._axis = axis</span>
+
+    <span class="s3">def </span><span class="s1">set_grid_helper(self</span><span class="s3">, </span><span class="s1">grid_helper):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set grid helper. 
+ 
+        Parameters 
+        ---------- 
+        grid_helper : `.GridHelperBase` subclass 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._grid_helper = grid_helper</span>
+
+    <span class="s3">def </span><span class="s1">draw(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s3">if </span><span class="s1">self._grid_helper </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self._grid_helper.update_lim(self.axes)</span>
+            <span class="s1">gl = self._grid_helper.get_gridlines(self._which</span><span class="s3">, </span><span class="s1">self._axis)</span>
+            <span class="s1">self.set_segments([np.transpose(l) </span><span class="s3">for </span><span class="s1">l </span><span class="s3">in </span><span class="s1">gl])</span>
+        <span class="s1">super().draw(renderer)</span>
+
+
+<span class="s3">class </span><span class="s1">AxisArtist(martist.Artist):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    An artist which draws axis (a line along which the n-th axes coord 
+    is constant) line, ticks, tick labels, and axis label. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">zorder = </span><span class="s5">2.5</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">LABELPAD(self):</span>
+        <span class="s3">return </span><span class="s1">self.label.get_pad()</span>
+
+    <span class="s1">@LABELPAD.setter</span>
+    <span class="s3">def </span><span class="s1">LABELPAD(self</span><span class="s3">, </span><span class="s1">v):</span>
+        <span class="s1">self.label.set_pad(v)</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">axes</span><span class="s3">,</span>
+                 <span class="s1">helper</span><span class="s3">,</span>
+                 <span class="s1">offset=</span><span class="s3">None,</span>
+                 <span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s3">,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        axes : `mpl_toolkits.axisartist.axislines.Axes` 
+        helper : `~mpl_toolkits.axisartist.axislines.AxisArtistHelper` 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># axes is also used to follow the axis attribute (tick color, etc).</span>
+
+        <span class="s1">super().__init__(**kwargs)</span>
+
+        <span class="s1">self.axes = axes</span>
+
+        <span class="s1">self._axis_artist_helper = helper</span>
+
+        <span class="s3">if </span><span class="s1">offset </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">offset = (</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">self.offset_transform = ScaledTranslation(</span>
+            <span class="s1">*offset</span><span class="s3">,</span>
+            <span class="s1">Affine2D().scale(</span><span class="s5">1 </span><span class="s1">/ </span><span class="s5">72</span><span class="s1">)  </span><span class="s2"># points to inches.</span>
+            <span class="s1">+ self.axes.figure.dpi_scale_trans)</span>
+
+        <span class="s3">if </span><span class="s1">axis_direction </span><span class="s3">in </span><span class="s1">[</span><span class="s4">&quot;left&quot;</span><span class="s3">, </span><span class="s4">&quot;right&quot;</span><span class="s1">]:</span>
+            <span class="s1">self.axis = axes.yaxis</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.axis = axes.xaxis</span>
+
+        <span class="s1">self._axisline_style = </span><span class="s3">None</span>
+        <span class="s1">self._axis_direction = axis_direction</span>
+
+        <span class="s1">self._init_line()</span>
+        <span class="s1">self._init_ticks(**kwargs)</span>
+        <span class="s1">self._init_offsetText(axis_direction)</span>
+        <span class="s1">self._init_label()</span>
+
+        <span class="s2"># axis direction</span>
+        <span class="s1">self._ticklabel_add_angle = </span><span class="s5">0.</span>
+        <span class="s1">self._axislabel_add_angle = </span><span class="s5">0.</span>
+        <span class="s1">self.set_axis_direction(axis_direction)</span>
+
+    <span class="s2"># axis direction</span>
+
+    <span class="s3">def </span><span class="s1">set_axis_direction(self</span><span class="s3">, </span><span class="s1">axis_direction):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Adjust the direction, text angle, and text alignment of tick labels 
+        and axis labels following the Matplotlib convention for the rectangle 
+        axes. 
+ 
+        The *axis_direction* must be one of [left, right, bottom, top]. 
+ 
+        =====================    ========== ========= ========== ========== 
+        Property                 left       bottom    right      top 
+        =====================    ========== ========= ========== ========== 
+        ticklabel direction      &quot;-&quot;        &quot;+&quot;       &quot;+&quot;        &quot;-&quot; 
+        axislabel direction      &quot;-&quot;        &quot;+&quot;       &quot;+&quot;        &quot;-&quot; 
+        ticklabel angle          90         0         -90        180 
+        ticklabel va             center     baseline  center     baseline 
+        ticklabel ha             right      center    right      center 
+        axislabel angle          180        0         0          180 
+        axislabel va             center     top       center     bottom 
+        axislabel ha             right      center    right      center 
+        =====================    ========== ========= ========== ========== 
+ 
+        Note that the direction &quot;+&quot; and &quot;-&quot; are relative to the direction of 
+        the increasing coordinate. Also, the text angles are actually 
+        relative to (90 + angle of the direction to the ticklabel), 
+        which gives 0 for bottom axis. 
+ 
+        Parameters 
+        ---------- 
+        axis_direction : {&quot;left&quot;, &quot;bottom&quot;, &quot;right&quot;, &quot;top&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.major_ticklabels.set_axis_direction(axis_direction)</span>
+        <span class="s1">self.label.set_axis_direction(axis_direction)</span>
+        <span class="s1">self._axis_direction = axis_direction</span>
+        <span class="s3">if </span><span class="s1">axis_direction </span><span class="s3">in </span><span class="s1">[</span><span class="s4">&quot;left&quot;</span><span class="s3">, </span><span class="s4">&quot;top&quot;</span><span class="s1">]:</span>
+            <span class="s1">self.set_ticklabel_direction(</span><span class="s4">&quot;-&quot;</span><span class="s1">)</span>
+            <span class="s1">self.set_axislabel_direction(</span><span class="s4">&quot;-&quot;</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.set_ticklabel_direction(</span><span class="s4">&quot;+&quot;</span><span class="s1">)</span>
+            <span class="s1">self.set_axislabel_direction(</span><span class="s4">&quot;+&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_ticklabel_direction(self</span><span class="s3">, </span><span class="s1">tick_direction):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Adjust the direction of the tick labels. 
+ 
+        Note that the *tick_direction*\s '+' and '-' are relative to the 
+        direction of the increasing coordinate. 
+ 
+        Parameters 
+        ---------- 
+        tick_direction : {&quot;+&quot;, &quot;-&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._ticklabel_add_angle = _api.check_getitem(</span>
+            <span class="s1">{</span><span class="s4">&quot;+&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;-&quot;</span><span class="s1">: </span><span class="s5">180</span><span class="s1">}</span><span class="s3">, </span><span class="s1">tick_direction=tick_direction)</span>
+
+    <span class="s3">def </span><span class="s1">invert_ticklabel_direction(self):</span>
+        <span class="s1">self._ticklabel_add_angle = (self._ticklabel_add_angle + </span><span class="s5">180</span><span class="s1">) % </span><span class="s5">360</span>
+        <span class="s1">self.major_ticklabels.invert_axis_direction()</span>
+        <span class="s1">self.minor_ticklabels.invert_axis_direction()</span>
+
+    <span class="s3">def </span><span class="s1">set_axislabel_direction(self</span><span class="s3">, </span><span class="s1">label_direction):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Adjust the direction of the axis label. 
+ 
+        Note that the *label_direction*\s '+' and '-' are relative to the 
+        direction of the increasing coordinate. 
+ 
+        Parameters 
+        ---------- 
+        label_direction : {&quot;+&quot;, &quot;-&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._axislabel_add_angle = _api.check_getitem(</span>
+            <span class="s1">{</span><span class="s4">&quot;+&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;-&quot;</span><span class="s1">: </span><span class="s5">180</span><span class="s1">}</span><span class="s3">, </span><span class="s1">label_direction=label_direction)</span>
+
+    <span class="s3">def </span><span class="s1">get_transform(self):</span>
+        <span class="s3">return </span><span class="s1">self.axes.transAxes + self.offset_transform</span>
+
+    <span class="s3">def </span><span class="s1">get_helper(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return axis artist helper instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._axis_artist_helper</span>
+
+    <span class="s3">def </span><span class="s1">set_axisline_style(self</span><span class="s3">, </span><span class="s1">axisline_style=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the axisline style. 
+ 
+        The new style is completely defined by the passed attributes. Existing 
+        style attributes are forgotten. 
+ 
+        Parameters 
+        ---------- 
+        axisline_style : str or None 
+            The line style, e.g. '-&gt;', optionally followed by a comma-separated 
+            list of attributes. Alternatively, the attributes can be provided 
+            as keywords. 
+ 
+            If *None* this returns a string containing the available styles. 
+ 
+        Examples 
+        -------- 
+        The following two commands are equal: 
+ 
+        &gt;&gt;&gt; set_axisline_style(&quot;-&gt;,size=1.5&quot;) 
+        &gt;&gt;&gt; set_axisline_style(&quot;-&gt;&quot;, size=1.5) 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">axisline_style </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">AxislineStyle.pprint_styles()</span>
+
+        <span class="s3">if </span><span class="s1">isinstance(axisline_style</span><span class="s3">, </span><span class="s1">AxislineStyle._Base):</span>
+            <span class="s1">self._axisline_style = axisline_style</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self._axisline_style = AxislineStyle(axisline_style</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s1">self._init_line()</span>
+
+    <span class="s3">def </span><span class="s1">get_axisline_style(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the current axisline style.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._axisline_style</span>
+
+    <span class="s3">def </span><span class="s1">_init_line(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize the *line* artist that is responsible to draw the axis line. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">tran = (self._axis_artist_helper.get_line_transform(self.axes)</span>
+                <span class="s1">+ self.offset_transform)</span>
+
+        <span class="s1">axisline_style = self.get_axisline_style()</span>
+        <span class="s3">if </span><span class="s1">axisline_style </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">self.line = PathPatch(</span>
+                <span class="s1">self._axis_artist_helper.get_line(self.axes)</span><span class="s3">,</span>
+                <span class="s1">color=mpl.rcParams[</span><span class="s4">'axes.edgecolor'</span><span class="s1">]</span><span class="s3">,</span>
+                <span class="s1">fill=</span><span class="s3">False,</span>
+                <span class="s1">linewidth=mpl.rcParams[</span><span class="s4">'axes.linewidth'</span><span class="s1">]</span><span class="s3">,</span>
+                <span class="s1">capstyle=mpl.rcParams[</span><span class="s4">'lines.solid_capstyle'</span><span class="s1">]</span><span class="s3">,</span>
+                <span class="s1">joinstyle=mpl.rcParams[</span><span class="s4">'lines.solid_joinstyle'</span><span class="s1">]</span><span class="s3">,</span>
+                <span class="s1">transform=tran)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.line = axisline_style(self</span><span class="s3">, </span><span class="s1">transform=tran)</span>
+
+    <span class="s3">def </span><span class="s1">_draw_line(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s1">self.line.set_path(self._axis_artist_helper.get_line(self.axes))</span>
+        <span class="s3">if </span><span class="s1">self.get_axisline_style() </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.line.set_line_mutation_scale(self.major_ticklabels.get_size())</span>
+        <span class="s1">self.line.draw(renderer)</span>
+
+    <span class="s3">def </span><span class="s1">_init_ticks(self</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">axis_name = self.axis.axis_name</span>
+
+        <span class="s1">trans = (self._axis_artist_helper.get_tick_transform(self.axes)</span>
+                 <span class="s1">+ self.offset_transform)</span>
+
+        <span class="s1">self.major_ticks = Ticks(</span>
+            <span class="s1">kwargs.get(</span>
+                <span class="s4">&quot;major_tick_size&quot;</span><span class="s3">,</span>
+                <span class="s1">mpl.rcParams[</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">axis_name</span><span class="s3">}</span><span class="s4">tick.major.size&quot;</span><span class="s1">])</span><span class="s3">,</span>
+            <span class="s1">axis=self.axis</span><span class="s3">, </span><span class="s1">transform=trans)</span>
+        <span class="s1">self.minor_ticks = Ticks(</span>
+            <span class="s1">kwargs.get(</span>
+                <span class="s4">&quot;minor_tick_size&quot;</span><span class="s3">,</span>
+                <span class="s1">mpl.rcParams[</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">axis_name</span><span class="s3">}</span><span class="s4">tick.minor.size&quot;</span><span class="s1">])</span><span class="s3">,</span>
+            <span class="s1">axis=self.axis</span><span class="s3">, </span><span class="s1">transform=trans)</span>
+
+        <span class="s1">size = mpl.rcParams[</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">axis_name</span><span class="s3">}</span><span class="s4">tick.labelsize&quot;</span><span class="s1">]</span>
+        <span class="s1">self.major_ticklabels = TickLabels(</span>
+            <span class="s1">axis=self.axis</span><span class="s3">,</span>
+            <span class="s1">axis_direction=self._axis_direction</span><span class="s3">,</span>
+            <span class="s1">figure=self.axes.figure</span><span class="s3">,</span>
+            <span class="s1">transform=trans</span><span class="s3">,</span>
+            <span class="s1">fontsize=size</span><span class="s3">,</span>
+            <span class="s1">pad=kwargs.get(</span>
+                <span class="s4">&quot;major_tick_pad&quot;</span><span class="s3">, </span><span class="s1">mpl.rcParams[</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">axis_name</span><span class="s3">}</span><span class="s4">tick.major.pad&quot;</span><span class="s1">])</span><span class="s3">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.minor_ticklabels = TickLabels(</span>
+            <span class="s1">axis=self.axis</span><span class="s3">,</span>
+            <span class="s1">axis_direction=self._axis_direction</span><span class="s3">,</span>
+            <span class="s1">figure=self.axes.figure</span><span class="s3">,</span>
+            <span class="s1">transform=trans</span><span class="s3">,</span>
+            <span class="s1">fontsize=size</span><span class="s3">,</span>
+            <span class="s1">pad=kwargs.get(</span>
+                <span class="s4">&quot;minor_tick_pad&quot;</span><span class="s3">, </span><span class="s1">mpl.rcParams[</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">axis_name</span><span class="s3">}</span><span class="s4">tick.minor.pad&quot;</span><span class="s1">])</span><span class="s3">,</span>
+        <span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">_get_tick_info(self</span><span class="s3">, </span><span class="s1">tick_iter):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a pair of: 
+ 
+        - list of locs and angles for ticks 
+        - list of locs, angles and labels for ticklabels. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ticks_loc_angle = []</span>
+        <span class="s1">ticklabels_loc_angle_label = []</span>
+
+        <span class="s1">ticklabel_add_angle = self._ticklabel_add_angle</span>
+
+        <span class="s3">for </span><span class="s1">loc</span><span class="s3">, </span><span class="s1">angle_normal</span><span class="s3">, </span><span class="s1">angle_tangent</span><span class="s3">, </span><span class="s1">label </span><span class="s3">in </span><span class="s1">tick_iter:</span>
+            <span class="s1">angle_label = angle_tangent - </span><span class="s5">90 </span><span class="s1">+ ticklabel_add_angle</span>
+            <span class="s1">angle_tick = (angle_normal</span>
+                          <span class="s3">if </span><span class="s5">90 </span><span class="s1">&lt;= (angle_label - angle_normal) % </span><span class="s5">360 </span><span class="s1">&lt;= </span><span class="s5">270</span>
+                          <span class="s3">else </span><span class="s1">angle_normal + </span><span class="s5">180</span><span class="s1">)</span>
+            <span class="s1">ticks_loc_angle.append([loc</span><span class="s3">, </span><span class="s1">angle_tick])</span>
+            <span class="s1">ticklabels_loc_angle_label.append([loc</span><span class="s3">, </span><span class="s1">angle_label</span><span class="s3">, </span><span class="s1">label])</span>
+
+        <span class="s3">return </span><span class="s1">ticks_loc_angle</span><span class="s3">, </span><span class="s1">ticklabels_loc_angle_label</span>
+
+    <span class="s3">def </span><span class="s1">_update_ticks(self</span><span class="s3">, </span><span class="s1">renderer=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2"># set extra pad for major and minor ticklabels: use ticksize of</span>
+        <span class="s2"># majorticks even for minor ticks. not clear what is best.</span>
+
+        <span class="s3">if </span><span class="s1">renderer </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">renderer = self.figure._get_renderer()</span>
+
+        <span class="s1">dpi_cor = renderer.points_to_pixels(</span><span class="s5">1.</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">self.major_ticks.get_visible() </span><span class="s3">and </span><span class="s1">self.major_ticks.get_tick_out():</span>
+            <span class="s1">ticklabel_pad = self.major_ticks._ticksize * dpi_cor</span>
+            <span class="s1">self.major_ticklabels._external_pad = ticklabel_pad</span>
+            <span class="s1">self.minor_ticklabels._external_pad = ticklabel_pad</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.major_ticklabels._external_pad = </span><span class="s5">0</span>
+            <span class="s1">self.minor_ticklabels._external_pad = </span><span class="s5">0</span>
+
+        <span class="s1">majortick_iter</span><span class="s3">, </span><span class="s1">minortick_iter = \</span>
+            <span class="s1">self._axis_artist_helper.get_tick_iterators(self.axes)</span>
+
+        <span class="s1">tick_loc_angle</span><span class="s3">, </span><span class="s1">ticklabel_loc_angle_label = \</span>
+            <span class="s1">self._get_tick_info(majortick_iter)</span>
+        <span class="s1">self.major_ticks.set_locs_angles(tick_loc_angle)</span>
+        <span class="s1">self.major_ticklabels.set_locs_angles_labels(ticklabel_loc_angle_label)</span>
+
+        <span class="s1">tick_loc_angle</span><span class="s3">, </span><span class="s1">ticklabel_loc_angle_label = \</span>
+            <span class="s1">self._get_tick_info(minortick_iter)</span>
+        <span class="s1">self.minor_ticks.set_locs_angles(tick_loc_angle)</span>
+        <span class="s1">self.minor_ticklabels.set_locs_angles_labels(ticklabel_loc_angle_label)</span>
+
+    <span class="s3">def </span><span class="s1">_draw_ticks(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s1">self._update_ticks(renderer)</span>
+        <span class="s1">self.major_ticks.draw(renderer)</span>
+        <span class="s1">self.major_ticklabels.draw(renderer)</span>
+        <span class="s1">self.minor_ticks.draw(renderer)</span>
+        <span class="s1">self.minor_ticklabels.draw(renderer)</span>
+        <span class="s3">if </span><span class="s1">(self.major_ticklabels.get_visible()</span>
+                <span class="s3">or </span><span class="s1">self.minor_ticklabels.get_visible()):</span>
+            <span class="s1">self._draw_offsetText(renderer)</span>
+
+    <span class="s1">_offsetText_pos = dict(left=(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s4">&quot;right&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                           <span class="s1">right=(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s4">&quot;left&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                           <span class="s1">bottom=(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;top&quot;</span><span class="s3">, </span><span class="s4">&quot;right&quot;</span><span class="s1">)</span><span class="s3">,</span>
+                           <span class="s1">top=(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s4">&quot;bottom&quot;</span><span class="s3">, </span><span class="s4">&quot;right&quot;</span><span class="s1">))</span>
+
+    <span class="s3">def </span><span class="s1">_init_offsetText(self</span><span class="s3">, </span><span class="s1">direction):</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">va</span><span class="s3">, </span><span class="s1">ha = self._offsetText_pos[direction]</span>
+        <span class="s1">self.offsetText = mtext.Annotation(</span>
+            <span class="s4">&quot;&quot;</span><span class="s3">,</span>
+            <span class="s1">xy=(x</span><span class="s3">, </span><span class="s1">y)</span><span class="s3">, </span><span class="s1">xycoords=</span><span class="s4">&quot;axes fraction&quot;</span><span class="s3">,</span>
+            <span class="s1">xytext=(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span><span class="s3">, </span><span class="s1">textcoords=</span><span class="s4">&quot;offset points&quot;</span><span class="s3">,</span>
+            <span class="s1">color=mpl.rcParams[</span><span class="s4">'xtick.color'</span><span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">horizontalalignment=ha</span><span class="s3">, </span><span class="s1">verticalalignment=va</span><span class="s3">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.offsetText.set_transform(IdentityTransform())</span>
+        <span class="s1">self.axes._set_artist_props(self.offsetText)</span>
+
+    <span class="s3">def </span><span class="s1">_update_offsetText(self):</span>
+        <span class="s1">self.offsetText.set_text(self.axis.major.formatter.get_offset())</span>
+        <span class="s1">self.offsetText.set_size(self.major_ticklabels.get_size())</span>
+        <span class="s1">offset = (self.major_ticklabels.get_pad()</span>
+                  <span class="s1">+ self.major_ticklabels.get_size()</span>
+                  <span class="s1">+ </span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">self.offsetText.xyann = (</span><span class="s5">0</span><span class="s3">, </span><span class="s1">offset)</span>
+
+    <span class="s3">def </span><span class="s1">_draw_offsetText(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s1">self._update_offsetText()</span>
+        <span class="s1">self.offsetText.draw(renderer)</span>
+
+    <span class="s3">def </span><span class="s1">_init_label(self</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">tr = (self._axis_artist_helper.get_axislabel_transform(self.axes)</span>
+              <span class="s1">+ self.offset_transform)</span>
+        <span class="s1">self.label = AxisLabel(</span>
+            <span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;__from_axes__&quot;</span><span class="s3">,</span>
+            <span class="s1">color=</span><span class="s4">&quot;auto&quot;</span><span class="s3">,</span>
+            <span class="s1">fontsize=kwargs.get(</span><span class="s4">&quot;labelsize&quot;</span><span class="s3">, </span><span class="s1">mpl.rcParams[</span><span class="s4">'axes.labelsize'</span><span class="s1">])</span><span class="s3">,</span>
+            <span class="s1">fontweight=mpl.rcParams[</span><span class="s4">'axes.labelweight'</span><span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">axis=self.axis</span><span class="s3">,</span>
+            <span class="s1">transform=tr</span><span class="s3">,</span>
+            <span class="s1">axis_direction=self._axis_direction</span><span class="s3">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.label.set_figure(self.axes.figure)</span>
+        <span class="s1">labelpad = kwargs.get(</span><span class="s4">&quot;labelpad&quot;</span><span class="s3">, </span><span class="s5">5</span><span class="s1">)</span>
+        <span class="s1">self.label.set_pad(labelpad)</span>
+
+    <span class="s3">def </span><span class="s1">_update_label(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s3">if not </span><span class="s1">self.label.get_visible():</span>
+            <span class="s3">return</span>
+
+        <span class="s3">if </span><span class="s1">self._ticklabel_add_angle != self._axislabel_add_angle:</span>
+            <span class="s3">if </span><span class="s1">((self.major_ticks.get_visible()</span>
+                 <span class="s3">and not </span><span class="s1">self.major_ticks.get_tick_out())</span>
+                <span class="s3">or </span><span class="s1">(self.minor_ticks.get_visible()</span>
+                    <span class="s3">and not </span><span class="s1">self.major_ticks.get_tick_out())):</span>
+                <span class="s1">axislabel_pad = self.major_ticks._ticksize</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">axislabel_pad = </span><span class="s5">0</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">axislabel_pad = max(self.major_ticklabels._axislabel_pad</span><span class="s3">,</span>
+                                <span class="s1">self.minor_ticklabels._axislabel_pad)</span>
+
+        <span class="s1">self.label._external_pad = axislabel_pad</span>
+
+        <span class="s1">xy</span><span class="s3">, </span><span class="s1">angle_tangent = \</span>
+            <span class="s1">self._axis_artist_helper.get_axislabel_pos_angle(self.axes)</span>
+        <span class="s3">if </span><span class="s1">xy </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">return</span>
+
+        <span class="s1">angle_label = angle_tangent - </span><span class="s5">90</span>
+
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">y = xy</span>
+        <span class="s1">self.label._ref_angle = angle_label + self._axislabel_add_angle</span>
+        <span class="s1">self.label.set(x=x</span><span class="s3">, </span><span class="s1">y=y)</span>
+
+    <span class="s3">def </span><span class="s1">_draw_label(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s1">self._update_label(renderer)</span>
+        <span class="s1">self.label.draw(renderer)</span>
+
+    <span class="s3">def </span><span class="s1">set_label(self</span><span class="s3">, </span><span class="s1">s):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s1">self.label.set_text(s)</span>
+
+    <span class="s3">def </span><span class="s1">get_tightbbox(self</span><span class="s3">, </span><span class="s1">renderer=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s3">return</span>
+        <span class="s1">self._axis_artist_helper.update_lim(self.axes)</span>
+        <span class="s1">self._update_ticks(renderer)</span>
+        <span class="s1">self._update_label(renderer)</span>
+
+        <span class="s1">self.line.set_path(self._axis_artist_helper.get_line(self.axes))</span>
+        <span class="s3">if </span><span class="s1">self.get_axisline_style() </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.line.set_line_mutation_scale(self.major_ticklabels.get_size())</span>
+
+        <span class="s1">bb = [</span>
+            <span class="s1">*self.major_ticklabels.get_window_extents(renderer)</span><span class="s3">,</span>
+            <span class="s1">*self.minor_ticklabels.get_window_extents(renderer)</span><span class="s3">,</span>
+            <span class="s1">self.label.get_window_extent(renderer)</span><span class="s3">,</span>
+            <span class="s1">self.offsetText.get_window_extent(renderer)</span><span class="s3">,</span>
+            <span class="s1">self.line.get_window_extent(renderer)</span><span class="s3">,</span>
+        <span class="s1">]</span>
+        <span class="s1">bb = [b </span><span class="s3">for </span><span class="s1">b </span><span class="s3">in </span><span class="s1">bb </span><span class="s3">if </span><span class="s1">b </span><span class="s3">and </span><span class="s1">(b.width != </span><span class="s5">0 </span><span class="s3">or </span><span class="s1">b.height != </span><span class="s5">0</span><span class="s1">)]</span>
+        <span class="s3">if </span><span class="s1">bb:</span>
+            <span class="s1">_bbox = Bbox.union(bb)</span>
+            <span class="s3">return </span><span class="s1">_bbox</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return None</span>
+
+    <span class="s1">@martist.allow_rasterization</span>
+    <span class="s3">def </span><span class="s1">draw(self</span><span class="s3">, </span><span class="s1">renderer):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s3">if not </span><span class="s1">self.get_visible():</span>
+            <span class="s3">return</span>
+        <span class="s1">renderer.open_group(__name__</span><span class="s3">, </span><span class="s1">gid=self.get_gid())</span>
+        <span class="s1">self._axis_artist_helper.update_lim(self.axes)</span>
+        <span class="s1">self._draw_ticks(renderer)</span>
+        <span class="s1">self._draw_line(renderer)</span>
+        <span class="s1">self._draw_label(renderer)</span>
+        <span class="s1">renderer.close_group(__name__)</span>
+
+    <span class="s3">def </span><span class="s1">toggle(self</span><span class="s3">, </span><span class="s1">all=</span><span class="s3">None, </span><span class="s1">ticks=</span><span class="s3">None, </span><span class="s1">ticklabels=</span><span class="s3">None, </span><span class="s1">label=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Toggle visibility of ticks, ticklabels, and (axis) label. 
+        To turn all off, :: 
+ 
+          axis.toggle(all=False) 
+ 
+        To turn all off but ticks on :: 
+ 
+          axis.toggle(all=False, ticks=True) 
+ 
+        To turn all on but (axis) label off :: 
+ 
+          axis.toggle(all=True, label=False) 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">all:</span>
+            <span class="s1">_ticks</span><span class="s3">, </span><span class="s1">_ticklabels</span><span class="s3">, </span><span class="s1">_label = </span><span class="s3">True, True, True</span>
+        <span class="s3">elif </span><span class="s1">all </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">_ticks</span><span class="s3">, </span><span class="s1">_ticklabels</span><span class="s3">, </span><span class="s1">_label = </span><span class="s3">False, False, False</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">_ticks</span><span class="s3">, </span><span class="s1">_ticklabels</span><span class="s3">, </span><span class="s1">_label = </span><span class="s3">None, None, None</span>
+
+        <span class="s3">if </span><span class="s1">ticks </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">_ticks = ticks</span>
+        <span class="s3">if </span><span class="s1">ticklabels </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">_ticklabels = ticklabels</span>
+        <span class="s3">if </span><span class="s1">label </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">_label = label</span>
+
+        <span class="s3">if </span><span class="s1">_ticks </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.major_ticks.set_visible(_ticks)</span>
+            <span class="s1">self.minor_ticks.set_visible(_ticks)</span>
+        <span class="s3">if </span><span class="s1">_ticklabels </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.major_ticklabels.set_visible(_ticklabels)</span>
+            <span class="s1">self.minor_ticklabels.set_visible(_ticklabels)</span>
+        <span class="s3">if </span><span class="s1">_label </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.label.set_visible(_label)</span>
+</pre>
+</body>
+</html>

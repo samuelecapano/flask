@@ -1,0 +1,746 @@
+<html>
+<head>
+<title>cm.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cm.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Builtin colormaps, colormap handling utilities, and the `ScalarMappable` mixin. 
+ 
+.. seealso:: 
+ 
+  :doc:`/gallery/color/colormap_reference` for a list of builtin colormaps. 
+ 
+  :doc:`/tutorials/colors/colormap-manipulation` for examples of how to 
+  make colormaps. 
+ 
+  :doc:`/tutorials/colors/colormaps` an in-depth discussion of 
+  choosing colormaps. 
+ 
+  :doc:`/tutorials/colors/colormapnorms` for more details about data 
+  normalization. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">collections.abc </span><span class="s2">import </span><span class="s1">Mapping</span>
+<span class="s2">import </span><span class="s1">functools</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy </span><span class="s2">import </span><span class="s1">ma</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">colors</span><span class="s2">, </span><span class="s1">cbook</span><span class="s2">, </span><span class="s1">scale</span>
+<span class="s2">from </span><span class="s1">matplotlib._cm </span><span class="s2">import </span><span class="s1">datad</span>
+<span class="s2">from </span><span class="s1">matplotlib._cm_listed </span><span class="s2">import </span><span class="s1">cmaps </span><span class="s2">as </span><span class="s1">cmaps_listed</span>
+
+
+<span class="s1">_LUTSIZE = mpl.rcParams[</span><span class="s3">'image.lut'</span><span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">_gen_cmap_registry():</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Generate a dict mapping standard colormap names to standard colormaps, as 
+    well as the reversed colormaps. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">cmap_d = {**cmaps_listed}</span>
+    <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">spec </span><span class="s2">in </span><span class="s1">datad.items():</span>
+        <span class="s1">cmap_d[name] = (  </span><span class="s4"># Precache the cmaps at a fixed lutsize..</span>
+            <span class="s1">colors.LinearSegmentedColormap(name</span><span class="s2">, </span><span class="s1">spec</span><span class="s2">, </span><span class="s1">_LUTSIZE)</span>
+            <span class="s2">if </span><span class="s3">'red' </span><span class="s2">in </span><span class="s1">spec </span><span class="s2">else</span>
+            <span class="s1">colors.ListedColormap(spec[</span><span class="s3">'listed'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">name)</span>
+            <span class="s2">if </span><span class="s3">'listed' </span><span class="s2">in </span><span class="s1">spec </span><span class="s2">else</span>
+            <span class="s1">colors.LinearSegmentedColormap.from_list(name</span><span class="s2">, </span><span class="s1">spec</span><span class="s2">, </span><span class="s1">_LUTSIZE))</span>
+    <span class="s4"># Generate reversed cmaps.</span>
+    <span class="s2">for </span><span class="s1">cmap </span><span class="s2">in </span><span class="s1">list(cmap_d.values()):</span>
+        <span class="s1">rmap = cmap.reversed()</span>
+        <span class="s1">cmap_d[rmap.name] = rmap</span>
+    <span class="s2">return </span><span class="s1">cmap_d</span>
+
+
+<span class="s2">class </span><span class="s1">ColormapRegistry(Mapping):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Container for colormaps that are known to Matplotlib by name. 
+ 
+    The universal registry instance is `matplotlib.colormaps`. There should be 
+    no need for users to instantiate `.ColormapRegistry` themselves. 
+ 
+    Read access uses a dict-like interface mapping names to `.Colormap`\s:: 
+ 
+        import matplotlib as mpl 
+        cmap = mpl.colormaps['viridis'] 
+ 
+    Returned `.Colormap`\s are copies, so that their modification does not 
+    change the global definition of the colormap. 
+ 
+    Additional colormaps can be added via `.ColormapRegistry.register`:: 
+ 
+        mpl.colormaps.register(my_colormap) 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">cmaps):</span>
+        <span class="s1">self._cmaps = cmaps</span>
+        <span class="s1">self._builtin_cmaps = tuple(cmaps)</span>
+        <span class="s4"># A shim to allow register_cmap() to force an override</span>
+        <span class="s1">self._allow_override_builtin = </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">item):</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._cmaps[item].copy()</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s2">raise </span><span class="s1">KeyError(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">item</span><span class="s2">!r} </span><span class="s3">is not a known colormap name&quot;</span><span class="s1">) </span><span class="s2">from None</span>
+
+    <span class="s2">def </span><span class="s1">__iter__(self):</span>
+        <span class="s2">return </span><span class="s1">iter(self._cmaps)</span>
+
+    <span class="s2">def </span><span class="s1">__len__(self):</span>
+        <span class="s2">return </span><span class="s1">len(self._cmaps)</span>
+
+    <span class="s2">def </span><span class="s1">__str__(self):</span>
+        <span class="s2">return </span><span class="s1">(</span><span class="s3">'ColormapRegistry; available colormaps:</span><span class="s2">\n</span><span class="s3">' </span><span class="s1">+</span>
+                <span class="s3">', '</span><span class="s1">.join(</span><span class="s3">f&quot;'</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s3">'&quot; </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self))</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a list of the registered colormap names. 
+ 
+        This exists only for backward-compatibility in `.pyplot` which had a 
+        ``plt.colormaps()`` method. The recommended way to get this list is 
+        now ``list(colormaps)``. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">list(self)</span>
+
+    <span class="s2">def </span><span class="s1">register(self</span><span class="s2">, </span><span class="s1">cmap</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">name=</span><span class="s2">None, </span><span class="s1">force=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Register a new colormap. 
+ 
+        The colormap name can then be used as a string argument to any ``cmap`` 
+        parameter in Matplotlib. It is also available in ``pyplot.get_cmap``. 
+ 
+        The colormap registry stores a copy of the given colormap, so that 
+        future changes to the original colormap instance do not affect the 
+        registered colormap. Think of this as the registry taking a snapshot 
+        of the colormap at registration. 
+ 
+        Parameters 
+        ---------- 
+        cmap : matplotlib.colors.Colormap 
+            The colormap to register. 
+ 
+        name : str, optional 
+            The name for the colormap. If not given, ``cmap.name`` is used. 
+ 
+        force : bool, default: False 
+            If False, a ValueError is raised if trying to overwrite an already 
+            registered name. True supports overwriting registered colormaps 
+            other than the builtin colormaps. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_api.check_isinstance(colors.Colormap</span><span class="s2">, </span><span class="s1">cmap=cmap)</span>
+
+        <span class="s1">name = name </span><span class="s2">or </span><span class="s1">cmap.name</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self:</span>
+            <span class="s2">if not </span><span class="s1">force:</span>
+                <span class="s4"># don't allow registering an already existing cmap</span>
+                <span class="s4"># unless explicitly asked to</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">f'A colormap named &quot;</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s3">&quot; is already registered.'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">(name </span><span class="s2">in </span><span class="s1">self._builtin_cmaps</span>
+                    <span class="s2">and not </span><span class="s1">self._allow_override_builtin):</span>
+                <span class="s4"># We don't allow overriding a builtin unless privately</span>
+                <span class="s4"># coming from register_cmap()</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Re-registering the builtin cmap &quot;</span>
+                                 <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">name</span><span class="s2">!r} </span><span class="s3">is not allowed.&quot;</span><span class="s1">)</span>
+
+            <span class="s4"># Warn that we are updating an already existing colormap</span>
+            <span class="s1">_api.warn_external(</span><span class="s3">f&quot;Overwriting the cmap </span><span class="s2">{</span><span class="s1">name</span><span class="s2">!r} </span><span class="s3">&quot;</span>
+                               <span class="s3">&quot;that was already in the registry.&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self._cmaps[name] = cmap.copy()</span>
+
+    <span class="s2">def </span><span class="s1">unregister(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Remove a colormap from the registry. 
+ 
+        You cannot remove built-in colormaps. 
+ 
+        If the named colormap is not registered, returns with no error, raises 
+        if you try to de-register a default colormap. 
+ 
+        .. warning:: 
+ 
+            Colormap names are currently a shared namespace that may be used 
+            by multiple packages. Use `unregister` only if you know you 
+            have registered that name before. In particular, do not 
+            unregister just in case to clean the name before registering a 
+            new colormap. 
+ 
+        Parameters 
+        ---------- 
+        name : str 
+            The name of the colormap to be removed. 
+ 
+        Raises 
+        ------ 
+        ValueError 
+            If you try to remove a default built-in colormap. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self._builtin_cmaps:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">f&quot;cannot unregister </span><span class="s2">{</span><span class="s1">name</span><span class="s2">!r} </span><span class="s3">which is a builtin &quot;</span>
+                             <span class="s3">&quot;colormap.&quot;</span><span class="s1">)</span>
+        <span class="s1">self._cmaps.pop(name</span><span class="s2">, None</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_cmap(self</span><span class="s2">, </span><span class="s1">cmap):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a color map specified through *cmap*. 
+ 
+        Parameters 
+        ---------- 
+        cmap : str or `~matplotlib.colors.Colormap` or None 
+ 
+            - if a `.Colormap`, return it 
+            - if a string, look it up in ``mpl.colormaps`` 
+            - if None, return the Colormap defined in :rc:`image.cmap` 
+ 
+        Returns 
+        ------- 
+        Colormap 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># get the default color map</span>
+        <span class="s2">if </span><span class="s1">cmap </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self[mpl.rcParams[</span><span class="s3">&quot;image.cmap&quot;</span><span class="s1">]]</span>
+
+        <span class="s4"># if the user passed in a Colormap, simply return it</span>
+        <span class="s2">if </span><span class="s1">isinstance(cmap</span><span class="s2">, </span><span class="s1">colors.Colormap):</span>
+            <span class="s2">return </span><span class="s1">cmap</span>
+        <span class="s2">if </span><span class="s1">isinstance(cmap</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">_api.check_in_list(sorted(_colormaps)</span><span class="s2">, </span><span class="s1">cmap=cmap)</span>
+            <span class="s4"># otherwise, it must be a string so look it up</span>
+            <span class="s2">return </span><span class="s1">self[cmap]</span>
+        <span class="s2">raise </span><span class="s1">TypeError(</span>
+            <span class="s3">'get_cmap expects None or an instance of a str or Colormap . ' </span><span class="s1">+</span>
+            <span class="s3">f'you passed </span><span class="s2">{</span><span class="s1">cmap</span><span class="s2">!r} </span><span class="s3">of type </span><span class="s2">{</span><span class="s1">type(cmap)</span><span class="s2">}</span><span class="s3">'</span>
+        <span class="s1">)</span>
+
+
+<span class="s4"># public access to the colormaps should be via `matplotlib.colormaps`. For now,</span>
+<span class="s4"># we still create the registry here, but that should stay an implementation</span>
+<span class="s4"># detail.</span>
+<span class="s1">_colormaps = ColormapRegistry(_gen_cmap_registry())</span>
+<span class="s1">globals().update(_colormaps)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s3">&quot;``matplotlib.colormaps.register(name)``&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">register_cmap(name=</span><span class="s2">None, </span><span class="s1">cmap=</span><span class="s2">None, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">override_builtin=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Add a colormap to the set recognized by :func:`get_cmap`. 
+ 
+    Register a new colormap to be accessed by name :: 
+ 
+        LinearSegmentedColormap('swirly', data, lut) 
+        register_cmap(cmap=swirly_cmap) 
+ 
+    Parameters 
+    ---------- 
+    name : str, optional 
+       The name that can be used in :func:`get_cmap` or :rc:`image.cmap` 
+ 
+       If absent, the name will be the :attr:`~matplotlib.colors.Colormap.name` 
+       attribute of the *cmap*. 
+ 
+    cmap : matplotlib.colors.Colormap 
+       Despite being the second argument and having a default value, this 
+       is a required argument. 
+ 
+    override_builtin : bool 
+ 
+        Allow built-in colormaps to be overridden by a user-supplied 
+        colormap. 
+ 
+        Please do not use this unless you are sure you need it. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_api.check_isinstance((str</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">, </span><span class="s1">name=name)</span>
+    <span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">name = cmap.name</span>
+        <span class="s2">except </span><span class="s1">AttributeError </span><span class="s2">as </span><span class="s1">err:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Arguments must include a name or a &quot;</span>
+                             <span class="s3">&quot;Colormap&quot;</span><span class="s1">) </span><span class="s2">from </span><span class="s1">err</span>
+    <span class="s4"># override_builtin is allowed here for backward compatibility</span>
+    <span class="s4"># this is just a shim to enable that to work privately in</span>
+    <span class="s4"># the global ColormapRegistry</span>
+    <span class="s1">_colormaps._allow_override_builtin = override_builtin</span>
+    <span class="s1">_colormaps.register(cmap</span><span class="s2">, </span><span class="s1">name=name</span><span class="s2">, </span><span class="s1">force=override_builtin)</span>
+    <span class="s1">_colormaps._allow_override_builtin = </span><span class="s2">False</span>
+
+
+<span class="s2">def </span><span class="s1">_get_cmap(name=</span><span class="s2">None, </span><span class="s1">lut=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Get a colormap instance, defaulting to rc values if *name* is None. 
+ 
+    Parameters 
+    ---------- 
+    name : `matplotlib.colors.Colormap` or str or None, default: None 
+        If a `.Colormap` instance, it will be returned. Otherwise, the name of 
+        a colormap known to Matplotlib, which will be resampled by *lut*. The 
+        default, None, means :rc:`image.cmap`. 
+    lut : int or None, default: None 
+        If *name* is not already a Colormap instance and *lut* is not None, the 
+        colormap will be resampled to have *lut* entries in the lookup table. 
+ 
+    Returns 
+    ------- 
+    Colormap 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">name = mpl.rcParams[</span><span class="s3">'image.cmap'</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">isinstance(name</span><span class="s2">, </span><span class="s1">colors.Colormap):</span>
+        <span class="s2">return </span><span class="s1">name</span>
+    <span class="s1">_api.check_in_list(sorted(_colormaps)</span><span class="s2">, </span><span class="s1">name=name)</span>
+    <span class="s2">if </span><span class="s1">lut </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_colormaps[name]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_colormaps[name].resampled(lut)</span>
+
+<span class="s4"># do it in two steps like this so we can have an un-deprecated version in</span>
+<span class="s4"># pyplot.</span>
+<span class="s1">get_cmap = _api.deprecated(</span>
+    <span class="s3">'3.7'</span><span class="s2">,</span>
+    <span class="s1">name=</span><span class="s3">'get_cmap'</span><span class="s2">,</span>
+    <span class="s1">alternative=(</span>
+        <span class="s3">&quot;``matplotlib.colormaps[name]`` &quot; </span><span class="s1">+</span>
+        <span class="s3">&quot;or ``matplotlib.colormaps.get_cmap(obj)``&quot;</span>
+    <span class="s1">)</span>
+<span class="s1">)(_get_cmap)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.7&quot;</span><span class="s2">,</span>
+                 <span class="s1">alternative=</span><span class="s3">&quot;``matplotlib.colormaps.unregister(name)``&quot;</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">unregister_cmap(name):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Remove a colormap recognized by :func:`get_cmap`. 
+ 
+    You may not remove built-in colormaps. 
+ 
+    If the named colormap is not registered, returns with no error, raises 
+    if you try to de-register a default colormap. 
+ 
+    .. warning:: 
+ 
+      Colormap names are currently a shared namespace that may be used 
+      by multiple packages. Use `unregister_cmap` only if you know you 
+      have registered that name before. In particular, do not 
+      unregister just in case to clean the name before registering a 
+      new colormap. 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        The name of the colormap to be un-registered 
+ 
+    Returns 
+    ------- 
+    ColorMap or None 
+        If the colormap was registered, return it if not return `None` 
+ 
+    Raises 
+    ------ 
+    ValueError 
+       If you try to de-register a default built-in colormap. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">cmap = _colormaps.get(name</span><span class="s2">, None</span><span class="s1">)</span>
+    <span class="s1">_colormaps.unregister(name)</span>
+    <span class="s2">return </span><span class="s1">cmap</span>
+
+
+<span class="s2">def </span><span class="s1">_auto_norm_from_scale(scale_cls):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Automatically generate a norm class from *scale_cls*. 
+ 
+    This differs from `.colors.make_norm_from_scale` in the following points: 
+ 
+    - This function is not a class decorator, but directly returns a norm class 
+      (as if decorating `.Normalize`). 
+    - The scale is automatically constructed with ``nonpositive=&quot;mask&quot;``, if it 
+      supports such a parameter, to work around the difference in defaults 
+      between standard scales (which use &quot;clip&quot;) and norms (which use &quot;mask&quot;). 
+ 
+    Note that ``make_norm_from_scale`` caches the generated norm classes 
+    (not the instances) and reuses them for later calls.  For example, 
+    ``type(_auto_norm_from_scale(&quot;log&quot;)) == LogNorm``. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Actually try to construct an instance, to verify whether</span>
+    <span class="s4"># ``nonpositive=&quot;mask&quot;`` is supported.</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">norm = colors.make_norm_from_scale(</span>
+            <span class="s1">functools.partial(scale_cls</span><span class="s2">, </span><span class="s1">nonpositive=</span><span class="s3">&quot;mask&quot;</span><span class="s1">))(</span>
+            <span class="s1">colors.Normalize)()</span>
+    <span class="s2">except </span><span class="s1">TypeError:</span>
+        <span class="s1">norm = colors.make_norm_from_scale(scale_cls)(</span>
+            <span class="s1">colors.Normalize)()</span>
+    <span class="s2">return </span><span class="s1">type(norm)</span>
+
+
+<span class="s2">class </span><span class="s1">ScalarMappable:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A mixin class to map scalar data to RGBA. 
+ 
+    The ScalarMappable applies data normalization before returning RGBA colors 
+    from the given colormap. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">norm=</span><span class="s2">None, </span><span class="s1">cmap=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        norm : `.Normalize` (or subclass thereof) or str or None 
+            The normalizing object which scales data, typically into the 
+            interval ``[0, 1]``. 
+            If a `str`, a `.Normalize` subclass is dynamically generated based 
+            on the scale with the corresponding name. 
+            If *None*, *norm* defaults to a *colors.Normalize* object which 
+            initializes its scaling based on the first data processed. 
+        cmap : str or `~matplotlib.colors.Colormap` 
+            The colormap used to map normalized data values to RGBA colors. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._A = </span><span class="s2">None</span>
+        <span class="s1">self._norm = </span><span class="s2">None  </span><span class="s4"># So that the setter knows we're initializing.</span>
+        <span class="s1">self.set_norm(norm)  </span><span class="s4"># The Normalize instance of this ScalarMappable.</span>
+        <span class="s1">self.cmap = </span><span class="s2">None  </span><span class="s4"># So that the setter knows we're initializing.</span>
+        <span class="s1">self.set_cmap(cmap)  </span><span class="s4"># The Colormap instance of this ScalarMappable.</span>
+        <span class="s4">#: The last colorbar associated with this ScalarMappable. May be None.</span>
+        <span class="s1">self.colorbar = </span><span class="s2">None</span>
+        <span class="s1">self.callbacks = cbook.CallbackRegistry(signals=[</span><span class="s3">&quot;changed&quot;</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">_scale_norm(self</span><span class="s2">, </span><span class="s1">norm</span><span class="s2">, </span><span class="s1">vmin</span><span class="s2">, </span><span class="s1">vmax):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Helper for initial scaling. 
+ 
+        Used by public functions that create a ScalarMappable and support 
+        parameters *vmin*, *vmax* and *norm*. This makes sure that a *norm* 
+        will take precedence over *vmin*, *vmax*. 
+ 
+        Note that this method does not set the norm. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">vmin </span><span class="s2">is not None or </span><span class="s1">vmax </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.set_clim(vmin</span><span class="s2">, </span><span class="s1">vmax)</span>
+            <span class="s2">if </span><span class="s1">isinstance(norm</span><span class="s2">, </span><span class="s1">colors.Normalize):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;Passing a Normalize instance simultaneously with &quot;</span>
+                    <span class="s3">&quot;vmin/vmax is not supported.  Please pass vmin/vmax &quot;</span>
+                    <span class="s3">&quot;directly to the norm when creating it.&quot;</span><span class="s1">)</span>
+
+        <span class="s4"># always resolve the autoscaling so we have concrete limits</span>
+        <span class="s4"># rather than deferring to draw time.</span>
+        <span class="s1">self.autoscale_None()</span>
+
+    <span class="s2">def </span><span class="s1">to_rgba(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s2">None, </span><span class="s1">bytes=</span><span class="s2">False, </span><span class="s1">norm=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a normalized rgba array corresponding to *x*. 
+ 
+        In the normal case, *x* is a 1D or 2D sequence of scalars, and 
+        the corresponding `~numpy.ndarray` of rgba values will be returned, 
+        based on the norm and colormap set for this ScalarMappable. 
+ 
+        There is one special case, for handling images that are already 
+        rgb or rgba, such as might have been read from an image file. 
+        If *x* is an `~numpy.ndarray` with 3 dimensions, 
+        and the last dimension is either 3 or 4, then it will be 
+        treated as an rgb or rgba array, and no mapping will be done. 
+        The array can be uint8, or it can be floating point with 
+        values in the 0-1 range; otherwise a ValueError will be raised. 
+        If it is a masked array, the mask will be ignored. 
+        If the last dimension is 3, the *alpha* kwarg (defaulting to 1) 
+        will be used to fill in the transparency.  If the last dimension 
+        is 4, the *alpha* kwarg is ignored; it does not 
+        replace the preexisting alpha.  A ValueError will be raised 
+        if the third dimension is other than 3 or 4. 
+ 
+        In either case, if *bytes* is *False* (default), the rgba 
+        array will be floats in the 0-1 range; if it is *True*, 
+        the returned rgba array will be uint8 in the 0 to 255 range. 
+ 
+        If norm is False, no normalization of the input data is 
+        performed, and it is assumed to be in the range (0-1). 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># First check for special case, image input:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">x.ndim == </span><span class="s5">3</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">x.shape[</span><span class="s5">2</span><span class="s1">] == </span><span class="s5">3</span><span class="s1">:</span>
+                    <span class="s2">if </span><span class="s1">alpha </span><span class="s2">is None</span><span class="s1">:</span>
+                        <span class="s1">alpha = </span><span class="s5">1</span>
+                    <span class="s2">if </span><span class="s1">x.dtype == np.uint8:</span>
+                        <span class="s1">alpha = np.uint8(alpha * </span><span class="s5">255</span><span class="s1">)</span>
+                    <span class="s1">m</span><span class="s2">, </span><span class="s1">n = x.shape[:</span><span class="s5">2</span><span class="s1">]</span>
+                    <span class="s1">xx = np.empty(shape=(m</span><span class="s2">, </span><span class="s1">n</span><span class="s2">, </span><span class="s5">4</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dtype=x.dtype)</span>
+                    <span class="s1">xx[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = x</span>
+                    <span class="s1">xx[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">3</span><span class="s1">] = alpha</span>
+                <span class="s2">elif </span><span class="s1">x.shape[</span><span class="s5">2</span><span class="s1">] == </span><span class="s5">4</span><span class="s1">:</span>
+                    <span class="s1">xx = x</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Third dimension must be 3 or 4&quot;</span><span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">xx.dtype.kind == </span><span class="s3">'f'</span><span class="s1">:</span>
+                    <span class="s2">if </span><span class="s1">norm </span><span class="s2">and </span><span class="s1">(xx.max() &gt; </span><span class="s5">1 </span><span class="s2">or </span><span class="s1">xx.min() &lt; </span><span class="s5">0</span><span class="s1">):</span>
+                        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Floating point image RGB values &quot;</span>
+                                         <span class="s3">&quot;must be in the 0..1 range.&quot;</span><span class="s1">)</span>
+                    <span class="s2">if </span><span class="s1">bytes:</span>
+                        <span class="s1">xx = (xx * </span><span class="s5">255</span><span class="s1">).astype(np.uint8)</span>
+                <span class="s2">elif </span><span class="s1">xx.dtype == np.uint8:</span>
+                    <span class="s2">if not </span><span class="s1">bytes:</span>
+                        <span class="s1">xx = xx.astype(np.float32) / </span><span class="s5">255</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Image RGB array must be uint8 or &quot;</span>
+                                     <span class="s3">&quot;floating point; found %s&quot; </span><span class="s1">% xx.dtype)</span>
+                <span class="s2">return </span><span class="s1">xx</span>
+        <span class="s2">except </span><span class="s1">AttributeError:</span>
+            <span class="s4"># e.g., x is not an ndarray; so try mapping it</span>
+            <span class="s2">pass</span>
+
+        <span class="s4"># This is the normal case, mapping a scalar array:</span>
+        <span class="s1">x = ma.asarray(x)</span>
+        <span class="s2">if </span><span class="s1">norm:</span>
+            <span class="s1">x = self.norm(x)</span>
+        <span class="s1">rgba = self.cmap(x</span><span class="s2">, </span><span class="s1">alpha=alpha</span><span class="s2">, </span><span class="s1">bytes=bytes)</span>
+        <span class="s2">return </span><span class="s1">rgba</span>
+
+    <span class="s2">def </span><span class="s1">set_array(self</span><span class="s2">, </span><span class="s1">A):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the value array from array-like *A*. 
+ 
+        Parameters 
+        ---------- 
+        A : array-like or None 
+            The values that are mapped to colors. 
+ 
+            The base class `.ScalarMappable` does not make any assumptions on 
+            the dimensionality and shape of the value array *A*. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">A </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._A = </span><span class="s2">None</span>
+            <span class="s2">return</span>
+
+        <span class="s1">A = cbook.safe_masked_invalid(A</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">np.can_cast(A.dtype</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s3">&quot;same_kind&quot;</span><span class="s1">):</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s3">f&quot;Image data of dtype </span><span class="s2">{</span><span class="s1">A.dtype</span><span class="s2">} </span><span class="s3">cannot be &quot;</span>
+                            <span class="s3">&quot;converted to float&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self._A = A</span>
+
+    <span class="s2">def </span><span class="s1">get_array(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the array of values, that are mapped to colors. 
+ 
+        The base class `.ScalarMappable` does not make any assumptions on 
+        the dimensionality and shape of the array. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._A</span>
+
+    <span class="s2">def </span><span class="s1">get_cmap(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the `.Colormap` instance.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.cmap</span>
+
+    <span class="s2">def </span><span class="s1">get_clim(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the values (min, max) that are mapped to the colormap limits. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.norm.vmin</span><span class="s2">, </span><span class="s1">self.norm.vmax</span>
+
+    <span class="s2">def </span><span class="s1">set_clim(self</span><span class="s2">, </span><span class="s1">vmin=</span><span class="s2">None, </span><span class="s1">vmax=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the norm limits for image scaling. 
+ 
+        Parameters 
+        ---------- 
+        vmin, vmax : float 
+             The limits. 
+ 
+             The limits may also be passed as a tuple (*vmin*, *vmax*) as a 
+             single positional argument. 
+ 
+             .. ACCEPTS: (vmin: float, vmax: float) 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># If the norm's limits are updated self.changed() will be called</span>
+        <span class="s4"># through the callbacks attached to the norm</span>
+        <span class="s2">if </span><span class="s1">vmax </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">vmin</span><span class="s2">, </span><span class="s1">vmax = vmin</span>
+            <span class="s2">except </span><span class="s1">(TypeError</span><span class="s2">, </span><span class="s1">ValueError):</span>
+                <span class="s2">pass</span>
+        <span class="s2">if </span><span class="s1">vmin </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.norm.vmin = colors._sanitize_extrema(vmin)</span>
+        <span class="s2">if </span><span class="s1">vmax </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.norm.vmax = colors._sanitize_extrema(vmax)</span>
+
+    <span class="s2">def </span><span class="s1">get_alpha(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns 
+        ------- 
+        float 
+            Always returns 1. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># This method is intended to be overridden by Artist sub-classes</span>
+        <span class="s2">return </span><span class="s5">1.</span>
+
+    <span class="s2">def </span><span class="s1">set_cmap(self</span><span class="s2">, </span><span class="s1">cmap):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the colormap for luminance data. 
+ 
+        Parameters 
+        ---------- 
+        cmap : `.Colormap` or str or None 
+        &quot;&quot;&quot;</span>
+        <span class="s1">in_init = self.cmap </span><span class="s2">is None</span>
+
+        <span class="s1">self.cmap = _ensure_cmap(cmap)</span>
+        <span class="s2">if not </span><span class="s1">in_init:</span>
+            <span class="s1">self.changed()  </span><span class="s4"># Things are not set up properly yet.</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">norm(self):</span>
+        <span class="s2">return </span><span class="s1">self._norm</span>
+
+    <span class="s1">@norm.setter</span>
+    <span class="s2">def </span><span class="s1">norm(self</span><span class="s2">, </span><span class="s1">norm):</span>
+        <span class="s1">_api.check_isinstance((colors.Normalize</span><span class="s2">, </span><span class="s1">str</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">, </span><span class="s1">norm=norm)</span>
+        <span class="s2">if </span><span class="s1">norm </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">norm = colors.Normalize()</span>
+        <span class="s2">elif </span><span class="s1">isinstance(norm</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">scale_cls = scale._scale_mapping[norm]</span>
+            <span class="s2">except </span><span class="s1">KeyError:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;Invalid norm str name; the following values are &quot;</span>
+                    <span class="s3">&quot;supported: {}&quot;</span><span class="s1">.format(</span><span class="s3">&quot;, &quot;</span><span class="s1">.join(scale._scale_mapping))</span>
+                <span class="s1">) </span><span class="s2">from None</span>
+            <span class="s1">norm = _auto_norm_from_scale(scale_cls)()</span>
+
+        <span class="s2">if </span><span class="s1">norm </span><span class="s2">is </span><span class="s1">self.norm:</span>
+            <span class="s4"># We aren't updating anything</span>
+            <span class="s2">return</span>
+
+        <span class="s1">in_init = self.norm </span><span class="s2">is None</span>
+        <span class="s4"># Remove the current callback and connect to the new one</span>
+        <span class="s2">if not </span><span class="s1">in_init:</span>
+            <span class="s1">self.norm.callbacks.disconnect(self._id_norm)</span>
+        <span class="s1">self._norm = norm</span>
+        <span class="s1">self._id_norm = self.norm.callbacks.connect(</span><span class="s3">'changed'</span><span class="s2">,</span>
+                                                    <span class="s1">self.changed)</span>
+        <span class="s2">if not </span><span class="s1">in_init:</span>
+            <span class="s1">self.changed()</span>
+
+    <span class="s2">def </span><span class="s1">set_norm(self</span><span class="s2">, </span><span class="s1">norm):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the normalization instance. 
+ 
+        Parameters 
+        ---------- 
+        norm : `.Normalize` or str or None 
+ 
+        Notes 
+        ----- 
+        If there are any colorbars using the mappable for this norm, setting 
+        the norm of the mappable will reset the norm, locator, and formatters 
+        on the colorbar to default. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.norm = norm</span>
+
+    <span class="s2">def </span><span class="s1">autoscale(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Autoscale the scalar limits on the norm instance using the 
+        current array 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._A </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s3">'You must first set_array for mappable'</span><span class="s1">)</span>
+        <span class="s4"># If the norm's limits are updated self.changed() will be called</span>
+        <span class="s4"># through the callbacks attached to the norm</span>
+        <span class="s1">self.norm.autoscale(self._A)</span>
+
+    <span class="s2">def </span><span class="s1">autoscale_None(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Autoscale the scalar limits on the norm instance using the 
+        current array, changing only limits that are None 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._A </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s3">'You must first set_array for mappable'</span><span class="s1">)</span>
+        <span class="s4"># If the norm's limits are updated self.changed() will be called</span>
+        <span class="s4"># through the callbacks attached to the norm</span>
+        <span class="s1">self.norm.autoscale_None(self._A)</span>
+
+    <span class="s2">def </span><span class="s1">changed(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Call this whenever the mappable is changed to notify all the 
+        callbackSM listeners to the 'changed' signal. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.callbacks.process(</span><span class="s3">'changed'</span><span class="s2">, </span><span class="s1">self)</span>
+        <span class="s1">self.stale = </span><span class="s2">True</span>
+
+
+<span class="s4"># The docstrings here must be generic enough to apply to all relevant methods.</span>
+<span class="s1">mpl._docstring.interpd.update(</span>
+    <span class="s1">cmap_doc=</span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">cmap : str or `~matplotlib.colors.Colormap`, default: :rc:`image.cmap` 
+    The Colormap instance or registered colormap name used to map scalar data 
+    to colors.&quot;&quot;&quot;</span><span class="s2">,</span>
+    <span class="s1">norm_doc=</span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">norm : str or `~matplotlib.colors.Normalize`, optional 
+    The normalization method used to scale scalar data to the [0, 1] range 
+    before mapping to colors using *cmap*. By default, a linear scaling is 
+    used, mapping the lowest value to 0 and the highest to 1. 
+ 
+    If given, this can be one of the following: 
+ 
+    - An instance of `.Normalize` or one of its subclasses 
+      (see :doc:`/tutorials/colors/colormapnorms`). 
+    - A scale name, i.e. one of &quot;linear&quot;, &quot;log&quot;, &quot;symlog&quot;, &quot;logit&quot;, etc.  For a 
+      list of available scales, call `matplotlib.scale.get_scale_names()`. 
+      In that case, a suitable `.Normalize` subclass is dynamically generated 
+      and instantiated.&quot;&quot;&quot;</span><span class="s2">,</span>
+    <span class="s1">vmin_vmax_doc=</span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">vmin, vmax : float, optional 
+    When using scalar data and no explicit *norm*, *vmin* and *vmax* define 
+    the data range that the colormap covers. By default, the colormap covers 
+    the complete value range of the supplied data. It is an error to use 
+    *vmin*/*vmax* when a *norm* instance is given (but using a `str` *norm* 
+    name together with *vmin*/*vmax* is acceptable).&quot;&quot;&quot;</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_ensure_cmap(cmap):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Ensure that we have a `.Colormap` object. 
+ 
+    For internal use to preserve type stability of errors. 
+ 
+    Parameters 
+    ---------- 
+    cmap : None, str, Colormap 
+ 
+        - if a `Colormap`, return it 
+        - if a string, look it up in mpl.colormaps 
+        - if None, look up the default color map in mpl.colormaps 
+ 
+    Returns 
+    ------- 
+    Colormap 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">isinstance(cmap</span><span class="s2">, </span><span class="s1">colors.Colormap):</span>
+        <span class="s2">return </span><span class="s1">cmap</span>
+    <span class="s1">cmap_name = cmap </span><span class="s2">if </span><span class="s1">cmap </span><span class="s2">is not None else </span><span class="s1">mpl.rcParams[</span><span class="s3">&quot;image.cmap&quot;</span><span class="s1">]</span>
+    <span class="s4"># use check_in_list to ensure type stability of the exception raised by</span>
+    <span class="s4"># the internal usage of this (ValueError vs KeyError)</span>
+    <span class="s1">_api.check_in_list(sorted(_colormaps)</span><span class="s2">, </span><span class="s1">cmap=cmap_name)</span>
+    <span class="s2">return </span><span class="s1">mpl.colormaps[cmap_name]</span>
+</pre>
+</body>
+</html>

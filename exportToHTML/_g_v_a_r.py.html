@@ -1,0 +1,280 @@
+<html>
+<head>
+<title>_g_v_a_r.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #a5c261;}
+.s6 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_g_v_a_r.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">UserDict</span><span class="s0">, </span><span class="s1">deque</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">partial</span>
+<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">sstruct</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">safeEval</span>
+<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+<span class="s0">import </span><span class="s1">array</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">fontTools.ttLib.tables.TupleVariation </span><span class="s0">as </span><span class="s1">tv</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+<span class="s1">TupleVariation = tv.TupleVariation</span>
+
+
+<span class="s2"># https://www.microsoft.com/typography/otspec/gvar.htm</span>
+<span class="s2"># https://www.microsoft.com/typography/otspec/otvarcommonformats.htm</span>
+<span class="s2">#</span>
+<span class="s2"># Apple's documentation of 'gvar':</span>
+<span class="s2"># https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6gvar.html</span>
+<span class="s2">#</span>
+<span class="s2"># FreeType2 source code for parsing 'gvar':</span>
+<span class="s2"># http://git.savannah.gnu.org/cgit/freetype/freetype2.git/tree/src/truetype/ttgxvar.c</span>
+
+<span class="s1">GVAR_HEADER_FORMAT = </span><span class="s3">&quot;&quot;&quot; 
+    &gt; # big endian 
+    version:            H 
+    reserved:           H 
+    axisCount:          H 
+    sharedTupleCount:       H 
+    offsetToSharedTuples:       I 
+    glyphCount:         H 
+    flags:              H 
+    offsetToGlyphVariationData: I 
+&quot;&quot;&quot;</span>
+
+<span class="s1">GVAR_HEADER_SIZE = sstruct.calcsize(GVAR_HEADER_FORMAT)</span>
+
+<span class="s0">class </span><span class="s1">_LazyDict(UserDict):</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s1">super().__init__()</span>
+		<span class="s1">self.data = data</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">k):</span>
+		<span class="s1">v = self.data[k]</span>
+		<span class="s0">if </span><span class="s1">callable(v):</span>
+			<span class="s1">v = v()</span>
+			<span class="s1">self.data[k] = v</span>
+		<span class="s0">return </span><span class="s1">v</span>
+
+
+<span class="s0">class </span><span class="s1">table__g_v_a_r(DefaultTable.DefaultTable):</span>
+	<span class="s1">dependencies = [</span><span class="s3">&quot;fvar&quot;</span><span class="s0">, </span><span class="s3">&quot;glyf&quot;</span><span class="s1">]</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">tag=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">DefaultTable.DefaultTable.__init__(self</span><span class="s0">, </span><span class="s1">tag)</span>
+		<span class="s1">self.version</span><span class="s0">, </span><span class="s1">self.reserved = </span><span class="s4">1</span><span class="s0">, </span><span class="s4">0</span>
+		<span class="s1">self.variations = {}</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">axisTags = [axis.axisTag </span><span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">ttFont[</span><span class="s3">&quot;fvar&quot;</span><span class="s1">].axes]</span>
+		<span class="s1">sharedTuples =  tv.compileSharedTuples(</span>
+			<span class="s1">axisTags</span><span class="s0">, </span><span class="s1">itertools.chain(*self.variations.values()))</span>
+		<span class="s1">sharedTupleIndices = {coord:i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">coord </span><span class="s0">in </span><span class="s1">enumerate(sharedTuples)}</span>
+		<span class="s1">sharedTupleSize = sum([len(c) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">sharedTuples])</span>
+		<span class="s1">compiledGlyphs = self.compileGlyphs_(</span>
+			<span class="s1">ttFont</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedTupleIndices)</span>
+		<span class="s1">offset = </span><span class="s4">0</span>
+		<span class="s1">offsets = []</span>
+		<span class="s0">for </span><span class="s1">glyph </span><span class="s0">in </span><span class="s1">compiledGlyphs:</span>
+			<span class="s1">offsets.append(offset)</span>
+			<span class="s1">offset += len(glyph)</span>
+		<span class="s1">offsets.append(offset)</span>
+		<span class="s1">compiledOffsets</span><span class="s0">, </span><span class="s1">tableFormat = self.compileOffsets_(offsets)</span>
+
+		<span class="s1">header = {}</span>
+		<span class="s1">header[</span><span class="s3">&quot;version&quot;</span><span class="s1">] = self.version</span>
+		<span class="s1">header[</span><span class="s3">&quot;reserved&quot;</span><span class="s1">] = self.reserved</span>
+		<span class="s1">header[</span><span class="s3">&quot;axisCount&quot;</span><span class="s1">] = len(axisTags)</span>
+		<span class="s1">header[</span><span class="s3">&quot;sharedTupleCount&quot;</span><span class="s1">] = len(sharedTuples)</span>
+		<span class="s1">header[</span><span class="s3">&quot;offsetToSharedTuples&quot;</span><span class="s1">] = GVAR_HEADER_SIZE + len(compiledOffsets)</span>
+		<span class="s1">header[</span><span class="s3">&quot;glyphCount&quot;</span><span class="s1">] = len(compiledGlyphs)</span>
+		<span class="s1">header[</span><span class="s3">&quot;flags&quot;</span><span class="s1">] = tableFormat</span>
+		<span class="s1">header[</span><span class="s3">&quot;offsetToGlyphVariationData&quot;</span><span class="s1">] = header[</span><span class="s3">&quot;offsetToSharedTuples&quot;</span><span class="s1">] + sharedTupleSize</span>
+		<span class="s1">compiledHeader = sstruct.pack(GVAR_HEADER_FORMAT</span><span class="s0">, </span><span class="s1">header)</span>
+
+		<span class="s1">result = [compiledHeader</span><span class="s0">, </span><span class="s1">compiledOffsets]</span>
+		<span class="s1">result.extend(sharedTuples)</span>
+		<span class="s1">result.extend(compiledGlyphs)</span>
+		<span class="s0">return </span><span class="s5">b''</span><span class="s1">.join(result)</span>
+
+	<span class="s0">def </span><span class="s1">compileGlyphs_(self</span><span class="s0">, </span><span class="s1">ttFont</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedCoordIndices):</span>
+		<span class="s1">result = []</span>
+		<span class="s1">glyf = ttFont[</span><span class="s3">'glyf'</span><span class="s1">]</span>
+		<span class="s0">for </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">ttFont.getGlyphOrder():</span>
+			<span class="s1">glyph = glyf[glyphName]</span>
+			<span class="s1">pointCount = self.getNumPoints_(glyph)</span>
+			<span class="s1">variations = self.variations.get(glyphName</span><span class="s0">, </span><span class="s1">[])</span>
+			<span class="s1">result.append(compileGlyph_(variations</span><span class="s0">, </span><span class="s1">pointCount</span><span class="s0">,</span>
+			                            <span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedCoordIndices))</span>
+		<span class="s0">return </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">axisTags = [axis.axisTag </span><span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">ttFont[</span><span class="s3">&quot;fvar&quot;</span><span class="s1">].axes]</span>
+		<span class="s1">glyphs = ttFont.getGlyphOrder()</span>
+		<span class="s1">sstruct.unpack(GVAR_HEADER_FORMAT</span><span class="s0">, </span><span class="s1">data[</span><span class="s4">0</span><span class="s1">:GVAR_HEADER_SIZE]</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">assert </span><span class="s1">len(glyphs) == self.glyphCount</span>
+		<span class="s0">assert </span><span class="s1">len(axisTags) == self.axisCount</span>
+		<span class="s1">offsets = self.decompileOffsets_(data[GVAR_HEADER_SIZE:]</span><span class="s0">, </span><span class="s1">tableFormat=(self.flags &amp; </span><span class="s4">1</span><span class="s1">)</span><span class="s0">, </span><span class="s1">glyphCount=self.glyphCount)</span>
+		<span class="s1">sharedCoords = tv.decompileSharedTuples(</span>
+			<span class="s1">axisTags</span><span class="s0">, </span><span class="s1">self.sharedTupleCount</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">self.offsetToSharedTuples)</span>
+		<span class="s1">variations = {}</span>
+		<span class="s1">offsetToData = self.offsetToGlyphVariationData</span>
+		<span class="s1">glyf = ttFont[</span><span class="s3">'glyf'</span><span class="s1">]</span>
+
+		<span class="s0">def </span><span class="s1">decompileVarGlyph(glyphName</span><span class="s0">, </span><span class="s1">gid):</span>
+			<span class="s1">glyph = glyf[glyphName]</span>
+			<span class="s1">numPointsInGlyph = self.getNumPoints_(glyph)</span>
+			<span class="s1">gvarData = data[offsetToData + offsets[gid] : offsetToData + offsets[gid + </span><span class="s4">1</span><span class="s1">]]</span>
+			<span class="s0">return </span><span class="s1">decompileGlyph_(numPointsInGlyph</span><span class="s0">, </span><span class="s1">sharedCoords</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">gvarData)</span>
+
+		<span class="s0">for </span><span class="s1">gid </span><span class="s0">in </span><span class="s1">range(self.glyphCount):</span>
+			<span class="s1">glyphName = glyphs[gid]</span>
+			<span class="s1">variations[glyphName] = partial(decompileVarGlyph</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">gid)</span>
+		<span class="s1">self.variations = _LazyDict(variations)</span>
+
+		<span class="s0">if </span><span class="s1">ttFont.lazy </span><span class="s0">is False</span><span class="s1">: </span><span class="s2"># Be lazy for None and True</span>
+			<span class="s1">self.ensureDecompiled()</span>
+
+	<span class="s0">def </span><span class="s1">ensureDecompiled(self</span><span class="s0">, </span><span class="s1">recurse=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s2"># The recurse argument is unused, but part of the signature of</span>
+		<span class="s2"># ensureDecompiled across the library.</span>
+		<span class="s2"># Use a zero-length deque to consume the lazy dict</span>
+		<span class="s1">deque(self.variations.values()</span><span class="s0">, </span><span class="s1">maxlen=</span><span class="s4">0</span><span class="s1">)</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">decompileOffsets_(data</span><span class="s0">, </span><span class="s1">tableFormat</span><span class="s0">, </span><span class="s1">glyphCount):</span>
+		<span class="s0">if </span><span class="s1">tableFormat == </span><span class="s4">0</span><span class="s1">:</span>
+			<span class="s2"># Short format: array of UInt16</span>
+			<span class="s1">offsets = array.array(</span><span class="s3">&quot;H&quot;</span><span class="s1">)</span>
+			<span class="s1">offsetsSize = (glyphCount + </span><span class="s4">1</span><span class="s1">) * </span><span class="s4">2</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s2"># Long format: array of UInt32</span>
+			<span class="s1">offsets = array.array(</span><span class="s3">&quot;I&quot;</span><span class="s1">)</span>
+			<span class="s1">offsetsSize = (glyphCount + </span><span class="s4">1</span><span class="s1">) * </span><span class="s4">4</span>
+		<span class="s1">offsets.frombytes(data[</span><span class="s4">0 </span><span class="s1">: offsetsSize])</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s3">&quot;big&quot;</span><span class="s1">: offsets.byteswap()</span>
+
+		<span class="s2"># In the short format, offsets need to be multiplied by 2.</span>
+		<span class="s2"># This is not documented in Apple's TrueType specification,</span>
+		<span class="s2"># but can be inferred from the FreeType implementation, and</span>
+		<span class="s2"># we could verify it with two sample GX fonts.</span>
+		<span class="s0">if </span><span class="s1">tableFormat == </span><span class="s4">0</span><span class="s1">:</span>
+			<span class="s1">offsets = [off * </span><span class="s4">2 </span><span class="s0">for </span><span class="s1">off </span><span class="s0">in </span><span class="s1">offsets]</span>
+
+		<span class="s0">return </span><span class="s1">offsets</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">compileOffsets_(offsets):</span>
+		<span class="s6">&quot;&quot;&quot;Packs a list of offsets into a 'gvar' offset table. 
+ 
+        Returns a pair (bytestring, tableFormat). Bytestring is the 
+        packed offset table. Format indicates whether the table 
+        uses short (tableFormat=0) or long (tableFormat=1) integers. 
+        The returned tableFormat should get packed into the flags field 
+        of the 'gvar' header. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">assert </span><span class="s1">len(offsets) &gt;= </span><span class="s4">2</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s4">1</span><span class="s0">, </span><span class="s1">len(offsets)):</span>
+			<span class="s0">assert </span><span class="s1">offsets[i - </span><span class="s4">1</span><span class="s1">] &lt;= offsets[i]</span>
+		<span class="s0">if </span><span class="s1">max(offsets) &lt;= </span><span class="s4">0xffff </span><span class="s1">* </span><span class="s4">2</span><span class="s1">:</span>
+			<span class="s1">packed = array.array(</span><span class="s3">&quot;H&quot;</span><span class="s0">, </span><span class="s1">[n &gt;&gt; </span><span class="s4">1 </span><span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">offsets])</span>
+			<span class="s1">tableFormat = </span><span class="s4">0</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">packed = array.array(</span><span class="s3">&quot;I&quot;</span><span class="s0">, </span><span class="s1">offsets)</span>
+			<span class="s1">tableFormat = </span><span class="s4">1</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s3">&quot;big&quot;</span><span class="s1">: packed.byteswap()</span>
+		<span class="s0">return </span><span class="s1">(packed.tobytes()</span><span class="s0">, </span><span class="s1">tableFormat)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.simpletag(</span><span class="s3">&quot;version&quot;</span><span class="s0">, </span><span class="s1">value=self.version)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">writer.simpletag(</span><span class="s3">&quot;reserved&quot;</span><span class="s0">, </span><span class="s1">value=self.reserved)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">axisTags = [axis.axisTag </span><span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">ttFont[</span><span class="s3">&quot;fvar&quot;</span><span class="s1">].axes]</span>
+		<span class="s0">for </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">ttFont.getGlyphNames():</span>
+			<span class="s1">variations = self.variations.get(glyphName)</span>
+			<span class="s0">if not </span><span class="s1">variations:</span>
+				<span class="s0">continue</span>
+			<span class="s1">writer.begintag(</span><span class="s3">&quot;glyphVariations&quot;</span><span class="s0">, </span><span class="s1">glyph=glyphName)</span>
+			<span class="s1">writer.newline()</span>
+			<span class="s0">for </span><span class="s1">gvar </span><span class="s0">in </span><span class="s1">variations:</span>
+				<span class="s1">gvar.toXML(writer</span><span class="s0">, </span><span class="s1">axisTags)</span>
+			<span class="s1">writer.endtag(</span><span class="s3">&quot;glyphVariations&quot;</span><span class="s1">)</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s3">&quot;version&quot;</span><span class="s1">:</span>
+			<span class="s1">self.version = safeEval(attrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">&quot;reserved&quot;</span><span class="s1">:</span>
+			<span class="s1">self.reserved = safeEval(attrs[</span><span class="s3">&quot;value&quot;</span><span class="s1">])</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">&quot;glyphVariations&quot;</span><span class="s1">:</span>
+			<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;variations&quot;</span><span class="s1">):</span>
+				<span class="s1">self.variations = {}</span>
+			<span class="s1">glyphName = attrs[</span><span class="s3">&quot;glyph&quot;</span><span class="s1">]</span>
+			<span class="s1">glyph = ttFont[</span><span class="s3">&quot;glyf&quot;</span><span class="s1">][glyphName]</span>
+			<span class="s1">numPointsInGlyph = self.getNumPoints_(glyph)</span>
+			<span class="s1">glyphVariations = []</span>
+			<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+				<span class="s0">if </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+					<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+					<span class="s0">if </span><span class="s1">name == </span><span class="s3">&quot;tuple&quot;</span><span class="s1">:</span>
+						<span class="s1">gvar = TupleVariation({}</span><span class="s0">, </span><span class="s1">[</span><span class="s0">None</span><span class="s1">] * numPointsInGlyph)</span>
+						<span class="s1">glyphVariations.append(gvar)</span>
+						<span class="s0">for </span><span class="s1">tupleElement </span><span class="s0">in </span><span class="s1">content:</span>
+							<span class="s0">if </span><span class="s1">isinstance(tupleElement</span><span class="s0">, </span><span class="s1">tuple):</span>
+								<span class="s1">tupleName</span><span class="s0">, </span><span class="s1">tupleAttrs</span><span class="s0">, </span><span class="s1">tupleContent = tupleElement</span>
+								<span class="s1">gvar.fromXML(tupleName</span><span class="s0">, </span><span class="s1">tupleAttrs</span><span class="s0">, </span><span class="s1">tupleContent)</span>
+			<span class="s1">self.variations[glyphName] = glyphVariations</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">getNumPoints_(glyph):</span>
+		<span class="s1">NUM_PHANTOM_POINTS = </span><span class="s4">4</span>
+		<span class="s0">if </span><span class="s1">glyph.isComposite():</span>
+			<span class="s0">return </span><span class="s1">len(glyph.components) + NUM_PHANTOM_POINTS</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s2"># Empty glyphs (eg. space, nonmarkingreturn) have no &quot;coordinates&quot; attribute.</span>
+			<span class="s0">return </span><span class="s1">len(getattr(glyph</span><span class="s0">, </span><span class="s3">&quot;coordinates&quot;</span><span class="s0">, </span><span class="s1">[])) + NUM_PHANTOM_POINTS</span>
+
+
+<span class="s0">def </span><span class="s1">compileGlyph_(variations</span><span class="s0">, </span><span class="s1">pointCount</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedCoordIndices):</span>
+	<span class="s1">tupleVariationCount</span><span class="s0">, </span><span class="s1">tuples</span><span class="s0">, </span><span class="s1">data = tv.compileTupleVariationStore(</span>
+		<span class="s1">variations</span><span class="s0">, </span><span class="s1">pointCount</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">sharedCoordIndices)</span>
+	<span class="s0">if </span><span class="s1">tupleVariationCount == </span><span class="s4">0</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s5">b&quot;&quot;</span>
+	<span class="s1">result = [</span>
+		<span class="s1">struct.pack(</span><span class="s3">&quot;&gt;HH&quot;</span><span class="s0">, </span><span class="s1">tupleVariationCount</span><span class="s0">, </span><span class="s4">4 </span><span class="s1">+ len(tuples))</span><span class="s0">,</span>
+		<span class="s1">tuples</span><span class="s0">,</span>
+		<span class="s1">data</span>
+	<span class="s1">]</span>
+	<span class="s0">if </span><span class="s1">(len(tuples) + len(data)) % </span><span class="s4">2 </span><span class="s1">!= </span><span class="s4">0</span><span class="s1">:</span>
+		<span class="s1">result.append(</span><span class="s5">b&quot;</span><span class="s0">\0</span><span class="s5">&quot;</span><span class="s1">)  </span><span class="s2"># padding</span>
+	<span class="s0">return </span><span class="s5">b''</span><span class="s1">.join(result)</span>
+
+
+<span class="s0">def </span><span class="s1">decompileGlyph_(pointCount</span><span class="s0">, </span><span class="s1">sharedTuples</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">, </span><span class="s1">data):</span>
+	<span class="s0">if </span><span class="s1">len(data) &lt; </span><span class="s4">4</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">[]</span>
+	<span class="s1">tupleVariationCount</span><span class="s0">, </span><span class="s1">offsetToData = struct.unpack(</span><span class="s3">&quot;&gt;HH&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s4">4</span><span class="s1">])</span>
+	<span class="s1">dataPos = offsetToData</span>
+	<span class="s0">return </span><span class="s1">tv.decompileTupleVariationStore(</span>
+		<span class="s3">&quot;gvar&quot;</span><span class="s0">, </span><span class="s1">axisTags</span><span class="s0">,</span>
+		<span class="s1">tupleVariationCount</span><span class="s0">, </span><span class="s1">pointCount</span><span class="s0">,</span>
+		<span class="s1">sharedTuples</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s4">4</span><span class="s0">, </span><span class="s1">offsetToData</span>
+	<span class="s1">)</span>
+</pre>
+</body>
+</html>

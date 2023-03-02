@@ -1,0 +1,1818 @@
+<html>
+<head>
+<title>text_format.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+text_format.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Protocol Buffers - Google's data interchange format</span>
+<span class="s0"># Copyright 2008 Google Inc.  All rights reserved.</span>
+<span class="s0"># https://developers.google.com/protocol-buffers/</span>
+<span class="s0">#</span>
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are</span>
+<span class="s0"># met:</span>
+<span class="s0">#</span>
+<span class="s0">#     * Redistributions of source code must retain the above copyright</span>
+<span class="s0"># notice, this list of conditions and the following disclaimer.</span>
+<span class="s0">#     * Redistributions in binary form must reproduce the above</span>
+<span class="s0"># copyright notice, this list of conditions and the following disclaimer</span>
+<span class="s0"># in the documentation and/or other materials provided with the</span>
+<span class="s0"># distribution.</span>
+<span class="s0">#     * Neither the name of Google Inc. nor the names of its</span>
+<span class="s0"># contributors may be used to endorse or promote products derived from</span>
+<span class="s0"># this software without specific prior written permission.</span>
+<span class="s0">#</span>
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</span>
+<span class="s0"># &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</span>
+<span class="s0"># A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</span>
+<span class="s0"># OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</span>
+<span class="s0"># SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</span>
+<span class="s0"># DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</span>
+<span class="s0"># THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</span>
+<span class="s0"># (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</span>
+<span class="s0"># OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</span>
+
+<span class="s2">&quot;&quot;&quot;Contains routines for printing protocol messages in text format. 
+ 
+Simple usage example:: 
+ 
+  # Create a proto object and serialize it to a text proto string. 
+  message = my_proto_pb2.MyMessage(foo='bar') 
+  text_proto = text_format.MessageToString(message) 
+ 
+  # Parse a text proto string. 
+  message = text_format.Parse(text_proto, my_proto_pb2.MyMessage()) 
+&quot;&quot;&quot;</span>
+
+<span class="s1">__author__ = </span><span class="s3">'kenton@google.com (Kenton Varda)'</span>
+
+<span class="s0"># TODO(b/129989314) Import thread contention leads to test failures.</span>
+<span class="s4">import </span><span class="s1">encodings.raw_unicode_escape  </span><span class="s0"># pylint: disable=unused-import</span>
+<span class="s4">import </span><span class="s1">encodings.unicode_escape  </span><span class="s0"># pylint: disable=unused-import</span>
+<span class="s4">import </span><span class="s1">io</span>
+<span class="s4">import </span><span class="s1">math</span>
+<span class="s4">import </span><span class="s1">re</span>
+
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">decoder</span>
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">type_checkers</span>
+<span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor</span>
+<span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">text_encoding</span>
+
+<span class="s0"># pylint: disable=g-import-not-at-top</span>
+<span class="s1">__all__ = [</span><span class="s3">'MessageToString'</span><span class="s4">, </span><span class="s3">'Parse'</span><span class="s4">, </span><span class="s3">'PrintMessage'</span><span class="s4">, </span><span class="s3">'PrintField'</span><span class="s4">,</span>
+           <span class="s3">'PrintFieldValue'</span><span class="s4">, </span><span class="s3">'Merge'</span><span class="s4">, </span><span class="s3">'MessageToBytes'</span><span class="s1">]</span>
+
+<span class="s1">_INTEGER_CHECKERS = (type_checkers.Uint32ValueChecker()</span><span class="s4">,</span>
+                     <span class="s1">type_checkers.Int32ValueChecker()</span><span class="s4">,</span>
+                     <span class="s1">type_checkers.Uint64ValueChecker()</span><span class="s4">,</span>
+                     <span class="s1">type_checkers.Int64ValueChecker())</span>
+<span class="s1">_FLOAT_INFINITY = re.compile(</span><span class="s3">'-?inf(?:inity)?f?$'</span><span class="s4">, </span><span class="s1">re.IGNORECASE)</span>
+<span class="s1">_FLOAT_NAN = re.compile(</span><span class="s3">'nanf?$'</span><span class="s4">, </span><span class="s1">re.IGNORECASE)</span>
+<span class="s1">_QUOTES = frozenset((</span><span class="s3">&quot;'&quot;</span><span class="s4">, </span><span class="s3">'&quot;'</span><span class="s1">))</span>
+<span class="s1">_ANY_FULL_TYPE_NAME = </span><span class="s3">'google.protobuf.Any'</span>
+
+
+<span class="s4">class </span><span class="s1">Error(Exception):</span>
+  <span class="s2">&quot;&quot;&quot;Top-level module error for text_format.&quot;&quot;&quot;</span>
+
+
+<span class="s4">class </span><span class="s1">ParseError(Error):</span>
+  <span class="s2">&quot;&quot;&quot;Thrown in case of text parsing or tokenizing error.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">message=</span><span class="s4">None, </span><span class="s1">line=</span><span class="s4">None, </span><span class="s1">column=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s4">if </span><span class="s1">message </span><span class="s4">is not None and </span><span class="s1">line </span><span class="s4">is not None</span><span class="s1">:</span>
+      <span class="s1">loc = str(line)</span>
+      <span class="s4">if </span><span class="s1">column </span><span class="s4">is not None</span><span class="s1">:</span>
+        <span class="s1">loc += </span><span class="s3">':{0}'</span><span class="s1">.format(column)</span>
+      <span class="s1">message = </span><span class="s3">'{0} : {1}'</span><span class="s1">.format(loc</span><span class="s4">, </span><span class="s1">message)</span>
+    <span class="s4">if </span><span class="s1">message </span><span class="s4">is not None</span><span class="s1">:</span>
+      <span class="s1">super(ParseError</span><span class="s4">, </span><span class="s1">self).__init__(message)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">super(ParseError</span><span class="s4">, </span><span class="s1">self).__init__()</span>
+    <span class="s1">self._line = line</span>
+    <span class="s1">self._column = column</span>
+
+  <span class="s4">def </span><span class="s1">GetLine(self):</span>
+    <span class="s4">return </span><span class="s1">self._line</span>
+
+  <span class="s4">def </span><span class="s1">GetColumn(self):</span>
+    <span class="s4">return </span><span class="s1">self._column</span>
+
+
+<span class="s4">class </span><span class="s1">TextWriter(object):</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">as_utf8):</span>
+    <span class="s1">self._writer = io.StringIO()</span>
+
+  <span class="s4">def </span><span class="s1">write(self</span><span class="s4">, </span><span class="s1">val):</span>
+    <span class="s4">return </span><span class="s1">self._writer.write(val)</span>
+
+  <span class="s4">def </span><span class="s1">close(self):</span>
+    <span class="s4">return </span><span class="s1">self._writer.close()</span>
+
+  <span class="s4">def </span><span class="s1">getvalue(self):</span>
+    <span class="s4">return </span><span class="s1">self._writer.getvalue()</span>
+
+
+<span class="s4">def </span><span class="s1">MessageToString(</span>
+    <span class="s1">message</span><span class="s4">,</span>
+    <span class="s1">as_utf8=</span><span class="s4">False,</span>
+    <span class="s1">as_one_line=</span><span class="s4">False,</span>
+    <span class="s1">use_short_repeated_primitives=</span><span class="s4">False,</span>
+    <span class="s1">pointy_brackets=</span><span class="s4">False,</span>
+    <span class="s1">use_index_order=</span><span class="s4">False,</span>
+    <span class="s1">float_format=</span><span class="s4">None,</span>
+    <span class="s1">double_format=</span><span class="s4">None,</span>
+    <span class="s1">use_field_number=</span><span class="s4">False,</span>
+    <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+    <span class="s1">indent=</span><span class="s5">0</span><span class="s4">,</span>
+    <span class="s1">message_formatter=</span><span class="s4">None,</span>
+    <span class="s1">print_unknown_fields=</span><span class="s4">False,</span>
+    <span class="s1">force_colon=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s0"># type: (...) -&gt; str</span>
+  <span class="s2">&quot;&quot;&quot;Convert protobuf message to text format. 
+ 
+  Double values can be formatted compactly with 15 digits of 
+  precision (which is the most that IEEE 754 &quot;double&quot; can guarantee) 
+  using double_format='.15g'. To ensure that converting to text and back to a 
+  proto will result in an identical value, double_format='.17g' should be used. 
+ 
+  Args: 
+    message: The protocol buffers message. 
+    as_utf8: Return unescaped Unicode for non-ASCII characters. 
+        In Python 3 actual Unicode characters may appear as is in strings. 
+        In Python 2 the return value will be valid UTF-8 rather than only ASCII. 
+    as_one_line: Don't introduce newlines between fields. 
+    use_short_repeated_primitives: Use short repeated format for primitives. 
+    pointy_brackets: If True, use angle brackets instead of curly braces for 
+      nesting. 
+    use_index_order: If True, fields of a proto message will be printed using 
+      the order defined in source code instead of the field number, extensions 
+      will be printed at the end of the message and their relative order is 
+      determined by the extension number. By default, use the field number 
+      order. 
+    float_format (str): If set, use this to specify float field formatting 
+      (per the &quot;Format Specification Mini-Language&quot;); otherwise, shortest float 
+      that has same value in wire will be printed. Also affect double field 
+      if double_format is not set but float_format is set. 
+    double_format (str): If set, use this to specify double field formatting 
+      (per the &quot;Format Specification Mini-Language&quot;); if it is not set but 
+      float_format is set, use float_format. Otherwise, use ``str()`` 
+    use_field_number: If True, print field numbers instead of names. 
+    descriptor_pool (DescriptorPool): Descriptor pool used to resolve Any types. 
+    indent (int): The initial indent level, in terms of spaces, for pretty 
+      print. 
+    message_formatter (function(message, indent, as_one_line) -&gt; unicode|None): 
+      Custom formatter for selected sub-messages (usually based on message 
+      type). Use to pretty print parts of the protobuf for easier diffing. 
+    print_unknown_fields: If True, unknown fields will be printed. 
+    force_colon: If set, a colon will be added after the field name even if the 
+      field is a proto message. 
+ 
+  Returns: 
+    str: A string of the text formatted protocol buffer message. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">out = TextWriter(as_utf8)</span>
+  <span class="s1">printer = _Printer(</span>
+      <span class="s1">out</span><span class="s4">,</span>
+      <span class="s1">indent</span><span class="s4">,</span>
+      <span class="s1">as_utf8</span><span class="s4">,</span>
+      <span class="s1">as_one_line</span><span class="s4">,</span>
+      <span class="s1">use_short_repeated_primitives</span><span class="s4">,</span>
+      <span class="s1">pointy_brackets</span><span class="s4">,</span>
+      <span class="s1">use_index_order</span><span class="s4">,</span>
+      <span class="s1">float_format</span><span class="s4">,</span>
+      <span class="s1">double_format</span><span class="s4">,</span>
+      <span class="s1">use_field_number</span><span class="s4">,</span>
+      <span class="s1">descriptor_pool</span><span class="s4">,</span>
+      <span class="s1">message_formatter</span><span class="s4">,</span>
+      <span class="s1">print_unknown_fields=print_unknown_fields</span><span class="s4">,</span>
+      <span class="s1">force_colon=force_colon)</span>
+  <span class="s1">printer.PrintMessage(message)</span>
+  <span class="s1">result = out.getvalue()</span>
+  <span class="s1">out.close()</span>
+  <span class="s4">if </span><span class="s1">as_one_line:</span>
+    <span class="s4">return </span><span class="s1">result.rstrip()</span>
+  <span class="s4">return </span><span class="s1">result</span>
+
+
+<span class="s4">def </span><span class="s1">MessageToBytes(message</span><span class="s4">, </span><span class="s1">**kwargs):</span>
+  <span class="s0"># type: (...) -&gt; bytes</span>
+  <span class="s2">&quot;&quot;&quot;Convert protobuf message to encoded text format.  See MessageToString.&quot;&quot;&quot;</span>
+  <span class="s1">text = MessageToString(message</span><span class="s4">, </span><span class="s1">**kwargs)</span>
+  <span class="s4">if </span><span class="s1">isinstance(text</span><span class="s4">, </span><span class="s1">bytes):</span>
+    <span class="s4">return </span><span class="s1">text</span>
+  <span class="s1">codec = </span><span class="s3">'utf-8' </span><span class="s4">if </span><span class="s1">kwargs.get(</span><span class="s3">'as_utf8'</span><span class="s1">) </span><span class="s4">else </span><span class="s3">'ascii'</span>
+  <span class="s4">return </span><span class="s1">text.encode(codec)</span>
+
+
+<span class="s4">def </span><span class="s1">_IsMapEntry(field):</span>
+  <span class="s4">return </span><span class="s1">(field.type == descriptor.FieldDescriptor.TYPE_MESSAGE </span><span class="s4">and</span>
+          <span class="s1">field.message_type.has_options </span><span class="s4">and</span>
+          <span class="s1">field.message_type.GetOptions().map_entry)</span>
+
+
+<span class="s4">def </span><span class="s1">PrintMessage(message</span><span class="s4">,</span>
+                 <span class="s1">out</span><span class="s4">,</span>
+                 <span class="s1">indent=</span><span class="s5">0</span><span class="s4">,</span>
+                 <span class="s1">as_utf8=</span><span class="s4">False,</span>
+                 <span class="s1">as_one_line=</span><span class="s4">False,</span>
+                 <span class="s1">use_short_repeated_primitives=</span><span class="s4">False,</span>
+                 <span class="s1">pointy_brackets=</span><span class="s4">False,</span>
+                 <span class="s1">use_index_order=</span><span class="s4">False,</span>
+                 <span class="s1">float_format=</span><span class="s4">None,</span>
+                 <span class="s1">double_format=</span><span class="s4">None,</span>
+                 <span class="s1">use_field_number=</span><span class="s4">False,</span>
+                 <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+                 <span class="s1">message_formatter=</span><span class="s4">None,</span>
+                 <span class="s1">print_unknown_fields=</span><span class="s4">False,</span>
+                 <span class="s1">force_colon=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s1">printer = _Printer(</span>
+      <span class="s1">out=out</span><span class="s4">, </span><span class="s1">indent=indent</span><span class="s4">, </span><span class="s1">as_utf8=as_utf8</span><span class="s4">,</span>
+      <span class="s1">as_one_line=as_one_line</span><span class="s4">,</span>
+      <span class="s1">use_short_repeated_primitives=use_short_repeated_primitives</span><span class="s4">,</span>
+      <span class="s1">pointy_brackets=pointy_brackets</span><span class="s4">,</span>
+      <span class="s1">use_index_order=use_index_order</span><span class="s4">,</span>
+      <span class="s1">float_format=float_format</span><span class="s4">,</span>
+      <span class="s1">double_format=double_format</span><span class="s4">,</span>
+      <span class="s1">use_field_number=use_field_number</span><span class="s4">,</span>
+      <span class="s1">descriptor_pool=descriptor_pool</span><span class="s4">,</span>
+      <span class="s1">message_formatter=message_formatter</span><span class="s4">,</span>
+      <span class="s1">print_unknown_fields=print_unknown_fields</span><span class="s4">,</span>
+      <span class="s1">force_colon=force_colon)</span>
+  <span class="s1">printer.PrintMessage(message)</span>
+
+
+<span class="s4">def </span><span class="s1">PrintField(field</span><span class="s4">,</span>
+               <span class="s1">value</span><span class="s4">,</span>
+               <span class="s1">out</span><span class="s4">,</span>
+               <span class="s1">indent=</span><span class="s5">0</span><span class="s4">,</span>
+               <span class="s1">as_utf8=</span><span class="s4">False,</span>
+               <span class="s1">as_one_line=</span><span class="s4">False,</span>
+               <span class="s1">use_short_repeated_primitives=</span><span class="s4">False,</span>
+               <span class="s1">pointy_brackets=</span><span class="s4">False,</span>
+               <span class="s1">use_index_order=</span><span class="s4">False,</span>
+               <span class="s1">float_format=</span><span class="s4">None,</span>
+               <span class="s1">double_format=</span><span class="s4">None,</span>
+               <span class="s1">message_formatter=</span><span class="s4">None,</span>
+               <span class="s1">print_unknown_fields=</span><span class="s4">False,</span>
+               <span class="s1">force_colon=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Print a single field name/value pair.&quot;&quot;&quot;</span>
+  <span class="s1">printer = _Printer(out</span><span class="s4">, </span><span class="s1">indent</span><span class="s4">, </span><span class="s1">as_utf8</span><span class="s4">, </span><span class="s1">as_one_line</span><span class="s4">,</span>
+                     <span class="s1">use_short_repeated_primitives</span><span class="s4">, </span><span class="s1">pointy_brackets</span><span class="s4">,</span>
+                     <span class="s1">use_index_order</span><span class="s4">, </span><span class="s1">float_format</span><span class="s4">, </span><span class="s1">double_format</span><span class="s4">,</span>
+                     <span class="s1">message_formatter=message_formatter</span><span class="s4">,</span>
+                     <span class="s1">print_unknown_fields=print_unknown_fields</span><span class="s4">,</span>
+                     <span class="s1">force_colon=force_colon)</span>
+  <span class="s1">printer.PrintField(field</span><span class="s4">, </span><span class="s1">value)</span>
+
+
+<span class="s4">def </span><span class="s1">PrintFieldValue(field</span><span class="s4">,</span>
+                    <span class="s1">value</span><span class="s4">,</span>
+                    <span class="s1">out</span><span class="s4">,</span>
+                    <span class="s1">indent=</span><span class="s5">0</span><span class="s4">,</span>
+                    <span class="s1">as_utf8=</span><span class="s4">False,</span>
+                    <span class="s1">as_one_line=</span><span class="s4">False,</span>
+                    <span class="s1">use_short_repeated_primitives=</span><span class="s4">False,</span>
+                    <span class="s1">pointy_brackets=</span><span class="s4">False,</span>
+                    <span class="s1">use_index_order=</span><span class="s4">False,</span>
+                    <span class="s1">float_format=</span><span class="s4">None,</span>
+                    <span class="s1">double_format=</span><span class="s4">None,</span>
+                    <span class="s1">message_formatter=</span><span class="s4">None,</span>
+                    <span class="s1">print_unknown_fields=</span><span class="s4">False,</span>
+                    <span class="s1">force_colon=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Print a single field value (not including name).&quot;&quot;&quot;</span>
+  <span class="s1">printer = _Printer(out</span><span class="s4">, </span><span class="s1">indent</span><span class="s4">, </span><span class="s1">as_utf8</span><span class="s4">, </span><span class="s1">as_one_line</span><span class="s4">,</span>
+                     <span class="s1">use_short_repeated_primitives</span><span class="s4">, </span><span class="s1">pointy_brackets</span><span class="s4">,</span>
+                     <span class="s1">use_index_order</span><span class="s4">, </span><span class="s1">float_format</span><span class="s4">, </span><span class="s1">double_format</span><span class="s4">,</span>
+                     <span class="s1">message_formatter=message_formatter</span><span class="s4">,</span>
+                     <span class="s1">print_unknown_fields=print_unknown_fields</span><span class="s4">,</span>
+                     <span class="s1">force_colon=force_colon)</span>
+  <span class="s1">printer.PrintFieldValue(field</span><span class="s4">, </span><span class="s1">value)</span>
+
+
+<span class="s4">def </span><span class="s1">_BuildMessageFromTypeName(type_name</span><span class="s4">, </span><span class="s1">descriptor_pool):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a protobuf message instance. 
+ 
+  Args: 
+    type_name: Fully-qualified protobuf  message type name string. 
+    descriptor_pool: DescriptorPool instance. 
+ 
+  Returns: 
+    A Message instance of type matching type_name, or None if the a Descriptor 
+    wasn't found matching type_name. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># pylint: disable=g-import-not-at-top</span>
+  <span class="s4">if </span><span class="s1">descriptor_pool </span><span class="s4">is None</span><span class="s1">:</span>
+    <span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor_pool </span><span class="s4">as </span><span class="s1">pool_mod</span>
+    <span class="s1">descriptor_pool = pool_mod.Default()</span>
+  <span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">symbol_database</span>
+  <span class="s1">database = symbol_database.Default()</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">message_descriptor = descriptor_pool.FindMessageTypeByName(type_name)</span>
+  <span class="s4">except </span><span class="s1">KeyError:</span>
+    <span class="s4">return None</span>
+  <span class="s1">message_type = database.GetPrototype(message_descriptor)</span>
+  <span class="s4">return </span><span class="s1">message_type()</span>
+
+
+<span class="s0"># These values must match WireType enum in google/protobuf/wire_format.h.</span>
+<span class="s1">WIRETYPE_LENGTH_DELIMITED = </span><span class="s5">2</span>
+<span class="s1">WIRETYPE_START_GROUP = </span><span class="s5">3</span>
+
+
+<span class="s4">class </span><span class="s1">_Printer(object):</span>
+  <span class="s2">&quot;&quot;&quot;Text format printer for protocol message.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(</span>
+      <span class="s1">self</span><span class="s4">,</span>
+      <span class="s1">out</span><span class="s4">,</span>
+      <span class="s1">indent=</span><span class="s5">0</span><span class="s4">,</span>
+      <span class="s1">as_utf8=</span><span class="s4">False,</span>
+      <span class="s1">as_one_line=</span><span class="s4">False,</span>
+      <span class="s1">use_short_repeated_primitives=</span><span class="s4">False,</span>
+      <span class="s1">pointy_brackets=</span><span class="s4">False,</span>
+      <span class="s1">use_index_order=</span><span class="s4">False,</span>
+      <span class="s1">float_format=</span><span class="s4">None,</span>
+      <span class="s1">double_format=</span><span class="s4">None,</span>
+      <span class="s1">use_field_number=</span><span class="s4">False,</span>
+      <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+      <span class="s1">message_formatter=</span><span class="s4">None,</span>
+      <span class="s1">print_unknown_fields=</span><span class="s4">False,</span>
+      <span class="s1">force_colon=</span><span class="s4">False</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Initialize the Printer. 
+ 
+    Double values can be formatted compactly with 15 digits of precision 
+    (which is the most that IEEE 754 &quot;double&quot; can guarantee) using 
+    double_format='.15g'. To ensure that converting to text and back to a proto 
+    will result in an identical value, double_format='.17g' should be used. 
+ 
+    Args: 
+      out: To record the text format result. 
+      indent: The initial indent level for pretty print. 
+      as_utf8: Return unescaped Unicode for non-ASCII characters. 
+          In Python 3 actual Unicode characters may appear as is in strings. 
+          In Python 2 the return value will be valid UTF-8 rather than ASCII. 
+      as_one_line: Don't introduce newlines between fields. 
+      use_short_repeated_primitives: Use short repeated format for primitives. 
+      pointy_brackets: If True, use angle brackets instead of curly braces for 
+        nesting. 
+      use_index_order: If True, print fields of a proto message using the order 
+        defined in source code instead of the field number. By default, use the 
+        field number order. 
+      float_format: If set, use this to specify float field formatting 
+        (per the &quot;Format Specification Mini-Language&quot;); otherwise, shortest 
+        float that has same value in wire will be printed. Also affect double 
+        field if double_format is not set but float_format is set. 
+      double_format: If set, use this to specify double field formatting 
+        (per the &quot;Format Specification Mini-Language&quot;); if it is not set but 
+        float_format is set, use float_format. Otherwise, str() is used. 
+      use_field_number: If True, print field numbers instead of names. 
+      descriptor_pool: A DescriptorPool used to resolve Any types. 
+      message_formatter: A function(message, indent, as_one_line): unicode|None 
+        to custom format selected sub-messages (usually based on message type). 
+        Use to pretty print parts of the protobuf for easier diffing. 
+      print_unknown_fields: If True, unknown fields will be printed. 
+      force_colon: If set, a colon will be added after the field name even if 
+        the field is a proto message. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.out = out</span>
+    <span class="s1">self.indent = indent</span>
+    <span class="s1">self.as_utf8 = as_utf8</span>
+    <span class="s1">self.as_one_line = as_one_line</span>
+    <span class="s1">self.use_short_repeated_primitives = use_short_repeated_primitives</span>
+    <span class="s1">self.pointy_brackets = pointy_brackets</span>
+    <span class="s1">self.use_index_order = use_index_order</span>
+    <span class="s1">self.float_format = float_format</span>
+    <span class="s4">if </span><span class="s1">double_format </span><span class="s4">is not None</span><span class="s1">:</span>
+      <span class="s1">self.double_format = double_format</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self.double_format = float_format</span>
+    <span class="s1">self.use_field_number = use_field_number</span>
+    <span class="s1">self.descriptor_pool = descriptor_pool</span>
+    <span class="s1">self.message_formatter = message_formatter</span>
+    <span class="s1">self.print_unknown_fields = print_unknown_fields</span>
+    <span class="s1">self.force_colon = force_colon</span>
+
+  <span class="s4">def </span><span class="s1">_TryPrintAsAnyMessage(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Serializes if message is a google.protobuf.Any field.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s3">'/' </span><span class="s4">not in </span><span class="s1">message.type_url:</span>
+      <span class="s4">return False</span>
+    <span class="s1">packed_message = _BuildMessageFromTypeName(message.TypeName()</span><span class="s4">,</span>
+                                               <span class="s1">self.descriptor_pool)</span>
+    <span class="s4">if </span><span class="s1">packed_message:</span>
+      <span class="s1">packed_message.MergeFromString(message.value)</span>
+      <span class="s1">colon = </span><span class="s3">':' </span><span class="s4">if </span><span class="s1">self.force_colon </span><span class="s4">else </span><span class="s3">''</span>
+      <span class="s1">self.out.write(</span><span class="s3">'%s[%s]%s ' </span><span class="s1">% (self.indent * </span><span class="s3">' '</span><span class="s4">, </span><span class="s1">message.type_url</span><span class="s4">, </span><span class="s1">colon))</span>
+      <span class="s1">self._PrintMessageFieldValue(packed_message)</span>
+      <span class="s1">self.out.write(</span><span class="s3">' ' </span><span class="s4">if </span><span class="s1">self.as_one_line </span><span class="s4">else </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+      <span class="s4">return True</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">_TryCustomFormatMessage(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s1">formatted = self.message_formatter(message</span><span class="s4">, </span><span class="s1">self.indent</span><span class="s4">, </span><span class="s1">self.as_one_line)</span>
+    <span class="s4">if </span><span class="s1">formatted </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s4">return False</span>
+
+    <span class="s1">out = self.out</span>
+    <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s1">* self.indent)</span>
+    <span class="s1">out.write(formatted)</span>
+    <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s4">if </span><span class="s1">self.as_one_line </span><span class="s4">else </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+    <span class="s4">return True</span>
+
+  <span class="s4">def </span><span class="s1">PrintMessage(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Convert protobuf message to text format. 
+ 
+    Args: 
+      message: The protocol buffers message. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self.message_formatter </span><span class="s4">and </span><span class="s1">self._TryCustomFormatMessage(message):</span>
+      <span class="s4">return</span>
+    <span class="s4">if </span><span class="s1">(message.DESCRIPTOR.full_name == _ANY_FULL_TYPE_NAME </span><span class="s4">and</span>
+        <span class="s1">self._TryPrintAsAnyMessage(message)):</span>
+      <span class="s4">return</span>
+    <span class="s1">fields = message.ListFields()</span>
+    <span class="s4">if </span><span class="s1">self.use_index_order:</span>
+      <span class="s1">fields.sort(</span>
+          <span class="s1">key=</span><span class="s4">lambda </span><span class="s1">x: x[</span><span class="s5">0</span><span class="s1">].number </span><span class="s4">if </span><span class="s1">x[</span><span class="s5">0</span><span class="s1">].is_extension </span><span class="s4">else </span><span class="s1">x[</span><span class="s5">0</span><span class="s1">].index)</span>
+    <span class="s4">for </span><span class="s1">field</span><span class="s4">, </span><span class="s1">value </span><span class="s4">in </span><span class="s1">fields:</span>
+      <span class="s4">if </span><span class="s1">_IsMapEntry(field):</span>
+        <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">sorted(value):</span>
+          <span class="s0"># This is slow for maps with submessage entries because it copies the</span>
+          <span class="s0"># entire tree.  Unfortunately this would take significant refactoring</span>
+          <span class="s0"># of this file to work around.</span>
+          <span class="s0">#</span>
+          <span class="s0"># TODO(haberman): refactor and optimize if this becomes an issue.</span>
+          <span class="s1">entry_submsg = value.GetEntryClass()(key=key</span><span class="s4">, </span><span class="s1">value=value[key])</span>
+          <span class="s1">self.PrintField(field</span><span class="s4">, </span><span class="s1">entry_submsg)</span>
+      <span class="s4">elif </span><span class="s1">field.label == descriptor.FieldDescriptor.LABEL_REPEATED:</span>
+        <span class="s4">if </span><span class="s1">(self.use_short_repeated_primitives</span>
+            <span class="s4">and </span><span class="s1">field.cpp_type != descriptor.FieldDescriptor.CPPTYPE_MESSAGE</span>
+            <span class="s4">and </span><span class="s1">field.cpp_type != descriptor.FieldDescriptor.CPPTYPE_STRING):</span>
+          <span class="s1">self._PrintShortRepeatedPrimitivesValue(field</span><span class="s4">, </span><span class="s1">value)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">for </span><span class="s1">element </span><span class="s4">in </span><span class="s1">value:</span>
+            <span class="s1">self.PrintField(field</span><span class="s4">, </span><span class="s1">element)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">self.PrintField(field</span><span class="s4">, </span><span class="s1">value)</span>
+
+    <span class="s4">if </span><span class="s1">self.print_unknown_fields:</span>
+      <span class="s1">self._PrintUnknownFields(message.UnknownFields())</span>
+
+  <span class="s4">def </span><span class="s1">_PrintUnknownFields(self</span><span class="s4">, </span><span class="s1">unknown_fields):</span>
+    <span class="s2">&quot;&quot;&quot;Print unknown fields.&quot;&quot;&quot;</span>
+    <span class="s1">out = self.out</span>
+    <span class="s4">for </span><span class="s1">field </span><span class="s4">in </span><span class="s1">unknown_fields:</span>
+      <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s1">* self.indent)</span>
+      <span class="s1">out.write(str(field.field_number))</span>
+      <span class="s4">if </span><span class="s1">field.wire_type == WIRETYPE_START_GROUP:</span>
+        <span class="s4">if </span><span class="s1">self.as_one_line:</span>
+          <span class="s1">out.write(</span><span class="s3">' { '</span><span class="s1">)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">out.write(</span><span class="s3">' {</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+          <span class="s1">self.indent += </span><span class="s5">2</span>
+
+        <span class="s1">self._PrintUnknownFields(field.data)</span>
+
+        <span class="s4">if </span><span class="s1">self.as_one_line:</span>
+          <span class="s1">out.write(</span><span class="s3">'} '</span><span class="s1">)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">self.indent -= </span><span class="s5">2</span>
+          <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s1">* self.indent + </span><span class="s3">'}</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+      <span class="s4">elif </span><span class="s1">field.wire_type == WIRETYPE_LENGTH_DELIMITED:</span>
+        <span class="s4">try</span><span class="s1">:</span>
+          <span class="s0"># If this field is parseable as a Message, it is probably</span>
+          <span class="s0"># an embedded message.</span>
+          <span class="s0"># pylint: disable=protected-access</span>
+          <span class="s1">(embedded_unknown_message</span><span class="s4">, </span><span class="s1">pos) = decoder._DecodeUnknownFieldSet(</span>
+              <span class="s1">memoryview(field.data)</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">len(field.data))</span>
+        <span class="s4">except </span><span class="s1">Exception:    </span><span class="s0"># pylint: disable=broad-except</span>
+          <span class="s1">pos = </span><span class="s5">0</span>
+
+        <span class="s4">if </span><span class="s1">pos == len(field.data):</span>
+          <span class="s4">if </span><span class="s1">self.as_one_line:</span>
+            <span class="s1">out.write(</span><span class="s3">' { '</span><span class="s1">)</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">out.write(</span><span class="s3">' {</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+            <span class="s1">self.indent += </span><span class="s5">2</span>
+
+          <span class="s1">self._PrintUnknownFields(embedded_unknown_message)</span>
+
+          <span class="s4">if </span><span class="s1">self.as_one_line:</span>
+            <span class="s1">out.write(</span><span class="s3">'} '</span><span class="s1">)</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">self.indent -= </span><span class="s5">2</span>
+            <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s1">* self.indent + </span><span class="s3">'}</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s0"># A string or bytes field. self.as_utf8 may not work.</span>
+          <span class="s1">out.write(</span><span class="s3">': </span><span class="s4">\&quot;</span><span class="s3">'</span><span class="s1">)</span>
+          <span class="s1">out.write(text_encoding.CEscape(field.data</span><span class="s4">, False</span><span class="s1">))</span>
+          <span class="s1">out.write(</span><span class="s3">'</span><span class="s4">\&quot; </span><span class="s3">' </span><span class="s4">if </span><span class="s1">self.as_one_line </span><span class="s4">else </span><span class="s3">'</span><span class="s4">\&quot;\n</span><span class="s3">'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s0"># varint, fixed32, fixed64</span>
+        <span class="s1">out.write(</span><span class="s3">': '</span><span class="s1">)</span>
+        <span class="s1">out.write(str(field.data))</span>
+        <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s4">if </span><span class="s1">self.as_one_line </span><span class="s4">else </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">_PrintFieldName(self</span><span class="s4">, </span><span class="s1">field):</span>
+    <span class="s2">&quot;&quot;&quot;Print field name.&quot;&quot;&quot;</span>
+    <span class="s1">out = self.out</span>
+    <span class="s1">out.write(</span><span class="s3">' ' </span><span class="s1">* self.indent)</span>
+    <span class="s4">if </span><span class="s1">self.use_field_number:</span>
+      <span class="s1">out.write(str(field.number))</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">if </span><span class="s1">field.is_extension:</span>
+        <span class="s1">out.write(</span><span class="s3">'['</span><span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">(field.containing_type.GetOptions().message_set_wire_format </span><span class="s4">and</span>
+            <span class="s1">field.type == descriptor.FieldDescriptor.TYPE_MESSAGE </span><span class="s4">and</span>
+            <span class="s1">field.label == descriptor.FieldDescriptor.LABEL_OPTIONAL):</span>
+          <span class="s1">out.write(field.message_type.full_name)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">out.write(field.full_name)</span>
+        <span class="s1">out.write(</span><span class="s3">']'</span><span class="s1">)</span>
+      <span class="s4">elif </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_GROUP:</span>
+        <span class="s0"># For groups, use the capitalized name.</span>
+        <span class="s1">out.write(field.message_type.name)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">out.write(field.name)</span>
+
+    <span class="s4">if </span><span class="s1">(self.force_colon </span><span class="s4">or</span>
+        <span class="s1">field.cpp_type != descriptor.FieldDescriptor.CPPTYPE_MESSAGE):</span>
+      <span class="s0"># The colon is optional in this case, but our cross-language golden files</span>
+      <span class="s0"># don't include it. Here, the colon is only included if force_colon is</span>
+      <span class="s0"># set to True</span>
+      <span class="s1">out.write(</span><span class="s3">':'</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">PrintField(self</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Print a single field name/value pair.&quot;&quot;&quot;</span>
+    <span class="s1">self._PrintFieldName(field)</span>
+    <span class="s1">self.out.write(</span><span class="s3">' '</span><span class="s1">)</span>
+    <span class="s1">self.PrintFieldValue(field</span><span class="s4">, </span><span class="s1">value)</span>
+    <span class="s1">self.out.write(</span><span class="s3">' ' </span><span class="s4">if </span><span class="s1">self.as_one_line </span><span class="s4">else </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">_PrintShortRepeatedPrimitivesValue(self</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;&quot;Prints short repeated primitives value.&quot;&quot;&quot;</span>
+    <span class="s0"># Note: this is called only when value has at least one element.</span>
+    <span class="s1">self._PrintFieldName(field)</span>
+    <span class="s1">self.out.write(</span><span class="s3">' ['</span><span class="s1">)</span>
+    <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">range(len(value) - </span><span class="s5">1</span><span class="s1">):</span>
+      <span class="s1">self.PrintFieldValue(field</span><span class="s4">, </span><span class="s1">value[i])</span>
+      <span class="s1">self.out.write(</span><span class="s3">', '</span><span class="s1">)</span>
+    <span class="s1">self.PrintFieldValue(field</span><span class="s4">, </span><span class="s1">value[-</span><span class="s5">1</span><span class="s1">])</span>
+    <span class="s1">self.out.write(</span><span class="s3">']'</span><span class="s1">)</span>
+    <span class="s1">self.out.write(</span><span class="s3">' ' </span><span class="s4">if </span><span class="s1">self.as_one_line </span><span class="s4">else </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">_PrintMessageFieldValue(self</span><span class="s4">, </span><span class="s1">value):</span>
+    <span class="s4">if </span><span class="s1">self.pointy_brackets:</span>
+      <span class="s1">openb = </span><span class="s3">'&lt;'</span>
+      <span class="s1">closeb = </span><span class="s3">'&gt;'</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">openb = </span><span class="s3">'{'</span>
+      <span class="s1">closeb = </span><span class="s3">'}'</span>
+
+    <span class="s4">if </span><span class="s1">self.as_one_line:</span>
+      <span class="s1">self.out.write(</span><span class="s3">'%s ' </span><span class="s1">% openb)</span>
+      <span class="s1">self.PrintMessage(value)</span>
+      <span class="s1">self.out.write(closeb)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self.out.write(</span><span class="s3">'%s</span><span class="s4">\n</span><span class="s3">' </span><span class="s1">% openb)</span>
+      <span class="s1">self.indent += </span><span class="s5">2</span>
+      <span class="s1">self.PrintMessage(value)</span>
+      <span class="s1">self.indent -= </span><span class="s5">2</span>
+      <span class="s1">self.out.write(</span><span class="s3">' ' </span><span class="s1">* self.indent + closeb)</span>
+
+  <span class="s4">def </span><span class="s1">PrintFieldValue(self</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Print a single field value (not including name). 
+ 
+    For repeated fields, the value should be a single element. 
+ 
+    Args: 
+      field: The descriptor of the field to be printed. 
+      value: The value of the field. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">out = self.out</span>
+    <span class="s4">if </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+      <span class="s1">self._PrintMessageFieldValue(value)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_ENUM:</span>
+      <span class="s1">enum_value = field.enum_type.values_by_number.get(value</span><span class="s4">, None</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">is not None</span><span class="s1">:</span>
+        <span class="s1">out.write(enum_value.name)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">out.write(str(value))</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_STRING:</span>
+      <span class="s1">out.write(</span><span class="s3">'</span><span class="s4">\&quot;</span><span class="s3">'</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">str) </span><span class="s4">and not </span><span class="s1">self.as_utf8:</span>
+        <span class="s1">out_value = value.encode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">out_value = value</span>
+      <span class="s4">if </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_BYTES:</span>
+        <span class="s0"># We always need to escape all binary data in TYPE_BYTES fields.</span>
+        <span class="s1">out_as_utf8 = </span><span class="s4">False</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">out_as_utf8 = self.as_utf8</span>
+      <span class="s1">out.write(text_encoding.CEscape(out_value</span><span class="s4">, </span><span class="s1">out_as_utf8))</span>
+      <span class="s1">out.write(</span><span class="s3">'</span><span class="s4">\&quot;</span><span class="s3">'</span><span class="s1">)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_BOOL:</span>
+      <span class="s4">if </span><span class="s1">value:</span>
+        <span class="s1">out.write(</span><span class="s3">'true'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">out.write(</span><span class="s3">'false'</span><span class="s1">)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_FLOAT:</span>
+      <span class="s4">if </span><span class="s1">self.float_format </span><span class="s4">is not None</span><span class="s1">:</span>
+        <span class="s1">out.write(</span><span class="s3">'{1:{0}}'</span><span class="s1">.format(self.float_format</span><span class="s4">, </span><span class="s1">value))</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">if </span><span class="s1">math.isnan(value):</span>
+          <span class="s1">out.write(str(value))</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">out.write(str(type_checkers.ToShortestFloat(value)))</span>
+    <span class="s4">elif </span><span class="s1">(field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_DOUBLE </span><span class="s4">and</span>
+          <span class="s1">self.double_format </span><span class="s4">is not None</span><span class="s1">):</span>
+      <span class="s1">out.write(</span><span class="s3">'{1:{0}}'</span><span class="s1">.format(self.double_format</span><span class="s4">, </span><span class="s1">value))</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">out.write(str(value))</span>
+
+
+<span class="s4">def </span><span class="s1">Parse(text</span><span class="s4">,</span>
+          <span class="s1">message</span><span class="s4">,</span>
+          <span class="s1">allow_unknown_extension=</span><span class="s4">False,</span>
+          <span class="s1">allow_field_number=</span><span class="s4">False,</span>
+          <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+          <span class="s1">allow_unknown_field=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses a text representation of a protocol message into a message. 
+ 
+  NOTE: for historical reasons this function does not clear the input 
+  message. This is different from what the binary msg.ParseFrom(...) does. 
+  If text contains a field already set in message, the value is appended if the 
+  field is repeated. Otherwise, an error is raised. 
+ 
+  Example:: 
+ 
+    a = MyProto() 
+    a.repeated_field.append('test') 
+    b = MyProto() 
+ 
+    # Repeated fields are combined 
+    text_format.Parse(repr(a), b) 
+    text_format.Parse(repr(a), b) # repeated_field contains [&quot;test&quot;, &quot;test&quot;] 
+ 
+    # Non-repeated fields cannot be overwritten 
+    a.singular_field = 1 
+    b.singular_field = 2 
+    text_format.Parse(repr(a), b) # ParseError 
+ 
+    # Binary version: 
+    b.ParseFromString(a.SerializeToString()) # repeated_field is now &quot;test&quot; 
+ 
+  Caller is responsible for clearing the message as needed. 
+ 
+  Args: 
+    text (str): Message text representation. 
+    message (Message): A protocol buffer message to merge into. 
+    allow_unknown_extension: if True, skip over missing extensions and keep 
+      parsing 
+    allow_field_number: if True, both field number and field name are allowed. 
+    descriptor_pool (DescriptorPool): Descriptor pool used to resolve Any types. 
+    allow_unknown_field: if True, skip over unknown field and keep 
+      parsing. Avoid to use this option if possible. It may hide some 
+      errors (e.g. spelling error on field name) 
+ 
+  Returns: 
+    Message: The same message passed as argument. 
+ 
+  Raises: 
+    ParseError: On text parsing problems. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">return </span><span class="s1">ParseLines(text.split(</span><span class="s6">b'</span><span class="s4">\n</span><span class="s6">' </span><span class="s4">if </span><span class="s1">isinstance(text</span><span class="s4">, </span><span class="s1">bytes) </span><span class="s4">else </span><span class="s3">u'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span><span class="s4">,</span>
+                    <span class="s1">message</span><span class="s4">,</span>
+                    <span class="s1">allow_unknown_extension</span><span class="s4">,</span>
+                    <span class="s1">allow_field_number</span><span class="s4">,</span>
+                    <span class="s1">descriptor_pool=descriptor_pool</span><span class="s4">,</span>
+                    <span class="s1">allow_unknown_field=allow_unknown_field)</span>
+
+
+<span class="s4">def </span><span class="s1">Merge(text</span><span class="s4">,</span>
+          <span class="s1">message</span><span class="s4">,</span>
+          <span class="s1">allow_unknown_extension=</span><span class="s4">False,</span>
+          <span class="s1">allow_field_number=</span><span class="s4">False,</span>
+          <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+          <span class="s1">allow_unknown_field=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses a text representation of a protocol message into a message. 
+ 
+  Like Parse(), but allows repeated values for a non-repeated field, and uses 
+  the last one. This means any non-repeated, top-level fields specified in text 
+  replace those in the message. 
+ 
+  Args: 
+    text (str): Message text representation. 
+    message (Message): A protocol buffer message to merge into. 
+    allow_unknown_extension: if True, skip over missing extensions and keep 
+      parsing 
+    allow_field_number: if True, both field number and field name are allowed. 
+    descriptor_pool (DescriptorPool): Descriptor pool used to resolve Any types. 
+    allow_unknown_field: if True, skip over unknown field and keep 
+      parsing. Avoid to use this option if possible. It may hide some 
+      errors (e.g. spelling error on field name) 
+ 
+  Returns: 
+    Message: The same message passed as argument. 
+ 
+  Raises: 
+    ParseError: On text parsing problems. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">return </span><span class="s1">MergeLines(</span>
+      <span class="s1">text.split(</span><span class="s6">b'</span><span class="s4">\n</span><span class="s6">' </span><span class="s4">if </span><span class="s1">isinstance(text</span><span class="s4">, </span><span class="s1">bytes) </span><span class="s4">else </span><span class="s3">u'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">message</span><span class="s4">,</span>
+      <span class="s1">allow_unknown_extension</span><span class="s4">,</span>
+      <span class="s1">allow_field_number</span><span class="s4">,</span>
+      <span class="s1">descriptor_pool=descriptor_pool</span><span class="s4">,</span>
+      <span class="s1">allow_unknown_field=allow_unknown_field)</span>
+
+
+<span class="s4">def </span><span class="s1">ParseLines(lines</span><span class="s4">,</span>
+               <span class="s1">message</span><span class="s4">,</span>
+               <span class="s1">allow_unknown_extension=</span><span class="s4">False,</span>
+               <span class="s1">allow_field_number=</span><span class="s4">False,</span>
+               <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+               <span class="s1">allow_unknown_field=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses a text representation of a protocol message into a message. 
+ 
+  See Parse() for caveats. 
+ 
+  Args: 
+    lines: An iterable of lines of a message's text representation. 
+    message: A protocol buffer message to merge into. 
+    allow_unknown_extension: if True, skip over missing extensions and keep 
+      parsing 
+    allow_field_number: if True, both field number and field name are allowed. 
+    descriptor_pool: A DescriptorPool used to resolve Any types. 
+    allow_unknown_field: if True, skip over unknown field and keep 
+      parsing. Avoid to use this option if possible. It may hide some 
+      errors (e.g. spelling error on field name) 
+ 
+  Returns: 
+    The same message passed as argument. 
+ 
+  Raises: 
+    ParseError: On text parsing problems. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">parser = _Parser(allow_unknown_extension</span><span class="s4">,</span>
+                   <span class="s1">allow_field_number</span><span class="s4">,</span>
+                   <span class="s1">descriptor_pool=descriptor_pool</span><span class="s4">,</span>
+                   <span class="s1">allow_unknown_field=allow_unknown_field)</span>
+  <span class="s4">return </span><span class="s1">parser.ParseLines(lines</span><span class="s4">, </span><span class="s1">message)</span>
+
+
+<span class="s4">def </span><span class="s1">MergeLines(lines</span><span class="s4">,</span>
+               <span class="s1">message</span><span class="s4">,</span>
+               <span class="s1">allow_unknown_extension=</span><span class="s4">False,</span>
+               <span class="s1">allow_field_number=</span><span class="s4">False,</span>
+               <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+               <span class="s1">allow_unknown_field=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses a text representation of a protocol message into a message. 
+ 
+  See Merge() for more details. 
+ 
+  Args: 
+    lines: An iterable of lines of a message's text representation. 
+    message: A protocol buffer message to merge into. 
+    allow_unknown_extension: if True, skip over missing extensions and keep 
+      parsing 
+    allow_field_number: if True, both field number and field name are allowed. 
+    descriptor_pool: A DescriptorPool used to resolve Any types. 
+    allow_unknown_field: if True, skip over unknown field and keep 
+      parsing. Avoid to use this option if possible. It may hide some 
+      errors (e.g. spelling error on field name) 
+ 
+  Returns: 
+    The same message passed as argument. 
+ 
+  Raises: 
+    ParseError: On text parsing problems. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">parser = _Parser(allow_unknown_extension</span><span class="s4">,</span>
+                   <span class="s1">allow_field_number</span><span class="s4">,</span>
+                   <span class="s1">descriptor_pool=descriptor_pool</span><span class="s4">,</span>
+                   <span class="s1">allow_unknown_field=allow_unknown_field)</span>
+  <span class="s4">return </span><span class="s1">parser.MergeLines(lines</span><span class="s4">, </span><span class="s1">message)</span>
+
+
+<span class="s4">class </span><span class="s1">_Parser(object):</span>
+  <span class="s2">&quot;&quot;&quot;Text format parser for protocol message.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">,</span>
+               <span class="s1">allow_unknown_extension=</span><span class="s4">False,</span>
+               <span class="s1">allow_field_number=</span><span class="s4">False,</span>
+               <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+               <span class="s1">allow_unknown_field=</span><span class="s4">False</span><span class="s1">):</span>
+    <span class="s1">self.allow_unknown_extension = allow_unknown_extension</span>
+    <span class="s1">self.allow_field_number = allow_field_number</span>
+    <span class="s1">self.descriptor_pool = descriptor_pool</span>
+    <span class="s1">self.allow_unknown_field = allow_unknown_field</span>
+
+  <span class="s4">def </span><span class="s1">ParseLines(self</span><span class="s4">, </span><span class="s1">lines</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Parses a text representation of a protocol message into a message.&quot;&quot;&quot;</span>
+    <span class="s1">self._allow_multiple_scalars = </span><span class="s4">False</span>
+    <span class="s1">self._ParseOrMerge(lines</span><span class="s4">, </span><span class="s1">message)</span>
+    <span class="s4">return </span><span class="s1">message</span>
+
+  <span class="s4">def </span><span class="s1">MergeLines(self</span><span class="s4">, </span><span class="s1">lines</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Merges a text representation of a protocol message into a message.&quot;&quot;&quot;</span>
+    <span class="s1">self._allow_multiple_scalars = </span><span class="s4">True</span>
+    <span class="s1">self._ParseOrMerge(lines</span><span class="s4">, </span><span class="s1">message)</span>
+    <span class="s4">return </span><span class="s1">message</span>
+
+  <span class="s4">def </span><span class="s1">_ParseOrMerge(self</span><span class="s4">, </span><span class="s1">lines</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts a text representation of a protocol message into a message. 
+ 
+    Args: 
+      lines: Lines of a message's text representation. 
+      message: A protocol buffer message to merge into. 
+ 
+    Raises: 
+      ParseError: On text parsing problems. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Tokenize expects native str lines.</span>
+    <span class="s1">str_lines = (</span>
+        <span class="s1">line </span><span class="s4">if </span><span class="s1">isinstance(line</span><span class="s4">, </span><span class="s1">str) </span><span class="s4">else </span><span class="s1">line.decode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+        <span class="s4">for </span><span class="s1">line </span><span class="s4">in </span><span class="s1">lines)</span>
+    <span class="s1">tokenizer = Tokenizer(str_lines)</span>
+    <span class="s4">while not </span><span class="s1">tokenizer.AtEnd():</span>
+      <span class="s1">self._MergeField(tokenizer</span><span class="s4">, </span><span class="s1">message)</span>
+
+  <span class="s4">def </span><span class="s1">_MergeField(self</span><span class="s4">, </span><span class="s1">tokenizer</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Merges a single protocol message field into a message. 
+ 
+    Args: 
+      tokenizer: A tokenizer to parse the field name and values. 
+      message: A protocol message to record the data. 
+ 
+    Raises: 
+      ParseError: In case of text parsing problems. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">message_descriptor = message.DESCRIPTOR</span>
+    <span class="s4">if </span><span class="s1">(message_descriptor.full_name == _ANY_FULL_TYPE_NAME </span><span class="s4">and</span>
+        <span class="s1">tokenizer.TryConsume(</span><span class="s3">'['</span><span class="s1">)):</span>
+      <span class="s1">type_url_prefix</span><span class="s4">, </span><span class="s1">packed_type_name = self._ConsumeAnyTypeUrl(tokenizer)</span>
+      <span class="s1">tokenizer.Consume(</span><span class="s3">']'</span><span class="s1">)</span>
+      <span class="s1">tokenizer.TryConsume(</span><span class="s3">':'</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'&lt;'</span><span class="s1">):</span>
+        <span class="s1">expanded_any_end_token = </span><span class="s3">'&gt;'</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">tokenizer.Consume(</span><span class="s3">'{'</span><span class="s1">)</span>
+        <span class="s1">expanded_any_end_token = </span><span class="s3">'}'</span>
+      <span class="s1">expanded_any_sub_message = _BuildMessageFromTypeName(packed_type_name</span><span class="s4">,</span>
+                                                           <span class="s1">self.descriptor_pool)</span>
+      <span class="s4">if not </span><span class="s1">expanded_any_sub_message:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Type %s not found in descriptor pool' </span><span class="s1">%</span>
+                         <span class="s1">packed_type_name)</span>
+      <span class="s4">while not </span><span class="s1">tokenizer.TryConsume(expanded_any_end_token):</span>
+        <span class="s4">if </span><span class="s1">tokenizer.AtEnd():</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span><span class="s3">'Expected &quot;%s&quot;.' </span><span class="s1">%</span>
+                                                  <span class="s1">(expanded_any_end_token</span><span class="s4">,</span><span class="s1">))</span>
+        <span class="s1">self._MergeField(tokenizer</span><span class="s4">, </span><span class="s1">expanded_any_sub_message)</span>
+      <span class="s1">deterministic = </span><span class="s4">False</span>
+
+      <span class="s1">message.Pack(expanded_any_sub_message</span><span class="s4">,</span>
+                   <span class="s1">type_url_prefix=type_url_prefix</span><span class="s4">,</span>
+                   <span class="s1">deterministic=deterministic)</span>
+      <span class="s4">return</span>
+
+    <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'['</span><span class="s1">):</span>
+      <span class="s1">name = [tokenizer.ConsumeIdentifier()]</span>
+      <span class="s4">while </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'.'</span><span class="s1">):</span>
+        <span class="s1">name.append(tokenizer.ConsumeIdentifier())</span>
+      <span class="s1">name = </span><span class="s3">'.'</span><span class="s1">.join(name)</span>
+
+      <span class="s4">if not </span><span class="s1">message_descriptor.is_extendable:</span>
+        <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+            <span class="s3">'Message type &quot;%s&quot; does not have extensions.' </span><span class="s1">%</span>
+            <span class="s1">message_descriptor.full_name)</span>
+      <span class="s0"># pylint: disable=protected-access</span>
+      <span class="s1">field = message.Extensions._FindExtensionByName(name)</span>
+      <span class="s0"># pylint: enable=protected-access</span>
+
+
+      <span class="s4">if not </span><span class="s1">field:</span>
+        <span class="s4">if </span><span class="s1">self.allow_unknown_extension:</span>
+          <span class="s1">field = </span><span class="s4">None</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+              <span class="s3">'Extension &quot;%s&quot; not registered. '</span>
+              <span class="s3">'Did you import the _pb2 module which defines it? '</span>
+              <span class="s3">'If you are trying to place the extension in the MessageSet '</span>
+              <span class="s3">'field of another message that is in an Any or MessageSet field, '</span>
+              <span class="s3">'that message</span><span class="s4">\'</span><span class="s3">s _pb2 module must be imported as well' </span><span class="s1">% name)</span>
+      <span class="s4">elif </span><span class="s1">message_descriptor != field.containing_type:</span>
+        <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+            <span class="s3">'Extension &quot;%s&quot; does not extend message type &quot;%s&quot;.' </span><span class="s1">%</span>
+            <span class="s1">(name</span><span class="s4">, </span><span class="s1">message_descriptor.full_name))</span>
+
+      <span class="s1">tokenizer.Consume(</span><span class="s3">']'</span><span class="s1">)</span>
+
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">name = tokenizer.ConsumeIdentifierOrNumber()</span>
+      <span class="s4">if </span><span class="s1">self.allow_field_number </span><span class="s4">and </span><span class="s1">name.isdigit():</span>
+        <span class="s1">number = ParseInteger(name</span><span class="s4">, True, True</span><span class="s1">)</span>
+        <span class="s1">field = message_descriptor.fields_by_number.get(number</span><span class="s4">, None</span><span class="s1">)</span>
+        <span class="s4">if not </span><span class="s1">field </span><span class="s4">and </span><span class="s1">message_descriptor.is_extendable:</span>
+          <span class="s1">field = message.Extensions._FindExtensionByNumber(number)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">field = message_descriptor.fields_by_name.get(name</span><span class="s4">, None</span><span class="s1">)</span>
+
+        <span class="s0"># Group names are expected to be capitalized as they appear in the</span>
+        <span class="s0"># .proto file, which actually matches their type names, not their field</span>
+        <span class="s0"># names.</span>
+        <span class="s4">if not </span><span class="s1">field:</span>
+          <span class="s1">field = message_descriptor.fields_by_name.get(name.lower()</span><span class="s4">, None</span><span class="s1">)</span>
+          <span class="s4">if </span><span class="s1">field </span><span class="s4">and </span><span class="s1">field.type != descriptor.FieldDescriptor.TYPE_GROUP:</span>
+            <span class="s1">field = </span><span class="s4">None</span>
+
+        <span class="s4">if </span><span class="s1">(field </span><span class="s4">and </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_GROUP </span><span class="s4">and</span>
+            <span class="s1">field.message_type.name != name):</span>
+          <span class="s1">field = </span><span class="s4">None</span>
+
+      <span class="s4">if not </span><span class="s1">field </span><span class="s4">and not </span><span class="s1">self.allow_unknown_field:</span>
+        <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+            <span class="s3">'Message type &quot;%s&quot; has no field named &quot;%s&quot;.' </span><span class="s1">%</span>
+            <span class="s1">(message_descriptor.full_name</span><span class="s4">, </span><span class="s1">name))</span>
+
+    <span class="s4">if </span><span class="s1">field:</span>
+      <span class="s4">if not </span><span class="s1">self._allow_multiple_scalars </span><span class="s4">and </span><span class="s1">field.containing_oneof:</span>
+        <span class="s0"># Check if there's a different field set in this oneof.</span>
+        <span class="s0"># Note that we ignore the case if the same field was set before, and we</span>
+        <span class="s0"># apply _allow_multiple_scalars to non-scalar fields as well.</span>
+        <span class="s1">which_oneof = message.WhichOneof(field.containing_oneof.name)</span>
+        <span class="s4">if </span><span class="s1">which_oneof </span><span class="s4">is not None and </span><span class="s1">which_oneof != field.name:</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+              <span class="s3">'Field &quot;%s&quot; is specified along with field &quot;%s&quot;, another member '</span>
+              <span class="s3">'of oneof &quot;%s&quot; for message type &quot;%s&quot;.' </span><span class="s1">%</span>
+              <span class="s1">(field.name</span><span class="s4">, </span><span class="s1">which_oneof</span><span class="s4">, </span><span class="s1">field.containing_oneof.name</span><span class="s4">,</span>
+               <span class="s1">message_descriptor.full_name))</span>
+
+      <span class="s4">if </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+        <span class="s1">tokenizer.TryConsume(</span><span class="s3">':'</span><span class="s1">)</span>
+        <span class="s1">merger = self._MergeMessageField</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">tokenizer.Consume(</span><span class="s3">':'</span><span class="s1">)</span>
+        <span class="s1">merger = self._MergeScalarField</span>
+
+      <span class="s4">if </span><span class="s1">(field.label == descriptor.FieldDescriptor.LABEL_REPEATED </span><span class="s4">and</span>
+          <span class="s1">tokenizer.TryConsume(</span><span class="s3">'['</span><span class="s1">)):</span>
+        <span class="s0"># Short repeated format, e.g. &quot;foo: [1, 2, 3]&quot;</span>
+        <span class="s4">if not </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">']'</span><span class="s1">):</span>
+          <span class="s4">while True</span><span class="s1">:</span>
+            <span class="s1">merger(tokenizer</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field)</span>
+            <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">']'</span><span class="s1">):</span>
+              <span class="s4">break</span>
+            <span class="s1">tokenizer.Consume(</span><span class="s3">','</span><span class="s1">)</span>
+
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">merger(tokenizer</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field)</span>
+
+    <span class="s4">else</span><span class="s1">:  </span><span class="s0"># Proto field is unknown.</span>
+      <span class="s4">assert </span><span class="s1">(self.allow_unknown_extension </span><span class="s4">or </span><span class="s1">self.allow_unknown_field)</span>
+      <span class="s1">_SkipFieldContents(tokenizer)</span>
+
+    <span class="s0"># For historical reasons, fields may optionally be separated by commas or</span>
+    <span class="s0"># semicolons.</span>
+    <span class="s4">if not </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">','</span><span class="s1">):</span>
+      <span class="s1">tokenizer.TryConsume(</span><span class="s3">';'</span><span class="s1">)</span>
+
+
+  <span class="s4">def </span><span class="s1">_ConsumeAnyTypeUrl(self</span><span class="s4">, </span><span class="s1">tokenizer):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes a google.protobuf.Any type URL and returns the type name.&quot;&quot;&quot;</span>
+    <span class="s0"># Consume &quot;type.googleapis.com/&quot;.</span>
+    <span class="s1">prefix = [tokenizer.ConsumeIdentifier()]</span>
+    <span class="s1">tokenizer.Consume(</span><span class="s3">'.'</span><span class="s1">)</span>
+    <span class="s1">prefix.append(tokenizer.ConsumeIdentifier())</span>
+    <span class="s1">tokenizer.Consume(</span><span class="s3">'.'</span><span class="s1">)</span>
+    <span class="s1">prefix.append(tokenizer.ConsumeIdentifier())</span>
+    <span class="s1">tokenizer.Consume(</span><span class="s3">'/'</span><span class="s1">)</span>
+    <span class="s0"># Consume the fully-qualified type name.</span>
+    <span class="s1">name = [tokenizer.ConsumeIdentifier()]</span>
+    <span class="s4">while </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'.'</span><span class="s1">):</span>
+      <span class="s1">name.append(tokenizer.ConsumeIdentifier())</span>
+    <span class="s4">return </span><span class="s3">'.'</span><span class="s1">.join(prefix)</span><span class="s4">, </span><span class="s3">'.'</span><span class="s1">.join(name)</span>
+
+  <span class="s4">def </span><span class="s1">_MergeMessageField(self</span><span class="s4">, </span><span class="s1">tokenizer</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field):</span>
+    <span class="s2">&quot;&quot;&quot;Merges a single scalar field into a message. 
+ 
+    Args: 
+      tokenizer: A tokenizer to parse the field value. 
+      message: The message of which field is a member. 
+      field: The descriptor of the field to be merged. 
+ 
+    Raises: 
+      ParseError: In case of text parsing problems. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">is_map_entry = _IsMapEntry(field)</span>
+
+    <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'&lt;'</span><span class="s1">):</span>
+      <span class="s1">end_token = </span><span class="s3">'&gt;'</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">tokenizer.Consume(</span><span class="s3">'{'</span><span class="s1">)</span>
+      <span class="s1">end_token = </span><span class="s3">'}'</span>
+
+    <span class="s4">if </span><span class="s1">field.label == descriptor.FieldDescriptor.LABEL_REPEATED:</span>
+      <span class="s4">if </span><span class="s1">field.is_extension:</span>
+        <span class="s1">sub_message = message.Extensions[field].add()</span>
+      <span class="s4">elif </span><span class="s1">is_map_entry:</span>
+        <span class="s1">sub_message = getattr(message</span><span class="s4">, </span><span class="s1">field.name).GetEntryClass()()</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">sub_message = getattr(message</span><span class="s4">, </span><span class="s1">field.name).add()</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">if </span><span class="s1">field.is_extension:</span>
+        <span class="s4">if </span><span class="s1">(</span><span class="s4">not </span><span class="s1">self._allow_multiple_scalars </span><span class="s4">and</span>
+            <span class="s1">message.HasExtension(field)):</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+              <span class="s3">'Message type &quot;%s&quot; should not have multiple &quot;%s&quot; extensions.' </span><span class="s1">%</span>
+              <span class="s1">(message.DESCRIPTOR.full_name</span><span class="s4">, </span><span class="s1">field.full_name))</span>
+        <span class="s1">sub_message = message.Extensions[field]</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s0"># Also apply _allow_multiple_scalars to message field.</span>
+        <span class="s0"># TODO(jieluo): Change to _allow_singular_overwrites.</span>
+        <span class="s4">if </span><span class="s1">(</span><span class="s4">not </span><span class="s1">self._allow_multiple_scalars </span><span class="s4">and</span>
+            <span class="s1">message.HasField(field.name)):</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+              <span class="s3">'Message type &quot;%s&quot; should not have multiple &quot;%s&quot; fields.' </span><span class="s1">%</span>
+              <span class="s1">(message.DESCRIPTOR.full_name</span><span class="s4">, </span><span class="s1">field.name))</span>
+        <span class="s1">sub_message = getattr(message</span><span class="s4">, </span><span class="s1">field.name)</span>
+      <span class="s1">sub_message.SetInParent()</span>
+
+    <span class="s4">while not </span><span class="s1">tokenizer.TryConsume(end_token):</span>
+      <span class="s4">if </span><span class="s1">tokenizer.AtEnd():</span>
+        <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span><span class="s3">'Expected &quot;%s&quot;.' </span><span class="s1">% (end_token</span><span class="s4">,</span><span class="s1">))</span>
+      <span class="s1">self._MergeField(tokenizer</span><span class="s4">, </span><span class="s1">sub_message)</span>
+
+    <span class="s4">if </span><span class="s1">is_map_entry:</span>
+      <span class="s1">value_cpptype = field.message_type.fields_by_name[</span><span class="s3">'value'</span><span class="s1">].cpp_type</span>
+      <span class="s4">if </span><span class="s1">value_cpptype == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+        <span class="s1">value = getattr(message</span><span class="s4">, </span><span class="s1">field.name)[sub_message.key]</span>
+        <span class="s1">value.CopyFrom(sub_message.value)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">getattr(message</span><span class="s4">, </span><span class="s1">field.name)[sub_message.key] = sub_message.value</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s4">def </span><span class="s1">_IsProto3Syntax(message):</span>
+    <span class="s1">message_descriptor = message.DESCRIPTOR</span>
+    <span class="s4">return </span><span class="s1">(hasattr(message_descriptor</span><span class="s4">, </span><span class="s3">'syntax'</span><span class="s1">) </span><span class="s4">and</span>
+            <span class="s1">message_descriptor.syntax == </span><span class="s3">'proto3'</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">_MergeScalarField(self</span><span class="s4">, </span><span class="s1">tokenizer</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field):</span>
+    <span class="s2">&quot;&quot;&quot;Merges a single scalar field into a message. 
+ 
+    Args: 
+      tokenizer: A tokenizer to parse the field value. 
+      message: A protocol message to record the data. 
+      field: The descriptor of the field to be merged. 
+ 
+    Raises: 
+      ParseError: In case of text parsing problems. 
+      RuntimeError: On runtime errors. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_ = self.allow_unknown_extension</span>
+    <span class="s1">value = </span><span class="s4">None</span>
+
+    <span class="s4">if </span><span class="s1">field.type </span><span class="s4">in </span><span class="s1">(descriptor.FieldDescriptor.TYPE_INT32</span><span class="s4">,</span>
+                      <span class="s1">descriptor.FieldDescriptor.TYPE_SINT32</span><span class="s4">,</span>
+                      <span class="s1">descriptor.FieldDescriptor.TYPE_SFIXED32):</span>
+      <span class="s1">value = _ConsumeInt32(tokenizer)</span>
+    <span class="s4">elif </span><span class="s1">field.type </span><span class="s4">in </span><span class="s1">(descriptor.FieldDescriptor.TYPE_INT64</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.TYPE_SINT64</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.TYPE_SFIXED64):</span>
+      <span class="s1">value = _ConsumeInt64(tokenizer)</span>
+    <span class="s4">elif </span><span class="s1">field.type </span><span class="s4">in </span><span class="s1">(descriptor.FieldDescriptor.TYPE_UINT32</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.TYPE_FIXED32):</span>
+      <span class="s1">value = _ConsumeUint32(tokenizer)</span>
+    <span class="s4">elif </span><span class="s1">field.type </span><span class="s4">in </span><span class="s1">(descriptor.FieldDescriptor.TYPE_UINT64</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.TYPE_FIXED64):</span>
+      <span class="s1">value = _ConsumeUint64(tokenizer)</span>
+    <span class="s4">elif </span><span class="s1">field.type </span><span class="s4">in </span><span class="s1">(descriptor.FieldDescriptor.TYPE_FLOAT</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.TYPE_DOUBLE):</span>
+      <span class="s1">value = tokenizer.ConsumeFloat()</span>
+    <span class="s4">elif </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_BOOL:</span>
+      <span class="s1">value = tokenizer.ConsumeBool()</span>
+    <span class="s4">elif </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_STRING:</span>
+      <span class="s1">value = tokenizer.ConsumeString()</span>
+    <span class="s4">elif </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_BYTES:</span>
+      <span class="s1">value = tokenizer.ConsumeByteString()</span>
+    <span class="s4">elif </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_ENUM:</span>
+      <span class="s1">value = tokenizer.ConsumeEnum(field)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">RuntimeError(</span><span class="s3">'Unknown field type %d' </span><span class="s1">% field.type)</span>
+
+    <span class="s4">if </span><span class="s1">field.label == descriptor.FieldDescriptor.LABEL_REPEATED:</span>
+      <span class="s4">if </span><span class="s1">field.is_extension:</span>
+        <span class="s1">message.Extensions[field].append(value)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">getattr(message</span><span class="s4">, </span><span class="s1">field.name).append(value)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">if </span><span class="s1">field.is_extension:</span>
+        <span class="s4">if </span><span class="s1">(</span><span class="s4">not </span><span class="s1">self._allow_multiple_scalars </span><span class="s4">and</span>
+            <span class="s4">not </span><span class="s1">self._IsProto3Syntax(message) </span><span class="s4">and</span>
+            <span class="s1">message.HasExtension(field)):</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+              <span class="s3">'Message type &quot;%s&quot; should not have multiple &quot;%s&quot; extensions.' </span><span class="s1">%</span>
+              <span class="s1">(message.DESCRIPTOR.full_name</span><span class="s4">, </span><span class="s1">field.full_name))</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">message.Extensions[field] = value</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">duplicate_error = </span><span class="s4">False</span>
+        <span class="s4">if not </span><span class="s1">self._allow_multiple_scalars:</span>
+          <span class="s4">if </span><span class="s1">self._IsProto3Syntax(message):</span>
+            <span class="s0"># Proto3 doesn't represent presence so we try best effort to check</span>
+            <span class="s0"># multiple scalars by compare to default values.</span>
+            <span class="s1">duplicate_error = bool(getattr(message</span><span class="s4">, </span><span class="s1">field.name))</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">duplicate_error = message.HasField(field.name)</span>
+
+        <span class="s4">if </span><span class="s1">duplicate_error:</span>
+          <span class="s4">raise </span><span class="s1">tokenizer.ParseErrorPreviousToken(</span>
+              <span class="s3">'Message type &quot;%s&quot; should not have multiple &quot;%s&quot; fields.' </span><span class="s1">%</span>
+              <span class="s1">(message.DESCRIPTOR.full_name</span><span class="s4">, </span><span class="s1">field.name))</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">setattr(message</span><span class="s4">, </span><span class="s1">field.name</span><span class="s4">, </span><span class="s1">value)</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipFieldContents(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Skips over contents (value or message) of a field. 
+ 
+  Args: 
+    tokenizer: A tokenizer to parse the field name and values. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># Try to guess the type of this field.</span>
+  <span class="s0"># If this field is not a message, there should be a &quot;:&quot; between the</span>
+  <span class="s0"># field name and the field value and also the field value should not</span>
+  <span class="s0"># start with &quot;{&quot; or &quot;&lt;&quot; which indicates the beginning of a message body.</span>
+  <span class="s0"># If there is no &quot;:&quot; or there is a &quot;{&quot; or &quot;&lt;&quot; after &quot;:&quot;, this field has</span>
+  <span class="s0"># to be a message or the input is ill-formed.</span>
+  <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">':'</span><span class="s1">) </span><span class="s4">and not </span><span class="s1">tokenizer.LookingAt(</span>
+      <span class="s3">'{'</span><span class="s1">) </span><span class="s4">and not </span><span class="s1">tokenizer.LookingAt(</span><span class="s3">'&lt;'</span><span class="s1">):</span>
+    <span class="s1">_SkipFieldValue(tokenizer)</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s1">_SkipFieldMessage(tokenizer)</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipField(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Skips over a complete field (name and value/message). 
+ 
+  Args: 
+    tokenizer: A tokenizer to parse the field name and values. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'['</span><span class="s1">):</span>
+    <span class="s0"># Consume extension name.</span>
+    <span class="s1">tokenizer.ConsumeIdentifier()</span>
+    <span class="s4">while </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'.'</span><span class="s1">):</span>
+      <span class="s1">tokenizer.ConsumeIdentifier()</span>
+    <span class="s1">tokenizer.Consume(</span><span class="s3">']'</span><span class="s1">)</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s1">tokenizer.ConsumeIdentifierOrNumber()</span>
+
+  <span class="s1">_SkipFieldContents(tokenizer)</span>
+
+  <span class="s0"># For historical reasons, fields may optionally be separated by commas or</span>
+  <span class="s0"># semicolons.</span>
+  <span class="s4">if not </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">','</span><span class="s1">):</span>
+    <span class="s1">tokenizer.TryConsume(</span><span class="s3">';'</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipFieldMessage(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Skips over a field message. 
+ 
+  Args: 
+    tokenizer: A tokenizer to parse the field name and values. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">tokenizer.TryConsume(</span><span class="s3">'&lt;'</span><span class="s1">):</span>
+    <span class="s1">delimiter = </span><span class="s3">'&gt;'</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s1">tokenizer.Consume(</span><span class="s3">'{'</span><span class="s1">)</span>
+    <span class="s1">delimiter = </span><span class="s3">'}'</span>
+
+  <span class="s4">while not </span><span class="s1">tokenizer.LookingAt(</span><span class="s3">'&gt;'</span><span class="s1">) </span><span class="s4">and not </span><span class="s1">tokenizer.LookingAt(</span><span class="s3">'}'</span><span class="s1">):</span>
+    <span class="s1">_SkipField(tokenizer)</span>
+
+  <span class="s1">tokenizer.Consume(delimiter)</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipFieldValue(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Skips over a field value. 
+ 
+  Args: 
+    tokenizer: A tokenizer to parse the field name and values. 
+ 
+  Raises: 
+    ParseError: In case an invalid field value is found. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># String/bytes tokens can come in multiple adjacent string literals.</span>
+  <span class="s0"># If we can consume one, consume as many as we can.</span>
+  <span class="s4">if </span><span class="s1">tokenizer.TryConsumeByteString():</span>
+    <span class="s4">while </span><span class="s1">tokenizer.TryConsumeByteString():</span>
+      <span class="s4">pass</span>
+    <span class="s4">return</span>
+
+  <span class="s4">if </span><span class="s1">(</span><span class="s4">not </span><span class="s1">tokenizer.TryConsumeIdentifier() </span><span class="s4">and</span>
+      <span class="s4">not </span><span class="s1">_TryConsumeInt64(tokenizer) </span><span class="s4">and not </span><span class="s1">_TryConsumeUint64(tokenizer) </span><span class="s4">and</span>
+      <span class="s4">not </span><span class="s1">tokenizer.TryConsumeFloat()):</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Invalid field value: ' </span><span class="s1">+ tokenizer.token)</span>
+
+
+<span class="s4">class </span><span class="s1">Tokenizer(object):</span>
+  <span class="s2">&quot;&quot;&quot;Protocol buffer text representation tokenizer. 
+ 
+  This class handles the lower level string parsing by splitting it into 
+  meaningful tokens. 
+ 
+  It was directly ported from the Java protocol buffer API. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">_WHITESPACE = re.compile(</span><span class="s3">r'\s+'</span><span class="s1">)</span>
+  <span class="s1">_COMMENT = re.compile(</span><span class="s3">r'(\s*#.*$)'</span><span class="s4">, </span><span class="s1">re.MULTILINE)</span>
+  <span class="s1">_WHITESPACE_OR_COMMENT = re.compile(</span><span class="s3">r'(\s|(#.*$))+'</span><span class="s4">, </span><span class="s1">re.MULTILINE)</span>
+  <span class="s1">_TOKEN = re.compile(</span><span class="s3">'|'</span><span class="s1">.join([</span>
+      <span class="s3">r'[a-zA-Z_][0-9a-zA-Z_+-]*'</span><span class="s4">,  </span><span class="s0"># an identifier</span>
+      <span class="s3">r'([0-9+-]|(\.[0-9]))[0-9a-zA-Z_.+-]*'</span><span class="s4">,  </span><span class="s0"># a number</span>
+  <span class="s1">] + [  </span><span class="s0"># quoted str for each quote mark</span>
+      <span class="s0"># Avoid backtracking! https://stackoverflow.com/a/844267</span>
+      <span class="s3">r'{qt}[^{qt}\n\\]*((\\.)+[^{qt}\n\\]*)*({qt}|\\?$)'</span><span class="s1">.format(qt=mark)</span>
+      <span class="s4">for </span><span class="s1">mark </span><span class="s4">in </span><span class="s1">_QUOTES</span>
+  <span class="s1">]))</span>
+
+  <span class="s1">_IDENTIFIER = re.compile(</span><span class="s3">r'[^\d\W]\w*'</span><span class="s1">)</span>
+  <span class="s1">_IDENTIFIER_OR_NUMBER = re.compile(</span><span class="s3">r'\w+'</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">lines</span><span class="s4">, </span><span class="s1">skip_comments=</span><span class="s4">True</span><span class="s1">):</span>
+    <span class="s1">self._position = </span><span class="s5">0</span>
+    <span class="s1">self._line = -</span><span class="s5">1</span>
+    <span class="s1">self._column = </span><span class="s5">0</span>
+    <span class="s1">self._token_start = </span><span class="s4">None</span>
+    <span class="s1">self.token = </span><span class="s3">''</span>
+    <span class="s1">self._lines = iter(lines)</span>
+    <span class="s1">self._current_line = </span><span class="s3">''</span>
+    <span class="s1">self._previous_line = </span><span class="s5">0</span>
+    <span class="s1">self._previous_column = </span><span class="s5">0</span>
+    <span class="s1">self._more_lines = </span><span class="s4">True</span>
+    <span class="s1">self._skip_comments = skip_comments</span>
+    <span class="s1">self._whitespace_pattern = (skip_comments </span><span class="s4">and </span><span class="s1">self._WHITESPACE_OR_COMMENT</span>
+                                <span class="s4">or </span><span class="s1">self._WHITESPACE)</span>
+    <span class="s1">self._SkipWhitespace()</span>
+    <span class="s1">self.NextToken()</span>
+
+  <span class="s4">def </span><span class="s1">LookingAt(self</span><span class="s4">, </span><span class="s1">token):</span>
+    <span class="s4">return </span><span class="s1">self.token == token</span>
+
+  <span class="s4">def </span><span class="s1">AtEnd(self):</span>
+    <span class="s2">&quot;&quot;&quot;Checks the end of the text was reached. 
+ 
+    Returns: 
+      True iff the end was reached. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">return not </span><span class="s1">self.token</span>
+
+  <span class="s4">def </span><span class="s1">_PopLine(self):</span>
+    <span class="s4">while </span><span class="s1">len(self._current_line) &lt;= self._column:</span>
+      <span class="s4">try</span><span class="s1">:</span>
+        <span class="s1">self._current_line = next(self._lines)</span>
+      <span class="s4">except </span><span class="s1">StopIteration:</span>
+        <span class="s1">self._current_line = </span><span class="s3">''</span>
+        <span class="s1">self._more_lines = </span><span class="s4">False</span>
+        <span class="s4">return</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">self._line += </span><span class="s5">1</span>
+        <span class="s1">self._column = </span><span class="s5">0</span>
+
+  <span class="s4">def </span><span class="s1">_SkipWhitespace(self):</span>
+    <span class="s4">while True</span><span class="s1">:</span>
+      <span class="s1">self._PopLine()</span>
+      <span class="s1">match = self._whitespace_pattern.match(self._current_line</span><span class="s4">, </span><span class="s1">self._column)</span>
+      <span class="s4">if not </span><span class="s1">match:</span>
+        <span class="s4">break</span>
+      <span class="s1">length = len(match.group(</span><span class="s5">0</span><span class="s1">))</span>
+      <span class="s1">self._column += length</span>
+
+  <span class="s4">def </span><span class="s1">TryConsume(self</span><span class="s4">, </span><span class="s1">token):</span>
+    <span class="s2">&quot;&quot;&quot;Tries to consume a given piece of text. 
+ 
+    Args: 
+      token: Text to consume. 
+ 
+    Returns: 
+      True iff the text was consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self.token == token:</span>
+      <span class="s1">self.NextToken()</span>
+      <span class="s4">return True</span>
+    <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">Consume(self</span><span class="s4">, </span><span class="s1">token):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes a piece of text. 
+ 
+    Args: 
+      token: Text to consume. 
+ 
+    Raises: 
+      ParseError: If the text couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if not </span><span class="s1">self.TryConsume(token):</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(</span><span class="s3">'Expected &quot;%s&quot;.' </span><span class="s1">% token)</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeComment(self):</span>
+    <span class="s1">result = self.token</span>
+    <span class="s4">if not </span><span class="s1">self._COMMENT.match(result):</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(</span><span class="s3">'Expected comment.'</span><span class="s1">)</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeCommentOrTrailingComment(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes a comment, returns a 2-tuple (trailing bool, comment str).&quot;&quot;&quot;</span>
+
+    <span class="s0"># Tokenizer initializes _previous_line and _previous_column to 0. As the</span>
+    <span class="s0"># tokenizer starts, it looks like there is a previous token on the line.</span>
+    <span class="s1">just_started = self._line == </span><span class="s5">0 </span><span class="s4">and </span><span class="s1">self._column == </span><span class="s5">0</span>
+
+    <span class="s1">before_parsing = self._previous_line</span>
+    <span class="s1">comment = self.ConsumeComment()</span>
+
+    <span class="s0"># A trailing comment is a comment on the same line than the previous token.</span>
+    <span class="s1">trailing = (self._previous_line == before_parsing</span>
+                <span class="s4">and not </span><span class="s1">just_started)</span>
+
+    <span class="s4">return </span><span class="s1">trailing</span><span class="s4">, </span><span class="s1">comment</span>
+
+  <span class="s4">def </span><span class="s1">TryConsumeIdentifier(self):</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">self.ConsumeIdentifier()</span>
+      <span class="s4">return True</span>
+    <span class="s4">except </span><span class="s1">ParseError:</span>
+      <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeIdentifier(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes protocol message field identifier. 
+ 
+    Returns: 
+      Identifier string. 
+ 
+    Raises: 
+      ParseError: If an identifier couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">result = self.token</span>
+    <span class="s4">if not </span><span class="s1">self._IDENTIFIER.match(result):</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(</span><span class="s3">'Expected identifier.'</span><span class="s1">)</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">TryConsumeIdentifierOrNumber(self):</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">self.ConsumeIdentifierOrNumber()</span>
+      <span class="s4">return True</span>
+    <span class="s4">except </span><span class="s1">ParseError:</span>
+      <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeIdentifierOrNumber(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes protocol message field identifier. 
+ 
+    Returns: 
+      Identifier string. 
+ 
+    Raises: 
+      ParseError: If an identifier couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">result = self.token</span>
+    <span class="s4">if not </span><span class="s1">self._IDENTIFIER_OR_NUMBER.match(result):</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(</span><span class="s3">'Expected identifier or number, got %s.' </span><span class="s1">% result)</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">TryConsumeInteger(self):</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">self.ConsumeInteger()</span>
+      <span class="s4">return True</span>
+    <span class="s4">except </span><span class="s1">ParseError:</span>
+      <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeInteger(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes an integer number. 
+ 
+    Returns: 
+      The integer parsed. 
+ 
+    Raises: 
+      ParseError: If an integer couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">result = _ParseAbstractInteger(self.token)</span>
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(str(e))</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">TryConsumeFloat(self):</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">self.ConsumeFloat()</span>
+      <span class="s4">return True</span>
+    <span class="s4">except </span><span class="s1">ParseError:</span>
+      <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeFloat(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes an floating point number. 
+ 
+    Returns: 
+      The number parsed. 
+ 
+    Raises: 
+      ParseError: If a floating point number couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">result = ParseFloat(self.token)</span>
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(str(e))</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeBool(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes a boolean value. 
+ 
+    Returns: 
+      The bool parsed. 
+ 
+    Raises: 
+      ParseError: If a boolean value couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">result = ParseBool(self.token)</span>
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(str(e))</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">TryConsumeByteString(self):</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">self.ConsumeByteString()</span>
+      <span class="s4">return True</span>
+    <span class="s4">except </span><span class="s1">ParseError:</span>
+      <span class="s4">return False</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeString(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes a string value. 
+ 
+    Returns: 
+      The string parsed. 
+ 
+    Raises: 
+      ParseError: If a string value couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">the_bytes = self.ConsumeByteString()</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s4">return </span><span class="s1">str(the_bytes</span><span class="s4">, </span><span class="s3">'utf-8'</span><span class="s1">)</span>
+    <span class="s4">except </span><span class="s1">UnicodeDecodeError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">self._StringParseError(e)</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeByteString(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consumes a byte array value. 
+ 
+    Returns: 
+      The array parsed (as a string). 
+ 
+    Raises: 
+      ParseError: If a byte array value couldn't be consumed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">the_list = [self._ConsumeSingleByteString()]</span>
+    <span class="s4">while </span><span class="s1">self.token </span><span class="s4">and </span><span class="s1">self.token[</span><span class="s5">0</span><span class="s1">] </span><span class="s4">in </span><span class="s1">_QUOTES:</span>
+      <span class="s1">the_list.append(self._ConsumeSingleByteString())</span>
+    <span class="s4">return </span><span class="s6">b''</span><span class="s1">.join(the_list)</span>
+
+  <span class="s4">def </span><span class="s1">_ConsumeSingleByteString(self):</span>
+    <span class="s2">&quot;&quot;&quot;Consume one token of a string literal. 
+ 
+    String literals (whether bytes or text) can come in multiple adjacent 
+    tokens which are automatically concatenated, like in C or Python.  This 
+    method only consumes one token. 
+ 
+    Returns: 
+      The token parsed. 
+    Raises: 
+      ParseError: When the wrong format data is found. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">text = self.token</span>
+    <span class="s4">if </span><span class="s1">len(text) &lt; </span><span class="s5">1 </span><span class="s4">or </span><span class="s1">text[</span><span class="s5">0</span><span class="s1">] </span><span class="s4">not in </span><span class="s1">_QUOTES:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(</span><span class="s3">'Expected string but found: %r' </span><span class="s1">% (text</span><span class="s4">,</span><span class="s1">))</span>
+
+    <span class="s4">if </span><span class="s1">len(text) &lt; </span><span class="s5">2 </span><span class="s4">or </span><span class="s1">text[-</span><span class="s5">1</span><span class="s1">] != text[</span><span class="s5">0</span><span class="s1">]:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(</span><span class="s3">'String missing ending quote: %r' </span><span class="s1">% (text</span><span class="s4">,</span><span class="s1">))</span>
+
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">result = text_encoding.CUnescape(text[</span><span class="s5">1</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">])</span>
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(str(e))</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">ConsumeEnum(self</span><span class="s4">, </span><span class="s1">field):</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">result = ParseEnum(field</span><span class="s4">, </span><span class="s1">self.token)</span>
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">self.ParseError(str(e))</span>
+    <span class="s1">self.NextToken()</span>
+    <span class="s4">return </span><span class="s1">result</span>
+
+  <span class="s4">def </span><span class="s1">ParseErrorPreviousToken(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Creates and *returns* a ParseError for the previously read token. 
+ 
+    Args: 
+      message: A message to set for the exception. 
+ 
+    Returns: 
+      A ParseError instance. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">return </span><span class="s1">ParseError(message</span><span class="s4">, </span><span class="s1">self._previous_line + </span><span class="s5">1</span><span class="s4">,</span>
+                      <span class="s1">self._previous_column + </span><span class="s5">1</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">ParseError(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Creates and *returns* a ParseError for the current token.&quot;&quot;&quot;</span>
+    <span class="s4">return </span><span class="s1">ParseError(</span><span class="s3">'</span><span class="s4">\'</span><span class="s3">' </span><span class="s1">+ self._current_line + </span><span class="s3">'</span><span class="s4">\'</span><span class="s3">: ' </span><span class="s1">+ message</span><span class="s4">,</span>
+                      <span class="s1">self._line + </span><span class="s5">1</span><span class="s4">, </span><span class="s1">self._column + </span><span class="s5">1</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">_StringParseError(self</span><span class="s4">, </span><span class="s1">e):</span>
+    <span class="s4">return </span><span class="s1">self.ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse string: ' </span><span class="s1">+ str(e))</span>
+
+  <span class="s4">def </span><span class="s1">NextToken(self):</span>
+    <span class="s2">&quot;&quot;&quot;Reads the next meaningful token.&quot;&quot;&quot;</span>
+    <span class="s1">self._previous_line = self._line</span>
+    <span class="s1">self._previous_column = self._column</span>
+
+    <span class="s1">self._column += len(self.token)</span>
+    <span class="s1">self._SkipWhitespace()</span>
+
+    <span class="s4">if not </span><span class="s1">self._more_lines:</span>
+      <span class="s1">self.token = </span><span class="s3">''</span>
+      <span class="s4">return</span>
+
+    <span class="s1">match = self._TOKEN.match(self._current_line</span><span class="s4">, </span><span class="s1">self._column)</span>
+    <span class="s4">if not </span><span class="s1">match </span><span class="s4">and not </span><span class="s1">self._skip_comments:</span>
+      <span class="s1">match = self._COMMENT.match(self._current_line</span><span class="s4">, </span><span class="s1">self._column)</span>
+    <span class="s4">if </span><span class="s1">match:</span>
+      <span class="s1">token = match.group(</span><span class="s5">0</span><span class="s1">)</span>
+      <span class="s1">self.token = token</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self.token = self._current_line[self._column]</span>
+
+<span class="s0"># Aliased so it can still be accessed by current visibility violators.</span>
+<span class="s0"># TODO(dbarnett): Migrate violators to textformat_tokenizer.</span>
+<span class="s1">_Tokenizer = Tokenizer  </span><span class="s0"># pylint: disable=invalid-name</span>
+
+
+<span class="s4">def </span><span class="s1">_ConsumeInt32(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Consumes a signed 32bit integer number from tokenizer. 
+ 
+  Args: 
+    tokenizer: A tokenizer used to parse the number. 
+ 
+  Returns: 
+    The integer parsed. 
+ 
+  Raises: 
+    ParseError: If a signed 32bit integer couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">return </span><span class="s1">_ConsumeInteger(tokenizer</span><span class="s4">, </span><span class="s1">is_signed=</span><span class="s4">True, </span><span class="s1">is_long=</span><span class="s4">False</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">_ConsumeUint32(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Consumes an unsigned 32bit integer number from tokenizer. 
+ 
+  Args: 
+    tokenizer: A tokenizer used to parse the number. 
+ 
+  Returns: 
+    The integer parsed. 
+ 
+  Raises: 
+    ParseError: If an unsigned 32bit integer couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">return </span><span class="s1">_ConsumeInteger(tokenizer</span><span class="s4">, </span><span class="s1">is_signed=</span><span class="s4">False, </span><span class="s1">is_long=</span><span class="s4">False</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">_TryConsumeInt64(tokenizer):</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">_ConsumeInt64(tokenizer)</span>
+    <span class="s4">return True</span>
+  <span class="s4">except </span><span class="s1">ParseError:</span>
+    <span class="s4">return False</span>
+
+
+<span class="s4">def </span><span class="s1">_ConsumeInt64(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Consumes a signed 32bit integer number from tokenizer. 
+ 
+  Args: 
+    tokenizer: A tokenizer used to parse the number. 
+ 
+  Returns: 
+    The integer parsed. 
+ 
+  Raises: 
+    ParseError: If a signed 32bit integer couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">return </span><span class="s1">_ConsumeInteger(tokenizer</span><span class="s4">, </span><span class="s1">is_signed=</span><span class="s4">True, </span><span class="s1">is_long=</span><span class="s4">True</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">_TryConsumeUint64(tokenizer):</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">_ConsumeUint64(tokenizer)</span>
+    <span class="s4">return True</span>
+  <span class="s4">except </span><span class="s1">ParseError:</span>
+    <span class="s4">return False</span>
+
+
+<span class="s4">def </span><span class="s1">_ConsumeUint64(tokenizer):</span>
+  <span class="s2">&quot;&quot;&quot;Consumes an unsigned 64bit integer number from tokenizer. 
+ 
+  Args: 
+    tokenizer: A tokenizer used to parse the number. 
+ 
+  Returns: 
+    The integer parsed. 
+ 
+  Raises: 
+    ParseError: If an unsigned 64bit integer couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">return </span><span class="s1">_ConsumeInteger(tokenizer</span><span class="s4">, </span><span class="s1">is_signed=</span><span class="s4">False, </span><span class="s1">is_long=</span><span class="s4">True</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">_ConsumeInteger(tokenizer</span><span class="s4">, </span><span class="s1">is_signed=</span><span class="s4">False, </span><span class="s1">is_long=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Consumes an integer number from tokenizer. 
+ 
+  Args: 
+    tokenizer: A tokenizer used to parse the number. 
+    is_signed: True if a signed integer must be parsed. 
+    is_long: True if a long integer must be parsed. 
+ 
+  Returns: 
+    The integer parsed. 
+ 
+  Raises: 
+    ParseError: If an integer with given characteristics couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">result = ParseInteger(tokenizer.token</span><span class="s4">, </span><span class="s1">is_signed=is_signed</span><span class="s4">, </span><span class="s1">is_long=is_long)</span>
+  <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+    <span class="s4">raise </span><span class="s1">tokenizer.ParseError(str(e))</span>
+  <span class="s1">tokenizer.NextToken()</span>
+  <span class="s4">return </span><span class="s1">result</span>
+
+
+<span class="s4">def </span><span class="s1">ParseInteger(text</span><span class="s4">, </span><span class="s1">is_signed=</span><span class="s4">False, </span><span class="s1">is_long=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses an integer. 
+ 
+  Args: 
+    text: The text to parse. 
+    is_signed: True if a signed integer must be parsed. 
+    is_long: True if a long integer must be parsed. 
+ 
+  Returns: 
+    The integer value. 
+ 
+  Raises: 
+    ValueError: Thrown Iff the text is not a valid integer. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># Do the actual parsing. Exception handling is propagated to caller.</span>
+  <span class="s1">result = _ParseAbstractInteger(text)</span>
+
+  <span class="s0"># Check if the integer is sane. Exceptions handled by callers.</span>
+  <span class="s1">checker = _INTEGER_CHECKERS[</span><span class="s5">2 </span><span class="s1">* int(is_long) + int(is_signed)]</span>
+  <span class="s1">checker.CheckValue(result)</span>
+  <span class="s4">return </span><span class="s1">result</span>
+
+
+<span class="s4">def </span><span class="s1">_ParseAbstractInteger(text):</span>
+  <span class="s2">&quot;&quot;&quot;Parses an integer without checking size/signedness. 
+ 
+  Args: 
+    text: The text to parse. 
+ 
+  Returns: 
+    The integer value. 
+ 
+  Raises: 
+    ValueError: Thrown Iff the text is not a valid integer. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># Do the actual parsing. Exception handling is propagated to caller.</span>
+  <span class="s1">orig_text = text</span>
+  <span class="s1">c_octal_match = re.match(</span><span class="s3">r'(-?)0(\d+)$'</span><span class="s4">, </span><span class="s1">text)</span>
+  <span class="s4">if </span><span class="s1">c_octal_match:</span>
+    <span class="s0"># Python 3 no longer supports 0755 octal syntax without the 'o', so</span>
+    <span class="s0"># we always use the '0o' prefix for multi-digit numbers starting with 0.</span>
+    <span class="s1">text = c_octal_match.group(</span><span class="s5">1</span><span class="s1">) + </span><span class="s3">'0o' </span><span class="s1">+ c_octal_match.group(</span><span class="s5">2</span><span class="s1">)</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s4">return </span><span class="s1">int(text</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span>
+  <span class="s4">except </span><span class="s1">ValueError:</span>
+    <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse integer: %s' </span><span class="s1">% orig_text)</span>
+
+
+<span class="s4">def </span><span class="s1">ParseFloat(text):</span>
+  <span class="s2">&quot;&quot;&quot;Parse a floating point number. 
+ 
+  Args: 
+    text: Text to parse. 
+ 
+  Returns: 
+    The number parsed. 
+ 
+  Raises: 
+    ValueError: If a floating point number couldn't be parsed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s0"># Assume Python compatible syntax.</span>
+    <span class="s4">return </span><span class="s1">float(text)</span>
+  <span class="s4">except </span><span class="s1">ValueError:</span>
+    <span class="s0"># Check alternative spellings.</span>
+    <span class="s4">if </span><span class="s1">_FLOAT_INFINITY.match(text):</span>
+      <span class="s4">if </span><span class="s1">text[</span><span class="s5">0</span><span class="s1">] == </span><span class="s3">'-'</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">float(</span><span class="s3">'-inf'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">float(</span><span class="s3">'inf'</span><span class="s1">)</span>
+    <span class="s4">elif </span><span class="s1">_FLOAT_NAN.match(text):</span>
+      <span class="s4">return </span><span class="s1">float(</span><span class="s3">'nan'</span><span class="s1">)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s0"># assume '1.0f' format</span>
+      <span class="s4">try</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">float(text.rstrip(</span><span class="s3">'f'</span><span class="s1">))</span>
+      <span class="s4">except </span><span class="s1">ValueError:</span>
+        <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse float: %s' </span><span class="s1">% text)</span>
+
+
+<span class="s4">def </span><span class="s1">ParseBool(text):</span>
+  <span class="s2">&quot;&quot;&quot;Parse a boolean value. 
+ 
+  Args: 
+    text: Text to parse. 
+ 
+  Returns: 
+    Boolean values parsed 
+ 
+  Raises: 
+    ValueError: If text is not a valid boolean. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">text </span><span class="s4">in </span><span class="s1">(</span><span class="s3">'true'</span><span class="s4">, </span><span class="s3">'t'</span><span class="s4">, </span><span class="s3">'1'</span><span class="s4">, </span><span class="s3">'True'</span><span class="s1">):</span>
+    <span class="s4">return True</span>
+  <span class="s4">elif </span><span class="s1">text </span><span class="s4">in </span><span class="s1">(</span><span class="s3">'false'</span><span class="s4">, </span><span class="s3">'f'</span><span class="s4">, </span><span class="s3">'0'</span><span class="s4">, </span><span class="s3">'False'</span><span class="s1">):</span>
+    <span class="s4">return False</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Expected &quot;true&quot; or &quot;false&quot;.'</span><span class="s1">)</span>
+
+
+<span class="s4">def </span><span class="s1">ParseEnum(field</span><span class="s4">, </span><span class="s1">value):</span>
+  <span class="s2">&quot;&quot;&quot;Parse an enum value. 
+ 
+  The value can be specified by a number (the enum value), or by 
+  a string literal (the enum name). 
+ 
+  Args: 
+    field: Enum field descriptor. 
+    value: String value. 
+ 
+  Returns: 
+    Enum value number. 
+ 
+  Raises: 
+    ValueError: If the enum value could not be parsed. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">enum_descriptor = field.enum_type</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">number = int(value</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span>
+  <span class="s4">except </span><span class="s1">ValueError:</span>
+    <span class="s0"># Identifier.</span>
+    <span class="s1">enum_value = enum_descriptor.values_by_name.get(value</span><span class="s4">, None</span><span class="s1">)</span>
+    <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Enum type &quot;%s&quot; has no value named %s.' </span><span class="s1">%</span>
+                       <span class="s1">(enum_descriptor.full_name</span><span class="s4">, </span><span class="s1">value))</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s0"># Numeric value.</span>
+    <span class="s4">if </span><span class="s1">hasattr(field.file</span><span class="s4">, </span><span class="s3">'syntax'</span><span class="s1">):</span>
+      <span class="s0"># Attribute is checked for compatibility.</span>
+      <span class="s4">if </span><span class="s1">field.file.syntax == </span><span class="s3">'proto3'</span><span class="s1">:</span>
+        <span class="s0"># Proto3 accept numeric unknown enums.</span>
+        <span class="s4">return </span><span class="s1">number</span>
+    <span class="s1">enum_value = enum_descriptor.values_by_number.get(number</span><span class="s4">, None</span><span class="s1">)</span>
+    <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Enum type &quot;%s&quot; has no value with number %d.' </span><span class="s1">%</span>
+                       <span class="s1">(enum_descriptor.full_name</span><span class="s4">, </span><span class="s1">number))</span>
+  <span class="s4">return </span><span class="s1">enum_value.number</span>
+</pre>
+</body>
+</html>

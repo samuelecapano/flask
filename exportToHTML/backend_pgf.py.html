@@ -1,0 +1,1079 @@
+<html>
+<head>
+<title>backend_pgf.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_pgf.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">codecs</span>
+<span class="s0">import </span><span class="s1">datetime</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">BytesIO</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">pathlib</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">subprocess</span>
+<span class="s0">from </span><span class="s1">tempfile </span><span class="s0">import </span><span class="s1">TemporaryDirectory</span>
+<span class="s0">import </span><span class="s1">weakref</span>
+
+<span class="s0">from </span><span class="s1">PIL </span><span class="s0">import </span><span class="s1">Image</span>
+
+<span class="s0">import </span><span class="s1">matplotlib </span><span class="s0">as </span><span class="s1">mpl</span>
+<span class="s0">from </span><span class="s1">matplotlib </span><span class="s0">import </span><span class="s1">_api</span><span class="s0">, </span><span class="s1">cbook</span><span class="s0">, </span><span class="s1">font_manager </span><span class="s0">as </span><span class="s1">fm</span>
+<span class="s0">from </span><span class="s1">matplotlib.backend_bases </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s0">, </span><span class="s1">FigureCanvasBase</span><span class="s0">, </span><span class="s1">FigureManagerBase</span><span class="s0">, </span><span class="s1">RendererBase</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">matplotlib.backends.backend_mixed </span><span class="s0">import </span><span class="s1">MixedModeRenderer</span>
+<span class="s0">from </span><span class="s1">matplotlib.backends.backend_pdf </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">_create_pdf_info_dict</span><span class="s0">, </span><span class="s1">_datetime_to_pdf)</span>
+<span class="s0">from </span><span class="s1">matplotlib.path </span><span class="s0">import </span><span class="s1">Path</span>
+<span class="s0">from </span><span class="s1">matplotlib.figure </span><span class="s0">import </span><span class="s1">Figure</span>
+<span class="s0">from </span><span class="s1">matplotlib._pylab_helpers </span><span class="s0">import </span><span class="s1">Gcf</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+
+<span class="s2"># Note: When formatting floating point values, it is important to use the</span>
+<span class="s2"># %f/{:f} format rather than %s/{} to avoid triggering scientific notation,</span>
+<span class="s2"># which is not recognized by TeX.</span>
+
+
+<span class="s1">@_api.caching_module_getattr</span>
+<span class="s0">class </span><span class="s1">__getattr__:</span>
+    <span class="s1">NO_ESCAPE = _api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s0">, </span><span class="s1">obj_type=</span><span class="s3">&quot;&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s0">lambda </span><span class="s1">self: _NO_ESCAPE))</span>
+    <span class="s1">re_mathsep = _api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s0">, </span><span class="s1">obj_type=</span><span class="s3">&quot;&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s0">lambda </span><span class="s1">self: _split_math.__self__))</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">get_fontspec():</span>
+    <span class="s4">&quot;&quot;&quot;Build fontspec preamble from rc.&quot;&quot;&quot;</span>
+    <span class="s0">with </span><span class="s1">mpl.rc_context({</span><span class="s3">&quot;pgf.preamble&quot;</span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">}):</span>
+        <span class="s0">return </span><span class="s1">_get_preamble()</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">get_preamble():</span>
+    <span class="s4">&quot;&quot;&quot;Get LaTeX preamble from rc.&quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s1">mpl.rcParams[</span><span class="s3">&quot;pgf.preamble&quot;</span><span class="s1">]</span>
+
+
+<span class="s0">def </span><span class="s1">_get_preamble():</span>
+    <span class="s4">&quot;&quot;&quot;Prepare a LaTeX preamble based on the rcParams configuration.&quot;&quot;&quot;</span>
+    <span class="s1">preamble = [mpl.rcParams[</span><span class="s3">&quot;pgf.preamble&quot;</span><span class="s1">]]</span>
+    <span class="s0">if </span><span class="s1">mpl.rcParams[</span><span class="s3">&quot;pgf.texsystem&quot;</span><span class="s1">] != </span><span class="s3">&quot;pdflatex&quot;</span><span class="s1">:</span>
+        <span class="s1">preamble.append(</span><span class="s3">&quot;</span><span class="s0">\\</span><span class="s3">usepackage{fontspec}&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">mpl.rcParams[</span><span class="s3">&quot;pgf.rcfonts&quot;</span><span class="s1">]:</span>
+            <span class="s1">families = [</span><span class="s3">&quot;serif&quot;</span><span class="s0">, </span><span class="s3">&quot;sans</span><span class="s0">\\</span><span class="s3">-serif&quot;</span><span class="s0">, </span><span class="s3">&quot;monospace&quot;</span><span class="s1">]</span>
+            <span class="s1">commands = [</span><span class="s3">&quot;setmainfont&quot;</span><span class="s0">, </span><span class="s3">&quot;setsansfont&quot;</span><span class="s0">, </span><span class="s3">&quot;setmonofont&quot;</span><span class="s1">]</span>
+            <span class="s0">for </span><span class="s1">family</span><span class="s0">, </span><span class="s1">command </span><span class="s0">in </span><span class="s1">zip(families</span><span class="s0">, </span><span class="s1">commands):</span>
+                <span class="s2"># 1) Forward slashes also work on Windows, so don't mess with</span>
+                <span class="s2"># backslashes.  2) The dirname needs to include a separator.</span>
+                <span class="s1">path = pathlib.Path(fm.findfont(family))</span>
+                <span class="s1">preamble.append(</span><span class="s3">r&quot;\%s{%s}[Path=\detokenize{%s/}]&quot; </span><span class="s1">% (</span>
+                    <span class="s1">command</span><span class="s0">, </span><span class="s1">path.name</span><span class="s0">, </span><span class="s1">path.parent.as_posix()))</span>
+    <span class="s1">preamble.append(mpl.texmanager._usepackage_if_not_loaded(</span>
+        <span class="s3">&quot;underscore&quot;</span><span class="s0">, </span><span class="s1">option=</span><span class="s3">&quot;strings&quot;</span><span class="s1">))  </span><span class="s2"># Documented as &quot;must come last&quot;.</span>
+    <span class="s0">return </span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">.join(preamble)</span>
+
+
+<span class="s2"># It's better to use only one unit for all coordinates, since the</span>
+<span class="s2"># arithmetic in latex seems to produce inaccurate conversions.</span>
+<span class="s1">latex_pt_to_in = </span><span class="s5">1. </span><span class="s1">/ </span><span class="s5">72.27</span>
+<span class="s1">latex_in_to_pt = </span><span class="s5">1. </span><span class="s1">/ latex_pt_to_in</span>
+<span class="s1">mpl_pt_to_in = </span><span class="s5">1. </span><span class="s1">/ </span><span class="s5">72.</span>
+<span class="s1">mpl_in_to_pt = </span><span class="s5">1. </span><span class="s1">/ mpl_pt_to_in</span>
+
+
+<span class="s1">_NO_ESCAPE = </span><span class="s3">r&quot;(?&lt;!\\)(?:\\\\)*&quot;</span>
+<span class="s1">_split_math = re.compile(_NO_ESCAPE + </span><span class="s3">r&quot;\$&quot;</span><span class="s1">).split</span>
+<span class="s1">_replace_escapetext = functools.partial(</span>
+    <span class="s2"># When the next character is an unescaped % or ^, insert a backslash.</span>
+    <span class="s1">re.compile(_NO_ESCAPE + </span><span class="s3">&quot;(?=[%^])&quot;</span><span class="s1">).sub</span><span class="s0">, </span><span class="s3">&quot;</span><span class="s0">\\\\</span><span class="s3">&quot;</span><span class="s1">)</span>
+<span class="s1">_replace_mathdefault = functools.partial(</span>
+    <span class="s2"># Replace \mathdefault (when not preceded by an escape) by empty string.</span>
+    <span class="s1">re.compile(_NO_ESCAPE + </span><span class="s3">r&quot;(\\mathdefault)&quot;</span><span class="s1">).sub</span><span class="s0">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">common_texification(text):</span>
+    <span class="s0">return </span><span class="s1">_tex_escape(text)</span>
+
+
+<span class="s0">def </span><span class="s1">_tex_escape(text):</span>
+    <span class="s4">r&quot;&quot;&quot; 
+    Do some necessary and/or useful substitutions for texts to be included in 
+    LaTeX documents. 
+ 
+    This distinguishes text-mode and math-mode by replacing the math separator 
+    ``$`` with ``\(\displaystyle %s\)``. Escaped math separators (``\$``) 
+    are ignored. 
+ 
+    The following characters are escaped in text segments: ``^%`` 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># Sometimes, matplotlib adds the unknown command \mathdefault.</span>
+    <span class="s2"># Not using \mathnormal instead since this looks odd for the latex cm font.</span>
+    <span class="s1">text = _replace_mathdefault(text)</span>
+    <span class="s1">text = text.replace(</span><span class="s3">&quot;</span><span class="s0">\N{MINUS SIGN}</span><span class="s3">&quot;</span><span class="s0">, </span><span class="s3">r&quot;\ensuremath{-}&quot;</span><span class="s1">)</span>
+    <span class="s2"># split text into normaltext and inline math parts</span>
+    <span class="s1">parts = _split_math(text)</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">s </span><span class="s0">in </span><span class="s1">enumerate(parts):</span>
+        <span class="s0">if not </span><span class="s1">i % </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2"># textmode replacements</span>
+            <span class="s1">s = _replace_escapetext(s)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># mathmode replacements</span>
+            <span class="s1">s = </span><span class="s3">r&quot;\(\displaystyle %s\)&quot; </span><span class="s1">% s</span>
+        <span class="s1">parts[i] = s</span>
+    <span class="s0">return </span><span class="s3">&quot;&quot;</span><span class="s1">.join(parts)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">writeln(fh</span><span class="s0">, </span><span class="s1">line):</span>
+    <span class="s0">return </span><span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s1">line)</span>
+
+
+<span class="s0">def </span><span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s1">line):</span>
+    <span class="s2"># Ending lines with a % prevents TeX from inserting spurious spaces</span>
+    <span class="s2"># (https://tex.stackexchange.com/questions/7453).</span>
+    <span class="s1">fh.write(line)</span>
+    <span class="s1">fh.write(</span><span class="s3">&quot;%</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_escape_and_apply_props(s</span><span class="s0">, </span><span class="s1">prop):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Generate a TeX string that renders string *s* with font properties *prop*, 
+    also applying any required escapes to *s*. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">commands = []</span>
+
+    <span class="s1">families = {</span><span class="s3">&quot;serif&quot;</span><span class="s1">: </span><span class="s3">r&quot;\rmfamily&quot;</span><span class="s0">, </span><span class="s3">&quot;sans&quot;</span><span class="s1">: </span><span class="s3">r&quot;\sffamily&quot;</span><span class="s0">,</span>
+                <span class="s3">&quot;sans-serif&quot;</span><span class="s1">: </span><span class="s3">r&quot;\sffamily&quot;</span><span class="s0">, </span><span class="s3">&quot;monospace&quot;</span><span class="s1">: </span><span class="s3">r&quot;\ttfamily&quot;</span><span class="s1">}</span>
+    <span class="s1">family = prop.get_family()[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">family </span><span class="s0">in </span><span class="s1">families:</span>
+        <span class="s1">commands.append(families[family])</span>
+    <span class="s0">elif </span><span class="s1">(any(font.name == family </span><span class="s0">for </span><span class="s1">font </span><span class="s0">in </span><span class="s1">fm.fontManager.ttflist)</span>
+          <span class="s0">and </span><span class="s1">mpl.rcParams[</span><span class="s3">&quot;pgf.texsystem&quot;</span><span class="s1">] != </span><span class="s3">&quot;pdflatex&quot;</span><span class="s1">):</span>
+        <span class="s1">commands.append(</span><span class="s3">r&quot;\setmainfont{%s}\rmfamily&quot; </span><span class="s1">% family)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">_log.warning(</span><span class="s3">&quot;Ignoring unknown font: %s&quot;</span><span class="s0">, </span><span class="s1">family)</span>
+
+    <span class="s1">size = prop.get_size_in_points()</span>
+    <span class="s1">commands.append(</span><span class="s3">r&quot;\fontsize{%f}{%f}&quot; </span><span class="s1">% (size</span><span class="s0">, </span><span class="s1">size * </span><span class="s5">1.2</span><span class="s1">))</span>
+
+    <span class="s1">styles = {</span><span class="s3">&quot;normal&quot;</span><span class="s1">: </span><span class="s3">r&quot;&quot;</span><span class="s0">, </span><span class="s3">&quot;italic&quot;</span><span class="s1">: </span><span class="s3">r&quot;\itshape&quot;</span><span class="s0">, </span><span class="s3">&quot;oblique&quot;</span><span class="s1">: </span><span class="s3">r&quot;\slshape&quot;</span><span class="s1">}</span>
+    <span class="s1">commands.append(styles[prop.get_style()])</span>
+
+    <span class="s1">boldstyles = [</span><span class="s3">&quot;semibold&quot;</span><span class="s0">, </span><span class="s3">&quot;demibold&quot;</span><span class="s0">, </span><span class="s3">&quot;demi&quot;</span><span class="s0">, </span><span class="s3">&quot;bold&quot;</span><span class="s0">, </span><span class="s3">&quot;heavy&quot;</span><span class="s0">,</span>
+                  <span class="s3">&quot;extra bold&quot;</span><span class="s0">, </span><span class="s3">&quot;black&quot;</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">prop.get_weight() </span><span class="s0">in </span><span class="s1">boldstyles:</span>
+        <span class="s1">commands.append(</span><span class="s3">r&quot;\bfseries&quot;</span><span class="s1">)</span>
+
+    <span class="s1">commands.append(</span><span class="s3">r&quot;\selectfont&quot;</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s3">&quot;&quot;</span><span class="s1">.join(commands) + </span><span class="s3">&quot; &quot; </span><span class="s1">+ _tex_escape(s)</span>
+
+
+<span class="s0">def </span><span class="s1">_metadata_to_str(key</span><span class="s0">, </span><span class="s1">value):</span>
+    <span class="s4">&quot;&quot;&quot;Convert metadata key/value to a form that hyperref accepts.&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance(value</span><span class="s0">, </span><span class="s1">datetime.datetime):</span>
+        <span class="s1">value = _datetime_to_pdf(value)</span>
+    <span class="s0">elif </span><span class="s1">key == </span><span class="s3">'Trapped'</span><span class="s1">:</span>
+        <span class="s1">value = value.name.decode(</span><span class="s3">'ascii'</span><span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">value = str(value)</span>
+    <span class="s0">return </span><span class="s3">f'</span><span class="s0">{</span><span class="s1">key</span><span class="s0">}</span><span class="s3">=</span><span class="s0">{{{</span><span class="s1">value</span><span class="s0">}}}</span><span class="s3">'</span>
+
+
+<span class="s0">def </span><span class="s1">make_pdf_to_png_converter():</span>
+    <span class="s4">&quot;&quot;&quot;Return a function that converts a pdf file to a png file.&quot;&quot;&quot;</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">mpl._get_executable_info(</span><span class="s3">&quot;pdftocairo&quot;</span><span class="s1">)</span>
+    <span class="s0">except </span><span class="s1">mpl.ExecutableNotFoundError:</span>
+        <span class="s0">pass</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return lambda </span><span class="s1">pdffile</span><span class="s0">, </span><span class="s1">pngfile</span><span class="s0">, </span><span class="s1">dpi: subprocess.check_output(</span>
+            <span class="s1">[</span><span class="s3">&quot;pdftocairo&quot;</span><span class="s0">, </span><span class="s3">&quot;-singlefile&quot;</span><span class="s0">, </span><span class="s3">&quot;-transp&quot;</span><span class="s0">, </span><span class="s3">&quot;-png&quot;</span><span class="s0">, </span><span class="s3">&quot;-r&quot;</span><span class="s0">, </span><span class="s3">&quot;%d&quot; </span><span class="s1">% dpi</span><span class="s0">,</span>
+             <span class="s1">pdffile</span><span class="s0">, </span><span class="s1">os.path.splitext(pngfile)[</span><span class="s5">0</span><span class="s1">]]</span><span class="s0">,</span>
+            <span class="s1">stderr=subprocess.STDOUT)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">gs_info = mpl._get_executable_info(</span><span class="s3">&quot;gs&quot;</span><span class="s1">)</span>
+    <span class="s0">except </span><span class="s1">mpl.ExecutableNotFoundError:</span>
+        <span class="s0">pass</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return lambda </span><span class="s1">pdffile</span><span class="s0">, </span><span class="s1">pngfile</span><span class="s0">, </span><span class="s1">dpi: subprocess.check_output(</span>
+            <span class="s1">[gs_info.executable</span><span class="s0">,</span>
+             <span class="s3">'-dQUIET'</span><span class="s0">, </span><span class="s3">'-dSAFER'</span><span class="s0">, </span><span class="s3">'-dBATCH'</span><span class="s0">, </span><span class="s3">'-dNOPAUSE'</span><span class="s0">, </span><span class="s3">'-dNOPROMPT'</span><span class="s0">,</span>
+             <span class="s3">'-dUseCIEColor'</span><span class="s0">, </span><span class="s3">'-dTextAlphaBits=4'</span><span class="s0">,</span>
+             <span class="s3">'-dGraphicsAlphaBits=4'</span><span class="s0">, </span><span class="s3">'-dDOINTERPOLATE'</span><span class="s0">,</span>
+             <span class="s3">'-sDEVICE=pngalpha'</span><span class="s0">, </span><span class="s3">'-sOutputFile=%s' </span><span class="s1">% pngfile</span><span class="s0">,</span>
+             <span class="s3">'-r%d' </span><span class="s1">% dpi</span><span class="s0">, </span><span class="s1">pdffile]</span><span class="s0">,</span>
+            <span class="s1">stderr=subprocess.STDOUT)</span>
+    <span class="s0">raise </span><span class="s1">RuntimeError(</span><span class="s3">&quot;No suitable pdf to png renderer found.&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">LatexError(Exception):</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">message</span><span class="s0">, </span><span class="s1">latex_output=</span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+        <span class="s1">super().__init__(message)</span>
+        <span class="s1">self.latex_output = latex_output</span>
+
+    <span class="s0">def </span><span class="s1">__str__(self):</span>
+        <span class="s1">s</span><span class="s0">, </span><span class="s1">= self.args</span>
+        <span class="s0">if </span><span class="s1">self.latex_output:</span>
+            <span class="s1">s += </span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot; </span><span class="s1">+ self.latex_output</span>
+        <span class="s0">return </span><span class="s1">s</span>
+
+
+<span class="s0">class </span><span class="s1">LatexManager:</span>
+    <span class="s4">&quot;&quot;&quot; 
+    The LatexManager opens an instance of the LaTeX application for 
+    determining the metrics of text elements. The LaTeX environment can be 
+    modified by setting fonts and/or a custom preamble in `.rcParams`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">_build_latex_header():</span>
+        <span class="s1">latex_header = [</span>
+            <span class="s3">r&quot;\documentclass{article}&quot;</span><span class="s0">,</span>
+            <span class="s2"># Include TeX program name as a comment for cache invalidation.</span>
+            <span class="s2"># TeX does not allow this to be the first line.</span>
+            <span class="s3">rf&quot;% !TeX program = </span><span class="s0">{</span><span class="s1">mpl.rcParams[</span><span class="s3">'pgf.texsystem'</span><span class="s1">]</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s0">,</span>
+            <span class="s2"># Test whether \includegraphics supports interpolate option.</span>
+            <span class="s3">r&quot;\usepackage{graphicx}&quot;</span><span class="s0">,</span>
+            <span class="s1">_get_preamble()</span><span class="s0">,</span>
+            <span class="s3">r&quot;\begin{document}&quot;</span><span class="s0">,</span>
+            <span class="s3">r&quot;\typeout{pgf_backend_query_start}&quot;</span><span class="s0">,</span>
+        <span class="s1">]</span>
+        <span class="s0">return </span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">.join(latex_header)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_get_cached_or_new(cls):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Return the previous LatexManager if the header and tex system did not 
+        change, or a new instance otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">cls._get_cached_or_new_impl(cls._build_latex_header())</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s1">@functools.lru_cache(</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s0">def </span><span class="s1">_get_cached_or_new_impl(cls</span><span class="s0">, </span><span class="s1">header):  </span><span class="s2"># Helper for _get_cached_or_new.</span>
+        <span class="s0">return </span><span class="s1">cls()</span>
+
+    <span class="s0">def </span><span class="s1">_stdin_writeln(self</span><span class="s0">, </span><span class="s1">s):</span>
+        <span class="s0">if </span><span class="s1">self.latex </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self._setup_latex_process()</span>
+        <span class="s1">self.latex.stdin.write(s)</span>
+        <span class="s1">self.latex.stdin.write(</span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s1">self.latex.stdin.flush()</span>
+
+    <span class="s0">def </span><span class="s1">_expect(self</span><span class="s0">, </span><span class="s1">s):</span>
+        <span class="s1">s = list(s)</span>
+        <span class="s1">chars = []</span>
+        <span class="s0">while True</span><span class="s1">:</span>
+            <span class="s1">c = self.latex.stdout.read(</span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">chars.append(c)</span>
+            <span class="s0">if </span><span class="s1">chars[-len(s):] == s:</span>
+                <span class="s0">break</span>
+            <span class="s0">if not </span><span class="s1">c:</span>
+                <span class="s1">self.latex.kill()</span>
+                <span class="s1">self.latex = </span><span class="s0">None</span>
+                <span class="s0">raise </span><span class="s1">LatexError(</span><span class="s3">&quot;LaTeX process halted&quot;</span><span class="s0">, </span><span class="s3">&quot;&quot;</span><span class="s1">.join(chars))</span>
+        <span class="s0">return </span><span class="s3">&quot;&quot;</span><span class="s1">.join(chars)</span>
+
+    <span class="s0">def </span><span class="s1">_expect_prompt(self):</span>
+        <span class="s0">return </span><span class="s1">self._expect(</span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">*&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self):</span>
+        <span class="s2"># create a tmp directory for running latex, register it for deletion</span>
+        <span class="s1">self._tmpdir = TemporaryDirectory()</span>
+        <span class="s1">self.tmpdir = self._tmpdir.name</span>
+        <span class="s1">self._finalize_tmpdir = weakref.finalize(self</span><span class="s0">, </span><span class="s1">self._tmpdir.cleanup)</span>
+
+        <span class="s2"># test the LaTeX setup to ensure a clean startup of the subprocess</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">self._setup_latex_process(expect_reply=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError </span><span class="s0">as </span><span class="s1">err:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">self.latex.args[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">!r} </span><span class="s3">not found.  Install it or change &quot;</span>
+                <span class="s3">f&quot;rcParams['pgf.texsystem'] to an available TeX &quot;</span>
+                <span class="s3">f&quot;implementation.&quot;</span><span class="s1">) </span><span class="s0">from </span><span class="s1">err</span>
+        <span class="s0">except </span><span class="s1">OSError </span><span class="s0">as </span><span class="s1">err:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s3">f&quot;Error starting process </span><span class="s0">{</span><span class="s1">self.latex.args[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">!r}</span><span class="s3">&quot;</span><span class="s1">) </span><span class="s0">from </span><span class="s1">err</span>
+        <span class="s1">stdout</span><span class="s0">, </span><span class="s1">stderr = self.latex.communicate(</span><span class="s3">&quot;</span><span class="s0">\n\\</span><span class="s3">makeatletter</span><span class="s0">\\</span><span class="s3">@@end</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.latex.returncode != </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">LatexError(</span>
+                <span class="s3">f&quot;LaTeX errored (probably missing font or error in preamble) &quot;</span>
+                <span class="s3">f&quot;while processing the following input:</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">self._build_latex_header()</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s0">,</span>
+                <span class="s1">stdout)</span>
+
+        <span class="s1">self.latex = </span><span class="s0">None  </span><span class="s2"># Will be set up on first use.</span>
+        <span class="s2"># Per-instance cache.</span>
+        <span class="s1">self._get_box_metrics = functools.lru_cache()(self._get_box_metrics)</span>
+
+    <span class="s1">texcommand = _api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s0">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s3">&quot;pgf.texsystem&quot;</span><span class="s1">]))</span>
+    <span class="s1">latex_header = _api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)(</span>
+        <span class="s1">property(</span><span class="s0">lambda </span><span class="s1">self: self._build_latex_header()))</span>
+
+    <span class="s0">def </span><span class="s1">_setup_latex_process(self</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">expect_reply=</span><span class="s0">True</span><span class="s1">):</span>
+        <span class="s2"># Open LaTeX process for real work; register it for deletion.  On</span>
+        <span class="s2"># Windows, we must ensure that the subprocess has quit before being</span>
+        <span class="s2"># able to delete the tmpdir in which it runs; in order to do so, we</span>
+        <span class="s2"># must first `kill()` it, and then `communicate()` with it.</span>
+        <span class="s1">self.latex = subprocess.Popen(</span>
+            <span class="s1">[mpl.rcParams[</span><span class="s3">&quot;pgf.texsystem&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s3">&quot;-halt-on-error&quot;</span><span class="s1">]</span><span class="s0">,</span>
+            <span class="s1">stdin=subprocess.PIPE</span><span class="s0">, </span><span class="s1">stdout=subprocess.PIPE</span><span class="s0">,</span>
+            <span class="s1">encoding=</span><span class="s3">&quot;utf-8&quot;</span><span class="s0">, </span><span class="s1">cwd=self.tmpdir)</span>
+
+        <span class="s0">def </span><span class="s1">finalize_latex(latex):</span>
+            <span class="s1">latex.kill()</span>
+            <span class="s1">latex.communicate()</span>
+
+        <span class="s1">self._finalize_latex = weakref.finalize(</span>
+            <span class="s1">self</span><span class="s0">, </span><span class="s1">finalize_latex</span><span class="s0">, </span><span class="s1">self.latex)</span>
+        <span class="s2"># write header with 'pgf_backend_query_start' token</span>
+        <span class="s1">self._stdin_writeln(self._build_latex_header())</span>
+        <span class="s0">if </span><span class="s1">expect_reply:  </span><span class="s2"># read until 'pgf_backend_query_start' token appears</span>
+            <span class="s1">self._expect(</span><span class="s3">&quot;*pgf_backend_query_start&quot;</span><span class="s1">)</span>
+            <span class="s1">self._expect_prompt()</span>
+
+    <span class="s0">def </span><span class="s1">get_width_height_descent(self</span><span class="s0">, </span><span class="s1">text</span><span class="s0">, </span><span class="s1">prop):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Get the width, total height, and descent (in TeX points) for a text 
+        typeset by the current LaTeX environment. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self._get_box_metrics(_escape_and_apply_props(text</span><span class="s0">, </span><span class="s1">prop))</span>
+
+    <span class="s0">def </span><span class="s1">_get_box_metrics(self</span><span class="s0">, </span><span class="s1">tex):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Get the width, total height and descent (in TeX points) for a TeX 
+        command's output in the current LaTeX environment. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># This method gets wrapped in __init__ for per-instance caching.</span>
+        <span class="s1">self._stdin_writeln(  </span><span class="s2"># Send textbox to TeX &amp; request metrics typeout.</span>
+            <span class="s3">r&quot;\sbox0{%s}\typeout{\the\wd0,\the\ht0,\the\dp0}&quot; </span><span class="s1">% tex)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">answer = self._expect_prompt()</span>
+        <span class="s0">except </span><span class="s1">LatexError </span><span class="s0">as </span><span class="s1">err:</span>
+            <span class="s2"># Here and below, use '{}' instead of {!r} to avoid doubling all</span>
+            <span class="s2"># backslashes.</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Error measuring {}</span><span class="s0">\n</span><span class="s3">LaTeX Output:</span><span class="s0">\n</span><span class="s3">{}&quot;</span>
+                             <span class="s1">.format(tex</span><span class="s0">, </span><span class="s1">err.latex_output)) </span><span class="s0">from </span><span class="s1">err</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s2"># Parse metrics from the answer string.  Last line is prompt, and</span>
+            <span class="s2"># next-to-last-line is blank line from \typeout.</span>
+            <span class="s1">width</span><span class="s0">, </span><span class="s1">height</span><span class="s0">, </span><span class="s1">offset = answer.splitlines()[-</span><span class="s5">3</span><span class="s1">].split(</span><span class="s3">&quot;,&quot;</span><span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">err:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Error measuring {}</span><span class="s0">\n</span><span class="s3">LaTeX Output:</span><span class="s0">\n</span><span class="s3">{}&quot;</span>
+                             <span class="s1">.format(tex</span><span class="s0">, </span><span class="s1">answer)) </span><span class="s0">from </span><span class="s1">err</span>
+        <span class="s1">w</span><span class="s0">, </span><span class="s1">h</span><span class="s0">, </span><span class="s1">o = float(width[:-</span><span class="s5">2</span><span class="s1">])</span><span class="s0">, </span><span class="s1">float(height[:-</span><span class="s5">2</span><span class="s1">])</span><span class="s0">, </span><span class="s1">float(offset[:-</span><span class="s5">2</span><span class="s1">])</span>
+        <span class="s2"># The height returned from LaTeX goes from base to top;</span>
+        <span class="s2"># the height Matplotlib expects goes from bottom to top.</span>
+        <span class="s0">return </span><span class="s1">w</span><span class="s0">, </span><span class="s1">h + o</span><span class="s0">, </span><span class="s1">o</span>
+
+
+<span class="s1">@functools.lru_cache(</span><span class="s5">1</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">_get_image_inclusion_command():</span>
+    <span class="s1">man = LatexManager._get_cached_or_new()</span>
+    <span class="s1">man._stdin_writeln(</span>
+        <span class="s3">r&quot;\includegraphics[interpolate=true]{%s}&quot;</span>
+        <span class="s2"># Don't mess with backslashes on Windows.</span>
+        <span class="s1">% cbook._get_data_path(</span><span class="s3">&quot;images/matplotlib.png&quot;</span><span class="s1">).as_posix())</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">man._expect_prompt()</span>
+        <span class="s0">return </span><span class="s3">r&quot;\includegraphics&quot;</span>
+    <span class="s0">except </span><span class="s1">LatexError:</span>
+        <span class="s2"># Discard the broken manager.</span>
+        <span class="s1">LatexManager._get_cached_or_new_impl.cache_clear()</span>
+        <span class="s0">return </span><span class="s3">r&quot;\pgfimage&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">RendererPgf(RendererBase):</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">figure</span><span class="s0">, </span><span class="s1">fh):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Create a new PGF renderer that translates any drawing instruction 
+        into text commands to be interpreted in a latex pgfpicture environment. 
+ 
+        Attributes 
+        ---------- 
+        figure : `matplotlib.figure.Figure` 
+            Matplotlib figure to initialize height, width and dpi from. 
+        fh : file-like 
+            File handle for the output of the drawing commands. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.dpi = figure.dpi</span>
+        <span class="s1">self.fh = fh</span>
+        <span class="s1">self.figure = figure</span>
+        <span class="s1">self.image_counter = </span><span class="s5">0</span>
+
+    <span class="s0">def </span><span class="s1">draw_markers(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">marker_path</span><span class="s0">, </span><span class="s1">marker_trans</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">trans</span><span class="s0">,</span>
+                     <span class="s1">rgbFace=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2"># docstring inherited</span>
+
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+
+        <span class="s2"># convert from display units to in</span>
+        <span class="s1">f = </span><span class="s5">1. </span><span class="s1">/ self.dpi</span>
+
+        <span class="s2"># set style and clip</span>
+        <span class="s1">self._print_pgf_clip(gc)</span>
+        <span class="s1">self._print_pgf_path_styles(gc</span><span class="s0">, </span><span class="s1">rgbFace)</span>
+
+        <span class="s2"># build marker definition</span>
+        <span class="s1">bl</span><span class="s0">, </span><span class="s1">tr = marker_path.get_extents(marker_trans).get_points()</span>
+        <span class="s1">coords = bl[</span><span class="s5">0</span><span class="s1">] * f</span><span class="s0">, </span><span class="s1">bl[</span><span class="s5">1</span><span class="s1">] * f</span><span class="s0">, </span><span class="s1">tr[</span><span class="s5">0</span><span class="s1">] * f</span><span class="s0">, </span><span class="s1">tr[</span><span class="s5">1</span><span class="s1">] * f</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                 <span class="s3">r&quot;\pgfsys@defobject{currentmarker}&quot;</span>
+                 <span class="s3">r&quot;{\pgfqpoint{%fin}{%fin}}{\pgfqpoint{%fin}{%fin}}{&quot; </span><span class="s1">% coords)</span>
+        <span class="s1">self._print_pgf_path(</span><span class="s0">None, </span><span class="s1">marker_path</span><span class="s0">, </span><span class="s1">marker_trans)</span>
+        <span class="s1">self._pgf_path_draw(stroke=gc.get_linewidth() != </span><span class="s5">0.0</span><span class="s0">,</span>
+                            <span class="s1">fill=rgbFace </span><span class="s0">is not None</span><span class="s1">)</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;}&quot;</span><span class="s1">)</span>
+
+        <span class="s1">maxcoord = </span><span class="s5">16383 </span><span class="s1">/ </span><span class="s5">72.27 </span><span class="s1">* self.dpi  </span><span class="s2"># Max dimensions in LaTeX.</span>
+        <span class="s1">clip = (-maxcoord</span><span class="s0">, </span><span class="s1">-maxcoord</span><span class="s0">, </span><span class="s1">maxcoord</span><span class="s0">, </span><span class="s1">maxcoord)</span>
+
+        <span class="s2"># draw marker for each vertex</span>
+        <span class="s0">for </span><span class="s1">point</span><span class="s0">, </span><span class="s1">code </span><span class="s0">in </span><span class="s1">path.iter_segments(trans</span><span class="s0">, </span><span class="s1">simplify=</span><span class="s0">False,</span>
+                                              <span class="s1">clip=clip):</span>
+            <span class="s1">x</span><span class="s0">, </span><span class="s1">y = point[</span><span class="s5">0</span><span class="s1">] * f</span><span class="s0">, </span><span class="s1">point[</span><span class="s5">1</span><span class="s1">] * f</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsys@transformshift{%fin}{%fin}&quot; </span><span class="s1">% (x</span><span class="s0">, </span><span class="s1">y))</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsys@useobject{currentmarker}{}&quot;</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">draw_path(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">transform</span><span class="s0">, </span><span class="s1">rgbFace=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+        <span class="s2"># draw the path</span>
+        <span class="s1">self._print_pgf_clip(gc)</span>
+        <span class="s1">self._print_pgf_path_styles(gc</span><span class="s0">, </span><span class="s1">rgbFace)</span>
+        <span class="s1">self._print_pgf_path(gc</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">transform</span><span class="s0">, </span><span class="s1">rgbFace)</span>
+        <span class="s1">self._pgf_path_draw(stroke=gc.get_linewidth() != </span><span class="s5">0.0</span><span class="s0">,</span>
+                            <span class="s1">fill=rgbFace </span><span class="s0">is not None</span><span class="s1">)</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+
+        <span class="s2"># if present, draw pattern on top</span>
+        <span class="s0">if </span><span class="s1">gc.get_hatch():</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+            <span class="s1">self._print_pgf_path_styles(gc</span><span class="s0">, </span><span class="s1">rgbFace)</span>
+
+            <span class="s2"># combine clip and path for clipping</span>
+            <span class="s1">self._print_pgf_clip(gc)</span>
+            <span class="s1">self._print_pgf_path(gc</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">transform</span><span class="s0">, </span><span class="s1">rgbFace)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfusepath{clip}&quot;</span><span class="s1">)</span>
+
+            <span class="s2"># build pattern definition</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfsys@defobject{currentpattern}&quot;</span>
+                     <span class="s3">r&quot;{\pgfqpoint{0in}{0in}}{\pgfqpoint{1in}{1in}}{&quot;</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfpathrectangle&quot;</span>
+                     <span class="s3">r&quot;{\pgfqpoint{0in}{0in}}{\pgfqpoint{1in}{1in}}&quot;</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfusepath{clip}&quot;</span><span class="s1">)</span>
+            <span class="s1">scale = mpl.transforms.Affine2D().scale(self.dpi)</span>
+            <span class="s1">self._print_pgf_path(</span><span class="s0">None, </span><span class="s1">gc.get_hatch_path()</span><span class="s0">, </span><span class="s1">scale)</span>
+            <span class="s1">self._pgf_path_draw(stroke=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;}&quot;</span><span class="s1">)</span>
+            <span class="s2"># repeat pattern, filling the bounding rect of the path</span>
+            <span class="s1">f = </span><span class="s5">1. </span><span class="s1">/ self.dpi</span>
+            <span class="s1">(xmin</span><span class="s0">, </span><span class="s1">ymin)</span><span class="s0">, </span><span class="s1">(xmax</span><span class="s0">, </span><span class="s1">ymax) = \</span>
+                <span class="s1">path.get_extents(transform).get_points()</span>
+            <span class="s1">xmin</span><span class="s0">, </span><span class="s1">xmax = f * xmin</span><span class="s0">, </span><span class="s1">f * xmax</span>
+            <span class="s1">ymin</span><span class="s0">, </span><span class="s1">ymax = f * ymin</span><span class="s0">, </span><span class="s1">f * ymax</span>
+            <span class="s1">repx</span><span class="s0">, </span><span class="s1">repy = math.ceil(xmax - xmin)</span><span class="s0">, </span><span class="s1">math.ceil(ymax - ymin)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfsys@transformshift{%fin}{%fin}&quot; </span><span class="s1">% (xmin</span><span class="s0">, </span><span class="s1">ymin))</span>
+            <span class="s0">for </span><span class="s1">iy </span><span class="s0">in </span><span class="s1">range(repy):</span>
+                <span class="s0">for </span><span class="s1">ix </span><span class="s0">in </span><span class="s1">range(repx):</span>
+                    <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsys@useobject{currentpattern}{}&quot;</span><span class="s1">)</span>
+                    <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsys@transformshift{1in}{0in}&quot;</span><span class="s1">)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsys@transformshift{-%din}{0in}&quot; </span><span class="s1">% repx)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsys@transformshift{0in}{1in}&quot;</span><span class="s1">)</span>
+
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_print_pgf_clip(self</span><span class="s0">, </span><span class="s1">gc):</span>
+        <span class="s1">f = </span><span class="s5">1. </span><span class="s1">/ self.dpi</span>
+        <span class="s2"># check for clip box</span>
+        <span class="s1">bbox = gc.get_clip_rectangle()</span>
+        <span class="s0">if </span><span class="s1">bbox:</span>
+            <span class="s1">p1</span><span class="s0">, </span><span class="s1">p2 = bbox.get_points()</span>
+            <span class="s1">w</span><span class="s0">, </span><span class="s1">h = p2 - p1</span>
+            <span class="s1">coords = p1[</span><span class="s5">0</span><span class="s1">] * f</span><span class="s0">, </span><span class="s1">p1[</span><span class="s5">1</span><span class="s1">] * f</span><span class="s0">, </span><span class="s1">w * f</span><span class="s0">, </span><span class="s1">h * f</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfpathrectangle&quot;</span>
+                     <span class="s3">r&quot;{\pgfqpoint{%fin}{%fin}}{\pgfqpoint{%fin}{%fin}}&quot;</span>
+                     <span class="s1">% coords)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfusepath{clip}&quot;</span><span class="s1">)</span>
+
+        <span class="s2"># check for clip path</span>
+        <span class="s1">clippath</span><span class="s0">, </span><span class="s1">clippath_trans = gc.get_clip_path()</span>
+        <span class="s0">if </span><span class="s1">clippath </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self._print_pgf_path(gc</span><span class="s0">, </span><span class="s1">clippath</span><span class="s0">, </span><span class="s1">clippath_trans)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfusepath{clip}&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_print_pgf_path_styles(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">rgbFace):</span>
+        <span class="s2"># cap style</span>
+        <span class="s1">capstyles = {</span><span class="s3">&quot;butt&quot;</span><span class="s1">: </span><span class="s3">r&quot;\pgfsetbuttcap&quot;</span><span class="s0">,</span>
+                     <span class="s3">&quot;round&quot;</span><span class="s1">: </span><span class="s3">r&quot;\pgfsetroundcap&quot;</span><span class="s0">,</span>
+                     <span class="s3">&quot;projecting&quot;</span><span class="s1">: </span><span class="s3">r&quot;\pgfsetrectcap&quot;</span><span class="s1">}</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s1">capstyles[gc.get_capstyle()])</span>
+
+        <span class="s2"># join style</span>
+        <span class="s1">joinstyles = {</span><span class="s3">&quot;miter&quot;</span><span class="s1">: </span><span class="s3">r&quot;\pgfsetmiterjoin&quot;</span><span class="s0">,</span>
+                      <span class="s3">&quot;round&quot;</span><span class="s1">: </span><span class="s3">r&quot;\pgfsetroundjoin&quot;</span><span class="s0">,</span>
+                      <span class="s3">&quot;bevel&quot;</span><span class="s1">: </span><span class="s3">r&quot;\pgfsetbeveljoin&quot;</span><span class="s1">}</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s1">joinstyles[gc.get_joinstyle()])</span>
+
+        <span class="s2"># filling</span>
+        <span class="s1">has_fill = rgbFace </span><span class="s0">is not None</span>
+
+        <span class="s0">if </span><span class="s1">gc.get_forced_alpha():</span>
+            <span class="s1">fillopacity = strokeopacity = gc.get_alpha()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">strokeopacity = gc.get_rgb()[</span><span class="s5">3</span><span class="s1">]</span>
+            <span class="s1">fillopacity = rgbFace[</span><span class="s5">3</span><span class="s1">] </span><span class="s0">if </span><span class="s1">has_fill </span><span class="s0">and </span><span class="s1">len(rgbFace) &gt; </span><span class="s5">3 </span><span class="s0">else </span><span class="s5">1.0</span>
+
+        <span class="s0">if </span><span class="s1">has_fill:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\definecolor{currentfill}{rgb}{%f,%f,%f}&quot;</span>
+                     <span class="s1">% tuple(rgbFace[:</span><span class="s5">3</span><span class="s1">]))</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetfillcolor{currentfill}&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">has_fill </span><span class="s0">and </span><span class="s1">fillopacity != </span><span class="s5">1.0</span><span class="s1">:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetfillopacity{%f}&quot; </span><span class="s1">% fillopacity)</span>
+
+        <span class="s2"># linewidth and color</span>
+        <span class="s1">lw = gc.get_linewidth() * mpl_pt_to_in * latex_in_to_pt</span>
+        <span class="s1">stroke_rgba = gc.get_rgb()</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetlinewidth{%fpt}&quot; </span><span class="s1">% lw)</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                 <span class="s3">r&quot;\definecolor{currentstroke}{rgb}{%f,%f,%f}&quot;</span>
+                 <span class="s1">% stroke_rgba[:</span><span class="s5">3</span><span class="s1">])</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetstrokecolor{currentstroke}&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">strokeopacity != </span><span class="s5">1.0</span><span class="s1">:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetstrokeopacity{%f}&quot; </span><span class="s1">% strokeopacity)</span>
+
+        <span class="s2"># line style</span>
+        <span class="s1">dash_offset</span><span class="s0">, </span><span class="s1">dash_list = gc.get_dashes()</span>
+        <span class="s0">if </span><span class="s1">dash_list </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetdash{}{0pt}&quot;</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfsetdash{%s}{%fpt}&quot;</span>
+                     <span class="s1">% (</span><span class="s3">&quot;&quot;</span><span class="s1">.join(</span><span class="s3">r&quot;{%fpt}&quot; </span><span class="s1">% dash </span><span class="s0">for </span><span class="s1">dash </span><span class="s0">in </span><span class="s1">dash_list)</span><span class="s0">,</span>
+                        <span class="s1">dash_offset))</span>
+
+    <span class="s0">def </span><span class="s1">_print_pgf_path(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">transform</span><span class="s0">, </span><span class="s1">rgbFace=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">f = </span><span class="s5">1. </span><span class="s1">/ self.dpi</span>
+        <span class="s2"># check for clip box / ignore clip for filled paths</span>
+        <span class="s1">bbox = gc.get_clip_rectangle() </span><span class="s0">if </span><span class="s1">gc </span><span class="s0">else None</span>
+        <span class="s1">maxcoord = </span><span class="s5">16383 </span><span class="s1">/ </span><span class="s5">72.27 </span><span class="s1">* self.dpi  </span><span class="s2"># Max dimensions in LaTeX.</span>
+        <span class="s0">if </span><span class="s1">bbox </span><span class="s0">and </span><span class="s1">(rgbFace </span><span class="s0">is None</span><span class="s1">):</span>
+            <span class="s1">p1</span><span class="s0">, </span><span class="s1">p2 = bbox.get_points()</span>
+            <span class="s1">clip = (max(p1[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">-maxcoord)</span><span class="s0">, </span><span class="s1">max(p1[</span><span class="s5">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">-maxcoord)</span><span class="s0">,</span>
+                    <span class="s1">min(p2[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">maxcoord)</span><span class="s0">, </span><span class="s1">min(p2[</span><span class="s5">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">maxcoord))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">clip = (-maxcoord</span><span class="s0">, </span><span class="s1">-maxcoord</span><span class="s0">, </span><span class="s1">maxcoord</span><span class="s0">, </span><span class="s1">maxcoord)</span>
+        <span class="s2"># build path</span>
+        <span class="s0">for </span><span class="s1">points</span><span class="s0">, </span><span class="s1">code </span><span class="s0">in </span><span class="s1">path.iter_segments(transform</span><span class="s0">, </span><span class="s1">clip=clip):</span>
+            <span class="s0">if </span><span class="s1">code == Path.MOVETO:</span>
+                <span class="s1">x</span><span class="s0">, </span><span class="s1">y = tuple(points)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                         <span class="s3">r&quot;\pgfpathmoveto{\pgfqpoint{%fin}{%fin}}&quot; </span><span class="s1">%</span>
+                         <span class="s1">(f * x</span><span class="s0">, </span><span class="s1">f * y))</span>
+            <span class="s0">elif </span><span class="s1">code == Path.CLOSEPOLY:</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfpathclose&quot;</span><span class="s1">)</span>
+            <span class="s0">elif </span><span class="s1">code == Path.LINETO:</span>
+                <span class="s1">x</span><span class="s0">, </span><span class="s1">y = tuple(points)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                         <span class="s3">r&quot;\pgfpathlineto{\pgfqpoint{%fin}{%fin}}&quot; </span><span class="s1">%</span>
+                         <span class="s1">(f * x</span><span class="s0">, </span><span class="s1">f * y))</span>
+            <span class="s0">elif </span><span class="s1">code == Path.CURVE3:</span>
+                <span class="s1">cx</span><span class="s0">, </span><span class="s1">cy</span><span class="s0">, </span><span class="s1">px</span><span class="s0">, </span><span class="s1">py = tuple(points)</span>
+                <span class="s1">coords = cx * f</span><span class="s0">, </span><span class="s1">cy * f</span><span class="s0">, </span><span class="s1">px * f</span><span class="s0">, </span><span class="s1">py * f</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                         <span class="s3">r&quot;\pgfpathquadraticcurveto&quot;</span>
+                         <span class="s3">r&quot;{\pgfqpoint{%fin}{%fin}}{\pgfqpoint{%fin}{%fin}}&quot;</span>
+                         <span class="s1">% coords)</span>
+            <span class="s0">elif </span><span class="s1">code == Path.CURVE4:</span>
+                <span class="s1">c1x</span><span class="s0">, </span><span class="s1">c1y</span><span class="s0">, </span><span class="s1">c2x</span><span class="s0">, </span><span class="s1">c2y</span><span class="s0">, </span><span class="s1">px</span><span class="s0">, </span><span class="s1">py = tuple(points)</span>
+                <span class="s1">coords = c1x * f</span><span class="s0">, </span><span class="s1">c1y * f</span><span class="s0">, </span><span class="s1">c2x * f</span><span class="s0">, </span><span class="s1">c2y * f</span><span class="s0">, </span><span class="s1">px * f</span><span class="s0">, </span><span class="s1">py * f</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                         <span class="s3">r&quot;\pgfpathcurveto&quot;</span>
+                         <span class="s3">r&quot;{\pgfqpoint{%fin}{%fin}}&quot;</span>
+                         <span class="s3">r&quot;{\pgfqpoint{%fin}{%fin}}&quot;</span>
+                         <span class="s3">r&quot;{\pgfqpoint{%fin}{%fin}}&quot;</span>
+                         <span class="s1">% coords)</span>
+
+        <span class="s2"># apply pgf decorators</span>
+        <span class="s1">sketch_params = gc.get_sketch_params() </span><span class="s0">if </span><span class="s1">gc </span><span class="s0">else None</span>
+        <span class="s0">if </span><span class="s1">sketch_params </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s2"># Only &quot;length&quot; directly maps to &quot;segment length&quot; in PGF's API.</span>
+            <span class="s2"># PGF uses &quot;amplitude&quot; to pass the combined deviation in both x-</span>
+            <span class="s2"># and y-direction, while matplotlib only varies the length of the</span>
+            <span class="s2"># wiggle along the line (&quot;randomness&quot; and &quot;length&quot; parameters)</span>
+            <span class="s2"># and has a separate &quot;scale&quot; argument for the amplitude.</span>
+            <span class="s2"># -&gt; Use &quot;randomness&quot; as PRNG seed to allow the user to force the</span>
+            <span class="s2"># same shape on multiple sketched lines</span>
+            <span class="s1">scale</span><span class="s0">, </span><span class="s1">length</span><span class="s0">, </span><span class="s1">randomness = sketch_params</span>
+            <span class="s0">if </span><span class="s1">scale </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s2"># make matplotlib and PGF rendering visually similar</span>
+                <span class="s1">length *= </span><span class="s5">0.5</span>
+                <span class="s1">scale *= </span><span class="s5">2</span>
+                <span class="s2"># PGF guarantees that repeated loading is a no-op</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\usepgfmodule{decorations}&quot;</span><span class="s1">)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\usepgflibrary{decorations.pathmorphing}&quot;</span><span class="s1">)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfkeys{/pgf/decoration/.cd, &quot;</span>
+                         <span class="s3">f&quot;segment length = </span><span class="s0">{</span><span class="s1">(length * f)</span><span class="s0">:</span><span class="s3">f</span><span class="s0">}</span><span class="s3">in, &quot;</span>
+                         <span class="s3">f&quot;amplitude = </span><span class="s0">{</span><span class="s1">(scale * f)</span><span class="s0">:</span><span class="s3">f</span><span class="s0">}</span><span class="s3">in</span><span class="s0">}}</span><span class="s3">&quot;</span><span class="s1">)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">f&quot;</span><span class="s0">\\</span><span class="s3">pgfmathsetseed</span><span class="s0">{{{</span><span class="s1">int(randomness)</span><span class="s0">}}}</span><span class="s3">&quot;</span><span class="s1">)</span>
+                <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfdecoratecurrentpath{random steps}&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_pgf_path_draw(self</span><span class="s0">, </span><span class="s1">stroke=</span><span class="s0">True, </span><span class="s1">fill=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s1">actions = []</span>
+        <span class="s0">if </span><span class="s1">stroke:</span>
+            <span class="s1">actions.append(</span><span class="s3">&quot;stroke&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">fill:</span>
+            <span class="s1">actions.append(</span><span class="s3">&quot;fill&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfusepath{%s}&quot; </span><span class="s1">% </span><span class="s3">&quot;,&quot;</span><span class="s1">.join(actions))</span>
+
+    <span class="s0">def </span><span class="s1">option_scale_image(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s0">return True</span>
+
+    <span class="s0">def </span><span class="s1">option_image_nocomposite(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s0">return not </span><span class="s1">mpl.rcParams[</span><span class="s3">'image.composite_image'</span><span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">draw_image(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">im</span><span class="s0">, </span><span class="s1">transform=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2"># docstring inherited</span>
+
+        <span class="s1">h</span><span class="s0">, </span><span class="s1">w = im.shape[:</span><span class="s5">2</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">w == </span><span class="s5">0 </span><span class="s0">or </span><span class="s1">h == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">return</span>
+
+        <span class="s0">if not </span><span class="s1">os.path.exists(getattr(self.fh</span><span class="s0">, </span><span class="s3">&quot;name&quot;</span><span class="s0">, </span><span class="s3">&quot;&quot;</span><span class="s1">)):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">&quot;streamed pgf-code does not support raster graphics, consider &quot;</span>
+                <span class="s3">&quot;using the pgf-to-pdf option&quot;</span><span class="s1">)</span>
+
+        <span class="s2"># save the images to png files</span>
+        <span class="s1">path = pathlib.Path(self.fh.name)</span>
+        <span class="s1">fname_img = </span><span class="s3">&quot;%s-img%d.png&quot; </span><span class="s1">% (path.stem</span><span class="s0">, </span><span class="s1">self.image_counter)</span>
+        <span class="s1">Image.fromarray(im[::-</span><span class="s5">1</span><span class="s1">]).save(path.parent / fname_img)</span>
+        <span class="s1">self.image_counter += </span><span class="s5">1</span>
+
+        <span class="s2"># reference the image in the pgf picture</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+        <span class="s1">self._print_pgf_clip(gc)</span>
+        <span class="s1">f = </span><span class="s5">1. </span><span class="s1">/ self.dpi  </span><span class="s2"># from display coords to inch</span>
+        <span class="s0">if </span><span class="s1">transform </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfsys@transformshift{%fin}{%fin}&quot; </span><span class="s1">% (x * f</span><span class="s0">, </span><span class="s1">y * f))</span>
+            <span class="s1">w</span><span class="s0">, </span><span class="s1">h = w * f</span><span class="s0">, </span><span class="s1">h * f</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">tr1</span><span class="s0">, </span><span class="s1">tr2</span><span class="s0">, </span><span class="s1">tr3</span><span class="s0">, </span><span class="s1">tr4</span><span class="s0">, </span><span class="s1">tr5</span><span class="s0">, </span><span class="s1">tr6 = transform.frozen().to_values()</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                     <span class="s3">r&quot;\pgfsys@transformcm{%f}{%f}{%f}{%f}{%fin}{%fin}&quot; </span><span class="s1">%</span>
+                     <span class="s1">(tr1 * f</span><span class="s0">, </span><span class="s1">tr2 * f</span><span class="s0">, </span><span class="s1">tr3 * f</span><span class="s0">, </span><span class="s1">tr4 * f</span><span class="s0">,</span>
+                      <span class="s1">(tr5 + x) * f</span><span class="s0">, </span><span class="s1">(tr6 + y) * f))</span>
+            <span class="s1">w = h = </span><span class="s5">1  </span><span class="s2"># scale is already included in the transform</span>
+        <span class="s1">interp = str(transform </span><span class="s0">is None</span><span class="s1">).lower()  </span><span class="s2"># interpolation in PDF reader</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">,</span>
+                 <span class="s3">r&quot;\pgftext[left,bottom]&quot;</span>
+                 <span class="s3">r&quot;{%s[interpolate=%s,width=%fin,height=%fin]{%s}}&quot; </span><span class="s1">%</span>
+                 <span class="s1">(_get_image_inclusion_command()</span><span class="s0">,</span>
+                  <span class="s1">interp</span><span class="s0">, </span><span class="s1">w</span><span class="s0">, </span><span class="s1">h</span><span class="s0">, </span><span class="s1">fname_img))</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">draw_tex(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">prop</span><span class="s0">, </span><span class="s1">angle</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">mtext=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s1">self.draw_text(gc</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">prop</span><span class="s0">, </span><span class="s1">angle</span><span class="s0">, </span><span class="s1">ismath=</span><span class="s3">&quot;TeX&quot;</span><span class="s0">, </span><span class="s1">mtext=mtext)</span>
+
+    <span class="s0">def </span><span class="s1">draw_text(self</span><span class="s0">, </span><span class="s1">gc</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">prop</span><span class="s0">, </span><span class="s1">angle</span><span class="s0">, </span><span class="s1">ismath=</span><span class="s0">False, </span><span class="s1">mtext=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2"># docstring inherited</span>
+
+        <span class="s2"># prepare string for tex</span>
+        <span class="s1">s = _escape_and_apply_props(s</span><span class="s0">, </span><span class="s1">prop)</span>
+
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfscope}&quot;</span><span class="s1">)</span>
+
+        <span class="s1">alpha = gc.get_alpha()</span>
+        <span class="s0">if </span><span class="s1">alpha != </span><span class="s5">1.0</span><span class="s1">:</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetfillopacity{%f}&quot; </span><span class="s1">% alpha)</span>
+            <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetstrokeopacity{%f}&quot; </span><span class="s1">% alpha)</span>
+        <span class="s1">rgb = tuple(gc.get_rgb())[:</span><span class="s5">3</span><span class="s1">]</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\definecolor{textcolor}{rgb}{%f,%f,%f}&quot; </span><span class="s1">% rgb)</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetstrokecolor{textcolor}&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfsetfillcolor{textcolor}&quot;</span><span class="s1">)</span>
+        <span class="s1">s = </span><span class="s3">r&quot;\color{textcolor}&quot; </span><span class="s1">+ s</span>
+
+        <span class="s1">dpi = self.figure.dpi</span>
+        <span class="s1">text_args = []</span>
+        <span class="s0">if </span><span class="s1">mtext </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(angle == </span><span class="s5">0 </span><span class="s0">or</span>
+                 <span class="s1">mtext.get_rotation_mode() == </span><span class="s3">&quot;anchor&quot;</span><span class="s1">) </span><span class="s0">and</span>
+                <span class="s1">mtext.get_verticalalignment() != </span><span class="s3">&quot;center_baseline&quot;</span><span class="s1">):</span>
+            <span class="s2"># if text anchoring can be supported, get the original coordinates</span>
+            <span class="s2"># and add alignment information</span>
+            <span class="s1">pos = mtext.get_unitless_position()</span>
+            <span class="s1">x</span><span class="s0">, </span><span class="s1">y = mtext.get_transform().transform(pos)</span>
+            <span class="s1">halign = {</span><span class="s3">&quot;left&quot;</span><span class="s1">: </span><span class="s3">&quot;left&quot;</span><span class="s0">, </span><span class="s3">&quot;right&quot;</span><span class="s1">: </span><span class="s3">&quot;right&quot;</span><span class="s0">, </span><span class="s3">&quot;center&quot;</span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">}</span>
+            <span class="s1">valign = {</span><span class="s3">&quot;top&quot;</span><span class="s1">: </span><span class="s3">&quot;top&quot;</span><span class="s0">, </span><span class="s3">&quot;bottom&quot;</span><span class="s1">: </span><span class="s3">&quot;bottom&quot;</span><span class="s0">,</span>
+                      <span class="s3">&quot;baseline&quot;</span><span class="s1">: </span><span class="s3">&quot;base&quot;</span><span class="s0">, </span><span class="s3">&quot;center&quot;</span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">}</span>
+            <span class="s1">text_args.extend([</span>
+                <span class="s3">f&quot;x=</span><span class="s0">{</span><span class="s1">x/dpi</span><span class="s0">:</span><span class="s3">f</span><span class="s0">}</span><span class="s3">in&quot;</span><span class="s0">,</span>
+                <span class="s3">f&quot;y=</span><span class="s0">{</span><span class="s1">y/dpi</span><span class="s0">:</span><span class="s3">f</span><span class="s0">}</span><span class="s3">in&quot;</span><span class="s0">,</span>
+                <span class="s1">halign[mtext.get_horizontalalignment()]</span><span class="s0">,</span>
+                <span class="s1">valign[mtext.get_verticalalignment()]</span><span class="s0">,</span>
+            <span class="s1">])</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># if not, use the text layout provided by Matplotlib.</span>
+            <span class="s1">text_args.append(</span><span class="s3">f&quot;x=</span><span class="s0">{</span><span class="s1">x/dpi</span><span class="s0">:</span><span class="s3">f</span><span class="s0">}</span><span class="s3">in, y=</span><span class="s0">{</span><span class="s1">y/dpi</span><span class="s0">:</span><span class="s3">f</span><span class="s0">}</span><span class="s3">in, left, base&quot;</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">angle != </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">text_args.append(</span><span class="s3">&quot;rotate=%f&quot; </span><span class="s1">% angle)</span>
+
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\pgftext[%s]{%s}&quot; </span><span class="s1">% (</span><span class="s3">&quot;,&quot;</span><span class="s1">.join(text_args)</span><span class="s0">, </span><span class="s1">s))</span>
+        <span class="s1">_writeln(self.fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfscope}&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">get_text_width_height_descent(self</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">prop</span><span class="s0">, </span><span class="s1">ismath):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s2"># get text metrics in units of latex pt, convert to display units</span>
+        <span class="s1">w</span><span class="s0">, </span><span class="s1">h</span><span class="s0">, </span><span class="s1">d = (LatexManager._get_cached_or_new()</span>
+                   <span class="s1">.get_width_height_descent(s</span><span class="s0">, </span><span class="s1">prop))</span>
+        <span class="s2"># TODO: this should be latex_pt_to_in instead of mpl_pt_to_in</span>
+        <span class="s2"># but having a little bit more space around the text looks better,</span>
+        <span class="s2"># plus the bounding box reported by LaTeX is VERY narrow</span>
+        <span class="s1">f = mpl_pt_to_in * self.dpi</span>
+        <span class="s0">return </span><span class="s1">w * f</span><span class="s0">, </span><span class="s1">h * f</span><span class="s0">, </span><span class="s1">d * f</span>
+
+    <span class="s0">def </span><span class="s1">flipy(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">get_canvas_width_height(self):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s0">return </span><span class="s1">(self.figure.get_figwidth() * self.dpi</span><span class="s0">,</span>
+                <span class="s1">self.figure.get_figheight() * self.dpi)</span>
+
+    <span class="s0">def </span><span class="s1">points_to_pixels(self</span><span class="s0">, </span><span class="s1">points):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s0">return </span><span class="s1">points * mpl_pt_to_in * self.dpi</span>
+
+
+<span class="s0">class </span><span class="s1">FigureCanvasPgf(FigureCanvasBase):</span>
+    <span class="s1">filetypes = {</span><span class="s3">&quot;pgf&quot;</span><span class="s1">: </span><span class="s3">&quot;LaTeX PGF picture&quot;</span><span class="s0">,</span>
+                 <span class="s3">&quot;pdf&quot;</span><span class="s1">: </span><span class="s3">&quot;LaTeX compiled PGF picture&quot;</span><span class="s0">,</span>
+                 <span class="s3">&quot;png&quot;</span><span class="s1">: </span><span class="s3">&quot;Portable Network Graphics&quot;</span><span class="s0">, </span><span class="s1">}</span>
+
+    <span class="s0">def </span><span class="s1">get_default_filetype(self):</span>
+        <span class="s0">return </span><span class="s3">'pdf'</span>
+
+    <span class="s0">def </span><span class="s1">_print_pgf_to_fh(self</span><span class="s0">, </span><span class="s1">fh</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">bbox_inches_restore=</span><span class="s0">None</span><span class="s1">):</span>
+
+        <span class="s1">header_text = </span><span class="s3">&quot;&quot;&quot;%% Creator: Matplotlib, PGF backend 
+%% 
+%% To include the figure in your LaTeX document, write 
+%%   </span><span class="s0">\\</span><span class="s3">input{&lt;filename&gt;.pgf} 
+%% 
+%% Make sure the required packages are loaded in your preamble 
+%%   </span><span class="s0">\\</span><span class="s3">usepackage{pgf} 
+%% 
+%% Also ensure that all the required font packages are loaded; for instance, 
+%% the lmodern package is sometimes necessary when using math font. 
+%%   </span><span class="s0">\\</span><span class="s3">usepackage{lmodern} 
+%% 
+%% Figures using additional raster images can only be included by </span><span class="s0">\\</span><span class="s3">input if 
+%% they are in the same directory as the main LaTeX file. For loading figures 
+%% from other directories you can use the `import` package 
+%%   </span><span class="s0">\\</span><span class="s3">usepackage{import} 
+%% 
+%% and then include the figures with 
+%%   </span><span class="s0">\\</span><span class="s3">import{&lt;path to file&gt;}{&lt;filename&gt;.pgf} 
+%% 
+&quot;&quot;&quot;</span>
+
+        <span class="s2"># append the preamble used by the backend as a comment for debugging</span>
+        <span class="s1">header_info_preamble = [</span><span class="s3">&quot;%% Matplotlib used the following preamble&quot;</span><span class="s1">]</span>
+        <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">_get_preamble().splitlines():</span>
+            <span class="s1">header_info_preamble.append(</span><span class="s3">&quot;%%   &quot; </span><span class="s1">+ line)</span>
+        <span class="s1">header_info_preamble.append(</span><span class="s3">&quot;%%&quot;</span><span class="s1">)</span>
+        <span class="s1">header_info_preamble = </span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">.join(header_info_preamble)</span>
+
+        <span class="s2"># get figure size in inch</span>
+        <span class="s1">w</span><span class="s0">, </span><span class="s1">h = self.figure.get_figwidth()</span><span class="s0">, </span><span class="s1">self.figure.get_figheight()</span>
+        <span class="s1">dpi = self.figure.dpi</span>
+
+        <span class="s2"># create pgfpicture environment and write the pgf code</span>
+        <span class="s1">fh.write(header_text)</span>
+        <span class="s1">fh.write(header_info_preamble)</span>
+        <span class="s1">fh.write(</span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\begingroup&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\makeatletter&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\begin{pgfpicture}&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(fh</span><span class="s0">,</span>
+                 <span class="s3">r&quot;\pgfpathrectangle{\pgfpointorigin}{\pgfqpoint{%fin}{%fin}}&quot;</span>
+                 <span class="s1">% (w</span><span class="s0">, </span><span class="s1">h))</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\pgfusepath{use as bounding box, clip}&quot;</span><span class="s1">)</span>
+        <span class="s1">renderer = MixedModeRenderer(self.figure</span><span class="s0">, </span><span class="s1">w</span><span class="s0">, </span><span class="s1">h</span><span class="s0">, </span><span class="s1">dpi</span><span class="s0">,</span>
+                                     <span class="s1">RendererPgf(self.figure</span><span class="s0">, </span><span class="s1">fh)</span><span class="s0">,</span>
+                                     <span class="s1">bbox_inches_restore=bbox_inches_restore)</span>
+        <span class="s1">self.figure.draw(renderer)</span>
+
+        <span class="s2"># end the pgfpicture environment</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\end{pgfpicture}&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\makeatother&quot;</span><span class="s1">)</span>
+        <span class="s1">_writeln(fh</span><span class="s0">, </span><span class="s3">r&quot;\endgroup&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">print_pgf(self</span><span class="s0">, </span><span class="s1">fname_or_fh</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Output pgf macros for drawing the figure so it can be included and 
+        rendered in latex documents. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">cbook.open_file_cm(fname_or_fh</span><span class="s0">, </span><span class="s3">&quot;w&quot;</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">file:</span>
+            <span class="s0">if not </span><span class="s1">cbook.file_requires_unicode(file):</span>
+                <span class="s1">file = codecs.getwriter(</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">)(file)</span>
+            <span class="s1">self._print_pgf_to_fh(file</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">print_pdf(self</span><span class="s0">, </span><span class="s1">fname_or_fh</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot;Use LaTeX to compile a pgf generated figure to pdf.&quot;&quot;&quot;</span>
+        <span class="s1">w</span><span class="s0">, </span><span class="s1">h = self.figure.get_size_inches()</span>
+
+        <span class="s1">info_dict = _create_pdf_info_dict(</span><span class="s3">'pgf'</span><span class="s0">, </span><span class="s1">metadata </span><span class="s0">or </span><span class="s1">{})</span>
+        <span class="s1">pdfinfo = </span><span class="s3">','</span><span class="s1">.join(</span>
+            <span class="s1">_metadata_to_str(k</span><span class="s0">, </span><span class="s1">v) </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">info_dict.items())</span>
+
+        <span class="s2"># print figure to pgf and compile it with latex</span>
+        <span class="s0">with </span><span class="s1">TemporaryDirectory() </span><span class="s0">as </span><span class="s1">tmpdir:</span>
+            <span class="s1">tmppath = pathlib.Path(tmpdir)</span>
+            <span class="s1">self.print_pgf(tmppath / </span><span class="s3">&quot;figure.pgf&quot;</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s1">(tmppath / </span><span class="s3">&quot;figure.tex&quot;</span><span class="s1">).write_text(</span>
+                <span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">.join([</span>
+                    <span class="s3">r&quot;\documentclass[12pt]{article}&quot;</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\usepackage[pdfinfo={%s}]{hyperref}&quot; </span><span class="s1">% pdfinfo</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\usepackage[papersize={%fin,%fin}, margin=0in]{geometry}&quot;</span>
+                    <span class="s1">% (w</span><span class="s0">, </span><span class="s1">h)</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\usepackage{pgf}&quot;</span><span class="s0">,</span>
+                    <span class="s1">_get_preamble()</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\begin{document}&quot;</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\centering&quot;</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\input{figure.pgf}&quot;</span><span class="s0">,</span>
+                    <span class="s3">r&quot;\end{document}&quot;</span><span class="s0">,</span>
+                <span class="s1">])</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">)</span>
+            <span class="s1">texcommand = mpl.rcParams[</span><span class="s3">&quot;pgf.texsystem&quot;</span><span class="s1">]</span>
+            <span class="s1">cbook._check_and_log_subprocess(</span>
+                <span class="s1">[texcommand</span><span class="s0">, </span><span class="s3">&quot;-interaction=nonstopmode&quot;</span><span class="s0">, </span><span class="s3">&quot;-halt-on-error&quot;</span><span class="s0">,</span>
+                 <span class="s3">&quot;figure.tex&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">_log</span><span class="s0">, </span><span class="s1">cwd=tmpdir)</span>
+            <span class="s0">with </span><span class="s1">(tmppath / </span><span class="s3">&quot;figure.pdf&quot;</span><span class="s1">).open(</span><span class="s3">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">orig</span><span class="s0">, </span><span class="s1">\</span>
+                 <span class="s1">cbook.open_file_cm(fname_or_fh</span><span class="s0">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">dest:</span>
+                <span class="s1">shutil.copyfileobj(orig</span><span class="s0">, </span><span class="s1">dest)  </span><span class="s2"># copy file contents to target</span>
+
+    <span class="s0">def </span><span class="s1">print_png(self</span><span class="s0">, </span><span class="s1">fname_or_fh</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot;Use LaTeX to compile a pgf figure to pdf and convert it to png.&quot;&quot;&quot;</span>
+        <span class="s1">converter = make_pdf_to_png_converter()</span>
+        <span class="s0">with </span><span class="s1">TemporaryDirectory() </span><span class="s0">as </span><span class="s1">tmpdir:</span>
+            <span class="s1">tmppath = pathlib.Path(tmpdir)</span>
+            <span class="s1">pdf_path = tmppath / </span><span class="s3">&quot;figure.pdf&quot;</span>
+            <span class="s1">png_path = tmppath / </span><span class="s3">&quot;figure.png&quot;</span>
+            <span class="s1">self.print_pdf(pdf_path</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s1">converter(pdf_path</span><span class="s0">, </span><span class="s1">png_path</span><span class="s0">, </span><span class="s1">dpi=self.figure.dpi)</span>
+            <span class="s0">with </span><span class="s1">png_path.open(</span><span class="s3">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">orig</span><span class="s0">, </span><span class="s1">\</span>
+                 <span class="s1">cbook.open_file_cm(fname_or_fh</span><span class="s0">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">dest:</span>
+                <span class="s1">shutil.copyfileobj(orig</span><span class="s0">, </span><span class="s1">dest)  </span><span class="s2"># copy file contents to target</span>
+
+    <span class="s0">def </span><span class="s1">get_renderer(self):</span>
+        <span class="s0">return </span><span class="s1">RendererPgf(self.figure</span><span class="s0">, None</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">draw(self):</span>
+        <span class="s1">self.figure.draw_without_rendering()</span>
+        <span class="s0">return </span><span class="s1">super().draw()</span>
+
+
+<span class="s1">FigureManagerPgf = FigureManagerBase</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s0">class </span><span class="s1">_BackendPgf(_Backend):</span>
+    <span class="s1">FigureCanvas = FigureCanvasPgf</span>
+
+
+<span class="s0">class </span><span class="s1">PdfPages:</span>
+    <span class="s4">&quot;&quot;&quot; 
+    A multi-page PDF file using the pgf backend 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import matplotlib.pyplot as plt 
+    &gt;&gt;&gt; # Initialize: 
+    &gt;&gt;&gt; with PdfPages('foo.pdf') as pdf: 
+    ...     # As many times as you like, create a figure fig and save it: 
+    ...     fig = plt.figure() 
+    ...     pdf.savefig(fig) 
+    ...     # When no figure is specified the current figure is saved 
+    ...     pdf.savefig() 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ = (</span>
+        <span class="s3">'_output_name'</span><span class="s0">,</span>
+        <span class="s3">'keep_empty'</span><span class="s0">,</span>
+        <span class="s3">'_n_figures'</span><span class="s0">,</span>
+        <span class="s3">'_file'</span><span class="s0">,</span>
+        <span class="s3">'_info_dict'</span><span class="s0">,</span>
+        <span class="s3">'_metadata'</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">filename</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">keep_empty=</span><span class="s0">True, </span><span class="s1">metadata=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Create a new PdfPages object. 
+ 
+        Parameters 
+        ---------- 
+        filename : str or path-like 
+            Plots using `PdfPages.savefig` will be written to a file at this 
+            location. Any older file with the same name is overwritten. 
+ 
+        keep_empty : bool, default: True 
+            If set to False, then empty pdf files will be deleted automatically 
+            when closed. 
+ 
+        metadata : dict, optional 
+            Information dictionary object (see PDF reference section 10.2.1 
+            'Document Information Dictionary'), e.g.: 
+            ``{'Creator': 'My software', 'Author': 'Me', 'Title': 'Awesome'}``. 
+ 
+            The standard keys are 'Title', 'Author', 'Subject', 'Keywords', 
+            'Creator', 'Producer', 'CreationDate', 'ModDate', and 
+            'Trapped'. Values have been predefined for 'Creator', 'Producer' 
+            and 'CreationDate'. They can be removed by setting them to `None`. 
+ 
+            Note that some versions of LaTeX engines may ignore the 'Producer' 
+            key and set it to themselves. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._output_name = filename</span>
+        <span class="s1">self._n_figures = </span><span class="s5">0</span>
+        <span class="s1">self.keep_empty = keep_empty</span>
+        <span class="s1">self._metadata = (metadata </span><span class="s0">or </span><span class="s1">{}).copy()</span>
+        <span class="s1">self._info_dict = _create_pdf_info_dict(</span><span class="s3">'pgf'</span><span class="s0">, </span><span class="s1">self._metadata)</span>
+        <span class="s1">self._file = BytesIO()</span>
+
+    <span class="s0">def </span><span class="s1">_write_header(self</span><span class="s0">, </span><span class="s1">width_inches</span><span class="s0">, </span><span class="s1">height_inches):</span>
+        <span class="s1">pdfinfo = </span><span class="s3">','</span><span class="s1">.join(</span>
+            <span class="s1">_metadata_to_str(k</span><span class="s0">, </span><span class="s1">v) </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self._info_dict.items())</span>
+        <span class="s1">latex_header = </span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s1">.join([</span>
+            <span class="s3">r&quot;\documentclass[12pt]{article}&quot;</span><span class="s0">,</span>
+            <span class="s3">r&quot;\usepackage[pdfinfo={%s}]{hyperref}&quot; </span><span class="s1">% pdfinfo</span><span class="s0">,</span>
+            <span class="s3">r&quot;\usepackage[papersize={%fin,%fin}, margin=0in]{geometry}&quot;</span>
+            <span class="s1">% (width_inches</span><span class="s0">, </span><span class="s1">height_inches)</span><span class="s0">,</span>
+            <span class="s3">r&quot;\usepackage{pgf}&quot;</span><span class="s0">,</span>
+            <span class="s1">_get_preamble()</span><span class="s0">,</span>
+            <span class="s3">r&quot;\setlength{\parindent}{0pt}&quot;</span><span class="s0">,</span>
+            <span class="s3">r&quot;\begin{document}%&quot;</span><span class="s0">,</span>
+        <span class="s1">])</span>
+        <span class="s1">self._file.write(latex_header.encode(</span><span class="s3">'utf-8'</span><span class="s1">))</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">exc_type</span><span class="s0">, </span><span class="s1">exc_val</span><span class="s0">, </span><span class="s1">exc_tb):</span>
+        <span class="s1">self.close()</span>
+
+    <span class="s0">def </span><span class="s1">close(self):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Finalize this object, running LaTeX in a temporary directory 
+        and moving the final pdf file to *filename*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._file.write(</span><span class="s6">rb'\end{document}\n'</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self._n_figures &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">self._run_latex()</span>
+        <span class="s0">elif </span><span class="s1">self.keep_empty:</span>
+            <span class="s1">open(self._output_name</span><span class="s0">, </span><span class="s3">'wb'</span><span class="s1">).close()</span>
+        <span class="s1">self._file.close()</span>
+
+    <span class="s0">def </span><span class="s1">_run_latex(self):</span>
+        <span class="s1">texcommand = mpl.rcParams[</span><span class="s3">&quot;pgf.texsystem&quot;</span><span class="s1">]</span>
+        <span class="s0">with </span><span class="s1">TemporaryDirectory() </span><span class="s0">as </span><span class="s1">tmpdir:</span>
+            <span class="s1">tex_source = pathlib.Path(tmpdir</span><span class="s0">, </span><span class="s3">&quot;pdf_pages.tex&quot;</span><span class="s1">)</span>
+            <span class="s1">tex_source.write_bytes(self._file.getvalue())</span>
+            <span class="s1">cbook._check_and_log_subprocess(</span>
+                <span class="s1">[texcommand</span><span class="s0">, </span><span class="s3">&quot;-interaction=nonstopmode&quot;</span><span class="s0">, </span><span class="s3">&quot;-halt-on-error&quot;</span><span class="s0">,</span>
+                 <span class="s1">tex_source]</span><span class="s0">,</span>
+                <span class="s1">_log</span><span class="s0">, </span><span class="s1">cwd=tmpdir)</span>
+            <span class="s1">shutil.move(tex_source.with_suffix(</span><span class="s3">&quot;.pdf&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">self._output_name)</span>
+
+    <span class="s0">def </span><span class="s1">savefig(self</span><span class="s0">, </span><span class="s1">figure=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Save a `.Figure` to this file as a new page. 
+ 
+        Any other keyword arguments are passed to `~.Figure.savefig`. 
+ 
+        Parameters 
+        ---------- 
+        figure : `.Figure` or int, default: the active figure 
+            The figure, or index of the figure, that is saved to the file. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if not </span><span class="s1">isinstance(figure</span><span class="s0">, </span><span class="s1">Figure):</span>
+            <span class="s0">if </span><span class="s1">figure </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">manager = Gcf.get_active()</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">manager = Gcf.get_fig_manager(figure)</span>
+            <span class="s0">if </span><span class="s1">manager </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;No figure {}&quot;</span><span class="s1">.format(figure))</span>
+            <span class="s1">figure = manager.canvas.figure</span>
+
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">orig_canvas = figure.canvas</span>
+            <span class="s1">figure.canvas = FigureCanvasPgf(figure)</span>
+
+            <span class="s1">width</span><span class="s0">, </span><span class="s1">height = figure.get_size_inches()</span>
+            <span class="s0">if </span><span class="s1">self._n_figures == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s1">self._write_header(width</span><span class="s0">, </span><span class="s1">height)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s2"># \pdfpagewidth and \pdfpageheight exist on pdftex, xetex, and</span>
+                <span class="s2"># luatex&lt;0.85; they were renamed to \pagewidth and \pageheight</span>
+                <span class="s2"># on luatex&gt;=0.85.</span>
+                <span class="s1">self._file.write(</span>
+                    <span class="s6">br'\newpage'</span>
+                    <span class="s6">br'\ifdefined\pdfpagewidth\pdfpagewidth'</span>
+                    <span class="s6">br'\else\pagewidth\fi=%ain'</span>
+                    <span class="s6">br'\ifdefined\pdfpageheight\pdfpageheight'</span>
+                    <span class="s6">br'\else\pageheight\fi=%ain'</span>
+                    <span class="s6">b'%%</span><span class="s0">\n</span><span class="s6">' </span><span class="s1">% (width</span><span class="s0">, </span><span class="s1">height)</span>
+                <span class="s1">)</span>
+
+            <span class="s1">figure.savefig(self._file</span><span class="s0">, </span><span class="s1">format=</span><span class="s3">&quot;pgf&quot;</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s1">self._n_figures += </span><span class="s5">1</span>
+        <span class="s0">finally</span><span class="s1">:</span>
+            <span class="s1">figure.canvas = orig_canvas</span>
+
+    <span class="s0">def </span><span class="s1">get_pagecount(self):</span>
+        <span class="s4">&quot;&quot;&quot;Return the current number of pages in the multipage pdf file.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self._n_figures</span>
+</pre>
+</body>
+</html>

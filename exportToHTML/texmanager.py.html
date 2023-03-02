@@ -1,0 +1,395 @@
+<html>
+<head>
+<title>texmanager.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+texmanager.py</font>
+</center></td></tr></table>
+<pre><span class="s0">r&quot;&quot;&quot; 
+Support for embedded TeX expressions in Matplotlib. 
+ 
+Requirements: 
+ 
+* LaTeX. 
+* \*Agg backends: dvipng&gt;=1.6. 
+* PS backend: PSfrag, dvips, and Ghostscript&gt;=9.0. 
+* PDF and SVG backends: if LuaTeX is present, it will be used to speed up some 
+  post-processing steps, but note that it is not used to parse the TeX string 
+  itself (only LaTeX is supported). 
+ 
+To enable TeX rendering of all text in your Matplotlib figure, set 
+:rc:`text.usetex` to True. 
+ 
+TeX and dvipng/dvips processing results are cached 
+in ~/.matplotlib/tex.cache for reuse between sessions. 
+ 
+`TexManager.get_rgba` can also be used to directly obtain raster output as RGBA 
+NumPy arrays. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">hashlib</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">from </span><span class="s1">tempfile </span><span class="s2">import </span><span class="s1">TemporaryDirectory</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span><span class="s2">, </span><span class="s1">dviread</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+
+<span class="s2">def </span><span class="s1">_usepackage_if_not_loaded(package</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">option=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Output LaTeX code that loads a package (possibly with an option) if it 
+    hasn't been loaded yet. 
+ 
+    LaTeX cannot load twice a package with different options, so this helper 
+    can be used to protect against users loading arbitrary packages/options in 
+    their custom preamble. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">option = </span><span class="s3">f&quot;[</span><span class="s2">{</span><span class="s1">option</span><span class="s2">}</span><span class="s3">]&quot; </span><span class="s2">if </span><span class="s1">option </span><span class="s2">is not None else </span><span class="s3">&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">(</span>
+        <span class="s3">r&quot;\makeatletter&quot;</span>
+        <span class="s3">r&quot;\@ifpackageloaded{%(package)s}{}{\usepackage%(option)s{%(package)s}}&quot;</span>
+        <span class="s3">r&quot;\makeatother&quot;</span>
+    <span class="s1">) % {</span><span class="s3">&quot;package&quot;</span><span class="s1">: package</span><span class="s2">, </span><span class="s3">&quot;option&quot;</span><span class="s1">: option}</span>
+
+
+<span class="s2">class </span><span class="s1">TexManager:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert strings to dvi files using TeX, caching the results to a directory. 
+ 
+    Repeated calls to this constructor always return the same instance. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">texcache = os.path.join(mpl.get_cachedir()</span><span class="s2">, </span><span class="s3">'tex.cache'</span><span class="s1">)</span>
+    <span class="s1">_grey_arrayd = {}</span>
+
+    <span class="s1">_font_families = (</span><span class="s3">'serif'</span><span class="s2">, </span><span class="s3">'sans-serif'</span><span class="s2">, </span><span class="s3">'cursive'</span><span class="s2">, </span><span class="s3">'monospace'</span><span class="s1">)</span>
+    <span class="s1">_font_preambles = {</span>
+        <span class="s3">'new century schoolbook'</span><span class="s1">: </span><span class="s3">r'\renewcommand{\rmdefault}{pnc}'</span><span class="s2">,</span>
+        <span class="s3">'bookman'</span><span class="s1">: </span><span class="s3">r'\renewcommand{\rmdefault}{pbk}'</span><span class="s2">,</span>
+        <span class="s3">'times'</span><span class="s1">: </span><span class="s3">r'\usepackage{mathptmx}'</span><span class="s2">,</span>
+        <span class="s3">'palatino'</span><span class="s1">: </span><span class="s3">r'\usepackage{mathpazo}'</span><span class="s2">,</span>
+        <span class="s3">'zapf chancery'</span><span class="s1">: </span><span class="s3">r'\usepackage{chancery}'</span><span class="s2">,</span>
+        <span class="s3">'cursive'</span><span class="s1">: </span><span class="s3">r'\usepackage{chancery}'</span><span class="s2">,</span>
+        <span class="s3">'charter'</span><span class="s1">: </span><span class="s3">r'\usepackage{charter}'</span><span class="s2">,</span>
+        <span class="s3">'serif'</span><span class="s1">: </span><span class="s3">''</span><span class="s2">,</span>
+        <span class="s3">'sans-serif'</span><span class="s1">: </span><span class="s3">''</span><span class="s2">,</span>
+        <span class="s3">'helvetica'</span><span class="s1">: </span><span class="s3">r'\usepackage{helvet}'</span><span class="s2">,</span>
+        <span class="s3">'avant garde'</span><span class="s1">: </span><span class="s3">r'\usepackage{avant}'</span><span class="s2">,</span>
+        <span class="s3">'courier'</span><span class="s1">: </span><span class="s3">r'\usepackage{courier}'</span><span class="s2">,</span>
+        <span class="s4"># Loading the type1ec package ensures that cm-super is installed, which</span>
+        <span class="s4"># is necessary for Unicode computer modern.  (It also allows the use of</span>
+        <span class="s4"># computer modern at arbitrary sizes, but that's just a side effect.)</span>
+        <span class="s3">'monospace'</span><span class="s1">: </span><span class="s3">r'\usepackage{type1ec}'</span><span class="s2">,</span>
+        <span class="s3">'computer modern roman'</span><span class="s1">: </span><span class="s3">r'\usepackage{type1ec}'</span><span class="s2">,</span>
+        <span class="s3">'computer modern sans serif'</span><span class="s1">: </span><span class="s3">r'\usepackage{type1ec}'</span><span class="s2">,</span>
+        <span class="s3">'computer modern typewriter'</span><span class="s1">: </span><span class="s3">r'\usepackage{type1ec}'</span><span class="s2">,</span>
+    <span class="s1">}</span>
+    <span class="s1">_font_types = {</span>
+        <span class="s3">'new century schoolbook'</span><span class="s1">: </span><span class="s3">'serif'</span><span class="s2">,</span>
+        <span class="s3">'bookman'</span><span class="s1">: </span><span class="s3">'serif'</span><span class="s2">,</span>
+        <span class="s3">'times'</span><span class="s1">: </span><span class="s3">'serif'</span><span class="s2">,</span>
+        <span class="s3">'palatino'</span><span class="s1">: </span><span class="s3">'serif'</span><span class="s2">,</span>
+        <span class="s3">'zapf chancery'</span><span class="s1">: </span><span class="s3">'cursive'</span><span class="s2">,</span>
+        <span class="s3">'charter'</span><span class="s1">: </span><span class="s3">'serif'</span><span class="s2">,</span>
+        <span class="s3">'helvetica'</span><span class="s1">: </span><span class="s3">'sans-serif'</span><span class="s2">,</span>
+        <span class="s3">'avant garde'</span><span class="s1">: </span><span class="s3">'sans-serif'</span><span class="s2">,</span>
+        <span class="s3">'courier'</span><span class="s1">: </span><span class="s3">'monospace'</span><span class="s2">,</span>
+        <span class="s3">'computer modern roman'</span><span class="s1">: </span><span class="s3">'serif'</span><span class="s2">,</span>
+        <span class="s3">'computer modern sans serif'</span><span class="s1">: </span><span class="s3">'sans-serif'</span><span class="s2">,</span>
+        <span class="s3">'computer modern typewriter'</span><span class="s1">: </span><span class="s3">'monospace'</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@functools.lru_cache()  </span><span class="s4"># Always return the same instance.</span>
+    <span class="s2">def </span><span class="s1">__new__(cls):</span>
+        <span class="s1">Path(cls.texcache).mkdir(parents=</span><span class="s2">True, </span><span class="s1">exist_ok=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">object.__new__(cls)</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">get_font_config(self):</span>
+        <span class="s1">preamble</span><span class="s2">, </span><span class="s1">font_cmd = self._get_font_preamble_and_command()</span>
+        <span class="s4"># Add a hash of the latex preamble to fontconfig so that the</span>
+        <span class="s4"># correct png is selected for strings rendered with same font and dpi</span>
+        <span class="s4"># even if the latex preamble changes within the session</span>
+        <span class="s1">preambles = preamble + font_cmd + self.get_custom_preamble()</span>
+        <span class="s2">return </span><span class="s1">hashlib.md5(preambles.encode(</span><span class="s3">'utf-8'</span><span class="s1">)).hexdigest()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_font_family_and_reduced(cls):</span>
+        <span class="s0">&quot;&quot;&quot;Return the font family name and whether the font is reduced.&quot;&quot;&quot;</span>
+        <span class="s1">ff = mpl.rcParams[</span><span class="s3">'font.family'</span><span class="s1">]</span>
+        <span class="s1">ff_val = ff[</span><span class="s5">0</span><span class="s1">].lower() </span><span class="s2">if </span><span class="s1">len(ff) == </span><span class="s5">1 </span><span class="s2">else None</span>
+        <span class="s2">if </span><span class="s1">len(ff) == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">ff_val </span><span class="s2">in </span><span class="s1">cls._font_families:</span>
+            <span class="s2">return </span><span class="s1">ff_val</span><span class="s2">, False</span>
+        <span class="s2">elif </span><span class="s1">len(ff) == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">ff_val </span><span class="s2">in </span><span class="s1">cls._font_preambles:</span>
+            <span class="s2">return </span><span class="s1">cls._font_types[ff_val]</span><span class="s2">, True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">_log.info(</span><span class="s3">'font.family must be one of (%s) when text.usetex is '</span>
+                      <span class="s3">'True. serif will be used by default.'</span><span class="s2">,</span>
+                      <span class="s3">', '</span><span class="s1">.join(cls._font_families))</span>
+            <span class="s2">return </span><span class="s3">'serif'</span><span class="s2">, False</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_font_preamble_and_command(cls):</span>
+        <span class="s1">requested_family</span><span class="s2">, </span><span class="s1">is_reduced_font = cls._get_font_family_and_reduced()</span>
+
+        <span class="s1">preambles = {}</span>
+        <span class="s2">for </span><span class="s1">font_family </span><span class="s2">in </span><span class="s1">cls._font_families:</span>
+            <span class="s2">if </span><span class="s1">is_reduced_font </span><span class="s2">and </span><span class="s1">font_family == requested_family:</span>
+                <span class="s1">preambles[font_family] = cls._font_preambles[</span>
+                    <span class="s1">mpl.rcParams[</span><span class="s3">'font.family'</span><span class="s1">][</span><span class="s5">0</span><span class="s1">].lower()]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">for </span><span class="s1">font </span><span class="s2">in </span><span class="s1">mpl.rcParams[</span><span class="s3">'font.' </span><span class="s1">+ font_family]:</span>
+                    <span class="s2">if </span><span class="s1">font.lower() </span><span class="s2">in </span><span class="s1">cls._font_preambles:</span>
+                        <span class="s1">preambles[font_family] = \</span>
+                            <span class="s1">cls._font_preambles[font.lower()]</span>
+                        <span class="s1">_log.debug(</span>
+                            <span class="s3">'family: %s, font: %s, info: %s'</span><span class="s2">,</span>
+                            <span class="s1">font_family</span><span class="s2">, </span><span class="s1">font</span><span class="s2">,</span>
+                            <span class="s1">cls._font_preambles[font.lower()])</span>
+                        <span class="s2">break</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s1">_log.debug(</span><span class="s3">'%s font is not compatible with usetex.'</span><span class="s2">,</span>
+                                   <span class="s1">font)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">_log.info(</span><span class="s3">'No LaTeX-compatible font found for the %s font'</span>
+                              <span class="s3">'family in rcParams. Using default.'</span><span class="s2">,</span>
+                              <span class="s1">font_family)</span>
+                    <span class="s1">preambles[font_family] = cls._font_preambles[font_family]</span>
+
+        <span class="s4"># The following packages and commands need to be included in the latex</span>
+        <span class="s4"># file's preamble:</span>
+        <span class="s1">cmd = {preambles[family]</span>
+               <span class="s2">for </span><span class="s1">family </span><span class="s2">in </span><span class="s1">[</span><span class="s3">'serif'</span><span class="s2">, </span><span class="s3">'sans-serif'</span><span class="s2">, </span><span class="s3">'monospace'</span><span class="s1">]}</span>
+        <span class="s2">if </span><span class="s1">requested_family == </span><span class="s3">'cursive'</span><span class="s1">:</span>
+            <span class="s1">cmd.add(preambles[</span><span class="s3">'cursive'</span><span class="s1">])</span>
+        <span class="s1">cmd.add(</span><span class="s3">r'\usepackage{type1cm}'</span><span class="s1">)</span>
+        <span class="s1">preamble = </span><span class="s3">'</span><span class="s2">\n</span><span class="s3">'</span><span class="s1">.join(sorted(cmd))</span>
+        <span class="s1">fontcmd = (</span><span class="s3">r'\sffamily' </span><span class="s2">if </span><span class="s1">requested_family == </span><span class="s3">'sans-serif' </span><span class="s2">else</span>
+                   <span class="s3">r'\ttfamily' </span><span class="s2">if </span><span class="s1">requested_family == </span><span class="s3">'monospace' </span><span class="s2">else</span>
+                   <span class="s3">r'\rmfamily'</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">preamble</span><span class="s2">, </span><span class="s1">fontcmd</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">get_basefile(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">dpi=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a filename based on a hash of the string, fontsize, and dpi. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">src = cls._get_tex_source(tex</span><span class="s2">, </span><span class="s1">fontsize) + str(dpi)</span>
+        <span class="s1">filehash = hashlib.md5(src.encode(</span><span class="s3">'utf-8'</span><span class="s1">)).hexdigest()</span>
+        <span class="s1">filepath = Path(cls.texcache)</span>
+
+        <span class="s1">num_letters</span><span class="s2">, </span><span class="s1">num_levels = </span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">num_letters*num_levels</span><span class="s2">, </span><span class="s1">num_letters):</span>
+            <span class="s1">filepath = filepath / Path(filehash[i:i+</span><span class="s5">2</span><span class="s1">])</span>
+
+        <span class="s1">filepath.mkdir(parents=</span><span class="s2">True, </span><span class="s1">exist_ok=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">os.path.join(filepath</span><span class="s2">, </span><span class="s1">filehash)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">get_font_preamble(cls):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a string containing font configuration for the tex preamble. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">font_preamble</span><span class="s2">, </span><span class="s1">command = cls._get_font_preamble_and_command()</span>
+        <span class="s2">return </span><span class="s1">font_preamble</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">get_custom_preamble(cls):</span>
+        <span class="s0">&quot;&quot;&quot;Return a string containing user additions to the tex preamble.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">mpl.rcParams[</span><span class="s3">'text.latex.preamble'</span><span class="s1">]</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_tex_source(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize):</span>
+        <span class="s0">&quot;&quot;&quot;Return the complete TeX source for processing a TeX string.&quot;&quot;&quot;</span>
+        <span class="s1">font_preamble</span><span class="s2">, </span><span class="s1">fontcmd = cls._get_font_preamble_and_command()</span>
+        <span class="s1">baselineskip = </span><span class="s5">1.25 </span><span class="s1">* fontsize</span>
+        <span class="s2">return </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join([</span>
+            <span class="s3">r&quot;\documentclass{article}&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% Pass-through \mathdefault, which is used in non-usetex mode&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% to use the default text font but was historically suppressed&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% in usetex mode.&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;\newcommand{\mathdefault}[1]{#1}&quot;</span><span class="s2">,</span>
+            <span class="s1">font_preamble</span><span class="s2">,</span>
+            <span class="s3">r&quot;\usepackage[utf8]{inputenc}&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;\DeclareUnicodeCharacter{2212}{\ensuremath{-}}&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% geometry is loaded before the custom preamble as &quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% convert_psfrags relies on a custom preamble to change the &quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% geometry.&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;\usepackage[papersize=72in, margin=1in]{geometry}&quot;</span><span class="s2">,</span>
+            <span class="s1">cls.get_custom_preamble()</span><span class="s2">,</span>
+            <span class="s3">r&quot;% Use `underscore` package to take care of underscores in text.&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% The [strings] option allows to use underscores in file names.&quot;</span><span class="s2">,</span>
+            <span class="s1">_usepackage_if_not_loaded(</span><span class="s3">&quot;underscore&quot;</span><span class="s2">, </span><span class="s1">option=</span><span class="s3">&quot;strings&quot;</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s3">r&quot;% Custom packages (e.g. newtxtext) may already have loaded &quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% textcomp with different options.&quot;</span><span class="s2">,</span>
+            <span class="s1">_usepackage_if_not_loaded(</span><span class="s3">&quot;textcomp&quot;</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s3">r&quot;\pagestyle{empty}&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;\begin{document}&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% The empty hbox ensures that a page is printed even for empty&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% inputs, except when using psfrag which gets confused by it.&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% matplotlibbaselinemarker is used by dviread to detect the&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;% last line's baseline.&quot;</span><span class="s2">,</span>
+            <span class="s3">rf&quot;\fontsize</span><span class="s2">{{{</span><span class="s1">fontsize</span><span class="s2">}}}{{{</span><span class="s1">baselineskip</span><span class="s2">}}}</span><span class="s3">%&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;\ifdefined\psfrag\else\hbox{}\fi%&quot;</span><span class="s2">,</span>
+            <span class="s3">rf&quot;</span><span class="s2">{{{</span><span class="s1">fontcmd</span><span class="s2">} {</span><span class="s1">tex</span><span class="s2">}}}</span><span class="s3">%&quot;</span><span class="s2">,</span>
+            <span class="s3">r&quot;\end{document}&quot;</span><span class="s2">,</span>
+        <span class="s1">])</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">make_tex(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a tex file to render the tex string at a specific font size. 
+ 
+        Return the file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">texfile = cls.get_basefile(tex</span><span class="s2">, </span><span class="s1">fontsize) + </span><span class="s3">&quot;.tex&quot;</span>
+        <span class="s1">Path(texfile).write_text(cls._get_tex_source(tex</span><span class="s2">, </span><span class="s1">fontsize)</span><span class="s2">,</span>
+                                 <span class="s1">encoding=</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">texfile</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_run_checked_subprocess(cls</span><span class="s2">, </span><span class="s1">command</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">cwd=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">_log.debug(cbook._pformat_subprocess(command))</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">report = subprocess.check_output(</span>
+                <span class="s1">command</span><span class="s2">, </span><span class="s1">cwd=cwd </span><span class="s2">if </span><span class="s1">cwd </span><span class="s2">is not None else </span><span class="s1">cls.texcache</span><span class="s2">,</span>
+                <span class="s1">stderr=subprocess.STDOUT)</span>
+        <span class="s2">except </span><span class="s1">FileNotFoundError </span><span class="s2">as </span><span class="s1">exc:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s3">'Failed to process string with tex because {} could not be '</span>
+                <span class="s3">'found'</span><span class="s1">.format(command[</span><span class="s5">0</span><span class="s1">])) </span><span class="s2">from </span><span class="s1">exc</span>
+        <span class="s2">except </span><span class="s1">subprocess.CalledProcessError </span><span class="s2">as </span><span class="s1">exc:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s3">'{prog} was not able to process the following string:</span><span class="s2">\n</span><span class="s3">'</span>
+                <span class="s3">'{tex!r}</span><span class="s2">\n\n</span><span class="s3">'</span>
+                <span class="s3">'Here is the full command invocation and its output:</span><span class="s2">\n\n</span><span class="s3">'</span>
+                <span class="s3">'{format_command}</span><span class="s2">\n\n</span><span class="s3">'</span>
+                <span class="s3">'{exc}</span><span class="s2">\n\n</span><span class="s3">'</span><span class="s1">.format(</span>
+                    <span class="s1">prog=command[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                    <span class="s1">format_command=cbook._pformat_subprocess(command)</span><span class="s2">,</span>
+                    <span class="s1">tex=tex.encode(</span><span class="s3">'unicode_escape'</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">exc=exc.output.decode(</span><span class="s3">'utf-8'</span><span class="s2">, </span><span class="s3">'backslashreplace'</span><span class="s1">))</span>
+                <span class="s1">) </span><span class="s2">from None</span>
+        <span class="s1">_log.debug(report)</span>
+        <span class="s2">return </span><span class="s1">report</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">make_dvi(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a dvi file containing latex's layout of tex string. 
+ 
+        Return the file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">basefile = cls.get_basefile(tex</span><span class="s2">, </span><span class="s1">fontsize)</span>
+        <span class="s1">dvifile = </span><span class="s3">'%s.dvi' </span><span class="s1">% basefile</span>
+        <span class="s2">if not </span><span class="s1">os.path.exists(dvifile):</span>
+            <span class="s1">texfile = Path(cls.make_tex(tex</span><span class="s2">, </span><span class="s1">fontsize))</span>
+            <span class="s4"># Generate the dvi in a temporary directory to avoid race</span>
+            <span class="s4"># conditions e.g. if multiple processes try to process the same tex</span>
+            <span class="s4"># string at the same time.  Having tmpdir be a subdirectory of the</span>
+            <span class="s4"># final output dir ensures that they are on the same filesystem,</span>
+            <span class="s4"># and thus replace() works atomically.  It also allows referring to</span>
+            <span class="s4"># the texfile with a relative path (for pathological MPLCONFIGDIRs,</span>
+            <span class="s4"># the absolute path may contain characters (e.g. ~) that TeX does</span>
+            <span class="s4"># not support; n.b. relative paths cannot traverse parents, or it</span>
+            <span class="s4"># will be blocked when `openin_any = p` in texmf.cnf).</span>
+            <span class="s1">cwd = Path(dvifile).parent</span>
+            <span class="s2">with </span><span class="s1">TemporaryDirectory(dir=cwd) </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+                <span class="s1">tmppath = Path(tmpdir)</span>
+                <span class="s1">cls._run_checked_subprocess(</span>
+                    <span class="s1">[</span><span class="s3">&quot;latex&quot;</span><span class="s2">, </span><span class="s3">&quot;-interaction=nonstopmode&quot;</span><span class="s2">, </span><span class="s3">&quot;--halt-on-error&quot;</span><span class="s2">,</span>
+                     <span class="s3">f&quot;--output-directory=</span><span class="s2">{</span><span class="s1">tmppath.name</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s2">,</span>
+                     <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">texfile.name</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">cwd=cwd)</span>
+                <span class="s1">(tmppath / Path(dvifile).name).replace(dvifile)</span>
+        <span class="s2">return </span><span class="s1">dvifile</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">make_png(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">dpi):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a png file containing latex's rendering of tex string. 
+ 
+        Return the file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">basefile = cls.get_basefile(tex</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">dpi)</span>
+        <span class="s1">pngfile = </span><span class="s3">'%s.png' </span><span class="s1">% basefile</span>
+        <span class="s4"># see get_rgba for a discussion of the background</span>
+        <span class="s2">if not </span><span class="s1">os.path.exists(pngfile):</span>
+            <span class="s1">dvifile = cls.make_dvi(tex</span><span class="s2">, </span><span class="s1">fontsize)</span>
+            <span class="s1">cmd = [</span><span class="s3">&quot;dvipng&quot;</span><span class="s2">, </span><span class="s3">&quot;-bg&quot;</span><span class="s2">, </span><span class="s3">&quot;Transparent&quot;</span><span class="s2">, </span><span class="s3">&quot;-D&quot;</span><span class="s2">, </span><span class="s1">str(dpi)</span><span class="s2">,</span>
+                   <span class="s3">&quot;-T&quot;</span><span class="s2">, </span><span class="s3">&quot;tight&quot;</span><span class="s2">, </span><span class="s3">&quot;-o&quot;</span><span class="s2">, </span><span class="s1">pngfile</span><span class="s2">, </span><span class="s1">dvifile]</span>
+            <span class="s4"># When testing, disable FreeType rendering for reproducibility; but</span>
+            <span class="s4"># dvipng 1.16 has a bug (fixed in f3ff241) that breaks --freetype0</span>
+            <span class="s4"># mode, so for it we keep FreeType enabled; the image will be</span>
+            <span class="s4"># slightly off.</span>
+            <span class="s2">if </span><span class="s1">(getattr(mpl</span><span class="s2">, </span><span class="s3">&quot;_called_from_pytest&quot;</span><span class="s2">, False</span><span class="s1">) </span><span class="s2">and</span>
+                    <span class="s1">mpl._get_executable_info(</span><span class="s3">&quot;dvipng&quot;</span><span class="s1">).raw_version != </span><span class="s3">&quot;1.16&quot;</span><span class="s1">):</span>
+                <span class="s1">cmd.insert(</span><span class="s5">1</span><span class="s2">, </span><span class="s3">&quot;--freetype0&quot;</span><span class="s1">)</span>
+            <span class="s1">cls._run_checked_subprocess(cmd</span><span class="s2">, </span><span class="s1">tex)</span>
+        <span class="s2">return </span><span class="s1">pngfile</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">get_grey(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize=</span><span class="s2">None, </span><span class="s1">dpi=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the alpha channel.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">fontsize:</span>
+            <span class="s1">fontsize = mpl.rcParams[</span><span class="s3">'font.size'</span><span class="s1">]</span>
+        <span class="s2">if not </span><span class="s1">dpi:</span>
+            <span class="s1">dpi = mpl.rcParams[</span><span class="s3">'savefig.dpi'</span><span class="s1">]</span>
+        <span class="s1">key = cls._get_tex_source(tex</span><span class="s2">, </span><span class="s1">fontsize)</span><span class="s2">, </span><span class="s1">dpi</span>
+        <span class="s1">alpha = cls._grey_arrayd.get(key)</span>
+        <span class="s2">if </span><span class="s1">alpha </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">pngfile = cls.make_png(tex</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">dpi)</span>
+            <span class="s1">rgba = mpl.image.imread(os.path.join(cls.texcache</span><span class="s2">, </span><span class="s1">pngfile))</span>
+            <span class="s1">cls._grey_arrayd[key] = alpha = rgba[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">alpha</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">get_rgba(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize=</span><span class="s2">None, </span><span class="s1">dpi=</span><span class="s2">None, </span><span class="s1">rgb=(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Return latex's rendering of the tex string as an rgba array. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; texmanager = TexManager() 
+        &gt;&gt;&gt; s = r&quot;\TeX\ is $\displaystyle\sum_n\frac{-e^{i\pi}}{2^n}$!&quot; 
+        &gt;&gt;&gt; Z = texmanager.get_rgba(s, fontsize=12, dpi=80, rgb=(1, 0, 0)) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">alpha = cls.get_grey(tex</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">dpi)</span>
+        <span class="s1">rgba = np.empty((*alpha.shape</span><span class="s2">, </span><span class="s5">4</span><span class="s1">))</span>
+        <span class="s1">rgba[...</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = mpl.colors.to_rgb(rgb)</span>
+        <span class="s1">rgba[...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">] = alpha</span>
+        <span class="s2">return </span><span class="s1">rgba</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent(cls</span><span class="s2">, </span><span class="s1">tex</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">renderer=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Return width, height and descent of the text.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">tex.strip() == </span><span class="s3">''</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span>
+        <span class="s1">dvifile = cls.make_dvi(tex</span><span class="s2">, </span><span class="s1">fontsize)</span>
+        <span class="s1">dpi_fraction = renderer.points_to_pixels(</span><span class="s5">1.</span><span class="s1">) </span><span class="s2">if </span><span class="s1">renderer </span><span class="s2">else </span><span class="s5">1</span>
+        <span class="s2">with </span><span class="s1">dviread.Dvi(dvifile</span><span class="s2">, </span><span class="s5">72 </span><span class="s1">* dpi_fraction) </span><span class="s2">as </span><span class="s1">dvi:</span>
+            <span class="s1">page</span><span class="s2">, </span><span class="s1">= dvi</span>
+        <span class="s4"># A total height (including the descent) needs to be returned.</span>
+        <span class="s2">return </span><span class="s1">page.width</span><span class="s2">, </span><span class="s1">page.height + page.descent</span><span class="s2">, </span><span class="s1">page.descent</span>
+</pre>
+</body>
+</html>

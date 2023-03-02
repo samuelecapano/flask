@@ -1,0 +1,354 @@
+<html>
+<head>
+<title>_backend_gtk.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_backend_gtk.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Common code for GTK3 and GTK4 backends. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">backend_tools</span><span class="s2">, </span><span class="s1">cbook</span>
+<span class="s2">from </span><span class="s1">matplotlib._pylab_helpers </span><span class="s2">import </span><span class="s1">Gcf</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s2">, </span><span class="s1">FigureCanvasBase</span><span class="s2">, </span><span class="s1">FigureManagerBase</span><span class="s2">, </span><span class="s1">NavigationToolbar2</span><span class="s2">,</span>
+    <span class="s1">TimerBase)</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_tools </span><span class="s2">import </span><span class="s1">Cursors</span>
+
+<span class="s2">import </span><span class="s1">gi</span>
+<span class="s3"># The GTK3/GTK4 backends will have already called `gi.require_version` to set</span>
+<span class="s3"># the desired GTK.</span>
+<span class="s2">from </span><span class="s1">gi.repository </span><span class="s2">import </span><span class="s1">Gdk</span><span class="s2">, </span><span class="s1">Gio</span><span class="s2">, </span><span class="s1">GLib</span><span class="s2">, </span><span class="s1">Gtk</span>
+
+
+<span class="s2">try</span><span class="s1">:</span>
+    <span class="s1">gi.require_foreign(</span><span class="s4">&quot;cairo&quot;</span><span class="s1">)</span>
+<span class="s2">except </span><span class="s1">ImportError </span><span class="s2">as </span><span class="s1">e:</span>
+    <span class="s2">raise </span><span class="s1">ImportError(</span><span class="s4">&quot;Gtk-based backends require cairo&quot;</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+<span class="s1">_application = </span><span class="s2">None  </span><span class="s3"># Placeholder</span>
+
+
+<span class="s2">def </span><span class="s1">_shutdown_application(app):</span>
+    <span class="s3"># The application might prematurely shut down if Ctrl-C'd out of IPython,</span>
+    <span class="s3"># so close all windows.</span>
+    <span class="s2">for </span><span class="s1">win </span><span class="s2">in </span><span class="s1">app.get_windows():</span>
+        <span class="s1">win.close()</span>
+    <span class="s3"># The PyGObject wrapper incorrectly thinks that None is not allowed, or we</span>
+    <span class="s3"># would call this:</span>
+    <span class="s3"># Gio.Application.set_default(None)</span>
+    <span class="s3"># Instead, we set this property and ignore default applications with it:</span>
+    <span class="s1">app._created_by_matplotlib = </span><span class="s2">True</span>
+    <span class="s2">global </span><span class="s1">_application</span>
+    <span class="s1">_application = </span><span class="s2">None</span>
+
+
+<span class="s2">def </span><span class="s1">_create_application():</span>
+    <span class="s2">global </span><span class="s1">_application</span>
+
+    <span class="s2">if </span><span class="s1">_application </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">app = Gio.Application.get_default()</span>
+        <span class="s2">if </span><span class="s1">app </span><span class="s2">is None or </span><span class="s1">getattr(app</span><span class="s2">, </span><span class="s4">'_created_by_matplotlib'</span><span class="s2">, False</span><span class="s1">):</span>
+            <span class="s3"># display_is_valid returns False only if on Linux and neither X11</span>
+            <span class="s3"># nor Wayland display can be opened.</span>
+            <span class="s2">if not </span><span class="s1">mpl._c_internal_utils.display_is_valid():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Invalid DISPLAY variable'</span><span class="s1">)</span>
+            <span class="s1">_application = Gtk.Application.new(</span><span class="s4">'org.matplotlib.Matplotlib3'</span><span class="s2">,</span>
+                                               <span class="s1">Gio.ApplicationFlags.NON_UNIQUE)</span>
+            <span class="s3"># The activate signal must be connected, but we don't care for</span>
+            <span class="s3"># handling it, since we don't do any remote processing.</span>
+            <span class="s1">_application.connect(</span><span class="s4">'activate'</span><span class="s2">, lambda </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs: </span><span class="s2">None</span><span class="s1">)</span>
+            <span class="s1">_application.connect(</span><span class="s4">'shutdown'</span><span class="s2">, </span><span class="s1">_shutdown_application)</span>
+            <span class="s1">_application.register()</span>
+            <span class="s1">cbook._setup_new_guiapp()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">_application = app</span>
+
+    <span class="s2">return </span><span class="s1">_application</span>
+
+
+<span class="s2">def </span><span class="s1">mpl_to_gtk_cursor_name(mpl_cursor):</span>
+    <span class="s2">return </span><span class="s1">_api.check_getitem({</span>
+        <span class="s1">Cursors.MOVE: </span><span class="s4">&quot;move&quot;</span><span class="s2">,</span>
+        <span class="s1">Cursors.HAND: </span><span class="s4">&quot;pointer&quot;</span><span class="s2">,</span>
+        <span class="s1">Cursors.POINTER: </span><span class="s4">&quot;default&quot;</span><span class="s2">,</span>
+        <span class="s1">Cursors.SELECT_REGION: </span><span class="s4">&quot;crosshair&quot;</span><span class="s2">,</span>
+        <span class="s1">Cursors.WAIT: </span><span class="s4">&quot;wait&quot;</span><span class="s2">,</span>
+        <span class="s1">Cursors.RESIZE_HORIZONTAL: </span><span class="s4">&quot;ew-resize&quot;</span><span class="s2">,</span>
+        <span class="s1">Cursors.RESIZE_VERTICAL: </span><span class="s4">&quot;ns-resize&quot;</span><span class="s2">,</span>
+    <span class="s1">}</span><span class="s2">, </span><span class="s1">cursor=mpl_cursor)</span>
+
+
+<span class="s2">class </span><span class="s1">TimerGTK(TimerBase):</span>
+    <span class="s0">&quot;&quot;&quot;Subclass of `.TimerBase` using GTK timer events.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._timer = </span><span class="s2">None</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_timer_start(self):</span>
+        <span class="s3"># Need to stop it, otherwise we potentially leak a timer id that will</span>
+        <span class="s3"># never be stopped.</span>
+        <span class="s1">self._timer_stop()</span>
+        <span class="s1">self._timer = GLib.timeout_add(self._interval</span><span class="s2">, </span><span class="s1">self._on_timer)</span>
+
+    <span class="s2">def </span><span class="s1">_timer_stop(self):</span>
+        <span class="s2">if </span><span class="s1">self._timer </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">GLib.source_remove(self._timer)</span>
+            <span class="s1">self._timer = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_timer_set_interval(self):</span>
+        <span class="s3"># Only stop and restart it if the timer has already been started.</span>
+        <span class="s2">if </span><span class="s1">self._timer </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self._timer_stop()</span>
+            <span class="s1">self._timer_start()</span>
+
+    <span class="s2">def </span><span class="s1">_on_timer(self):</span>
+        <span class="s1">super()._on_timer()</span>
+
+        <span class="s3"># Gtk timeout_add() requires that the callback returns True if it</span>
+        <span class="s3"># is to be called again.</span>
+        <span class="s2">if </span><span class="s1">self.callbacks </span><span class="s2">and not </span><span class="s1">self._single:</span>
+            <span class="s2">return True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._timer = </span><span class="s2">None</span>
+            <span class="s2">return False</span>
+
+
+<span class="s2">class </span><span class="s1">_FigureCanvasGTK(FigureCanvasBase):</span>
+    <span class="s1">_timer_cls = TimerGTK</span>
+
+
+<span class="s2">class </span><span class="s1">_FigureManagerGTK(FigureManagerBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Attributes 
+    ---------- 
+    canvas : `FigureCanvas` 
+        The FigureCanvas instance 
+    num : int or str 
+        The Figure number 
+    toolbar : Gtk.Toolbar or Gtk.Box 
+        The toolbar 
+    vbox : Gtk.VBox 
+        The Gtk.VBox containing the canvas and toolbar 
+    window : Gtk.Window 
+        The Gtk.Window 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">canvas</span><span class="s2">, </span><span class="s1">num):</span>
+        <span class="s1">self._gtk_ver = gtk_ver = Gtk.get_major_version()</span>
+
+        <span class="s1">app = _create_application()</span>
+        <span class="s1">self.window = Gtk.Window()</span>
+        <span class="s1">app.add_window(self.window)</span>
+        <span class="s1">super().__init__(canvas</span><span class="s2">, </span><span class="s1">num)</span>
+
+        <span class="s2">if </span><span class="s1">gtk_ver == </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s1">self.window.set_wmclass(</span><span class="s4">&quot;matplotlib&quot;</span><span class="s2">, </span><span class="s4">&quot;Matplotlib&quot;</span><span class="s1">)</span>
+            <span class="s1">icon_ext = </span><span class="s4">&quot;png&quot; </span><span class="s2">if </span><span class="s1">sys.platform == </span><span class="s4">&quot;win32&quot; </span><span class="s2">else </span><span class="s4">&quot;svg&quot;</span>
+            <span class="s1">self.window.set_icon_from_file(</span>
+                <span class="s1">str(cbook._get_data_path(</span><span class="s4">f&quot;images/matplotlib.</span><span class="s2">{</span><span class="s1">icon_ext</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)))</span>
+
+        <span class="s1">self.vbox = Gtk.Box()</span>
+        <span class="s1">self.vbox.set_property(</span><span class="s4">&quot;orientation&quot;</span><span class="s2">, </span><span class="s1">Gtk.Orientation.VERTICAL)</span>
+
+        <span class="s2">if </span><span class="s1">gtk_ver == </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s1">self.window.add(self.vbox)</span>
+            <span class="s1">self.vbox.show()</span>
+            <span class="s1">self.canvas.show()</span>
+            <span class="s1">self.vbox.pack_start(self.canvas</span><span class="s2">, True, True, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">gtk_ver == </span><span class="s5">4</span><span class="s1">:</span>
+            <span class="s1">self.window.set_child(self.vbox)</span>
+            <span class="s1">self.vbox.prepend(self.canvas)</span>
+
+        <span class="s3"># calculate size for window</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h = self.canvas.get_width_height()</span>
+
+        <span class="s2">if </span><span class="s1">self.toolbar </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">gtk_ver == </span><span class="s5">3</span><span class="s1">:</span>
+                <span class="s1">self.toolbar.show()</span>
+                <span class="s1">self.vbox.pack_end(self.toolbar</span><span class="s2">, False, False, </span><span class="s5">0</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">gtk_ver == </span><span class="s5">4</span><span class="s1">:</span>
+                <span class="s1">sw = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER)</span>
+                <span class="s1">sw.set_child(self.toolbar)</span>
+                <span class="s1">self.vbox.append(sw)</span>
+            <span class="s1">min_size</span><span class="s2">, </span><span class="s1">nat_size = self.toolbar.get_preferred_size()</span>
+            <span class="s1">h += nat_size.height</span>
+
+        <span class="s1">self.window.set_default_size(w</span><span class="s2">, </span><span class="s1">h)</span>
+
+        <span class="s1">self._destroying = </span><span class="s2">False</span>
+        <span class="s1">self.window.connect(</span><span class="s4">&quot;destroy&quot;</span><span class="s2">, lambda </span><span class="s1">*args: Gcf.destroy(self))</span>
+        <span class="s1">self.window.connect({</span><span class="s5">3</span><span class="s1">: </span><span class="s4">&quot;delete_event&quot;</span><span class="s2">, </span><span class="s5">4</span><span class="s1">: </span><span class="s4">&quot;close-request&quot;</span><span class="s1">}[gtk_ver]</span><span class="s2">,</span>
+                            <span class="s2">lambda </span><span class="s1">*args: Gcf.destroy(self))</span>
+        <span class="s2">if </span><span class="s1">mpl.is_interactive():</span>
+            <span class="s1">self.window.show()</span>
+            <span class="s1">self.canvas.draw_idle()</span>
+
+        <span class="s1">self.canvas.grab_focus()</span>
+
+    <span class="s2">def </span><span class="s1">destroy(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s2">if </span><span class="s1">self._destroying:</span>
+            <span class="s3"># Otherwise, this can be called twice when the user presses 'q',</span>
+            <span class="s3"># which calls Gcf.destroy(self), then this destroy(), then triggers</span>
+            <span class="s3"># Gcf.destroy(self) once again via</span>
+            <span class="s3"># `connect(&quot;destroy&quot;, lambda *args: Gcf.destroy(self))`.</span>
+            <span class="s2">return</span>
+        <span class="s1">self._destroying = </span><span class="s2">True</span>
+        <span class="s1">self.window.destroy()</span>
+        <span class="s1">self.canvas.destroy()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">start_main_loop(cls):</span>
+        <span class="s2">global </span><span class="s1">_application</span>
+        <span class="s2">if </span><span class="s1">_application </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">_application.run()  </span><span class="s3"># Quits when all added windows close.</span>
+        <span class="s2">except </span><span class="s1">KeyboardInterrupt:</span>
+            <span class="s3"># Ensure all windows can process their close event from</span>
+            <span class="s3"># _shutdown_application.</span>
+            <span class="s1">context = GLib.MainContext.default()</span>
+            <span class="s2">while </span><span class="s1">context.pending():</span>
+                <span class="s1">context.iteration(</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s2">raise</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s3"># Running after quit is undefined, so create a new one next time.</span>
+            <span class="s1">_application = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">show(self):</span>
+        <span class="s3"># show the figure window</span>
+        <span class="s1">self.window.show()</span>
+        <span class="s1">self.canvas.draw()</span>
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s4">&quot;figure.raise_window&quot;</span><span class="s1">]:</span>
+            <span class="s1">meth_name = {</span><span class="s5">3</span><span class="s1">: </span><span class="s4">&quot;get_window&quot;</span><span class="s2">, </span><span class="s5">4</span><span class="s1">: </span><span class="s4">&quot;get_surface&quot;</span><span class="s1">}[self._gtk_ver]</span>
+            <span class="s2">if </span><span class="s1">getattr(self.window</span><span class="s2">, </span><span class="s1">meth_name)():</span>
+                <span class="s1">self.window.present()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s3"># If this is called by a callback early during init,</span>
+                <span class="s3"># self.window (a GtkWindow) may not have an associated</span>
+                <span class="s3"># low-level GdkWindow (on GTK3) or GdkSurface (on GTK4) yet,</span>
+                <span class="s3"># and present() would crash.</span>
+                <span class="s1">_api.warn_external(</span><span class="s4">&quot;Cannot raise window yet to be setup&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">full_screen_toggle(self):</span>
+        <span class="s1">is_fullscreen = {</span>
+            <span class="s5">3</span><span class="s1">: </span><span class="s2">lambda </span><span class="s1">w: (w.get_window().get_state()</span>
+                          <span class="s1">&amp; Gdk.WindowState.FULLSCREEN)</span><span class="s2">,</span>
+            <span class="s5">4</span><span class="s1">: </span><span class="s2">lambda </span><span class="s1">w: w.is_fullscreen()</span><span class="s2">,</span>
+        <span class="s1">}[self._gtk_ver]</span>
+        <span class="s2">if </span><span class="s1">is_fullscreen(self.window):</span>
+            <span class="s1">self.window.unfullscreen()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.window.fullscreen()</span>
+
+    <span class="s2">def </span><span class="s1">get_window_title(self):</span>
+        <span class="s2">return </span><span class="s1">self.window.get_title()</span>
+
+    <span class="s2">def </span><span class="s1">set_window_title(self</span><span class="s2">, </span><span class="s1">title):</span>
+        <span class="s1">self.window.set_title(title)</span>
+
+    <span class="s2">def </span><span class="s1">resize(self</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height):</span>
+        <span class="s1">width = int(width / self.canvas.device_pixel_ratio)</span>
+        <span class="s1">height = int(height / self.canvas.device_pixel_ratio)</span>
+        <span class="s2">if </span><span class="s1">self.toolbar:</span>
+            <span class="s1">min_size</span><span class="s2">, </span><span class="s1">nat_size = self.toolbar.get_preferred_size()</span>
+            <span class="s1">height += nat_size.height</span>
+        <span class="s1">canvas_size = self.canvas.get_allocation()</span>
+        <span class="s2">if </span><span class="s1">self._gtk_ver &gt;= </span><span class="s5">4 </span><span class="s2">or </span><span class="s1">canvas_size.width == canvas_size.height == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s3"># A canvas size of (1, 1) cannot exist in most cases, because</span>
+            <span class="s3"># window decorations would prevent such a small window. This call</span>
+            <span class="s3"># must be before the window has been mapped and widgets have been</span>
+            <span class="s3"># sized, so just change the window's starting size.</span>
+            <span class="s1">self.window.set_default_size(width</span><span class="s2">, </span><span class="s1">height)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.window.resize(width</span><span class="s2">, </span><span class="s1">height)</span>
+
+
+<span class="s2">class </span><span class="s1">_NavigationToolbar2GTK(NavigationToolbar2):</span>
+    <span class="s3"># Must be implemented in GTK3/GTK4 backends:</span>
+    <span class="s3"># * __init__</span>
+    <span class="s3"># * save_figure</span>
+
+    <span class="s2">def </span><span class="s1">set_message(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s1">escaped = GLib.markup_escape_text(s)</span>
+        <span class="s1">self.message.set_markup(</span><span class="s4">f'&lt;small&gt;</span><span class="s2">{</span><span class="s1">escaped</span><span class="s2">}</span><span class="s4">&lt;/small&gt;'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">draw_rubberband(self</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1):</span>
+        <span class="s1">height = self.canvas.figure.bbox.height</span>
+        <span class="s1">y1 = height - y1</span>
+        <span class="s1">y0 = height - y0</span>
+        <span class="s1">rect = [int(val) </span><span class="s2">for </span><span class="s1">val </span><span class="s2">in </span><span class="s1">(x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1 - x0</span><span class="s2">, </span><span class="s1">y1 - y0)]</span>
+        <span class="s1">self.canvas._draw_rubberband(rect)</span>
+
+    <span class="s2">def </span><span class="s1">remove_rubberband(self):</span>
+        <span class="s1">self.canvas._draw_rubberband(</span><span class="s2">None</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_update_buttons_checked(self):</span>
+        <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">active </span><span class="s2">in </span><span class="s1">[(</span><span class="s4">&quot;Pan&quot;</span><span class="s2">, </span><span class="s4">&quot;PAN&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;Zoom&quot;</span><span class="s2">, </span><span class="s4">&quot;ZOOM&quot;</span><span class="s1">)]:</span>
+            <span class="s1">button = self._gtk_ids.get(name)</span>
+            <span class="s2">if </span><span class="s1">button:</span>
+                <span class="s2">with </span><span class="s1">button.handler_block(button._signal_handler):</span>
+                    <span class="s1">button.set_active(self.mode.name == active)</span>
+
+    <span class="s2">def </span><span class="s1">pan(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().pan(*args)</span>
+        <span class="s1">self._update_buttons_checked()</span>
+
+    <span class="s2">def </span><span class="s1">zoom(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().zoom(*args)</span>
+        <span class="s1">self._update_buttons_checked()</span>
+
+    <span class="s2">def </span><span class="s1">set_history_buttons(self):</span>
+        <span class="s1">can_backward = self._nav_stack._pos &gt; </span><span class="s5">0</span>
+        <span class="s1">can_forward = self._nav_stack._pos &lt; len(self._nav_stack._elements) - </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s4">'Back' </span><span class="s2">in </span><span class="s1">self._gtk_ids:</span>
+            <span class="s1">self._gtk_ids[</span><span class="s4">'Back'</span><span class="s1">].set_sensitive(can_backward)</span>
+        <span class="s2">if </span><span class="s4">'Forward' </span><span class="s2">in </span><span class="s1">self._gtk_ids:</span>
+            <span class="s1">self._gtk_ids[</span><span class="s4">'Forward'</span><span class="s1">].set_sensitive(can_forward)</span>
+
+
+<span class="s2">class </span><span class="s1">RubberbandGTK(backend_tools.RubberbandBase):</span>
+    <span class="s2">def </span><span class="s1">draw_rubberband(self</span><span class="s2">, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1):</span>
+        <span class="s1">_NavigationToolbar2GTK.draw_rubberband(</span>
+            <span class="s1">self._make_classic_style_pseudo_toolbar()</span><span class="s2">, None, </span><span class="s1">x0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1)</span>
+
+    <span class="s2">def </span><span class="s1">remove_rubberband(self):</span>
+        <span class="s1">_NavigationToolbar2GTK.remove_rubberband(</span>
+            <span class="s1">self._make_classic_style_pseudo_toolbar())</span>
+
+
+<span class="s2">class </span><span class="s1">ConfigureSubplotsGTK(backend_tools.ConfigureSubplotsBase):</span>
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">_NavigationToolbar2GTK.configure_subplots(self</span><span class="s2">, None</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">_BackendGTK(_Backend):</span>
+    <span class="s1">backend_version = </span><span class="s4">&quot;%s.%s.%s&quot; </span><span class="s1">% (</span>
+        <span class="s1">Gtk.get_major_version()</span><span class="s2">,</span>
+        <span class="s1">Gtk.get_minor_version()</span><span class="s2">,</span>
+        <span class="s1">Gtk.get_micro_version()</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s1">mainloop = _FigureManagerGTK.start_main_loop</span>
+</pre>
+</body>
+</html>

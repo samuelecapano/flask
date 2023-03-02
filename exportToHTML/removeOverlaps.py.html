@@ -1,0 +1,270 @@
+<html>
+<head>
+<title>removeOverlaps.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+removeOverlaps.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; Simplify TrueType glyphs by merging overlapping contours/components. 
+ 
+Requires https://github.com/fonttools/skia-pathops 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Iterable</span><span class="s2">, </span><span class="s1">Optional</span><span class="s2">, </span><span class="s1">Mapping</span>
+
+<span class="s2">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s2">import </span><span class="s1">otRound</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">ttFont</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s2">import </span><span class="s1">_g_l_y_f</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s2">import </span><span class="s1">_h_m_t_x</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.ttGlyphPen </span><span class="s2">import </span><span class="s1">TTGlyphPen</span>
+
+<span class="s2">import </span><span class="s1">pathops</span>
+
+
+<span class="s1">__all__ = [</span><span class="s3">&quot;removeOverlaps&quot;</span><span class="s1">]</span>
+
+
+<span class="s2">class </span><span class="s1">RemoveOverlapsError(Exception):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s1">log = logging.getLogger(</span><span class="s3">&quot;fontTools.ttLib.removeOverlaps&quot;</span><span class="s1">)</span>
+
+<span class="s1">_TTGlyphMapping = Mapping[str</span><span class="s2">, </span><span class="s1">ttFont._TTGlyph]</span>
+
+
+<span class="s2">def </span><span class="s1">skPathFromGlyph(glyphName: str</span><span class="s2">, </span><span class="s1">glyphSet: _TTGlyphMapping) -&gt; pathops.Path:</span>
+    <span class="s1">path = pathops.Path()</span>
+    <span class="s1">pathPen = path.getPen(glyphSet=glyphSet)</span>
+    <span class="s1">glyphSet[glyphName].draw(pathPen)</span>
+    <span class="s2">return </span><span class="s1">path</span>
+
+
+<span class="s2">def </span><span class="s1">skPathFromGlyphComponent(</span>
+    <span class="s1">component: _g_l_y_f.GlyphComponent</span><span class="s2">, </span><span class="s1">glyphSet: _TTGlyphMapping</span>
+<span class="s1">):</span>
+    <span class="s1">baseGlyphName</span><span class="s2">, </span><span class="s1">transformation = component.getComponentInfo()</span>
+    <span class="s1">path = skPathFromGlyph(baseGlyphName</span><span class="s2">, </span><span class="s1">glyphSet)</span>
+    <span class="s2">return </span><span class="s1">path.transform(*transformation)</span>
+
+
+<span class="s2">def </span><span class="s1">componentsOverlap(glyph: _g_l_y_f.Glyph</span><span class="s2">, </span><span class="s1">glyphSet: _TTGlyphMapping) -&gt; bool:</span>
+    <span class="s2">if not </span><span class="s1">glyph.isComposite():</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;This method only works with TrueType composite glyphs&quot;</span><span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">len(glyph.components) &lt; </span><span class="s4">2</span><span class="s1">:</span>
+        <span class="s2">return False  </span><span class="s5"># single component, no overlaps</span>
+
+    <span class="s1">component_paths = {}</span>
+
+    <span class="s2">def </span><span class="s1">_get_nth_component_path(index: int) -&gt; pathops.Path:</span>
+        <span class="s2">if </span><span class="s1">index </span><span class="s2">not in </span><span class="s1">component_paths:</span>
+            <span class="s1">component_paths[index] = skPathFromGlyphComponent(</span>
+                <span class="s1">glyph.components[index]</span><span class="s2">, </span><span class="s1">glyphSet</span>
+            <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">component_paths[index]</span>
+
+    <span class="s2">return </span><span class="s1">any(</span>
+        <span class="s1">pathops.op(</span>
+            <span class="s1">_get_nth_component_path(i)</span><span class="s2">,</span>
+            <span class="s1">_get_nth_component_path(j)</span><span class="s2">,</span>
+            <span class="s1">pathops.PathOp.INTERSECTION</span><span class="s2">,</span>
+            <span class="s1">fix_winding=</span><span class="s2">False,</span>
+            <span class="s1">keep_starting_points=</span><span class="s2">False,</span>
+        <span class="s1">)</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j </span><span class="s2">in </span><span class="s1">itertools.combinations(range(len(glyph.components))</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">ttfGlyphFromSkPath(path: pathops.Path) -&gt; _g_l_y_f.Glyph:</span>
+    <span class="s5"># Skia paths have no 'components', no need for glyphSet</span>
+    <span class="s1">ttPen = TTGlyphPen(glyphSet=</span><span class="s2">None</span><span class="s1">)</span>
+    <span class="s1">path.draw(ttPen)</span>
+    <span class="s1">glyph = ttPen.glyph()</span>
+    <span class="s2">assert not </span><span class="s1">glyph.isComposite()</span>
+    <span class="s5"># compute glyph.xMin (glyfTable parameter unused for non composites)</span>
+    <span class="s1">glyph.recalcBounds(glyfTable=</span><span class="s2">None</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">glyph</span>
+
+
+<span class="s2">def </span><span class="s1">_round_path(</span>
+    <span class="s1">path: pathops.Path</span><span class="s2">, </span><span class="s1">round: Callable[[float]</span><span class="s2">, </span><span class="s1">float] = otRound</span>
+<span class="s1">) -&gt; pathops.Path:</span>
+    <span class="s1">rounded_path = pathops.Path()</span>
+    <span class="s2">for </span><span class="s1">verb</span><span class="s2">, </span><span class="s1">points </span><span class="s2">in </span><span class="s1">path:</span>
+        <span class="s1">rounded_path.add(verb</span><span class="s2">, </span><span class="s1">*((round(p[</span><span class="s4">0</span><span class="s1">])</span><span class="s2">, </span><span class="s1">round(p[</span><span class="s4">1</span><span class="s1">])) </span><span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">points))</span>
+    <span class="s2">return </span><span class="s1">rounded_path</span>
+
+
+<span class="s2">def </span><span class="s1">_simplify(path: pathops.Path</span><span class="s2">, </span><span class="s1">debugGlyphName: str) -&gt; pathops.Path:</span>
+    <span class="s5"># skia-pathops has a bug where it sometimes fails to simplify paths when there</span>
+    <span class="s5"># are float coordinates and control points are very close to one another.</span>
+    <span class="s5"># Rounding coordinates to integers works around the bug.</span>
+    <span class="s5"># Since we are going to round glyf coordinates later on anyway, here it is</span>
+    <span class="s5"># ok(-ish) to also round before simplify. Better than failing the whole process</span>
+    <span class="s5"># for the entire font.</span>
+    <span class="s5"># https://bugs.chromium.org/p/skia/issues/detail?id=11958</span>
+    <span class="s5"># https://github.com/google/fonts/issues/3365</span>
+    <span class="s5"># TODO(anthrotype): remove once this Skia bug is fixed</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">pathops.simplify(path</span><span class="s2">, </span><span class="s1">clockwise=path.clockwise)</span>
+    <span class="s2">except </span><span class="s1">pathops.PathOpsError:</span>
+        <span class="s2">pass</span>
+
+    <span class="s1">path = _round_path(path)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">path = pathops.simplify(path</span><span class="s2">, </span><span class="s1">clockwise=path.clockwise)</span>
+        <span class="s1">log.debug(</span>
+            <span class="s3">&quot;skia-pathops failed to simplify '%s' with float coordinates, &quot;</span>
+            <span class="s3">&quot;but succeded using rounded integer coordinates&quot;</span><span class="s2">,</span>
+            <span class="s1">debugGlyphName</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">path</span>
+    <span class="s2">except </span><span class="s1">pathops.PathOpsError </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">if </span><span class="s1">log.isEnabledFor(logging.DEBUG):</span>
+            <span class="s1">path.dump()</span>
+        <span class="s2">raise </span><span class="s1">RemoveOverlapsError(</span>
+            <span class="s3">f&quot;Failed to remove overlaps from glyph </span><span class="s2">{</span><span class="s1">debugGlyphName</span><span class="s2">!r}</span><span class="s3">&quot;</span>
+        <span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+    <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s3">&quot;Unreachable&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">removeTTGlyphOverlaps(</span>
+    <span class="s1">glyphName: str</span><span class="s2">,</span>
+    <span class="s1">glyphSet: _TTGlyphMapping</span><span class="s2">,</span>
+    <span class="s1">glyfTable: _g_l_y_f.table__g_l_y_f</span><span class="s2">,</span>
+    <span class="s1">hmtxTable: _h_m_t_x.table__h_m_t_x</span><span class="s2">,</span>
+    <span class="s1">removeHinting: bool = </span><span class="s2">True,</span>
+<span class="s1">) -&gt; bool:</span>
+    <span class="s1">glyph = glyfTable[glyphName]</span>
+    <span class="s5"># decompose composite glyphs only if components overlap each other</span>
+    <span class="s2">if </span><span class="s1">(</span>
+        <span class="s1">glyph.numberOfContours &gt; </span><span class="s4">0</span>
+        <span class="s2">or </span><span class="s1">glyph.isComposite()</span>
+        <span class="s2">and </span><span class="s1">componentsOverlap(glyph</span><span class="s2">, </span><span class="s1">glyphSet)</span>
+    <span class="s1">):</span>
+        <span class="s1">path = skPathFromGlyph(glyphName</span><span class="s2">, </span><span class="s1">glyphSet)</span>
+
+        <span class="s5"># remove overlaps</span>
+        <span class="s1">path2 = _simplify(path</span><span class="s2">, </span><span class="s1">glyphName)</span>
+
+        <span class="s5"># replace TTGlyph if simplified path is different (ignoring contour order)</span>
+        <span class="s2">if </span><span class="s1">{tuple(c) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">path.contours} != {tuple(c) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">path2.contours}:</span>
+            <span class="s1">glyfTable[glyphName] = glyph = ttfGlyphFromSkPath(path2)</span>
+            <span class="s5"># simplified glyph is always unhinted</span>
+            <span class="s2">assert not </span><span class="s1">glyph.program</span>
+            <span class="s5"># also ensure hmtx LSB == glyph.xMin so glyph origin is at x=0</span>
+            <span class="s1">width</span><span class="s2">, </span><span class="s1">lsb = hmtxTable[glyphName]</span>
+            <span class="s2">if </span><span class="s1">lsb != glyph.xMin:</span>
+                <span class="s1">hmtxTable[glyphName] = (width</span><span class="s2">, </span><span class="s1">glyph.xMin)</span>
+            <span class="s2">return True</span>
+
+    <span class="s2">if </span><span class="s1">removeHinting:</span>
+        <span class="s1">glyph.removeHinting()</span>
+    <span class="s2">return False</span>
+
+
+<span class="s2">def </span><span class="s1">removeOverlaps(</span>
+    <span class="s1">font: ttFont.TTFont</span><span class="s2">,</span>
+    <span class="s1">glyphNames: Optional[Iterable[str]] = </span><span class="s2">None,</span>
+    <span class="s1">removeHinting: bool = </span><span class="s2">True,</span>
+    <span class="s1">ignoreErrors=</span><span class="s2">False,</span>
+<span class="s1">) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+    <span class="s0">&quot;&quot;&quot;Simplify glyphs in TTFont by merging overlapping contours. 
+ 
+    Overlapping components are first decomposed to simple contours, then merged. 
+ 
+    Currently this only works with TrueType fonts with 'glyf' table. 
+    Raises NotImplementedError if 'glyf' table is absent. 
+ 
+    Note that removing overlaps invalidates the hinting. By default we drop hinting 
+    from all glyphs whether or not overlaps are removed from a given one, as it would 
+    look weird if only some glyphs are left (un)hinted. 
+ 
+    Args: 
+        font: input TTFont object, modified in place. 
+        glyphNames: optional iterable of glyph names (str) to remove overlaps from. 
+            By default, all glyphs in the font are processed. 
+        removeHinting (bool): set to False to keep hinting for unmodified glyphs. 
+        ignoreErrors (bool): set to True to ignore errors while removing overlaps, 
+            thus keeping the tricky glyphs unchanged (fonttools/fonttools#2363). 
+    &quot;&quot;&quot;</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">glyfTable = font[</span><span class="s3">&quot;glyf&quot;</span><span class="s1">]</span>
+    <span class="s2">except </span><span class="s1">KeyError:</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s3">&quot;removeOverlaps currently only works with TTFs&quot;</span><span class="s1">)</span>
+
+    <span class="s1">hmtxTable = font[</span><span class="s3">&quot;hmtx&quot;</span><span class="s1">]</span>
+    <span class="s5"># wraps the underlying glyf Glyphs, takes care of interfacing with drawing pens</span>
+    <span class="s1">glyphSet = font.getGlyphSet()</span>
+
+    <span class="s2">if </span><span class="s1">glyphNames </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">glyphNames = font.getGlyphOrder()</span>
+
+    <span class="s5"># process all simple glyphs first, then composites with increasing component depth,</span>
+    <span class="s5"># so that by the time we test for component intersections the respective base glyphs</span>
+    <span class="s5"># have already been simplified</span>
+    <span class="s1">glyphNames = sorted(</span>
+        <span class="s1">glyphNames</span><span class="s2">,</span>
+        <span class="s1">key=</span><span class="s2">lambda </span><span class="s1">name: (</span>
+            <span class="s1">glyfTable[name].getCompositeMaxpValues(glyfTable).maxComponentDepth</span>
+            <span class="s2">if </span><span class="s1">glyfTable[name].isComposite()</span>
+            <span class="s2">else </span><span class="s4">0</span><span class="s2">,</span>
+            <span class="s1">name</span><span class="s2">,</span>
+        <span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s1">modified = set()</span>
+    <span class="s2">for </span><span class="s1">glyphName </span><span class="s2">in </span><span class="s1">glyphNames:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">removeTTGlyphOverlaps(</span>
+                <span class="s1">glyphName</span><span class="s2">, </span><span class="s1">glyphSet</span><span class="s2">, </span><span class="s1">glyfTable</span><span class="s2">, </span><span class="s1">hmtxTable</span><span class="s2">, </span><span class="s1">removeHinting</span>
+            <span class="s1">):</span>
+                <span class="s1">modified.add(glyphName)</span>
+        <span class="s2">except </span><span class="s1">RemoveOverlapsError:</span>
+            <span class="s2">if not </span><span class="s1">ignoreErrors:</span>
+                <span class="s2">raise</span>
+            <span class="s1">log.error(</span><span class="s3">&quot;Failed to remove overlaps for '%s'&quot;</span><span class="s2">, </span><span class="s1">glyphName)</span>
+
+    <span class="s1">log.debug(</span><span class="s3">&quot;Removed overlaps for %s glyphs:</span><span class="s2">\n</span><span class="s3">%s&quot;</span><span class="s2">, </span><span class="s1">len(modified)</span><span class="s2">, </span><span class="s3">&quot; &quot;</span><span class="s1">.join(modified))</span>
+
+
+<span class="s2">def </span><span class="s1">main(args=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s2">import </span><span class="s1">sys</span>
+
+    <span class="s2">if </span><span class="s1">args </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">args = sys.argv[</span><span class="s4">1</span><span class="s1">:]</span>
+
+    <span class="s2">if </span><span class="s1">len(args) &lt; </span><span class="s4">2</span><span class="s1">:</span>
+        <span class="s1">print(</span>
+            <span class="s3">f&quot;usage: fonttools ttLib.removeOverlaps INPUT.ttf OUTPUT.ttf [GLYPHS ...]&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">sys.exit(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">src = args[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">dst = args[</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s1">glyphNames = args[</span><span class="s4">2</span><span class="s1">:] </span><span class="s2">or None</span>
+
+    <span class="s2">with </span><span class="s1">ttFont.TTFont(src) </span><span class="s2">as </span><span class="s1">f:</span>
+        <span class="s1">removeOverlaps(f</span><span class="s2">, </span><span class="s1">glyphNames)</span>
+        <span class="s1">f.save(dst)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+    <span class="s1">main()</span>
+</pre>
+</body>
+</html>

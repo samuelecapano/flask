@@ -1,0 +1,1555 @@
+<html>
+<head>
+<title>woff2.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #a5c261;}
+.s5 { color: #808080;}
+.s6 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+woff2.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">BytesIO</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">array</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">OrderedDict</span>
+<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">sstruct</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.arrayTools </span><span class="s0">import </span><span class="s1">calcIntBounds</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">Tag</span><span class="s0">, </span><span class="s1">bytechr</span><span class="s0">, </span><span class="s1">byteord</span><span class="s0">, </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">pad</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib </span><span class="s0">import </span><span class="s1">(TTFont</span><span class="s0">, </span><span class="s1">TTLibError</span><span class="s0">, </span><span class="s1">getTableModule</span><span class="s0">, </span><span class="s1">getTableClass</span><span class="s0">,</span>
+	<span class="s1">getSearchRange)</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.sfnt </span><span class="s0">import </span><span class="s1">(SFNTReader</span><span class="s0">, </span><span class="s1">SFNTWriter</span><span class="s0">, </span><span class="s1">DirectoryEntry</span><span class="s0">,</span>
+	<span class="s1">WOFFFlavorData</span><span class="s0">, </span><span class="s1">sfntDirectoryFormat</span><span class="s0">, </span><span class="s1">sfntDirectorySize</span><span class="s0">, </span><span class="s1">SFNTDirectoryEntry</span><span class="s0">,</span>
+	<span class="s1">sfntDirectoryEntrySize</span><span class="s0">, </span><span class="s1">calcChecksum)</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s0">import </span><span class="s1">ttProgram</span><span class="s0">, </span><span class="s1">_g_l_y_f</span>
+<span class="s0">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(</span><span class="s2">&quot;fontTools.ttLib.woff2&quot;</span><span class="s1">)</span>
+
+<span class="s1">haveBrotli = </span><span class="s0">False</span>
+<span class="s0">try</span><span class="s1">:</span>
+	<span class="s0">try</span><span class="s1">:</span>
+		<span class="s0">import </span><span class="s1">brotlicffi </span><span class="s0">as </span><span class="s1">brotli</span>
+	<span class="s0">except </span><span class="s1">ImportError:</span>
+		<span class="s0">import </span><span class="s1">brotli</span>
+	<span class="s1">haveBrotli = </span><span class="s0">True</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+	<span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2Reader(SFNTReader):</span>
+
+	<span class="s1">flavor = </span><span class="s2">&quot;woff2&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">file</span><span class="s0">, </span><span class="s1">checkChecksums=</span><span class="s3">0</span><span class="s0">, </span><span class="s1">fontNumber=-</span><span class="s3">1</span><span class="s1">):</span>
+		<span class="s0">if not </span><span class="s1">haveBrotli:</span>
+			<span class="s1">log.error(</span>
+				<span class="s2">'The WOFF2 decoder requires the Brotli Python extension, available at: '</span>
+				<span class="s2">'https://github.com/google/brotli'</span><span class="s1">)</span>
+			<span class="s0">raise </span><span class="s1">ImportError(</span><span class="s2">&quot;No module named brotli&quot;</span><span class="s1">)</span>
+
+		<span class="s1">self.file = file</span>
+
+		<span class="s1">signature = Tag(self.file.read(</span><span class="s3">4</span><span class="s1">))</span>
+		<span class="s0">if </span><span class="s1">signature != </span><span class="s4">b&quot;wOF2&quot;</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;Not a WOFF2 font (bad signature)&quot;</span><span class="s1">)</span>
+
+		<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s1">)</span>
+		<span class="s1">self.DirectoryEntry = WOFF2DirectoryEntry</span>
+		<span class="s1">data = self.file.read(woff2DirectorySize)</span>
+		<span class="s0">if </span><span class="s1">len(data) != woff2DirectorySize:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'Not a WOFF2 font (not enough data)'</span><span class="s1">)</span>
+		<span class="s1">sstruct.unpack(woff2DirectoryFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">self)</span>
+
+		<span class="s1">self.tables = OrderedDict()</span>
+		<span class="s1">offset = </span><span class="s3">0</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.numTables):</span>
+			<span class="s1">entry = self.DirectoryEntry()</span>
+			<span class="s1">entry.fromFile(self.file)</span>
+			<span class="s1">tag = Tag(entry.tag)</span>
+			<span class="s1">self.tables[tag] = entry</span>
+			<span class="s1">entry.offset = offset</span>
+			<span class="s1">offset += entry.length</span>
+
+		<span class="s1">totalUncompressedSize = offset</span>
+		<span class="s1">compressedData = self.file.read(self.totalCompressedSize)</span>
+		<span class="s1">decompressedData = brotli.decompress(compressedData)</span>
+		<span class="s0">if </span><span class="s1">len(decompressedData) != totalUncompressedSize:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span>
+				<span class="s2">'unexpected size for decompressed font data: expected %d, found %d'</span>
+				<span class="s1">% (totalUncompressedSize</span><span class="s0">, </span><span class="s1">len(decompressedData)))</span>
+		<span class="s1">self.transformBuffer = BytesIO(decompressedData)</span>
+
+		<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s0">, </span><span class="s3">2</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">self.length != self.file.tell():</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;reported 'length' doesn't match the actual file size&quot;</span><span class="s1">)</span>
+
+		<span class="s1">self.flavorData = WOFF2FlavorData(self)</span>
+
+		<span class="s5"># make empty TTFont to store data while reconstructing tables</span>
+		<span class="s1">self.ttFont = TTFont(recalcBBoxes=</span><span class="s0">False, </span><span class="s1">recalcTimestamp=</span><span class="s0">False</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s6">&quot;&quot;&quot;Fetch the raw table data. Reconstruct transformed tables.&quot;&quot;&quot;</span>
+		<span class="s1">entry = self.tables[Tag(tag)]</span>
+		<span class="s0">if not </span><span class="s1">hasattr(entry</span><span class="s0">, </span><span class="s2">'data'</span><span class="s1">):</span>
+			<span class="s0">if </span><span class="s1">entry.transformed:</span>
+				<span class="s1">entry.data = self.reconstructTable(tag)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">entry.data = entry.loadData(self.transformBuffer)</span>
+		<span class="s0">return </span><span class="s1">entry.data</span>
+
+	<span class="s0">def </span><span class="s1">reconstructTable(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s6">&quot;&quot;&quot;Reconstruct table named 'tag' from transformed data.&quot;&quot;&quot;</span>
+		<span class="s1">entry = self.tables[Tag(tag)]</span>
+		<span class="s1">rawData = entry.loadData(self.transformBuffer)</span>
+		<span class="s0">if </span><span class="s1">tag == </span><span class="s2">'glyf'</span><span class="s1">:</span>
+			<span class="s5"># no need to pad glyph data when reconstructing</span>
+			<span class="s1">padding = self.padding </span><span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s2">'padding'</span><span class="s1">) </span><span class="s0">else None</span>
+			<span class="s1">data = self._reconstructGlyf(rawData</span><span class="s0">, </span><span class="s1">padding)</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s2">'loca'</span><span class="s1">:</span>
+			<span class="s1">data = self._reconstructLoca()</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s2">'hmtx'</span><span class="s1">:</span>
+			<span class="s1">data = self._reconstructHmtx(rawData)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;transform for table '%s' is unknown&quot; </span><span class="s1">% tag)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_reconstructGlyf(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">padding=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s6">&quot;&quot;&quot; Return recostructed glyf table data, and set the corresponding loca's 
+        locations. Optionally pad glyph offsets to the specified number of bytes. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">self.ttFont[</span><span class="s2">'loca'</span><span class="s1">] = WOFF2LocaTable()</span>
+		<span class="s1">glyfTable = self.ttFont[</span><span class="s2">'glyf'</span><span class="s1">] = WOFF2GlyfTable()</span>
+		<span class="s1">glyfTable.reconstruct(data</span><span class="s0">, </span><span class="s1">self.ttFont)</span>
+		<span class="s0">if </span><span class="s1">padding:</span>
+			<span class="s1">glyfTable.padding = padding</span>
+		<span class="s1">data = glyfTable.compile(self.ttFont)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_reconstructLoca(self):</span>
+		<span class="s6">&quot;&quot;&quot; Return reconstructed loca table data. &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s2">'loca' </span><span class="s0">not in </span><span class="s1">self.ttFont:</span>
+			<span class="s5"># make sure glyf is reconstructed first</span>
+			<span class="s1">self.tables[</span><span class="s2">'glyf'</span><span class="s1">].data = self.reconstructTable(</span><span class="s2">'glyf'</span><span class="s1">)</span>
+		<span class="s1">locaTable = self.ttFont[</span><span class="s2">'loca'</span><span class="s1">]</span>
+		<span class="s1">data = locaTable.compile(self.ttFont)</span>
+		<span class="s0">if </span><span class="s1">len(data) != self.tables[</span><span class="s2">'loca'</span><span class="s1">].origLength:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span>
+				<span class="s2">&quot;reconstructed 'loca' table doesn't match original size: &quot;</span>
+				<span class="s2">&quot;expected %d, found %d&quot;</span>
+				<span class="s1">% (self.tables[</span><span class="s2">'loca'</span><span class="s1">].origLength</span><span class="s0">, </span><span class="s1">len(data)))</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_reconstructHmtx(self</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s6">&quot;&quot;&quot; Return reconstructed hmtx table data. &quot;&quot;&quot;</span>
+		<span class="s5"># Before reconstructing 'hmtx' table we need to parse other tables:</span>
+		<span class="s5"># 'glyf' is required for reconstructing the sidebearings from the glyphs'</span>
+		<span class="s5"># bounding box; 'hhea' is needed for the numberOfHMetrics field.</span>
+		<span class="s0">if </span><span class="s2">&quot;glyf&quot; </span><span class="s0">in </span><span class="s1">self.flavorData.transformedTables:</span>
+			<span class="s5"># transformed 'glyf' table is self-contained, thus 'loca' not needed</span>
+			<span class="s1">tableDependencies = (</span><span class="s2">&quot;maxp&quot;</span><span class="s0">, </span><span class="s2">&quot;hhea&quot;</span><span class="s0">, </span><span class="s2">&quot;glyf&quot;</span><span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># decompiling untransformed 'glyf' requires 'loca', which requires 'head'</span>
+			<span class="s1">tableDependencies = (</span><span class="s2">&quot;maxp&quot;</span><span class="s0">, </span><span class="s2">&quot;head&quot;</span><span class="s0">, </span><span class="s2">&quot;hhea&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s0">, </span><span class="s2">&quot;glyf&quot;</span><span class="s1">)</span>
+		<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">tableDependencies:</span>
+			<span class="s1">self._decompileTable(tag)</span>
+		<span class="s1">hmtxTable = self.ttFont[</span><span class="s2">&quot;hmtx&quot;</span><span class="s1">] = WOFF2HmtxTable()</span>
+		<span class="s1">hmtxTable.reconstruct(data</span><span class="s0">, </span><span class="s1">self.ttFont)</span>
+		<span class="s1">data = hmtxTable.compile(self.ttFont)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_decompileTable(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s6">&quot;&quot;&quot;Decompile table data and store it inside self.ttFont.&quot;&quot;&quot;</span>
+		<span class="s1">data = self[tag]</span>
+		<span class="s0">if </span><span class="s1">self.ttFont.isLoaded(tag):</span>
+			<span class="s0">return </span><span class="s1">self.ttFont[tag]</span>
+		<span class="s1">tableClass = getTableClass(tag)</span>
+		<span class="s1">table = tableClass(tag)</span>
+		<span class="s1">self.ttFont.tables[tag] = table</span>
+		<span class="s1">table.decompile(data</span><span class="s0">, </span><span class="s1">self.ttFont)</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2Writer(SFNTWriter):</span>
+
+	<span class="s1">flavor = </span><span class="s2">&quot;woff2&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">file</span><span class="s0">, </span><span class="s1">numTables</span><span class="s0">, </span><span class="s1">sfntVersion=</span><span class="s2">&quot;</span><span class="s0">\000\001\000\000</span><span class="s2">&quot;</span><span class="s0">,</span>
+		         <span class="s1">flavor=</span><span class="s0">None, </span><span class="s1">flavorData=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">if not </span><span class="s1">haveBrotli:</span>
+			<span class="s1">log.error(</span>
+				<span class="s2">'The WOFF2 encoder requires the Brotli Python extension, available at: '</span>
+				<span class="s2">'https://github.com/google/brotli'</span><span class="s1">)</span>
+			<span class="s0">raise </span><span class="s1">ImportError(</span><span class="s2">&quot;No module named brotli&quot;</span><span class="s1">)</span>
+
+		<span class="s1">self.file = file</span>
+		<span class="s1">self.numTables = numTables</span>
+		<span class="s1">self.sfntVersion = Tag(sfntVersion)</span>
+		<span class="s1">self.flavorData = WOFF2FlavorData(data=flavorData)</span>
+
+		<span class="s1">self.directoryFormat = woff2DirectoryFormat</span>
+		<span class="s1">self.directorySize = woff2DirectorySize</span>
+		<span class="s1">self.DirectoryEntry = WOFF2DirectoryEntry</span>
+
+		<span class="s1">self.signature = Tag(</span><span class="s2">&quot;wOF2&quot;</span><span class="s1">)</span>
+
+		<span class="s1">self.nextTableOffset = </span><span class="s3">0</span>
+		<span class="s1">self.transformBuffer = BytesIO()</span>
+
+		<span class="s1">self.tables = OrderedDict()</span>
+
+		<span class="s5"># make empty TTFont to store data while normalising and transforming tables</span>
+		<span class="s1">self.ttFont = TTFont(recalcBBoxes=</span><span class="s0">False, </span><span class="s1">recalcTimestamp=</span><span class="s0">False</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s6">&quot;&quot;&quot;Associate new entry named 'tag' with raw table data.&quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.tables:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;cannot rewrite '%s' table&quot; </span><span class="s1">% tag)</span>
+		<span class="s0">if </span><span class="s1">tag == </span><span class="s2">'DSIG'</span><span class="s1">:</span>
+			<span class="s5"># always drop DSIG table, since the encoding process can invalidate it</span>
+			<span class="s1">self.numTables -= </span><span class="s3">1</span>
+			<span class="s0">return</span>
+
+		<span class="s1">entry = self.DirectoryEntry()</span>
+		<span class="s1">entry.tag = Tag(tag)</span>
+		<span class="s1">entry.flags = getKnownTagIndex(entry.tag)</span>
+		<span class="s5"># WOFF2 table data are written to disk only on close(), after all tags</span>
+		<span class="s5"># have been specified</span>
+		<span class="s1">entry.data = data</span>
+
+		<span class="s1">self.tables[tag] = entry</span>
+
+	<span class="s0">def </span><span class="s1">close(self):</span>
+		<span class="s6">&quot;&quot;&quot; All tags must have been specified. Now write the table data and directory. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">len(self.tables) != self.numTables:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;wrong number of tables; expected %d, found %d&quot; </span><span class="s1">% (self.numTables</span><span class="s0">, </span><span class="s1">len(self.tables)))</span>
+
+		<span class="s0">if </span><span class="s1">self.sfntVersion </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;</span><span class="s0">\x00\x01\x00\x00</span><span class="s2">&quot;</span><span class="s0">, </span><span class="s2">&quot;true&quot;</span><span class="s1">):</span>
+			<span class="s1">isTrueType = </span><span class="s0">True</span>
+		<span class="s0">elif </span><span class="s1">self.sfntVersion == </span><span class="s2">&quot;OTTO&quot;</span><span class="s1">:</span>
+			<span class="s1">isTrueType = </span><span class="s0">False</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;Not a TrueType or OpenType font (bad sfntVersion)&quot;</span><span class="s1">)</span>
+
+		<span class="s5"># The WOFF2 spec no longer requires the glyph offsets to be 4-byte aligned.</span>
+		<span class="s5"># However, the reference WOFF2 implementation still fails to reconstruct</span>
+		<span class="s5"># 'unpadded' glyf tables, therefore we need to 'normalise' them.</span>
+		<span class="s5"># See:</span>
+		<span class="s5"># https://github.com/khaledhosny/ots/issues/60</span>
+		<span class="s5"># https://github.com/google/woff2/issues/15</span>
+		<span class="s0">if </span><span class="s1">(</span>
+			<span class="s1">isTrueType</span>
+			<span class="s0">and </span><span class="s2">&quot;glyf&quot; </span><span class="s0">in </span><span class="s1">self.flavorData.transformedTables</span>
+			<span class="s0">and </span><span class="s2">&quot;glyf&quot; </span><span class="s0">in </span><span class="s1">self.tables</span>
+		<span class="s1">):</span>
+			<span class="s1">self._normaliseGlyfAndLoca(padding=</span><span class="s3">4</span><span class="s1">)</span>
+		<span class="s1">self._setHeadTransformFlag()</span>
+
+		<span class="s5"># To pass the legacy OpenType Sanitiser currently included in browsers,</span>
+		<span class="s5"># we must sort the table directory and data alphabetically by tag.</span>
+		<span class="s5"># See:</span>
+		<span class="s5"># https://github.com/google/woff2/pull/3</span>
+		<span class="s5"># https://lists.w3.org/Archives/Public/public-webfonts-wg/2015Mar/0000.html</span>
+		<span class="s5"># TODO(user): remove to match spec once browsers are on newer OTS</span>
+		<span class="s1">self.tables = OrderedDict(sorted(self.tables.items()))</span>
+
+		<span class="s1">self.totalSfntSize = self._calcSFNTChecksumsLengthsAndOffsets()</span>
+
+		<span class="s1">fontData = self._transformTables()</span>
+		<span class="s1">compressedFont = brotli.compress(fontData</span><span class="s0">, </span><span class="s1">mode=brotli.MODE_FONT)</span>
+
+		<span class="s1">self.totalCompressedSize = len(compressedFont)</span>
+		<span class="s1">self.length = self._calcTotalSize()</span>
+		<span class="s1">self.majorVersion</span><span class="s0">, </span><span class="s1">self.minorVersion = self._getVersion()</span>
+		<span class="s1">self.reserved = </span><span class="s3">0</span>
+
+		<span class="s1">directory = self._packTableDirectory()</span>
+		<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s1">)</span>
+		<span class="s1">self.file.write(pad(directory + compressedFont</span><span class="s0">, </span><span class="s1">size=</span><span class="s3">4</span><span class="s1">))</span>
+		<span class="s1">self._writeFlavorData()</span>
+
+	<span class="s0">def </span><span class="s1">_normaliseGlyfAndLoca(self</span><span class="s0">, </span><span class="s1">padding=</span><span class="s3">4</span><span class="s1">):</span>
+		<span class="s6">&quot;&quot;&quot; Recompile glyf and loca tables, aligning glyph offsets to multiples of 
+        'padding' size. Update the head table's 'indexToLocFormat' accordingly while 
+        compiling loca. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">self.sfntVersion == </span><span class="s2">&quot;OTTO&quot;</span><span class="s1">:</span>
+			<span class="s0">return</span>
+
+		<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'maxp'</span><span class="s0">, </span><span class="s2">'head'</span><span class="s0">, </span><span class="s2">'loca'</span><span class="s0">, </span><span class="s2">'glyf'</span><span class="s1">):</span>
+			<span class="s1">self._decompileTable(tag)</span>
+		<span class="s1">self.ttFont[</span><span class="s2">'glyf'</span><span class="s1">].padding = padding</span>
+		<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'glyf'</span><span class="s0">, </span><span class="s2">'loca'</span><span class="s1">):</span>
+			<span class="s1">self._compileTable(tag)</span>
+
+	<span class="s0">def </span><span class="s1">_setHeadTransformFlag(self):</span>
+		<span class="s6">&quot;&quot;&quot; Set bit 11 of 'head' table flags to indicate that the font has undergone 
+        a lossless modifying transform. Re-compile head table data.&quot;&quot;&quot;</span>
+		<span class="s1">self._decompileTable(</span><span class="s2">'head'</span><span class="s1">)</span>
+		<span class="s1">self.ttFont[</span><span class="s2">'head'</span><span class="s1">].flags |= (</span><span class="s3">1 </span><span class="s1">&lt;&lt; </span><span class="s3">11</span><span class="s1">)</span>
+		<span class="s1">self._compileTable(</span><span class="s2">'head'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">_decompileTable(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s6">&quot;&quot;&quot; Fetch table data, decompile it, and store it inside self.ttFont. &quot;&quot;&quot;</span>
+		<span class="s1">tag = Tag(tag)</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">not in </span><span class="s1">self.tables:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;missing required table: %s&quot; </span><span class="s1">% tag)</span>
+		<span class="s0">if </span><span class="s1">self.ttFont.isLoaded(tag):</span>
+			<span class="s0">return</span>
+		<span class="s1">data = self.tables[tag].data</span>
+		<span class="s0">if </span><span class="s1">tag == </span><span class="s2">'loca'</span><span class="s1">:</span>
+			<span class="s1">tableClass = WOFF2LocaTable</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s2">'glyf'</span><span class="s1">:</span>
+			<span class="s1">tableClass = WOFF2GlyfTable</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s2">'hmtx'</span><span class="s1">:</span>
+			<span class="s1">tableClass = WOFF2HmtxTable</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">tableClass = getTableClass(tag)</span>
+		<span class="s1">table = tableClass(tag)</span>
+		<span class="s1">self.ttFont.tables[tag] = table</span>
+		<span class="s1">table.decompile(data</span><span class="s0">, </span><span class="s1">self.ttFont)</span>
+
+	<span class="s0">def </span><span class="s1">_compileTable(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s6">&quot;&quot;&quot; Compile table and store it in its 'data' attribute. &quot;&quot;&quot;</span>
+		<span class="s1">self.tables[tag].data = self.ttFont[tag].compile(self.ttFont)</span>
+
+	<span class="s0">def </span><span class="s1">_calcSFNTChecksumsLengthsAndOffsets(self):</span>
+		<span class="s6">&quot;&quot;&quot; Compute the 'original' SFNT checksums, lengths and offsets for checksum 
+        adjustment calculation. Return the total size of the uncompressed font. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">offset = sfntDirectorySize + sfntDirectoryEntrySize * len(self.tables)</span>
+		<span class="s0">for </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">self.tables.items():</span>
+			<span class="s1">data = entry.data</span>
+			<span class="s1">entry.origOffset = offset</span>
+			<span class="s1">entry.origLength = len(data)</span>
+			<span class="s0">if </span><span class="s1">tag == </span><span class="s2">'head'</span><span class="s1">:</span>
+				<span class="s1">entry.checkSum = calcChecksum(data[:</span><span class="s3">8</span><span class="s1">] + </span><span class="s4">b'</span><span class="s0">\0\0\0\0</span><span class="s4">' </span><span class="s1">+ data[</span><span class="s3">12</span><span class="s1">:])</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">entry.checkSum = calcChecksum(data)</span>
+			<span class="s1">offset += (entry.origLength + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span>
+		<span class="s0">return </span><span class="s1">offset</span>
+
+	<span class="s0">def </span><span class="s1">_transformTables(self):</span>
+		<span class="s6">&quot;&quot;&quot;Return transformed font data.&quot;&quot;&quot;</span>
+		<span class="s1">transformedTables = self.flavorData.transformedTables</span>
+		<span class="s0">for </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">self.tables.items():</span>
+			<span class="s1">data = </span><span class="s0">None</span>
+			<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">transformedTables:</span>
+				<span class="s1">data = self.transformTable(tag)</span>
+				<span class="s0">if </span><span class="s1">data </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">entry.transformed = </span><span class="s0">True</span>
+			<span class="s0">if </span><span class="s1">data </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s5"># pass-through the table data without transformation</span>
+				<span class="s1">data = entry.data</span>
+				<span class="s1">entry.transformed = </span><span class="s0">False</span>
+			<span class="s1">entry.offset = self.nextTableOffset</span>
+			<span class="s1">entry.saveData(self.transformBuffer</span><span class="s0">, </span><span class="s1">data)</span>
+			<span class="s1">self.nextTableOffset += entry.length</span>
+		<span class="s1">self.writeMasterChecksum()</span>
+		<span class="s1">fontData = self.transformBuffer.getvalue()</span>
+		<span class="s0">return </span><span class="s1">fontData</span>
+
+	<span class="s0">def </span><span class="s1">transformTable(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s6">&quot;&quot;&quot;Return transformed table data, or None if some pre-conditions aren't 
+        met -- in which case, the non-transformed table data will be used. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">tag == </span><span class="s2">&quot;loca&quot;</span><span class="s1">:</span>
+			<span class="s1">data = </span><span class="s4">b&quot;&quot;</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s2">&quot;glyf&quot;</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'maxp'</span><span class="s0">, </span><span class="s2">'head'</span><span class="s0">, </span><span class="s2">'loca'</span><span class="s0">, </span><span class="s2">'glyf'</span><span class="s1">):</span>
+				<span class="s1">self._decompileTable(tag)</span>
+			<span class="s1">glyfTable = self.ttFont[</span><span class="s2">'glyf'</span><span class="s1">]</span>
+			<span class="s1">data = glyfTable.transform(self.ttFont)</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s2">&quot;hmtx&quot;</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s2">&quot;glyf&quot; </span><span class="s0">not in </span><span class="s1">self.tables:</span>
+				<span class="s0">return</span>
+			<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;maxp&quot;</span><span class="s0">, </span><span class="s2">&quot;head&quot;</span><span class="s0">, </span><span class="s2">&quot;hhea&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s0">, </span><span class="s2">&quot;glyf&quot;</span><span class="s0">, </span><span class="s2">&quot;hmtx&quot;</span><span class="s1">):</span>
+				<span class="s1">self._decompileTable(tag)</span>
+			<span class="s1">hmtxTable = self.ttFont[</span><span class="s2">&quot;hmtx&quot;</span><span class="s1">]</span>
+			<span class="s1">data = hmtxTable.transform(self.ttFont)  </span><span class="s5"># can be None</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;Transform for table '%s' is unknown&quot; </span><span class="s1">% tag)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_calcMasterChecksum(self):</span>
+		<span class="s6">&quot;&quot;&quot;Calculate checkSumAdjustment.&quot;&quot;&quot;</span>
+		<span class="s1">tags = list(self.tables.keys())</span>
+		<span class="s1">checksums = []</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(tags)):</span>
+			<span class="s1">checksums.append(self.tables[tags[i]].checkSum)</span>
+
+		<span class="s5"># Create a SFNT directory for checksum calculation purposes</span>
+		<span class="s1">self.searchRange</span><span class="s0">, </span><span class="s1">self.entrySelector</span><span class="s0">, </span><span class="s1">self.rangeShift = getSearchRange(self.numTables</span><span class="s0">, </span><span class="s3">16</span><span class="s1">)</span>
+		<span class="s1">directory = sstruct.pack(sfntDirectoryFormat</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">tables = sorted(self.tables.items())</span>
+		<span class="s0">for </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">tables:</span>
+			<span class="s1">sfntEntry = SFNTDirectoryEntry()</span>
+			<span class="s1">sfntEntry.tag = entry.tag</span>
+			<span class="s1">sfntEntry.checkSum = entry.checkSum</span>
+			<span class="s1">sfntEntry.offset = entry.origOffset</span>
+			<span class="s1">sfntEntry.length = entry.origLength</span>
+			<span class="s1">directory = directory + sfntEntry.toString()</span>
+
+		<span class="s1">directory_end = sfntDirectorySize + len(self.tables) * sfntDirectoryEntrySize</span>
+		<span class="s0">assert </span><span class="s1">directory_end == len(directory)</span>
+
+		<span class="s1">checksums.append(calcChecksum(directory))</span>
+		<span class="s1">checksum = sum(checksums) &amp; </span><span class="s3">0xffffffff</span>
+		<span class="s5"># BiboAfba!</span>
+		<span class="s1">checksumadjustment = (</span><span class="s3">0xB1B0AFBA </span><span class="s1">- checksum) &amp; </span><span class="s3">0xffffffff</span>
+		<span class="s0">return </span><span class="s1">checksumadjustment</span>
+
+	<span class="s0">def </span><span class="s1">writeMasterChecksum(self):</span>
+		<span class="s6">&quot;&quot;&quot;Write checkSumAdjustment to the transformBuffer.&quot;&quot;&quot;</span>
+		<span class="s1">checksumadjustment = self._calcMasterChecksum()</span>
+		<span class="s1">self.transformBuffer.seek(self.tables[</span><span class="s2">'head'</span><span class="s1">].offset + </span><span class="s3">8</span><span class="s1">)</span>
+		<span class="s1">self.transformBuffer.write(struct.pack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">checksumadjustment))</span>
+
+	<span class="s0">def </span><span class="s1">_calcTotalSize(self):</span>
+		<span class="s6">&quot;&quot;&quot;Calculate total size of WOFF2 font, including any meta- and/or private data.&quot;&quot;&quot;</span>
+		<span class="s1">offset = self.directorySize</span>
+		<span class="s0">for </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">self.tables.values():</span>
+			<span class="s1">offset += len(entry.toString())</span>
+		<span class="s1">offset += self.totalCompressedSize</span>
+		<span class="s1">offset = (offset + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span>
+		<span class="s1">offset = self._calcFlavorDataOffsetsAndSize(offset)</span>
+		<span class="s0">return </span><span class="s1">offset</span>
+
+	<span class="s0">def </span><span class="s1">_calcFlavorDataOffsetsAndSize(self</span><span class="s0">, </span><span class="s1">start):</span>
+		<span class="s6">&quot;&quot;&quot;Calculate offsets and lengths for any meta- and/or private data.&quot;&quot;&quot;</span>
+		<span class="s1">offset = start</span>
+		<span class="s1">data = self.flavorData</span>
+		<span class="s0">if </span><span class="s1">data.metaData:</span>
+			<span class="s1">self.metaOrigLength = len(data.metaData)</span>
+			<span class="s1">self.metaOffset = offset</span>
+			<span class="s1">self.compressedMetaData = brotli.compress(</span>
+				<span class="s1">data.metaData</span><span class="s0">, </span><span class="s1">mode=brotli.MODE_TEXT)</span>
+			<span class="s1">self.metaLength = len(self.compressedMetaData)</span>
+			<span class="s1">offset += self.metaLength</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.metaOffset = self.metaLength = self.metaOrigLength = </span><span class="s3">0</span>
+			<span class="s1">self.compressedMetaData = </span><span class="s4">b&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">data.privData:</span>
+			<span class="s5"># make sure private data is padded to 4-byte boundary</span>
+			<span class="s1">offset = (offset + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span>
+			<span class="s1">self.privOffset = offset</span>
+			<span class="s1">self.privLength = len(data.privData)</span>
+			<span class="s1">offset += self.privLength</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.privOffset = self.privLength = </span><span class="s3">0</span>
+		<span class="s0">return </span><span class="s1">offset</span>
+
+	<span class="s0">def </span><span class="s1">_getVersion(self):</span>
+		<span class="s6">&quot;&quot;&quot;Return the WOFF2 font's (majorVersion, minorVersion) tuple.&quot;&quot;&quot;</span>
+		<span class="s1">data = self.flavorData</span>
+		<span class="s0">if </span><span class="s1">data.majorVersion </span><span class="s0">is not None and </span><span class="s1">data.minorVersion </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">data.majorVersion</span><span class="s0">, </span><span class="s1">data.minorVersion</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># if None, return 'fontRevision' from 'head' table</span>
+			<span class="s0">if </span><span class="s2">'head' </span><span class="s0">in </span><span class="s1">self.tables:</span>
+				<span class="s0">return </span><span class="s1">struct.unpack(</span><span class="s2">&quot;&gt;HH&quot;</span><span class="s0">, </span><span class="s1">self.tables[</span><span class="s2">'head'</span><span class="s1">].data[</span><span class="s3">4</span><span class="s1">:</span><span class="s3">8</span><span class="s1">])</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">return </span><span class="s3">0</span><span class="s0">, </span><span class="s3">0</span>
+
+	<span class="s0">def </span><span class="s1">_packTableDirectory(self):</span>
+		<span class="s6">&quot;&quot;&quot;Return WOFF2 table directory data.&quot;&quot;&quot;</span>
+		<span class="s1">directory = sstruct.pack(self.directoryFormat</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">for </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">self.tables.values():</span>
+			<span class="s1">directory = directory + entry.toString()</span>
+		<span class="s0">return </span><span class="s1">directory</span>
+
+	<span class="s0">def </span><span class="s1">_writeFlavorData(self):</span>
+		<span class="s6">&quot;&quot;&quot;Write metadata and/or private data using appropiate padding.&quot;&quot;&quot;</span>
+		<span class="s1">compressedMetaData = self.compressedMetaData</span>
+		<span class="s1">privData = self.flavorData.privData</span>
+		<span class="s0">if </span><span class="s1">compressedMetaData </span><span class="s0">and </span><span class="s1">privData:</span>
+			<span class="s1">compressedMetaData = pad(compressedMetaData</span><span class="s0">, </span><span class="s1">size=</span><span class="s3">4</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">compressedMetaData:</span>
+			<span class="s1">self.file.seek(self.metaOffset)</span>
+			<span class="s0">assert </span><span class="s1">self.file.tell() == self.metaOffset</span>
+			<span class="s1">self.file.write(compressedMetaData)</span>
+		<span class="s0">if </span><span class="s1">privData:</span>
+			<span class="s1">self.file.seek(self.privOffset)</span>
+			<span class="s0">assert </span><span class="s1">self.file.tell() == self.privOffset</span>
+			<span class="s1">self.file.write(privData)</span>
+
+	<span class="s0">def </span><span class="s1">reordersTables(self):</span>
+		<span class="s0">return True</span>
+
+
+<span class="s5"># -- woff2 directory helpers and cruft</span>
+
+<span class="s1">woff2DirectoryFormat = </span><span class="s2">&quot;&quot;&quot; 
+        &gt; # big endian 
+        signature:           4s   # &quot;wOF2&quot; 
+        sfntVersion:         4s 
+        length:              L    # total woff2 file size 
+        numTables:           H    # number of tables 
+        reserved:            H    # set to 0 
+        totalSfntSize:       L    # uncompressed size 
+        totalCompressedSize: L    # compressed size 
+        majorVersion:        H    # major version of WOFF file 
+        minorVersion:        H    # minor version of WOFF file 
+        metaOffset:          L    # offset to metadata block 
+        metaLength:          L    # length of compressed metadata 
+        metaOrigLength:      L    # length of uncompressed metadata 
+        privOffset:          L    # offset to private data block 
+        privLength:          L    # length of private data block 
+&quot;&quot;&quot;</span>
+
+<span class="s1">woff2DirectorySize = sstruct.calcsize(woff2DirectoryFormat)</span>
+
+<span class="s1">woff2KnownTags = (</span>
+	<span class="s2">&quot;cmap&quot;</span><span class="s0">, </span><span class="s2">&quot;head&quot;</span><span class="s0">, </span><span class="s2">&quot;hhea&quot;</span><span class="s0">, </span><span class="s2">&quot;hmtx&quot;</span><span class="s0">, </span><span class="s2">&quot;maxp&quot;</span><span class="s0">, </span><span class="s2">&quot;name&quot;</span><span class="s0">, </span><span class="s2">&quot;OS/2&quot;</span><span class="s0">, </span><span class="s2">&quot;post&quot;</span><span class="s0">, </span><span class="s2">&quot;cvt &quot;</span><span class="s0">,</span>
+	<span class="s2">&quot;fpgm&quot;</span><span class="s0">, </span><span class="s2">&quot;glyf&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s0">, </span><span class="s2">&quot;prep&quot;</span><span class="s0">, </span><span class="s2">&quot;CFF &quot;</span><span class="s0">, </span><span class="s2">&quot;VORG&quot;</span><span class="s0">, </span><span class="s2">&quot;EBDT&quot;</span><span class="s0">, </span><span class="s2">&quot;EBLC&quot;</span><span class="s0">, </span><span class="s2">&quot;gasp&quot;</span><span class="s0">,</span>
+	<span class="s2">&quot;hdmx&quot;</span><span class="s0">, </span><span class="s2">&quot;kern&quot;</span><span class="s0">, </span><span class="s2">&quot;LTSH&quot;</span><span class="s0">, </span><span class="s2">&quot;PCLT&quot;</span><span class="s0">, </span><span class="s2">&quot;VDMX&quot;</span><span class="s0">, </span><span class="s2">&quot;vhea&quot;</span><span class="s0">, </span><span class="s2">&quot;vmtx&quot;</span><span class="s0">, </span><span class="s2">&quot;BASE&quot;</span><span class="s0">, </span><span class="s2">&quot;GDEF&quot;</span><span class="s0">,</span>
+	<span class="s2">&quot;GPOS&quot;</span><span class="s0">, </span><span class="s2">&quot;GSUB&quot;</span><span class="s0">, </span><span class="s2">&quot;EBSC&quot;</span><span class="s0">, </span><span class="s2">&quot;JSTF&quot;</span><span class="s0">, </span><span class="s2">&quot;MATH&quot;</span><span class="s0">, </span><span class="s2">&quot;CBDT&quot;</span><span class="s0">, </span><span class="s2">&quot;CBLC&quot;</span><span class="s0">, </span><span class="s2">&quot;COLR&quot;</span><span class="s0">, </span><span class="s2">&quot;CPAL&quot;</span><span class="s0">,</span>
+	<span class="s2">&quot;SVG &quot;</span><span class="s0">, </span><span class="s2">&quot;sbix&quot;</span><span class="s0">, </span><span class="s2">&quot;acnt&quot;</span><span class="s0">, </span><span class="s2">&quot;avar&quot;</span><span class="s0">, </span><span class="s2">&quot;bdat&quot;</span><span class="s0">, </span><span class="s2">&quot;bloc&quot;</span><span class="s0">, </span><span class="s2">&quot;bsln&quot;</span><span class="s0">, </span><span class="s2">&quot;cvar&quot;</span><span class="s0">, </span><span class="s2">&quot;fdsc&quot;</span><span class="s0">,</span>
+	<span class="s2">&quot;feat&quot;</span><span class="s0">, </span><span class="s2">&quot;fmtx&quot;</span><span class="s0">, </span><span class="s2">&quot;fvar&quot;</span><span class="s0">, </span><span class="s2">&quot;gvar&quot;</span><span class="s0">, </span><span class="s2">&quot;hsty&quot;</span><span class="s0">, </span><span class="s2">&quot;just&quot;</span><span class="s0">, </span><span class="s2">&quot;lcar&quot;</span><span class="s0">, </span><span class="s2">&quot;mort&quot;</span><span class="s0">, </span><span class="s2">&quot;morx&quot;</span><span class="s0">,</span>
+	<span class="s2">&quot;opbd&quot;</span><span class="s0">, </span><span class="s2">&quot;prop&quot;</span><span class="s0">, </span><span class="s2">&quot;trak&quot;</span><span class="s0">, </span><span class="s2">&quot;Zapf&quot;</span><span class="s0">, </span><span class="s2">&quot;Silf&quot;</span><span class="s0">, </span><span class="s2">&quot;Glat&quot;</span><span class="s0">, </span><span class="s2">&quot;Gloc&quot;</span><span class="s0">, </span><span class="s2">&quot;Feat&quot;</span><span class="s0">, </span><span class="s2">&quot;Sill&quot;</span><span class="s1">)</span>
+
+<span class="s1">woff2FlagsFormat = </span><span class="s2">&quot;&quot;&quot; 
+        &gt; # big endian 
+        flags: B  # table type and flags 
+&quot;&quot;&quot;</span>
+
+<span class="s1">woff2FlagsSize = sstruct.calcsize(woff2FlagsFormat)</span>
+
+<span class="s1">woff2UnknownTagFormat = </span><span class="s2">&quot;&quot;&quot; 
+        &gt; # big endian 
+        tag: 4s  # 4-byte tag (optional) 
+&quot;&quot;&quot;</span>
+
+<span class="s1">woff2UnknownTagSize = sstruct.calcsize(woff2UnknownTagFormat)</span>
+
+<span class="s1">woff2UnknownTagIndex = </span><span class="s3">0x3F</span>
+
+<span class="s1">woff2Base128MaxSize = </span><span class="s3">5</span>
+<span class="s1">woff2DirectoryEntryMaxSize = woff2FlagsSize + woff2UnknownTagSize + </span><span class="s3">2 </span><span class="s1">* woff2Base128MaxSize</span>
+
+<span class="s1">woff2TransformedTableTags = (</span><span class="s2">'glyf'</span><span class="s0">, </span><span class="s2">'loca'</span><span class="s1">)</span>
+
+<span class="s1">woff2GlyfTableFormat = </span><span class="s2">&quot;&quot;&quot; 
+        &gt; # big endian 
+        version:                  L  # = 0x00000000 
+        numGlyphs:                H  # Number of glyphs 
+        indexFormat:              H  # Offset format for loca table 
+        nContourStreamSize:       L  # Size of nContour stream 
+        nPointsStreamSize:        L  # Size of nPoints stream 
+        flagStreamSize:           L  # Size of flag stream 
+        glyphStreamSize:          L  # Size of glyph stream 
+        compositeStreamSize:      L  # Size of composite stream 
+        bboxStreamSize:           L  # Comnined size of bboxBitmap and bboxStream 
+        instructionStreamSize:    L  # Size of instruction stream 
+&quot;&quot;&quot;</span>
+
+<span class="s1">woff2GlyfTableFormatSize = sstruct.calcsize(woff2GlyfTableFormat)</span>
+
+<span class="s1">bboxFormat = </span><span class="s2">&quot;&quot;&quot; 
+        &gt;   # big endian 
+        xMin:               h 
+        yMin:               h 
+        xMax:               h 
+        yMax:               h 
+&quot;&quot;&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">getKnownTagIndex(tag):</span>
+	<span class="s6">&quot;&quot;&quot;Return index of 'tag' in woff2KnownTags list. Return 63 if not found.&quot;&quot;&quot;</span>
+	<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(woff2KnownTags)):</span>
+		<span class="s0">if </span><span class="s1">tag == woff2KnownTags[i]:</span>
+			<span class="s0">return </span><span class="s1">i</span>
+	<span class="s0">return </span><span class="s1">woff2UnknownTagIndex</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2DirectoryEntry(DirectoryEntry):</span>
+
+	<span class="s0">def </span><span class="s1">fromFile(self</span><span class="s0">, </span><span class="s1">file):</span>
+		<span class="s1">pos = file.tell()</span>
+		<span class="s1">data = file.read(woff2DirectoryEntryMaxSize)</span>
+		<span class="s1">left = self.fromString(data)</span>
+		<span class="s1">consumed = len(data) - len(left)</span>
+		<span class="s1">file.seek(pos + consumed)</span>
+
+	<span class="s0">def </span><span class="s1">fromString(self</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s0">if </span><span class="s1">len(data) &lt; </span><span class="s3">1</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;can't read table 'flags': not enough data&quot;</span><span class="s1">)</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(woff2FlagsFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">if </span><span class="s1">self.flags &amp; </span><span class="s3">0x3F </span><span class="s1">== </span><span class="s3">0x3F</span><span class="s1">:</span>
+			<span class="s5"># if bits [0..5] of the flags byte == 63, read a 4-byte arbitrary tag value</span>
+			<span class="s0">if </span><span class="s1">len(data) &lt; woff2UnknownTagSize:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;can't read table 'tag': not enough data&quot;</span><span class="s1">)</span>
+			<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(woff2UnknownTagFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># otherwise, tag is derived from a fixed 'Known Tags' table</span>
+			<span class="s1">self.tag = woff2KnownTags[self.flags &amp; </span><span class="s3">0x3F</span><span class="s1">]</span>
+		<span class="s1">self.tag = Tag(self.tag)</span>
+		<span class="s1">self.origLength</span><span class="s0">, </span><span class="s1">data = unpackBase128(data)</span>
+		<span class="s1">self.length = self.origLength</span>
+		<span class="s0">if </span><span class="s1">self.transformed:</span>
+			<span class="s1">self.length</span><span class="s0">, </span><span class="s1">data = unpackBase128(data)</span>
+			<span class="s0">if </span><span class="s1">self.tag == </span><span class="s2">'loca' </span><span class="s0">and </span><span class="s1">self.length != </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span>
+					<span class="s2">&quot;the transformLength of the 'loca' table must be 0&quot;</span><span class="s1">)</span>
+		<span class="s5"># return left over data</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">toString(self):</span>
+		<span class="s1">data = bytechr(self.flags)</span>
+		<span class="s0">if </span><span class="s1">(self.flags &amp; </span><span class="s3">0x3F</span><span class="s1">) == </span><span class="s3">0x3F</span><span class="s1">:</span>
+			<span class="s1">data += struct.pack(</span><span class="s2">'&gt;4s'</span><span class="s0">, </span><span class="s1">self.tag.tobytes())</span>
+		<span class="s1">data += packBase128(self.origLength)</span>
+		<span class="s0">if </span><span class="s1">self.transformed:</span>
+			<span class="s1">data += packBase128(self.length)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s1">@property</span>
+	<span class="s0">def </span><span class="s1">transformVersion(self):</span>
+		<span class="s6">&quot;&quot;&quot;Return bits 6-7 of table entry's flags, which indicate the preprocessing 
+        transformation version number (between 0 and 3). 
+        &quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">self.flags &gt;&gt; </span><span class="s3">6</span>
+
+	<span class="s1">@transformVersion.setter</span>
+	<span class="s0">def </span><span class="s1">transformVersion(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">assert </span><span class="s3">0 </span><span class="s1">&lt;= value &lt;= </span><span class="s3">3</span>
+		<span class="s1">self.flags |= value &lt;&lt; </span><span class="s3">6</span>
+
+	<span class="s1">@property</span>
+	<span class="s0">def </span><span class="s1">transformed(self):</span>
+		<span class="s6">&quot;&quot;&quot;Return True if the table has any transformation, else return False.&quot;&quot;&quot;</span>
+		<span class="s5"># For all tables in a font, except for 'glyf' and 'loca', the transformation</span>
+		<span class="s5"># version 0 indicates the null transform (where the original table data is</span>
+		<span class="s5"># passed directly to the Brotli compressor). For 'glyf' and 'loca' tables,</span>
+		<span class="s5"># transformation version 3 indicates the null transform</span>
+		<span class="s0">if </span><span class="s1">self.tag </span><span class="s0">in </span><span class="s1">{</span><span class="s2">&quot;glyf&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s1">}:</span>
+			<span class="s0">return </span><span class="s1">self.transformVersion != </span><span class="s3">3</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.transformVersion != </span><span class="s3">0</span>
+
+	<span class="s1">@transformed.setter</span>
+	<span class="s0">def </span><span class="s1">transformed(self</span><span class="s0">, </span><span class="s1">booleanValue):</span>
+		<span class="s5"># here we assume that a non-null transform means version 0 for 'glyf' and</span>
+		<span class="s5"># 'loca' and 1 for every other table (e.g. hmtx); but that may change as</span>
+		<span class="s5"># new transformation formats are introduced in the future (if ever).</span>
+		<span class="s0">if </span><span class="s1">self.tag </span><span class="s0">in </span><span class="s1">{</span><span class="s2">&quot;glyf&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s1">}:</span>
+			<span class="s1">self.transformVersion = </span><span class="s3">3 </span><span class="s0">if not </span><span class="s1">booleanValue </span><span class="s0">else </span><span class="s3">0</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.transformVersion = int(booleanValue)</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2LocaTable(getTableClass(</span><span class="s2">'loca'</span><span class="s1">)):</span>
+	<span class="s6">&quot;&quot;&quot;Same as parent class. The only difference is that it attempts to preserve 
+    the 'indexFormat' as encoded in the WOFF2 glyf table. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">tag=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.tableTag = Tag(tag </span><span class="s0">or </span><span class="s2">'loca'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">max_location = max(self.locations)</span>
+		<span class="s0">except </span><span class="s1">AttributeError:</span>
+			<span class="s1">self.set([])</span>
+			<span class="s1">max_location = </span><span class="s3">0</span>
+		<span class="s0">if </span><span class="s2">'glyf' </span><span class="s0">in </span><span class="s1">ttFont </span><span class="s0">and </span><span class="s1">hasattr(ttFont[</span><span class="s2">'glyf'</span><span class="s1">]</span><span class="s0">, </span><span class="s2">'indexFormat'</span><span class="s1">):</span>
+			<span class="s5"># copile loca using the indexFormat specified in the WOFF2 glyf table</span>
+			<span class="s1">indexFormat = ttFont[</span><span class="s2">'glyf'</span><span class="s1">].indexFormat</span>
+			<span class="s0">if </span><span class="s1">indexFormat == </span><span class="s3">0</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">max_location &gt;= </span><span class="s3">0x20000</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;indexFormat is 0 but local offsets &gt; 0x20000&quot;</span><span class="s1">)</span>
+				<span class="s0">if not </span><span class="s1">all(l % </span><span class="s3">2 </span><span class="s1">== </span><span class="s3">0 </span><span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">self.locations):</span>
+					<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;indexFormat is 0 but local offsets not multiples of 2&quot;</span><span class="s1">)</span>
+				<span class="s1">locations = array.array(</span><span class="s2">&quot;H&quot;</span><span class="s1">)</span>
+				<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(self.locations)):</span>
+					<span class="s1">locations.append(self.locations[i] // </span><span class="s3">2</span><span class="s1">)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">locations = array.array(</span><span class="s2">&quot;I&quot;</span><span class="s0">, </span><span class="s1">self.locations)</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">: locations.byteswap()</span>
+			<span class="s1">data = locations.tobytes()</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># use the most compact indexFormat given the current glyph offsets</span>
+			<span class="s1">data = super(WOFF2LocaTable</span><span class="s0">, </span><span class="s1">self).compile(ttFont)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2GlyfTable(getTableClass(</span><span class="s2">'glyf'</span><span class="s1">)):</span>
+	<span class="s6">&quot;&quot;&quot;Decoder/Encoder for WOFF2 'glyf' table transform.&quot;&quot;&quot;</span>
+
+	<span class="s1">subStreams = (</span>
+		<span class="s2">'nContourStream'</span><span class="s0">, </span><span class="s2">'nPointsStream'</span><span class="s0">, </span><span class="s2">'flagStream'</span><span class="s0">, </span><span class="s2">'glyphStream'</span><span class="s0">,</span>
+		<span class="s2">'compositeStream'</span><span class="s0">, </span><span class="s2">'bboxStream'</span><span class="s0">, </span><span class="s2">'instructionStream'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">tag=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.tableTag = Tag(tag </span><span class="s0">or </span><span class="s2">'glyf'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">reconstruct(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s6">&quot;&quot;&quot; Decompile transformed 'glyf' data. &quot;&quot;&quot;</span>
+		<span class="s1">inputDataSize = len(data)</span>
+
+		<span class="s0">if </span><span class="s1">inputDataSize &lt; woff2GlyfTableFormatSize:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;not enough 'glyf' data&quot;</span><span class="s1">)</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(woff2GlyfTableFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">offset = woff2GlyfTableFormatSize</span>
+
+		<span class="s0">for </span><span class="s1">stream </span><span class="s0">in </span><span class="s1">self.subStreams:</span>
+			<span class="s1">size = getattr(self</span><span class="s0">, </span><span class="s1">stream + </span><span class="s2">'Size'</span><span class="s1">)</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">stream</span><span class="s0">, </span><span class="s1">data[:size])</span>
+			<span class="s1">data = data[size:]</span>
+			<span class="s1">offset += size</span>
+
+		<span class="s0">if </span><span class="s1">offset != inputDataSize:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span>
+				<span class="s2">&quot;incorrect size of transformed 'glyf' table: expected %d, received %d bytes&quot;</span>
+				<span class="s1">% (offset</span><span class="s0">, </span><span class="s1">inputDataSize))</span>
+
+		<span class="s1">bboxBitmapSize = ((self.numGlyphs + </span><span class="s3">31</span><span class="s1">) &gt;&gt; </span><span class="s3">5</span><span class="s1">) &lt;&lt; </span><span class="s3">2</span>
+		<span class="s1">bboxBitmap = self.bboxStream[:bboxBitmapSize]</span>
+		<span class="s1">self.bboxBitmap = array.array(</span><span class="s2">'B'</span><span class="s0">, </span><span class="s1">bboxBitmap)</span>
+		<span class="s1">self.bboxStream = self.bboxStream[bboxBitmapSize:]</span>
+
+		<span class="s1">self.nContourStream = array.array(</span><span class="s2">&quot;h&quot;</span><span class="s0">, </span><span class="s1">self.nContourStream)</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">: self.nContourStream.byteswap()</span>
+		<span class="s0">assert </span><span class="s1">len(self.nContourStream) == self.numGlyphs</span>
+
+		<span class="s0">if </span><span class="s2">'head' </span><span class="s0">in </span><span class="s1">ttFont:</span>
+			<span class="s1">ttFont[</span><span class="s2">'head'</span><span class="s1">].indexToLocFormat = self.indexFormat</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">self.glyphOrder = ttFont.getGlyphOrder()</span>
+		<span class="s0">except</span><span class="s1">:</span>
+			<span class="s1">self.glyphOrder = </span><span class="s0">None</span>
+		<span class="s0">if </span><span class="s1">self.glyphOrder </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">self.glyphOrder = [</span><span class="s2">&quot;.notdef&quot;</span><span class="s1">]</span>
+			<span class="s1">self.glyphOrder.extend([</span><span class="s2">&quot;glyph%.5d&quot; </span><span class="s1">% i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s0">, </span><span class="s1">self.numGlyphs)])</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">len(self.glyphOrder) != self.numGlyphs:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span>
+					<span class="s2">&quot;incorrect glyphOrder: expected %d glyphs, found %d&quot; </span><span class="s1">%</span>
+					<span class="s1">(len(self.glyphOrder)</span><span class="s0">, </span><span class="s1">self.numGlyphs))</span>
+
+		<span class="s1">glyphs = self.glyphs = {}</span>
+		<span class="s0">for </span><span class="s1">glyphID</span><span class="s0">, </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">enumerate(self.glyphOrder):</span>
+			<span class="s1">glyph = self._decodeGlyph(glyphID)</span>
+			<span class="s1">glyphs[glyphName] = glyph</span>
+
+	<span class="s0">def </span><span class="s1">transform(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s6">&quot;&quot;&quot; Return transformed 'glyf' data &quot;&quot;&quot;</span>
+		<span class="s1">self.numGlyphs = len(self.glyphs)</span>
+		<span class="s0">assert </span><span class="s1">len(self.glyphOrder) == self.numGlyphs</span>
+		<span class="s0">if </span><span class="s2">'maxp' </span><span class="s0">in </span><span class="s1">ttFont:</span>
+			<span class="s1">ttFont[</span><span class="s2">'maxp'</span><span class="s1">].numGlyphs = self.numGlyphs</span>
+		<span class="s1">self.indexFormat = ttFont[</span><span class="s2">'head'</span><span class="s1">].indexToLocFormat</span>
+
+		<span class="s0">for </span><span class="s1">stream </span><span class="s0">in </span><span class="s1">self.subStreams:</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">stream</span><span class="s0">, </span><span class="s4">b&quot;&quot;</span><span class="s1">)</span>
+		<span class="s1">bboxBitmapSize = ((self.numGlyphs + </span><span class="s3">31</span><span class="s1">) &gt;&gt; </span><span class="s3">5</span><span class="s1">) &lt;&lt; </span><span class="s3">2</span>
+		<span class="s1">self.bboxBitmap = array.array(</span><span class="s2">'B'</span><span class="s0">, </span><span class="s1">[</span><span class="s3">0</span><span class="s1">]*bboxBitmapSize)</span>
+
+		<span class="s0">for </span><span class="s1">glyphID </span><span class="s0">in </span><span class="s1">range(self.numGlyphs):</span>
+			<span class="s1">self._encodeGlyph(glyphID)</span>
+
+		<span class="s1">self.bboxStream = self.bboxBitmap.tobytes() + self.bboxStream</span>
+		<span class="s0">for </span><span class="s1">stream </span><span class="s0">in </span><span class="s1">self.subStreams:</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">stream + </span><span class="s2">'Size'</span><span class="s0">, </span><span class="s1">len(getattr(self</span><span class="s0">, </span><span class="s1">stream)))</span>
+		<span class="s1">self.version = </span><span class="s3">0</span>
+		<span class="s1">data = sstruct.pack(woff2GlyfTableFormat</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">data += bytesjoin([getattr(self</span><span class="s0">, </span><span class="s1">s) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">self.subStreams])</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">_decodeGlyph(self</span><span class="s0">, </span><span class="s1">glyphID):</span>
+		<span class="s1">glyph = getTableModule(</span><span class="s2">'glyf'</span><span class="s1">).Glyph()</span>
+		<span class="s1">glyph.numberOfContours = self.nContourStream[glyphID]</span>
+		<span class="s0">if </span><span class="s1">glyph.numberOfContours == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">glyph</span>
+		<span class="s0">elif </span><span class="s1">glyph.isComposite():</span>
+			<span class="s1">self._decodeComponents(glyph)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self._decodeCoordinates(glyph)</span>
+		<span class="s1">self._decodeBBox(glyphID</span><span class="s0">, </span><span class="s1">glyph)</span>
+		<span class="s0">return </span><span class="s1">glyph</span>
+
+	<span class="s0">def </span><span class="s1">_decodeComponents(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">data = self.compositeStream</span>
+		<span class="s1">glyph.components = []</span>
+		<span class="s1">more = </span><span class="s3">1</span>
+		<span class="s1">haveInstructions = </span><span class="s3">0</span>
+		<span class="s0">while </span><span class="s1">more:</span>
+			<span class="s1">component = getTableModule(</span><span class="s2">'glyf'</span><span class="s1">).GlyphComponent()</span>
+			<span class="s1">more</span><span class="s0">, </span><span class="s1">haveInstr</span><span class="s0">, </span><span class="s1">data = component.decompile(data</span><span class="s0">, </span><span class="s1">self)</span>
+			<span class="s1">haveInstructions = haveInstructions | haveInstr</span>
+			<span class="s1">glyph.components.append(component)</span>
+		<span class="s1">self.compositeStream = data</span>
+		<span class="s0">if </span><span class="s1">haveInstructions:</span>
+			<span class="s1">self._decodeInstructions(glyph)</span>
+
+	<span class="s0">def </span><span class="s1">_decodeCoordinates(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">data = self.nPointsStream</span>
+		<span class="s1">endPtsOfContours = []</span>
+		<span class="s1">endPoint = -</span><span class="s3">1</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(glyph.numberOfContours):</span>
+			<span class="s1">ptsOfContour</span><span class="s0">, </span><span class="s1">data = unpack255UShort(data)</span>
+			<span class="s1">endPoint += ptsOfContour</span>
+			<span class="s1">endPtsOfContours.append(endPoint)</span>
+		<span class="s1">glyph.endPtsOfContours = endPtsOfContours</span>
+		<span class="s1">self.nPointsStream = data</span>
+		<span class="s1">self._decodeTriplets(glyph)</span>
+		<span class="s1">self._decodeInstructions(glyph)</span>
+
+	<span class="s0">def </span><span class="s1">_decodeInstructions(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">glyphStream = self.glyphStream</span>
+		<span class="s1">instructionStream = self.instructionStream</span>
+		<span class="s1">instructionLength</span><span class="s0">, </span><span class="s1">glyphStream = unpack255UShort(glyphStream)</span>
+		<span class="s1">glyph.program = ttProgram.Program()</span>
+		<span class="s1">glyph.program.fromBytecode(instructionStream[:instructionLength])</span>
+		<span class="s1">self.glyphStream = glyphStream</span>
+		<span class="s1">self.instructionStream = instructionStream[instructionLength:]</span>
+
+	<span class="s0">def </span><span class="s1">_decodeBBox(self</span><span class="s0">, </span><span class="s1">glyphID</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">haveBBox = bool(self.bboxBitmap[glyphID &gt;&gt; </span><span class="s3">3</span><span class="s1">] &amp; (</span><span class="s3">0x80 </span><span class="s1">&gt;&gt; (glyphID &amp; </span><span class="s3">7</span><span class="s1">)))</span>
+		<span class="s0">if </span><span class="s1">glyph.isComposite() </span><span class="s0">and not </span><span class="s1">haveBBox:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'no bbox values for composite glyph %d' </span><span class="s1">% glyphID)</span>
+		<span class="s0">if </span><span class="s1">haveBBox:</span>
+			<span class="s1">dummy</span><span class="s0">, </span><span class="s1">self.bboxStream = sstruct.unpack2(bboxFormat</span><span class="s0">, </span><span class="s1">self.bboxStream</span><span class="s0">, </span><span class="s1">glyph)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">glyph.recalcBounds(self)</span>
+
+	<span class="s0">def </span><span class="s1">_decodeTriplets(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+
+		<span class="s0">def </span><span class="s1">withSign(flag</span><span class="s0">, </span><span class="s1">baseval):</span>
+			<span class="s0">assert </span><span class="s3">0 </span><span class="s1">&lt;= baseval </span><span class="s0">and </span><span class="s1">baseval &lt; </span><span class="s3">65536</span><span class="s0">, </span><span class="s2">'integer overflow'</span>
+			<span class="s0">return </span><span class="s1">baseval </span><span class="s0">if </span><span class="s1">flag &amp; </span><span class="s3">1 </span><span class="s0">else </span><span class="s1">-baseval</span>
+
+		<span class="s1">nPoints = glyph.endPtsOfContours[-</span><span class="s3">1</span><span class="s1">] + </span><span class="s3">1</span>
+		<span class="s1">flagSize = nPoints</span>
+		<span class="s0">if </span><span class="s1">flagSize &gt; len(self.flagStream):</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;not enough 'flagStream' data&quot;</span><span class="s1">)</span>
+		<span class="s1">flagsData = self.flagStream[:flagSize]</span>
+		<span class="s1">self.flagStream = self.flagStream[flagSize:]</span>
+		<span class="s1">flags = array.array(</span><span class="s2">'B'</span><span class="s0">, </span><span class="s1">flagsData)</span>
+
+		<span class="s1">triplets = array.array(</span><span class="s2">'B'</span><span class="s0">, </span><span class="s1">self.glyphStream)</span>
+		<span class="s1">nTriplets = len(triplets)</span>
+		<span class="s0">assert </span><span class="s1">nPoints &lt;= nTriplets</span>
+
+		<span class="s1">x = </span><span class="s3">0</span>
+		<span class="s1">y = </span><span class="s3">0</span>
+		<span class="s1">glyph.coordinates = getTableModule(</span><span class="s2">'glyf'</span><span class="s1">).GlyphCoordinates.zeros(nPoints)</span>
+		<span class="s1">glyph.flags = array.array(</span><span class="s2">&quot;B&quot;</span><span class="s1">)</span>
+		<span class="s1">tripletIndex = </span><span class="s3">0</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(nPoints):</span>
+			<span class="s1">flag = flags[i]</span>
+			<span class="s1">onCurve = </span><span class="s0">not </span><span class="s1">bool(flag &gt;&gt; </span><span class="s3">7</span><span class="s1">)</span>
+			<span class="s1">flag &amp;= </span><span class="s3">0x7f</span>
+			<span class="s0">if </span><span class="s1">flag &lt; </span><span class="s3">84</span><span class="s1">:</span>
+				<span class="s1">nBytes = </span><span class="s3">1</span>
+			<span class="s0">elif </span><span class="s1">flag &lt; </span><span class="s3">120</span><span class="s1">:</span>
+				<span class="s1">nBytes = </span><span class="s3">2</span>
+			<span class="s0">elif </span><span class="s1">flag &lt; </span><span class="s3">124</span><span class="s1">:</span>
+				<span class="s1">nBytes = </span><span class="s3">3</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">nBytes = </span><span class="s3">4</span>
+			<span class="s0">assert </span><span class="s1">((tripletIndex + nBytes) &lt;= nTriplets)</span>
+			<span class="s0">if </span><span class="s1">flag &lt; </span><span class="s3">10</span><span class="s1">:</span>
+				<span class="s1">dx = </span><span class="s3">0</span>
+				<span class="s1">dy = withSign(flag</span><span class="s0">, </span><span class="s1">((flag &amp; </span><span class="s3">14</span><span class="s1">) &lt;&lt; </span><span class="s3">7</span><span class="s1">) + triplets[tripletIndex])</span>
+			<span class="s0">elif </span><span class="s1">flag &lt; </span><span class="s3">20</span><span class="s1">:</span>
+				<span class="s1">dx = withSign(flag</span><span class="s0">, </span><span class="s1">(((flag - </span><span class="s3">10</span><span class="s1">) &amp; </span><span class="s3">14</span><span class="s1">) &lt;&lt; </span><span class="s3">7</span><span class="s1">) + triplets[tripletIndex])</span>
+				<span class="s1">dy = </span><span class="s3">0</span>
+			<span class="s0">elif </span><span class="s1">flag &lt; </span><span class="s3">84</span><span class="s1">:</span>
+				<span class="s1">b0 = flag - </span><span class="s3">20</span>
+				<span class="s1">b1 = triplets[tripletIndex]</span>
+				<span class="s1">dx = withSign(flag</span><span class="s0">, </span><span class="s3">1 </span><span class="s1">+ (b0 &amp; </span><span class="s3">0x30</span><span class="s1">) + (b1 &gt;&gt; </span><span class="s3">4</span><span class="s1">))</span>
+				<span class="s1">dy = withSign(flag &gt;&gt; </span><span class="s3">1</span><span class="s0">, </span><span class="s3">1 </span><span class="s1">+ ((b0 &amp; </span><span class="s3">0x0c</span><span class="s1">) &lt;&lt; </span><span class="s3">2</span><span class="s1">) + (b1 &amp; </span><span class="s3">0x0f</span><span class="s1">))</span>
+			<span class="s0">elif </span><span class="s1">flag &lt; </span><span class="s3">120</span><span class="s1">:</span>
+				<span class="s1">b0 = flag - </span><span class="s3">84</span>
+				<span class="s1">dx = withSign(flag</span><span class="s0">, </span><span class="s3">1 </span><span class="s1">+ ((b0 // </span><span class="s3">12</span><span class="s1">) &lt;&lt; </span><span class="s3">8</span><span class="s1">) + triplets[tripletIndex])</span>
+				<span class="s1">dy = withSign(flag &gt;&gt; </span><span class="s3">1</span><span class="s0">,</span>
+					<span class="s3">1 </span><span class="s1">+ (((b0 % </span><span class="s3">12</span><span class="s1">) &gt;&gt; </span><span class="s3">2</span><span class="s1">) &lt;&lt; </span><span class="s3">8</span><span class="s1">) + triplets[tripletIndex + </span><span class="s3">1</span><span class="s1">])</span>
+			<span class="s0">elif </span><span class="s1">flag &lt; </span><span class="s3">124</span><span class="s1">:</span>
+				<span class="s1">b2 = triplets[tripletIndex + </span><span class="s3">1</span><span class="s1">]</span>
+				<span class="s1">dx = withSign(flag</span><span class="s0">, </span><span class="s1">(triplets[tripletIndex] &lt;&lt; </span><span class="s3">4</span><span class="s1">) + (b2 &gt;&gt; </span><span class="s3">4</span><span class="s1">))</span>
+				<span class="s1">dy = withSign(flag &gt;&gt; </span><span class="s3">1</span><span class="s0">,</span>
+					<span class="s1">((b2 &amp; </span><span class="s3">0x0f</span><span class="s1">) &lt;&lt; </span><span class="s3">8</span><span class="s1">) + triplets[tripletIndex + </span><span class="s3">2</span><span class="s1">])</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">dx = withSign(flag</span><span class="s0">,</span>
+					<span class="s1">(triplets[tripletIndex] &lt;&lt; </span><span class="s3">8</span><span class="s1">) + triplets[tripletIndex + </span><span class="s3">1</span><span class="s1">])</span>
+				<span class="s1">dy = withSign(flag &gt;&gt; </span><span class="s3">1</span><span class="s0">,</span>
+					<span class="s1">(triplets[tripletIndex + </span><span class="s3">2</span><span class="s1">] &lt;&lt; </span><span class="s3">8</span><span class="s1">) + triplets[tripletIndex + </span><span class="s3">3</span><span class="s1">])</span>
+			<span class="s1">tripletIndex += nBytes</span>
+			<span class="s1">x += dx</span>
+			<span class="s1">y += dy</span>
+			<span class="s1">glyph.coordinates[i] = (x</span><span class="s0">, </span><span class="s1">y)</span>
+			<span class="s1">glyph.flags.append(int(onCurve))</span>
+		<span class="s1">bytesConsumed = tripletIndex</span>
+		<span class="s1">self.glyphStream = self.glyphStream[bytesConsumed:]</span>
+
+	<span class="s0">def </span><span class="s1">_encodeGlyph(self</span><span class="s0">, </span><span class="s1">glyphID):</span>
+		<span class="s1">glyphName = self.getGlyphName(glyphID)</span>
+		<span class="s1">glyph = self[glyphName]</span>
+		<span class="s1">self.nContourStream += struct.pack(</span><span class="s2">&quot;&gt;h&quot;</span><span class="s0">, </span><span class="s1">glyph.numberOfContours)</span>
+		<span class="s0">if </span><span class="s1">glyph.numberOfContours == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">return</span>
+		<span class="s0">elif </span><span class="s1">glyph.isComposite():</span>
+			<span class="s1">self._encodeComponents(glyph)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self._encodeCoordinates(glyph)</span>
+		<span class="s1">self._encodeBBox(glyphID</span><span class="s0">, </span><span class="s1">glyph)</span>
+
+	<span class="s0">def </span><span class="s1">_encodeComponents(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">lastcomponent = len(glyph.components) - </span><span class="s3">1</span>
+		<span class="s1">more = </span><span class="s3">1</span>
+		<span class="s1">haveInstructions = </span><span class="s3">0</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(glyph.components)):</span>
+			<span class="s0">if </span><span class="s1">i == lastcomponent:</span>
+				<span class="s1">haveInstructions = hasattr(glyph</span><span class="s0">, </span><span class="s2">&quot;program&quot;</span><span class="s1">)</span>
+				<span class="s1">more = </span><span class="s3">0</span>
+			<span class="s1">component = glyph.components[i]</span>
+			<span class="s1">self.compositeStream += component.compile(more</span><span class="s0">, </span><span class="s1">haveInstructions</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">if </span><span class="s1">haveInstructions:</span>
+			<span class="s1">self._encodeInstructions(glyph)</span>
+
+	<span class="s0">def </span><span class="s1">_encodeCoordinates(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">lastEndPoint = -</span><span class="s3">1</span>
+		<span class="s0">for </span><span class="s1">endPoint </span><span class="s0">in </span><span class="s1">glyph.endPtsOfContours:</span>
+			<span class="s1">ptsOfContour = endPoint - lastEndPoint</span>
+			<span class="s1">self.nPointsStream += pack255UShort(ptsOfContour)</span>
+			<span class="s1">lastEndPoint = endPoint</span>
+		<span class="s1">self._encodeTriplets(glyph)</span>
+		<span class="s1">self._encodeInstructions(glyph)</span>
+
+	<span class="s0">def </span><span class="s1">_encodeInstructions(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s1">instructions = glyph.program.getBytecode()</span>
+		<span class="s1">self.glyphStream += pack255UShort(len(instructions))</span>
+		<span class="s1">self.instructionStream += instructions</span>
+
+	<span class="s0">def </span><span class="s1">_encodeBBox(self</span><span class="s0">, </span><span class="s1">glyphID</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s0">assert </span><span class="s1">glyph.numberOfContours != </span><span class="s3">0</span><span class="s0">, </span><span class="s2">&quot;empty glyph has no bbox&quot;</span>
+		<span class="s0">if not </span><span class="s1">glyph.isComposite():</span>
+			<span class="s5"># for simple glyphs, compare the encoded bounding box info with the calculated</span>
+			<span class="s5"># values, and if they match omit the bounding box info</span>
+			<span class="s1">currentBBox = glyph.xMin</span><span class="s0">, </span><span class="s1">glyph.yMin</span><span class="s0">, </span><span class="s1">glyph.xMax</span><span class="s0">, </span><span class="s1">glyph.yMax</span>
+			<span class="s1">calculatedBBox = calcIntBounds(glyph.coordinates)</span>
+			<span class="s0">if </span><span class="s1">currentBBox == calculatedBBox:</span>
+				<span class="s0">return</span>
+		<span class="s1">self.bboxBitmap[glyphID &gt;&gt; </span><span class="s3">3</span><span class="s1">] |= </span><span class="s3">0x80 </span><span class="s1">&gt;&gt; (glyphID &amp; </span><span class="s3">7</span><span class="s1">)</span>
+		<span class="s1">self.bboxStream += sstruct.pack(bboxFormat</span><span class="s0">, </span><span class="s1">glyph)</span>
+
+	<span class="s0">def </span><span class="s1">_encodeTriplets(self</span><span class="s0">, </span><span class="s1">glyph):</span>
+		<span class="s0">assert </span><span class="s1">len(glyph.coordinates) == len(glyph.flags)</span>
+		<span class="s1">coordinates = glyph.coordinates.copy()</span>
+		<span class="s1">coordinates.absoluteToRelative()</span>
+
+		<span class="s1">flags = array.array(</span><span class="s2">'B'</span><span class="s1">)</span>
+		<span class="s1">triplets = array.array(</span><span class="s2">'B'</span><span class="s1">)</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(coordinates)):</span>
+			<span class="s1">onCurve = glyph.flags[i] &amp; _g_l_y_f.flagOnCurve</span>
+			<span class="s1">x</span><span class="s0">, </span><span class="s1">y = coordinates[i]</span>
+			<span class="s1">absX = abs(x)</span>
+			<span class="s1">absY = abs(y)</span>
+			<span class="s1">onCurveBit = </span><span class="s3">0 </span><span class="s0">if </span><span class="s1">onCurve </span><span class="s0">else </span><span class="s3">128</span>
+			<span class="s1">xSignBit = </span><span class="s3">0 </span><span class="s0">if </span><span class="s1">(x &lt; </span><span class="s3">0</span><span class="s1">) </span><span class="s0">else </span><span class="s3">1</span>
+			<span class="s1">ySignBit = </span><span class="s3">0 </span><span class="s0">if </span><span class="s1">(y &lt; </span><span class="s3">0</span><span class="s1">) </span><span class="s0">else </span><span class="s3">1</span>
+			<span class="s1">xySignBits = xSignBit + </span><span class="s3">2 </span><span class="s1">* ySignBit</span>
+
+			<span class="s0">if </span><span class="s1">x == </span><span class="s3">0 </span><span class="s0">and </span><span class="s1">absY &lt; </span><span class="s3">1280</span><span class="s1">:</span>
+				<span class="s1">flags.append(onCurveBit + ((absY &amp; </span><span class="s3">0xf00</span><span class="s1">) &gt;&gt; </span><span class="s3">7</span><span class="s1">) + ySignBit)</span>
+				<span class="s1">triplets.append(absY &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+			<span class="s0">elif </span><span class="s1">y == </span><span class="s3">0 </span><span class="s0">and </span><span class="s1">absX &lt; </span><span class="s3">1280</span><span class="s1">:</span>
+				<span class="s1">flags.append(onCurveBit + </span><span class="s3">10 </span><span class="s1">+ ((absX &amp; </span><span class="s3">0xf00</span><span class="s1">) &gt;&gt; </span><span class="s3">7</span><span class="s1">) + xSignBit)</span>
+				<span class="s1">triplets.append(absX &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+			<span class="s0">elif </span><span class="s1">absX &lt; </span><span class="s3">65 </span><span class="s0">and </span><span class="s1">absY &lt; </span><span class="s3">65</span><span class="s1">:</span>
+				<span class="s1">flags.append(onCurveBit + </span><span class="s3">20 </span><span class="s1">+ ((absX - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0x30</span><span class="s1">) + (((absY - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0x30</span><span class="s1">) &gt;&gt; </span><span class="s3">2</span><span class="s1">) + xySignBits)</span>
+				<span class="s1">triplets.append((((absX - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0xf</span><span class="s1">) &lt;&lt; </span><span class="s3">4</span><span class="s1">) | ((absY - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0xf</span><span class="s1">))</span>
+			<span class="s0">elif </span><span class="s1">absX &lt; </span><span class="s3">769 </span><span class="s0">and </span><span class="s1">absY &lt; </span><span class="s3">769</span><span class="s1">:</span>
+				<span class="s1">flags.append(onCurveBit + </span><span class="s3">84 </span><span class="s1">+ </span><span class="s3">12 </span><span class="s1">* (((absX - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0x300</span><span class="s1">) &gt;&gt; </span><span class="s3">8</span><span class="s1">) + (((absY - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0x300</span><span class="s1">) &gt;&gt; </span><span class="s3">6</span><span class="s1">) + xySignBits)</span>
+				<span class="s1">triplets.append((absX - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+				<span class="s1">triplets.append((absY - </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+			<span class="s0">elif </span><span class="s1">absX &lt; </span><span class="s3">4096 </span><span class="s0">and </span><span class="s1">absY &lt; </span><span class="s3">4096</span><span class="s1">:</span>
+				<span class="s1">flags.append(onCurveBit + </span><span class="s3">120 </span><span class="s1">+ xySignBits)</span>
+				<span class="s1">triplets.append(absX &gt;&gt; </span><span class="s3">4</span><span class="s1">)</span>
+				<span class="s1">triplets.append(((absX &amp; </span><span class="s3">0xf</span><span class="s1">) &lt;&lt; </span><span class="s3">4</span><span class="s1">) | (absY &gt;&gt; </span><span class="s3">8</span><span class="s1">))</span>
+				<span class="s1">triplets.append(absY &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">flags.append(onCurveBit + </span><span class="s3">124 </span><span class="s1">+ xySignBits)</span>
+				<span class="s1">triplets.append(absX &gt;&gt; </span><span class="s3">8</span><span class="s1">)</span>
+				<span class="s1">triplets.append(absX &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+				<span class="s1">triplets.append(absY &gt;&gt; </span><span class="s3">8</span><span class="s1">)</span>
+				<span class="s1">triplets.append(absY &amp; </span><span class="s3">0xff</span><span class="s1">)</span>
+
+		<span class="s1">self.flagStream += flags.tobytes()</span>
+		<span class="s1">self.glyphStream += triplets.tobytes()</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2HmtxTable(getTableClass(</span><span class="s2">&quot;hmtx&quot;</span><span class="s1">)):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">tag=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.tableTag = Tag(tag </span><span class="s0">or </span><span class="s2">'hmtx'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">reconstruct(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">flags</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s2">&quot;&gt;B&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s3">1</span><span class="s1">])</span>
+		<span class="s1">data = data[</span><span class="s3">1</span><span class="s1">:]</span>
+		<span class="s0">if </span><span class="s1">flags &amp; </span><span class="s3">0b11111100 </span><span class="s1">!= </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;Bits 2-7 of '%s' flags are reserved&quot; </span><span class="s1">% self.tableTag)</span>
+
+		<span class="s5"># When bit 0 is _not_ set, the lsb[] array is present</span>
+		<span class="s1">hasLsbArray = flags &amp; </span><span class="s3">1 </span><span class="s1">== </span><span class="s3">0</span>
+		<span class="s5"># When bit 1 is _not_ set, the leftSideBearing[] array is present</span>
+		<span class="s1">hasLeftSideBearingArray = flags &amp; </span><span class="s3">2 </span><span class="s1">== </span><span class="s3">0</span>
+		<span class="s0">if </span><span class="s1">hasLsbArray </span><span class="s0">and </span><span class="s1">hasLeftSideBearingArray:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span>
+				<span class="s2">&quot;either bits 0 or 1 (or both) must set in transformed '%s' flags&quot;</span>
+				<span class="s1">% self.tableTag</span>
+			<span class="s1">)</span>
+
+		<span class="s1">glyfTable = ttFont[</span><span class="s2">&quot;glyf&quot;</span><span class="s1">]</span>
+		<span class="s1">headerTable = ttFont[</span><span class="s2">&quot;hhea&quot;</span><span class="s1">]</span>
+		<span class="s1">glyphOrder = glyfTable.glyphOrder</span>
+		<span class="s1">numGlyphs = len(glyphOrder)</span>
+		<span class="s1">numberOfHMetrics = min(int(headerTable.numberOfHMetrics)</span><span class="s0">, </span><span class="s1">numGlyphs)</span>
+
+		<span class="s0">assert </span><span class="s1">len(data) &gt;= </span><span class="s3">2 </span><span class="s1">* numberOfHMetrics</span>
+		<span class="s1">advanceWidthArray = array.array(</span><span class="s2">&quot;H&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s3">2 </span><span class="s1">* numberOfHMetrics])</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">:</span>
+			<span class="s1">advanceWidthArray.byteswap()</span>
+		<span class="s1">data = data[</span><span class="s3">2 </span><span class="s1">* numberOfHMetrics:]</span>
+
+		<span class="s0">if </span><span class="s1">hasLsbArray:</span>
+			<span class="s0">assert </span><span class="s1">len(data) &gt;= </span><span class="s3">2 </span><span class="s1">* numberOfHMetrics</span>
+			<span class="s1">lsbArray = array.array(</span><span class="s2">&quot;h&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s3">2 </span><span class="s1">* numberOfHMetrics])</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">:</span>
+				<span class="s1">lsbArray.byteswap()</span>
+			<span class="s1">data = data[</span><span class="s3">2 </span><span class="s1">* numberOfHMetrics:]</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># compute (proportional) glyphs' lsb from their xMin</span>
+			<span class="s1">lsbArray = array.array(</span><span class="s2">&quot;h&quot;</span><span class="s1">)</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">enumerate(glyphOrder):</span>
+				<span class="s0">if </span><span class="s1">i &gt;= numberOfHMetrics:</span>
+					<span class="s0">break</span>
+				<span class="s1">glyph = glyfTable[glyphName]</span>
+				<span class="s1">xMin = getattr(glyph</span><span class="s0">, </span><span class="s2">&quot;xMin&quot;</span><span class="s0">, </span><span class="s3">0</span><span class="s1">)</span>
+				<span class="s1">lsbArray.append(xMin)</span>
+
+		<span class="s1">numberOfSideBearings = numGlyphs - numberOfHMetrics</span>
+		<span class="s0">if </span><span class="s1">hasLeftSideBearingArray:</span>
+			<span class="s0">assert </span><span class="s1">len(data) &gt;= </span><span class="s3">2 </span><span class="s1">* numberOfSideBearings</span>
+			<span class="s1">leftSideBearingArray = array.array(</span><span class="s2">&quot;h&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s3">2 </span><span class="s1">* numberOfSideBearings])</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">:</span>
+				<span class="s1">leftSideBearingArray.byteswap()</span>
+			<span class="s1">data = data[</span><span class="s3">2 </span><span class="s1">* numberOfSideBearings:]</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># compute (monospaced) glyphs' leftSideBearing from their xMin</span>
+			<span class="s1">leftSideBearingArray = array.array(</span><span class="s2">&quot;h&quot;</span><span class="s1">)</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">enumerate(glyphOrder):</span>
+				<span class="s0">if </span><span class="s1">i &lt; numberOfHMetrics:</span>
+					<span class="s0">continue</span>
+				<span class="s1">glyph = glyfTable[glyphName]</span>
+				<span class="s1">xMin = getattr(glyph</span><span class="s0">, </span><span class="s2">&quot;xMin&quot;</span><span class="s0">, </span><span class="s3">0</span><span class="s1">)</span>
+				<span class="s1">leftSideBearingArray.append(xMin)</span>
+
+		<span class="s0">if </span><span class="s1">data:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">&quot;too much '%s' table data&quot; </span><span class="s1">% self.tableTag)</span>
+
+		<span class="s1">self.metrics = {}</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numberOfHMetrics):</span>
+			<span class="s1">glyphName = glyphOrder[i]</span>
+			<span class="s1">advanceWidth</span><span class="s0">, </span><span class="s1">lsb = advanceWidthArray[i]</span><span class="s0">, </span><span class="s1">lsbArray[i]</span>
+			<span class="s1">self.metrics[glyphName] = (advanceWidth</span><span class="s0">, </span><span class="s1">lsb)</span>
+		<span class="s1">lastAdvance = advanceWidthArray[-</span><span class="s3">1</span><span class="s1">]</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numberOfSideBearings):</span>
+			<span class="s1">glyphName = glyphOrder[i + numberOfHMetrics]</span>
+			<span class="s1">self.metrics[glyphName] = (lastAdvance</span><span class="s0">, </span><span class="s1">leftSideBearingArray[i])</span>
+
+	<span class="s0">def </span><span class="s1">transform(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">glyphOrder = ttFont.getGlyphOrder()</span>
+		<span class="s1">glyf = ttFont[</span><span class="s2">&quot;glyf&quot;</span><span class="s1">]</span>
+		<span class="s1">hhea = ttFont[</span><span class="s2">&quot;hhea&quot;</span><span class="s1">]</span>
+		<span class="s1">numberOfHMetrics = hhea.numberOfHMetrics</span>
+
+		<span class="s5"># check if any of the proportional glyphs has left sidebearings that</span>
+		<span class="s5"># differ from their xMin bounding box values.</span>
+		<span class="s1">hasLsbArray = </span><span class="s0">False</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numberOfHMetrics):</span>
+			<span class="s1">glyphName = glyphOrder[i]</span>
+			<span class="s1">lsb = self.metrics[glyphName][</span><span class="s3">1</span><span class="s1">]</span>
+			<span class="s0">if </span><span class="s1">lsb != getattr(glyf[glyphName]</span><span class="s0">, </span><span class="s2">&quot;xMin&quot;</span><span class="s0">, </span><span class="s3">0</span><span class="s1">):</span>
+				<span class="s1">hasLsbArray = </span><span class="s0">True</span>
+				<span class="s0">break</span>
+
+		<span class="s5"># do the same for the monospaced glyphs (if any) at the end of hmtx table</span>
+		<span class="s1">hasLeftSideBearingArray = </span><span class="s0">False</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numberOfHMetrics</span><span class="s0">, </span><span class="s1">len(glyphOrder)):</span>
+			<span class="s1">glyphName = glyphOrder[i]</span>
+			<span class="s1">lsb = self.metrics[glyphName][</span><span class="s3">1</span><span class="s1">]</span>
+			<span class="s0">if </span><span class="s1">lsb != getattr(glyf[glyphName]</span><span class="s0">, </span><span class="s2">&quot;xMin&quot;</span><span class="s0">, </span><span class="s3">0</span><span class="s1">):</span>
+				<span class="s1">hasLeftSideBearingArray = </span><span class="s0">True</span>
+				<span class="s0">break</span>
+
+		<span class="s5"># if we need to encode both sidebearings arrays, then no transformation is</span>
+		<span class="s5"># applicable, and we must use the untransformed hmtx data</span>
+		<span class="s0">if </span><span class="s1">hasLsbArray </span><span class="s0">and </span><span class="s1">hasLeftSideBearingArray:</span>
+			<span class="s0">return</span>
+
+		<span class="s5"># set bit 0 and 1 when the respective arrays are _not_ present</span>
+		<span class="s1">flags = </span><span class="s3">0</span>
+		<span class="s0">if not </span><span class="s1">hasLsbArray:</span>
+			<span class="s1">flags |= </span><span class="s3">1 </span><span class="s1">&lt;&lt; </span><span class="s3">0</span>
+		<span class="s0">if not </span><span class="s1">hasLeftSideBearingArray:</span>
+			<span class="s1">flags |= </span><span class="s3">1 </span><span class="s1">&lt;&lt; </span><span class="s3">1</span>
+
+		<span class="s1">data = struct.pack(</span><span class="s2">&quot;&gt;B&quot;</span><span class="s0">, </span><span class="s1">flags)</span>
+
+		<span class="s1">advanceWidthArray = array.array(</span>
+			<span class="s2">&quot;H&quot;</span><span class="s0">,</span>
+			<span class="s1">[</span>
+				<span class="s1">self.metrics[glyphName][</span><span class="s3">0</span><span class="s1">]</span>
+				<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">enumerate(glyphOrder)</span>
+				<span class="s0">if </span><span class="s1">i &lt; numberOfHMetrics</span>
+			<span class="s1">]</span>
+		<span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">:</span>
+			<span class="s1">advanceWidthArray.byteswap()</span>
+		<span class="s1">data += advanceWidthArray.tobytes()</span>
+
+		<span class="s0">if </span><span class="s1">hasLsbArray:</span>
+			<span class="s1">lsbArray = array.array(</span>
+				<span class="s2">&quot;h&quot;</span><span class="s0">,</span>
+				<span class="s1">[</span>
+					<span class="s1">self.metrics[glyphName][</span><span class="s3">1</span><span class="s1">]</span>
+					<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">enumerate(glyphOrder)</span>
+					<span class="s0">if </span><span class="s1">i &lt; numberOfHMetrics</span>
+				<span class="s1">]</span>
+			<span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">:</span>
+				<span class="s1">lsbArray.byteswap()</span>
+			<span class="s1">data += lsbArray.tobytes()</span>
+
+		<span class="s0">if </span><span class="s1">hasLeftSideBearingArray:</span>
+			<span class="s1">leftSideBearingArray = array.array(</span>
+				<span class="s2">&quot;h&quot;</span><span class="s0">,</span>
+				<span class="s1">[</span>
+					<span class="s1">self.metrics[glyphOrder[i]][</span><span class="s3">1</span><span class="s1">]</span>
+					<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numberOfHMetrics</span><span class="s0">, </span><span class="s1">len(glyphOrder))</span>
+				<span class="s1">]</span>
+			<span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s2">&quot;big&quot;</span><span class="s1">:</span>
+				<span class="s1">leftSideBearingArray.byteswap()</span>
+			<span class="s1">data += leftSideBearingArray.tobytes()</span>
+
+		<span class="s0">return </span><span class="s1">data</span>
+
+
+<span class="s0">class </span><span class="s1">WOFF2FlavorData(WOFFFlavorData):</span>
+
+	<span class="s1">Flavor = </span><span class="s2">'woff2'</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">reader=</span><span class="s0">None, </span><span class="s1">data=</span><span class="s0">None, </span><span class="s1">transformedTables=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s6">&quot;&quot;&quot;Data class that holds the WOFF2 header major/minor version, any 
+        metadata or private data (as bytes strings), and the set of 
+        table tags that have transformations applied (if reader is not None), 
+        or will have once the WOFF2 font is compiled. 
+ 
+        Args: 
+            reader: an SFNTReader (or subclass) object to read flavor data from. 
+            data: another WOFFFlavorData object to initialise data from. 
+            transformedTables: set of strings containing table tags to be transformed. 
+ 
+        Raises: 
+            ImportError if the brotli module is not installed. 
+ 
+        NOTE: The 'reader' argument, on the one hand, and the 'data' and 
+        'transformedTables' arguments, on the other hand, are mutually exclusive. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if not </span><span class="s1">haveBrotli:</span>
+			<span class="s0">raise </span><span class="s1">ImportError(</span><span class="s2">&quot;No module named brotli&quot;</span><span class="s1">)</span>
+
+		<span class="s0">if </span><span class="s1">reader </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">data </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s0">raise </span><span class="s1">TypeError(</span>
+					<span class="s2">&quot;'reader' and 'data' arguments are mutually exclusive&quot;</span>
+				<span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">transformedTables </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s0">raise </span><span class="s1">TypeError(</span>
+					<span class="s2">&quot;'reader' and 'transformedTables' arguments are mutually exclusive&quot;</span>
+				<span class="s1">)</span>
+
+		<span class="s0">if </span><span class="s1">transformedTables </span><span class="s0">is not None and </span><span class="s1">(</span>
+				<span class="s2">&quot;glyf&quot; </span><span class="s0">in </span><span class="s1">transformedTables </span><span class="s0">and </span><span class="s2">&quot;loca&quot; </span><span class="s0">not in </span><span class="s1">transformedTables</span>
+				<span class="s0">or </span><span class="s2">&quot;loca&quot; </span><span class="s0">in </span><span class="s1">transformedTables </span><span class="s0">and </span><span class="s2">&quot;glyf&quot; </span><span class="s0">not in </span><span class="s1">transformedTables</span>
+			<span class="s1">):</span>
+				<span class="s0">raise </span><span class="s1">ValueError(</span>
+					<span class="s2">&quot;'glyf' and 'loca' must be transformed (or not) together&quot;</span>
+				<span class="s1">)</span>
+		<span class="s1">super(WOFF2FlavorData</span><span class="s0">, </span><span class="s1">self).__init__(reader=reader)</span>
+		<span class="s0">if </span><span class="s1">reader:</span>
+			<span class="s1">transformedTables = [</span>
+				<span class="s1">tag</span>
+				<span class="s0">for </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">reader.tables.items()</span>
+				<span class="s0">if </span><span class="s1">entry.transformed</span>
+			<span class="s1">]</span>
+		<span class="s0">elif </span><span class="s1">data:</span>
+			<span class="s1">self.majorVersion = data.majorVersion</span>
+			<span class="s1">self.majorVersion = data.minorVersion</span>
+			<span class="s1">self.metaData = data.metaData</span>
+			<span class="s1">self.privData = data.privData</span>
+			<span class="s0">if </span><span class="s1">transformedTables </span><span class="s0">is None and </span><span class="s1">hasattr(data</span><span class="s0">, </span><span class="s2">&quot;transformedTables&quot;</span><span class="s1">):</span>
+				 <span class="s1">transformedTables = data.transformedTables</span>
+
+		<span class="s0">if </span><span class="s1">transformedTables </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">transformedTables = woff2TransformedTableTags</span>
+
+		<span class="s1">self.transformedTables = set(transformedTables)</span>
+
+	<span class="s0">def </span><span class="s1">_decompress(self</span><span class="s0">, </span><span class="s1">rawData):</span>
+		<span class="s0">return </span><span class="s1">brotli.decompress(rawData)</span>
+
+
+<span class="s0">def </span><span class="s1">unpackBase128(data):</span>
+	<span class="s6">r&quot;&quot;&quot; Read one to five bytes from UIntBase128-encoded input string, and return 
+    a tuple containing the decoded integer plus any leftover data. 
+ 
+    &gt;&gt;&gt; unpackBase128(b'\x3f\x00\x00') == (63, b&quot;\x00\x00&quot;) 
+    True 
+    &gt;&gt;&gt; unpackBase128(b'\x8f\xff\xff\xff\x7f')[0] == 4294967295 
+    True 
+    &gt;&gt;&gt; unpackBase128(b'\x80\x80\x3f')  # doctest: +IGNORE_EXCEPTION_DETAIL 
+    Traceback (most recent call last): 
+      File &quot;&lt;stdin&gt;&quot;, line 1, in ? 
+    TTLibError: UIntBase128 value must not start with leading zeros 
+    &gt;&gt;&gt; unpackBase128(b'\x8f\xff\xff\xff\xff\x7f')[0]  # doctest: +IGNORE_EXCEPTION_DETAIL 
+    Traceback (most recent call last): 
+      File &quot;&lt;stdin&gt;&quot;, line 1, in ? 
+    TTLibError: UIntBase128-encoded sequence is longer than 5 bytes 
+    &gt;&gt;&gt; unpackBase128(b'\x90\x80\x80\x80\x00')[0]  # doctest: +IGNORE_EXCEPTION_DETAIL 
+    Traceback (most recent call last): 
+      File &quot;&lt;stdin&gt;&quot;, line 1, in ? 
+    TTLibError: UIntBase128 value exceeds 2**32-1 
+    &quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">len(data) == </span><span class="s3">0</span><span class="s1">:</span>
+		<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'not enough data to unpack UIntBase128'</span><span class="s1">)</span>
+	<span class="s1">result = </span><span class="s3">0</span>
+	<span class="s0">if </span><span class="s1">byteord(data[</span><span class="s3">0</span><span class="s1">]) == </span><span class="s3">0x80</span><span class="s1">:</span>
+		<span class="s5"># font must be rejected if UIntBase128 value starts with 0x80</span>
+		<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'UIntBase128 value must not start with leading zeros'</span><span class="s1">)</span>
+	<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(woff2Base128MaxSize):</span>
+		<span class="s0">if </span><span class="s1">len(data) == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'not enough data to unpack UIntBase128'</span><span class="s1">)</span>
+		<span class="s1">code = byteord(data[</span><span class="s3">0</span><span class="s1">])</span>
+		<span class="s1">data = data[</span><span class="s3">1</span><span class="s1">:]</span>
+		<span class="s5"># if any of the top seven bits are set then we're about to overflow</span>
+		<span class="s0">if </span><span class="s1">result &amp; </span><span class="s3">0xFE000000</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'UIntBase128 value exceeds 2**32-1'</span><span class="s1">)</span>
+		<span class="s5"># set current value = old value times 128 bitwise-or (byte bitwise-and 127)</span>
+		<span class="s1">result = (result &lt;&lt; </span><span class="s3">7</span><span class="s1">) | (code &amp; </span><span class="s3">0x7f</span><span class="s1">)</span>
+		<span class="s5"># repeat until the most significant bit of byte is false</span>
+		<span class="s0">if </span><span class="s1">(code &amp; </span><span class="s3">0x80</span><span class="s1">) == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s5"># return result plus left over data</span>
+			<span class="s0">return </span><span class="s1">result</span><span class="s0">, </span><span class="s1">data</span>
+	<span class="s5"># make sure not to exceed the size bound</span>
+	<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'UIntBase128-encoded sequence is longer than 5 bytes'</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">base128Size(n):</span>
+	<span class="s6">&quot;&quot;&quot; Return the length in bytes of a UIntBase128-encoded sequence with value n. 
+ 
+    &gt;&gt;&gt; base128Size(0) 
+    1 
+    &gt;&gt;&gt; base128Size(24567) 
+    3 
+    &gt;&gt;&gt; base128Size(2**32-1) 
+    5 
+    &quot;&quot;&quot;</span>
+	<span class="s0">assert </span><span class="s1">n &gt;= </span><span class="s3">0</span>
+	<span class="s1">size = </span><span class="s3">1</span>
+	<span class="s0">while </span><span class="s1">n &gt;= </span><span class="s3">128</span><span class="s1">:</span>
+		<span class="s1">size += </span><span class="s3">1</span>
+		<span class="s1">n &gt;&gt;= </span><span class="s3">7</span>
+	<span class="s0">return </span><span class="s1">size</span>
+
+
+<span class="s0">def </span><span class="s1">packBase128(n):</span>
+	<span class="s6">r&quot;&quot;&quot; Encode unsigned integer in range 0 to 2**32-1 (inclusive) to a string of 
+    bytes using UIntBase128 variable-length encoding. Produce the shortest possible 
+    encoding. 
+ 
+    &gt;&gt;&gt; packBase128(63) == b&quot;\x3f&quot; 
+    True 
+    &gt;&gt;&gt; packBase128(2**32-1) == b'\x8f\xff\xff\xff\x7f' 
+    True 
+    &quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">n &lt; </span><span class="s3">0 </span><span class="s0">or </span><span class="s1">n &gt;= </span><span class="s3">2</span><span class="s1">**</span><span class="s3">32</span><span class="s1">:</span>
+		<span class="s0">raise </span><span class="s1">TTLibError(</span>
+			<span class="s2">&quot;UIntBase128 format requires 0 &lt;= integer &lt;= 2**32-1&quot;</span><span class="s1">)</span>
+	<span class="s1">data = </span><span class="s4">b''</span>
+	<span class="s1">size = base128Size(n)</span>
+	<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(size):</span>
+		<span class="s1">b = (n &gt;&gt; (</span><span class="s3">7 </span><span class="s1">* (size - i - </span><span class="s3">1</span><span class="s1">))) &amp; </span><span class="s3">0x7f</span>
+		<span class="s0">if </span><span class="s1">i &lt; size - </span><span class="s3">1</span><span class="s1">:</span>
+			<span class="s1">b |= </span><span class="s3">0x80</span>
+		<span class="s1">data += struct.pack(</span><span class="s2">'B'</span><span class="s0">, </span><span class="s1">b)</span>
+	<span class="s0">return </span><span class="s1">data</span>
+
+
+<span class="s0">def </span><span class="s1">unpack255UShort(data):</span>
+	<span class="s6">&quot;&quot;&quot; Read one to three bytes from 255UInt16-encoded input string, and return a 
+    tuple containing the decoded integer plus any leftover data. 
+ 
+    &gt;&gt;&gt; unpack255UShort(bytechr(252))[0] 
+    252 
+ 
+    Note that some numbers (e.g. 506) can have multiple encodings: 
+    &gt;&gt;&gt; unpack255UShort(struct.pack(&quot;BB&quot;, 254, 0))[0] 
+    506 
+    &gt;&gt;&gt; unpack255UShort(struct.pack(&quot;BB&quot;, 255, 253))[0] 
+    506 
+    &gt;&gt;&gt; unpack255UShort(struct.pack(&quot;BBB&quot;, 253, 1, 250))[0] 
+    506 
+    &quot;&quot;&quot;</span>
+	<span class="s1">code = byteord(data[:</span><span class="s3">1</span><span class="s1">])</span>
+	<span class="s1">data = data[</span><span class="s3">1</span><span class="s1">:]</span>
+	<span class="s0">if </span><span class="s1">code == </span><span class="s3">253</span><span class="s1">:</span>
+		<span class="s5"># read two more bytes as an unsigned short</span>
+		<span class="s0">if </span><span class="s1">len(data) &lt; </span><span class="s3">2</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'not enough data to unpack 255UInt16'</span><span class="s1">)</span>
+		<span class="s1">result</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s3">2</span><span class="s1">])</span>
+		<span class="s1">data = data[</span><span class="s3">2</span><span class="s1">:]</span>
+	<span class="s0">elif </span><span class="s1">code == </span><span class="s3">254</span><span class="s1">:</span>
+		<span class="s5"># read another byte, plus 253 * 2</span>
+		<span class="s0">if </span><span class="s1">len(data) == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'not enough data to unpack 255UInt16'</span><span class="s1">)</span>
+		<span class="s1">result = byteord(data[:</span><span class="s3">1</span><span class="s1">])</span>
+		<span class="s1">result += </span><span class="s3">506</span>
+		<span class="s1">data = data[</span><span class="s3">1</span><span class="s1">:]</span>
+	<span class="s0">elif </span><span class="s1">code == </span><span class="s3">255</span><span class="s1">:</span>
+		<span class="s5"># read another byte, plus 253</span>
+		<span class="s0">if </span><span class="s1">len(data) == </span><span class="s3">0</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s2">'not enough data to unpack 255UInt16'</span><span class="s1">)</span>
+		<span class="s1">result = byteord(data[:</span><span class="s3">1</span><span class="s1">])</span>
+		<span class="s1">result += </span><span class="s3">253</span>
+		<span class="s1">data = data[</span><span class="s3">1</span><span class="s1">:]</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s5"># leave as is if lower than 253</span>
+		<span class="s1">result = code</span>
+	<span class="s5"># return result plus left over data</span>
+	<span class="s0">return </span><span class="s1">result</span><span class="s0">, </span><span class="s1">data</span>
+
+
+<span class="s0">def </span><span class="s1">pack255UShort(value):</span>
+	<span class="s6">r&quot;&quot;&quot; Encode unsigned integer in range 0 to 65535 (inclusive) to a bytestring 
+    using 255UInt16 variable-length encoding. 
+ 
+    &gt;&gt;&gt; pack255UShort(252) == b'\xfc' 
+    True 
+    &gt;&gt;&gt; pack255UShort(506) == b'\xfe\x00' 
+    True 
+    &gt;&gt;&gt; pack255UShort(762) == b'\xfd\x02\xfa' 
+    True 
+    &quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">value &lt; </span><span class="s3">0 </span><span class="s0">or </span><span class="s1">value &gt; </span><span class="s3">0xFFFF</span><span class="s1">:</span>
+		<span class="s0">raise </span><span class="s1">TTLibError(</span>
+			<span class="s2">&quot;255UInt16 format requires 0 &lt;= integer &lt;= 65535&quot;</span><span class="s1">)</span>
+	<span class="s0">if </span><span class="s1">value &lt; </span><span class="s3">253</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s2">&quot;&gt;B&quot;</span><span class="s0">, </span><span class="s1">value)</span>
+	<span class="s0">elif </span><span class="s1">value &lt; </span><span class="s3">506</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s2">&quot;&gt;BB&quot;</span><span class="s0">, </span><span class="s3">255</span><span class="s0">, </span><span class="s1">value - </span><span class="s3">253</span><span class="s1">)</span>
+	<span class="s0">elif </span><span class="s1">value &lt; </span><span class="s3">762</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s2">&quot;&gt;BB&quot;</span><span class="s0">, </span><span class="s3">254</span><span class="s0">, </span><span class="s1">value - </span><span class="s3">506</span><span class="s1">)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s2">&quot;&gt;BH&quot;</span><span class="s0">, </span><span class="s3">253</span><span class="s0">, </span><span class="s1">value)</span>
+
+
+<span class="s0">def </span><span class="s1">compress(input_file</span><span class="s0">, </span><span class="s1">output_file</span><span class="s0">, </span><span class="s1">transform_tables=</span><span class="s0">None</span><span class="s1">):</span>
+	<span class="s6">&quot;&quot;&quot;Compress OpenType font to WOFF2. 
+ 
+    Args: 
+        input_file: a file path, file or file-like object (open in binary mode) 
+            containing an OpenType font (either CFF- or TrueType-flavored). 
+        output_file: a file path, file or file-like object where to save the 
+            compressed WOFF2 font. 
+        transform_tables: Optional[Iterable[str]]: a set of table tags for which 
+            to enable preprocessing transformations. By default, only 'glyf' 
+            and 'loca' tables are transformed. An empty set means disable all 
+            transformations. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">log.info(</span><span class="s2">&quot;Processing %s =&gt; %s&quot; </span><span class="s1">% (input_file</span><span class="s0">, </span><span class="s1">output_file))</span>
+
+	<span class="s1">font = TTFont(input_file</span><span class="s0">, </span><span class="s1">recalcBBoxes=</span><span class="s0">False, </span><span class="s1">recalcTimestamp=</span><span class="s0">False</span><span class="s1">)</span>
+	<span class="s1">font.flavor = </span><span class="s2">&quot;woff2&quot;</span>
+
+	<span class="s0">if </span><span class="s1">transform_tables </span><span class="s0">is not None</span><span class="s1">:</span>
+		<span class="s1">font.flavorData = WOFF2FlavorData(</span>
+			<span class="s1">data=font.flavorData</span><span class="s0">, </span><span class="s1">transformedTables=transform_tables</span>
+		<span class="s1">)</span>
+
+	<span class="s1">font.save(output_file</span><span class="s0">, </span><span class="s1">reorderTables=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">decompress(input_file</span><span class="s0">, </span><span class="s1">output_file):</span>
+	<span class="s6">&quot;&quot;&quot;Decompress WOFF2 font to OpenType font. 
+ 
+    Args: 
+        input_file: a file path, file or file-like object (open in binary mode) 
+            containing a compressed WOFF2 font. 
+        output_file: a file path, file or file-like object where to save the 
+            decompressed OpenType font. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">log.info(</span><span class="s2">&quot;Processing %s =&gt; %s&quot; </span><span class="s1">% (input_file</span><span class="s0">, </span><span class="s1">output_file))</span>
+
+	<span class="s1">font = TTFont(input_file</span><span class="s0">, </span><span class="s1">recalcBBoxes=</span><span class="s0">False, </span><span class="s1">recalcTimestamp=</span><span class="s0">False</span><span class="s1">)</span>
+	<span class="s1">font.flavor = </span><span class="s0">None</span>
+	<span class="s1">font.flavorData = </span><span class="s0">None</span>
+	<span class="s1">font.save(output_file</span><span class="s0">, </span><span class="s1">reorderTables=</span><span class="s0">True</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">main(args=</span><span class="s0">None</span><span class="s1">):</span>
+	<span class="s6">&quot;&quot;&quot;Compress and decompress WOFF2 fonts&quot;&quot;&quot;</span>
+	<span class="s0">import </span><span class="s1">argparse</span>
+	<span class="s0">from </span><span class="s1">fontTools </span><span class="s0">import </span><span class="s1">configLogger</span>
+	<span class="s0">from </span><span class="s1">fontTools.ttx </span><span class="s0">import </span><span class="s1">makeOutputFileName</span>
+
+	<span class="s0">class </span><span class="s1">_HelpAction(argparse._HelpAction):</span>
+
+		<span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">parser</span><span class="s0">, </span><span class="s1">namespace</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">option_string=</span><span class="s0">None</span><span class="s1">):</span>
+			<span class="s1">subparsers_actions = [</span>
+					<span class="s1">action </span><span class="s0">for </span><span class="s1">action </span><span class="s0">in </span><span class="s1">parser._actions</span>
+					<span class="s0">if </span><span class="s1">isinstance(action</span><span class="s0">, </span><span class="s1">argparse._SubParsersAction)]</span>
+			<span class="s0">for </span><span class="s1">subparsers_action </span><span class="s0">in </span><span class="s1">subparsers_actions:</span>
+					<span class="s0">for </span><span class="s1">choice</span><span class="s0">, </span><span class="s1">subparser </span><span class="s0">in </span><span class="s1">subparsers_action.choices.items():</span>
+							<span class="s1">print(subparser.format_help())</span>
+			<span class="s1">parser.exit()</span>
+
+	<span class="s0">class </span><span class="s1">_NoGlyfTransformAction(argparse.Action):</span>
+		<span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">parser</span><span class="s0">, </span><span class="s1">namespace</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">option_string=</span><span class="s0">None</span><span class="s1">):</span>
+			<span class="s1">namespace.transform_tables.difference_update({</span><span class="s2">&quot;glyf&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s1">})</span>
+
+	<span class="s0">class </span><span class="s1">_HmtxTransformAction(argparse.Action):</span>
+		<span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">parser</span><span class="s0">, </span><span class="s1">namespace</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">option_string=</span><span class="s0">None</span><span class="s1">):</span>
+			<span class="s1">namespace.transform_tables.add(</span><span class="s2">&quot;hmtx&quot;</span><span class="s1">)</span>
+
+	<span class="s1">parser = argparse.ArgumentParser(</span>
+		<span class="s1">prog=</span><span class="s2">&quot;fonttools ttLib.woff2&quot;</span><span class="s0">,</span>
+		<span class="s1">description=main.__doc__</span><span class="s0">,</span>
+		<span class="s1">add_help = </span><span class="s0">False</span>
+	<span class="s1">)</span>
+
+	<span class="s1">parser.add_argument(</span><span class="s2">'-h'</span><span class="s0">, </span><span class="s2">'--help'</span><span class="s0">, </span><span class="s1">action=_HelpAction</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">'show this help message and exit'</span><span class="s1">)</span>
+
+	<span class="s1">parser_group = parser.add_subparsers(title=</span><span class="s2">&quot;sub-commands&quot;</span><span class="s1">)</span>
+	<span class="s1">parser_compress = parser_group.add_parser(</span><span class="s2">&quot;compress&quot;</span><span class="s0">,</span>
+		<span class="s1">description = </span><span class="s2">&quot;Compress a TTF or OTF font to WOFF2&quot;</span><span class="s1">)</span>
+	<span class="s1">parser_decompress = parser_group.add_parser(</span><span class="s2">&quot;decompress&quot;</span><span class="s0">,</span>
+		<span class="s1">description = </span><span class="s2">&quot;Decompress a WOFF2 font to OTF&quot;</span><span class="s1">)</span>
+
+	<span class="s0">for </span><span class="s1">subparser </span><span class="s0">in </span><span class="s1">(parser_compress</span><span class="s0">, </span><span class="s1">parser_decompress):</span>
+		<span class="s1">group = subparser.add_mutually_exclusive_group(required=</span><span class="s0">False</span><span class="s1">)</span>
+		<span class="s1">group.add_argument(</span>
+			<span class="s2">&quot;-v&quot;</span><span class="s0">,</span>
+			<span class="s2">&quot;--verbose&quot;</span><span class="s0">,</span>
+			<span class="s1">action=</span><span class="s2">&quot;store_true&quot;</span><span class="s0">,</span>
+			<span class="s1">help=</span><span class="s2">&quot;print more messages to console&quot;</span><span class="s0">,</span>
+		<span class="s1">)</span>
+		<span class="s1">group.add_argument(</span>
+			<span class="s2">&quot;-q&quot;</span><span class="s0">,</span>
+			<span class="s2">&quot;--quiet&quot;</span><span class="s0">,</span>
+			<span class="s1">action=</span><span class="s2">&quot;store_true&quot;</span><span class="s0">,</span>
+			<span class="s1">help=</span><span class="s2">&quot;do not print messages to console&quot;</span><span class="s0">,</span>
+		<span class="s1">)</span>
+
+	<span class="s1">parser_compress.add_argument(</span>
+		<span class="s2">&quot;input_file&quot;</span><span class="s0">,</span>
+		<span class="s1">metavar=</span><span class="s2">&quot;INPUT&quot;</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">&quot;the input OpenType font (.ttf or .otf)&quot;</span><span class="s0">,</span>
+	<span class="s1">)</span>
+	<span class="s1">parser_decompress.add_argument(</span>
+		<span class="s2">&quot;input_file&quot;</span><span class="s0">,</span>
+		<span class="s1">metavar=</span><span class="s2">&quot;INPUT&quot;</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">&quot;the input WOFF2 font&quot;</span><span class="s0">,</span>
+	<span class="s1">)</span>
+
+	<span class="s1">parser_compress.add_argument(</span>
+		<span class="s2">&quot;-o&quot;</span><span class="s0">,</span>
+		<span class="s2">&quot;--output-file&quot;</span><span class="s0">,</span>
+		<span class="s1">metavar=</span><span class="s2">&quot;OUTPUT&quot;</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">&quot;the output WOFF2 font&quot;</span><span class="s0">,</span>
+	<span class="s1">)</span>
+	<span class="s1">parser_decompress.add_argument(</span>
+		<span class="s2">&quot;-o&quot;</span><span class="s0">,</span>
+		<span class="s2">&quot;--output-file&quot;</span><span class="s0">,</span>
+		<span class="s1">metavar=</span><span class="s2">&quot;OUTPUT&quot;</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">&quot;the output OpenType font&quot;</span><span class="s0">,</span>
+	<span class="s1">)</span>
+
+	<span class="s1">transform_group = parser_compress.add_argument_group()</span>
+	<span class="s1">transform_group.add_argument(</span>
+		<span class="s2">&quot;--no-glyf-transform&quot;</span><span class="s0">,</span>
+		<span class="s1">dest=</span><span class="s2">&quot;transform_tables&quot;</span><span class="s0">,</span>
+		<span class="s1">nargs=</span><span class="s3">0</span><span class="s0">,</span>
+		<span class="s1">action=_NoGlyfTransformAction</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">&quot;Do not transform glyf (and loca) tables&quot;</span><span class="s0">,</span>
+	<span class="s1">)</span>
+	<span class="s1">transform_group.add_argument(</span>
+		<span class="s2">&quot;--hmtx-transform&quot;</span><span class="s0">,</span>
+		<span class="s1">dest=</span><span class="s2">&quot;transform_tables&quot;</span><span class="s0">,</span>
+		<span class="s1">nargs=</span><span class="s3">0</span><span class="s0">,</span>
+		<span class="s1">action=_HmtxTransformAction</span><span class="s0">,</span>
+		<span class="s1">help=</span><span class="s2">&quot;Enable optional transformation for 'hmtx' table&quot;</span><span class="s0">,</span>
+	<span class="s1">)</span>
+
+	<span class="s1">parser_compress.set_defaults(</span>
+		<span class="s1">subcommand=compress</span><span class="s0">,</span>
+		<span class="s1">transform_tables={</span><span class="s2">&quot;glyf&quot;</span><span class="s0">, </span><span class="s2">&quot;loca&quot;</span><span class="s1">}</span><span class="s0">,</span>
+	<span class="s1">)</span>
+	<span class="s1">parser_decompress.set_defaults(subcommand=decompress)</span>
+
+	<span class="s1">options = vars(parser.parse_args(args))</span>
+
+	<span class="s1">subcommand = options.pop(</span><span class="s2">&quot;subcommand&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+	<span class="s0">if not </span><span class="s1">subcommand:</span>
+		<span class="s1">parser.print_help()</span>
+		<span class="s0">return</span>
+
+	<span class="s1">quiet = options.pop(</span><span class="s2">&quot;quiet&quot;</span><span class="s1">)</span>
+	<span class="s1">verbose = options.pop(</span><span class="s2">&quot;verbose&quot;</span><span class="s1">)</span>
+	<span class="s1">configLogger(</span>
+		<span class="s1">level=(</span><span class="s2">&quot;ERROR&quot; </span><span class="s0">if </span><span class="s1">quiet </span><span class="s0">else </span><span class="s2">&quot;DEBUG&quot; </span><span class="s0">if </span><span class="s1">verbose </span><span class="s0">else </span><span class="s2">&quot;INFO&quot;</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">)</span>
+
+	<span class="s0">if not </span><span class="s1">options[</span><span class="s2">&quot;output_file&quot;</span><span class="s1">]:</span>
+		<span class="s0">if </span><span class="s1">subcommand </span><span class="s0">is </span><span class="s1">compress:</span>
+			<span class="s1">extension = </span><span class="s2">&quot;.woff2&quot;</span>
+		<span class="s0">elif </span><span class="s1">subcommand </span><span class="s0">is </span><span class="s1">decompress:</span>
+			<span class="s5"># choose .ttf/.otf file extension depending on sfntVersion</span>
+			<span class="s0">with </span><span class="s1">open(options[</span><span class="s2">&quot;input_file&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+				<span class="s1">f.seek(</span><span class="s3">4</span><span class="s1">)  </span><span class="s5"># skip 'wOF2' signature</span>
+				<span class="s1">sfntVersion = f.read(</span><span class="s3">4</span><span class="s1">)</span>
+			<span class="s0">assert </span><span class="s1">len(sfntVersion) == </span><span class="s3">4</span><span class="s0">, </span><span class="s2">&quot;not enough data&quot;</span>
+			<span class="s1">extension = </span><span class="s2">&quot;.otf&quot; </span><span class="s0">if </span><span class="s1">sfntVersion == </span><span class="s4">b&quot;OTTO&quot; </span><span class="s0">else </span><span class="s2">&quot;.ttf&quot;</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">AssertionError(subcommand)</span>
+		<span class="s1">options[</span><span class="s2">&quot;output_file&quot;</span><span class="s1">] = makeOutputFileName(</span>
+			<span class="s1">options[</span><span class="s2">&quot;input_file&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">outputDir=</span><span class="s0">None, </span><span class="s1">extension=extension</span>
+		<span class="s1">)</span>
+
+	<span class="s0">try</span><span class="s1">:</span>
+		<span class="s1">subcommand(**options)</span>
+	<span class="s0">except </span><span class="s1">TTLibError </span><span class="s0">as </span><span class="s1">e:</span>
+		<span class="s1">parser.error(e)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ == </span><span class="s2">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s1">sys.exit(main())</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,803 @@
+<html>
+<head>
+<title>_constrained_layout.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_constrained_layout.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Adjust subplot layouts so that there are no overlapping axes or axes 
+decorations.  All axes decorations are dealt with (labels, ticks, titles, 
+ticklabels) and some dependent artists are also dealt with (colorbar, 
+suptitle). 
+ 
+Layout is done via `~matplotlib.gridspec`, with one constraint per gridspec, 
+so it is possible to have overlapping axes if the gridspecs overlap (i.e. 
+using `~matplotlib.gridspec.GridSpecFromSubplotSpec`).  Axes placed using 
+``figure.subplots()`` or ``figure.add_subplots()`` will participate in the 
+layout.  Axes manually placed via ``figure.add_axes()`` will not. 
+ 
+See Tutorial: :doc:`/tutorials/intermediate/constrainedlayout_guide` 
+ 
+General idea: 
+------------- 
+ 
+First, a figure has a gridspec that divides the figure into nrows and ncols, 
+with heights and widths set by ``height_ratios`` and ``width_ratios``, 
+often just set to 1 for an equal grid. 
+ 
+Subplotspecs that are derived from this gridspec can contain either a 
+``SubPanel``, a ``GridSpecFromSubplotSpec``, or an ``Axes``.  The ``SubPanel`` 
+and ``GridSpecFromSubplotSpec`` are dealt with recursively and each contain an 
+analogous layout. 
+ 
+Each ``GridSpec`` has a ``_layoutgrid`` attached to it.  The ``_layoutgrid`` 
+has the same logical layout as the ``GridSpec``.   Each row of the grid spec 
+has a top and bottom &quot;margin&quot; and each column has a left and right &quot;margin&quot;. 
+The &quot;inner&quot; height of each row is constrained to be the same (or as modified 
+by ``height_ratio``), and the &quot;inner&quot; width of each column is 
+constrained to be the same (as modified by ``width_ratio``), where &quot;inner&quot; 
+is the width or height of each column/row minus the size of the margins. 
+ 
+Then the size of the margins for each row and column are determined as the 
+max width of the decorators on each axes that has decorators in that margin. 
+For instance, a normal axes would have a left margin that includes the 
+left ticklabels, and the ylabel if it exists.  The right margin may include a 
+colorbar, the bottom margin the xaxis decorations, and the top margin the 
+title. 
+ 
+With these constraints, the solver then finds appropriate bounds for the 
+columns and rows.  It's possible that the margins take up the whole figure, 
+in which case the algorithm is not applied and a warning is raised. 
+ 
+See the tutorial doc:`/tutorials/intermediate/constrainedlayout_guide` 
+for more discussion of the algorithm with examples. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">logging</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">artist </span><span class="s2">as </span><span class="s1">martist</span>
+<span class="s2">import </span><span class="s1">matplotlib.transforms </span><span class="s2">as </span><span class="s1">mtransforms</span>
+<span class="s2">import </span><span class="s1">matplotlib._layoutgrid </span><span class="s2">as </span><span class="s1">mlayoutgrid</span>
+
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+
+<span class="s3">######################################################</span>
+<span class="s2">def </span><span class="s1">do_constrained_layout(fig</span><span class="s2">, </span><span class="s1">h_pad</span><span class="s2">, </span><span class="s1">w_pad</span><span class="s2">,</span>
+                          <span class="s1">hspace=</span><span class="s2">None, </span><span class="s1">wspace=</span><span class="s2">None, </span><span class="s1">rect=(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,</span>
+                          <span class="s1">compress=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Do the constrained_layout.  Called at draw time in 
+     ``figure.constrained_layout()`` 
+ 
+    Parameters 
+    ---------- 
+    fig : Figure 
+        ``Figure`` instance to do the layout in. 
+ 
+    renderer : Renderer 
+        Renderer to use. 
+ 
+    h_pad, w_pad : float 
+      Padding around the axes elements in figure-normalized units. 
+ 
+    hspace, wspace : float 
+       Fraction of the figure to dedicate to space between the 
+       axes.  These are evenly spread between the gaps between the axes. 
+       A value of 0.2 for a three-column layout would have a space 
+       of 0.1 of the figure width between each column. 
+       If h/wspace &lt; h/w_pad, then the pads are used instead. 
+ 
+    rect : tuple of 4 floats 
+        Rectangle in figure coordinates to perform constrained layout in 
+        [left, bottom, width, height], each from 0-1. 
+ 
+    compress : bool 
+        Whether to shift Axes so that white space in between them is 
+        removed. This is useful for simple grids of fixed-aspect Axes (e.g. 
+        a grid of images). 
+ 
+    Returns 
+    ------- 
+    layoutgrid : private debugging structure 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">renderer = fig._get_renderer()</span>
+    <span class="s3"># make layoutgrid tree...</span>
+    <span class="s1">layoutgrids = make_layoutgrids(fig</span><span class="s2">, None, </span><span class="s1">rect=rect)</span>
+    <span class="s2">if not </span><span class="s1">layoutgrids[</span><span class="s5">'hasgrids'</span><span class="s1">]:</span>
+        <span class="s1">_api.warn_external(</span><span class="s5">'There are no gridspecs with layoutgrids. '</span>
+                           <span class="s5">'Possibly did not call parent GridSpec with the'</span>
+                           <span class="s5">' &quot;figure&quot; keyword'</span><span class="s1">)</span>
+        <span class="s2">return</span>
+
+    <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">2</span><span class="s1">):</span>
+        <span class="s3"># do the algorithm twice.  This has to be done because decorations</span>
+        <span class="s3"># change size after the first re-position (i.e. x/yticklabels get</span>
+        <span class="s3"># larger/smaller).  This second reposition tends to be much milder,</span>
+        <span class="s3"># so doing twice makes things work OK.</span>
+
+        <span class="s3"># make margins for all the axes and subfigures in the</span>
+        <span class="s3"># figure.  Add margins for colorbars...</span>
+        <span class="s1">make_layout_margins(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                            <span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">hspace=hspace</span><span class="s2">, </span><span class="s1">wspace=wspace)</span>
+        <span class="s1">make_margin_suptitles(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                              <span class="s1">w_pad=w_pad)</span>
+
+        <span class="s3"># if a layout is such that a columns (or rows) margin has no</span>
+        <span class="s3"># constraints, we need to make all such instances in the grid</span>
+        <span class="s3"># match in margin size.</span>
+        <span class="s1">match_submerged_margins(layoutgrids</span><span class="s2">, </span><span class="s1">fig)</span>
+
+        <span class="s3"># update all the variables in the layout.</span>
+        <span class="s1">layoutgrids[fig].update_variables()</span>
+
+        <span class="s1">warn_collapsed = (</span><span class="s5">'constrained_layout not applied because '</span>
+                          <span class="s5">'axes sizes collapsed to zero.  Try making '</span>
+                          <span class="s5">'figure larger or axes decorations smaller.'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">check_no_collapsed_axes(layoutgrids</span><span class="s2">, </span><span class="s1">fig):</span>
+            <span class="s1">reposition_axes(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                            <span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">hspace=hspace</span><span class="s2">, </span><span class="s1">wspace=wspace)</span>
+            <span class="s2">if </span><span class="s1">compress:</span>
+                <span class="s1">layoutgrids = compress_fixed_aspect(layoutgrids</span><span class="s2">, </span><span class="s1">fig)</span>
+                <span class="s1">layoutgrids[fig].update_variables()</span>
+                <span class="s2">if </span><span class="s1">check_no_collapsed_axes(layoutgrids</span><span class="s2">, </span><span class="s1">fig):</span>
+                    <span class="s1">reposition_axes(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                                    <span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">hspace=hspace</span><span class="s2">, </span><span class="s1">wspace=wspace)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">_api.warn_external(warn_collapsed)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">_api.warn_external(warn_collapsed)</span>
+        <span class="s1">reset_margins(layoutgrids</span><span class="s2">, </span><span class="s1">fig)</span>
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">make_layoutgrids(fig</span><span class="s2">, </span><span class="s1">layoutgrids</span><span class="s2">, </span><span class="s1">rect=(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make the layoutgrid tree. 
+ 
+    (Sub)Figures get a layoutgrid so we can have figure margins. 
+ 
+    Gridspecs that are attached to axes get a layoutgrid so axes 
+    can have margins. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">layoutgrids </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">layoutgrids = dict()</span>
+        <span class="s1">layoutgrids[</span><span class="s5">'hasgrids'</span><span class="s1">] = </span><span class="s2">False</span>
+    <span class="s2">if not </span><span class="s1">hasattr(fig</span><span class="s2">, </span><span class="s5">'_parent'</span><span class="s1">):</span>
+        <span class="s3"># top figure;  pass rect as parent to allow user-specified</span>
+        <span class="s3"># margins</span>
+        <span class="s1">layoutgrids[fig] = mlayoutgrid.LayoutGrid(parent=rect</span><span class="s2">, </span><span class="s1">name=</span><span class="s5">'figlb'</span><span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s3"># subfigure</span>
+        <span class="s1">gs = fig._subplotspec.get_gridspec()</span>
+        <span class="s3"># it is possible the gridspec containing this subfigure hasn't</span>
+        <span class="s3"># been added to the tree yet:</span>
+        <span class="s1">layoutgrids = make_layoutgrids_gs(layoutgrids</span><span class="s2">, </span><span class="s1">gs)</span>
+        <span class="s3"># add the layoutgrid for the subfigure:</span>
+        <span class="s1">parentlb = layoutgrids[gs]</span>
+        <span class="s1">layoutgrids[fig] = mlayoutgrid.LayoutGrid(</span>
+            <span class="s1">parent=parentlb</span><span class="s2">,</span>
+            <span class="s1">name=</span><span class="s5">'panellb'</span><span class="s2">,</span>
+            <span class="s1">parent_inner=</span><span class="s2">True,</span>
+            <span class="s1">nrows=</span><span class="s4">1</span><span class="s2">, </span><span class="s1">ncols=</span><span class="s4">1</span><span class="s2">,</span>
+            <span class="s1">parent_pos=(fig._subplotspec.rowspan</span><span class="s2">,</span>
+                        <span class="s1">fig._subplotspec.colspan))</span>
+    <span class="s3"># recursively do all subfigures in this figure...</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:</span>
+        <span class="s1">layoutgrids = make_layoutgrids(sfig</span><span class="s2">, </span><span class="s1">layoutgrids)</span>
+
+    <span class="s3"># for each axes at the local level add its gridspec:</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig._localaxes:</span>
+        <span class="s1">gs = ax.get_gridspec()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">layoutgrids = make_layoutgrids_gs(layoutgrids</span><span class="s2">, </span><span class="s1">gs)</span>
+
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">make_layoutgrids_gs(layoutgrids</span><span class="s2">, </span><span class="s1">gs):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make the layoutgrid for a gridspec (and anything nested in the gridspec) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">gs </span><span class="s2">in </span><span class="s1">layoutgrids </span><span class="s2">or </span><span class="s1">gs.figure </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">layoutgrids</span>
+    <span class="s3"># in order to do constrained_layout there has to be at least *one*</span>
+    <span class="s3"># gridspec in the tree:</span>
+    <span class="s1">layoutgrids[</span><span class="s5">'hasgrids'</span><span class="s1">] = </span><span class="s2">True</span>
+    <span class="s2">if not </span><span class="s1">hasattr(gs</span><span class="s2">, </span><span class="s5">'_subplot_spec'</span><span class="s1">):</span>
+        <span class="s3"># normal gridspec</span>
+        <span class="s1">parent = layoutgrids[gs.figure]</span>
+        <span class="s1">layoutgrids[gs] = mlayoutgrid.LayoutGrid(</span>
+                <span class="s1">parent=parent</span><span class="s2">,</span>
+                <span class="s1">parent_inner=</span><span class="s2">True,</span>
+                <span class="s1">name=</span><span class="s5">'gridspec'</span><span class="s2">,</span>
+                <span class="s1">ncols=gs._ncols</span><span class="s2">, </span><span class="s1">nrows=gs._nrows</span><span class="s2">,</span>
+                <span class="s1">width_ratios=gs.get_width_ratios()</span><span class="s2">,</span>
+                <span class="s1">height_ratios=gs.get_height_ratios())</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s3"># this is a gridspecfromsubplotspec:</span>
+        <span class="s1">subplot_spec = gs._subplot_spec</span>
+        <span class="s1">parentgs = subplot_spec.get_gridspec()</span>
+        <span class="s3"># if a nested gridspec it is possible the parent is not in there yet:</span>
+        <span class="s2">if </span><span class="s1">parentgs </span><span class="s2">not in </span><span class="s1">layoutgrids:</span>
+            <span class="s1">layoutgrids = make_layoutgrids_gs(layoutgrids</span><span class="s2">, </span><span class="s1">parentgs)</span>
+        <span class="s1">subspeclb = layoutgrids[parentgs]</span>
+        <span class="s3"># gridspecfromsubplotspec need an outer container:</span>
+        <span class="s3"># get a unique representation:</span>
+        <span class="s1">rep = (gs</span><span class="s2">, </span><span class="s5">'top'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">rep </span><span class="s2">not in </span><span class="s1">layoutgrids:</span>
+            <span class="s1">layoutgrids[rep] = mlayoutgrid.LayoutGrid(</span>
+                <span class="s1">parent=subspeclb</span><span class="s2">,</span>
+                <span class="s1">name=</span><span class="s5">'top'</span><span class="s2">,</span>
+                <span class="s1">nrows=</span><span class="s4">1</span><span class="s2">, </span><span class="s1">ncols=</span><span class="s4">1</span><span class="s2">,</span>
+                <span class="s1">parent_pos=(subplot_spec.rowspan</span><span class="s2">, </span><span class="s1">subplot_spec.colspan))</span>
+        <span class="s1">layoutgrids[gs] = mlayoutgrid.LayoutGrid(</span>
+                <span class="s1">parent=layoutgrids[rep]</span><span class="s2">,</span>
+                <span class="s1">name=</span><span class="s5">'gridspec'</span><span class="s2">,</span>
+                <span class="s1">nrows=gs._nrows</span><span class="s2">, </span><span class="s1">ncols=gs._ncols</span><span class="s2">,</span>
+                <span class="s1">width_ratios=gs.get_width_ratios()</span><span class="s2">,</span>
+                <span class="s1">height_ratios=gs.get_height_ratios())</span>
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">check_no_collapsed_axes(layoutgrids</span><span class="s2">, </span><span class="s1">fig):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Check that no axes have collapsed to zero size. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:</span>
+        <span class="s1">ok = check_no_collapsed_axes(layoutgrids</span><span class="s2">, </span><span class="s1">sfig)</span>
+        <span class="s2">if not </span><span class="s1">ok:</span>
+            <span class="s2">return False</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig.axes:</span>
+        <span class="s1">gs = ax.get_gridspec()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">in </span><span class="s1">layoutgrids:  </span><span class="s3"># also implies gs is not None.</span>
+            <span class="s1">lg = layoutgrids[gs]</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(gs.nrows):</span>
+                <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(gs.ncols):</span>
+                    <span class="s1">bb = lg.get_inner_bbox(i</span><span class="s2">, </span><span class="s1">j)</span>
+                    <span class="s2">if </span><span class="s1">bb.width &lt;= </span><span class="s4">0 </span><span class="s2">or </span><span class="s1">bb.height &lt;= </span><span class="s4">0</span><span class="s1">:</span>
+                        <span class="s2">return False</span>
+    <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">compress_fixed_aspect(layoutgrids</span><span class="s2">, </span><span class="s1">fig):</span>
+    <span class="s1">gs = </span><span class="s2">None</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig.axes:</span>
+        <span class="s2">if </span><span class="s1">ax.get_subplotspec() </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">continue</span>
+        <span class="s1">ax.apply_aspect()</span>
+        <span class="s1">sub = ax.get_subplotspec()</span>
+        <span class="s1">_gs = sub.get_gridspec()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">gs = _gs</span>
+            <span class="s1">extraw = np.zeros(gs.ncols)</span>
+            <span class="s1">extrah = np.zeros(gs.nrows)</span>
+        <span class="s2">elif </span><span class="s1">_gs != gs:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Cannot do compressed layout if axes are not'</span>
+                                <span class="s5">'all from the same gridspec'</span><span class="s1">)</span>
+        <span class="s1">orig = ax.get_position(original=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">actual = ax.get_position(original=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">dw = orig.width - actual.width</span>
+        <span class="s2">if </span><span class="s1">dw &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">extraw[sub.colspan] = np.maximum(extraw[sub.colspan]</span><span class="s2">, </span><span class="s1">dw)</span>
+        <span class="s1">dh = orig.height - actual.height</span>
+        <span class="s2">if </span><span class="s1">dh &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">extrah[sub.rowspan] = np.maximum(extrah[sub.rowspan]</span><span class="s2">, </span><span class="s1">dh)</span>
+
+    <span class="s2">if </span><span class="s1">gs </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Cannot do compressed layout if no axes '</span>
+                         <span class="s5">'are part of a gridspec.'</span><span class="s1">)</span>
+    <span class="s1">w = np.sum(extraw) / </span><span class="s4">2</span>
+    <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'left'</span><span class="s2">, </span><span class="s1">w)</span>
+    <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'right'</span><span class="s2">, </span><span class="s1">w)</span>
+
+    <span class="s1">h = np.sum(extrah) / </span><span class="s4">2</span>
+    <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'top'</span><span class="s2">, </span><span class="s1">h)</span>
+    <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'bottom'</span><span class="s2">, </span><span class="s1">h)</span>
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">get_margin_from_padding(obj</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">w_pad=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s4">0</span><span class="s2">,</span>
+                            <span class="s1">hspace=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">wspace=</span><span class="s4">0</span><span class="s1">):</span>
+
+    <span class="s1">ss = obj._subplotspec</span>
+    <span class="s1">gs = ss.get_gridspec()</span>
+
+    <span class="s2">if </span><span class="s1">hasattr(gs</span><span class="s2">, </span><span class="s5">'hspace'</span><span class="s1">):</span>
+        <span class="s1">_hspace = (gs.hspace </span><span class="s2">if </span><span class="s1">gs.hspace </span><span class="s2">is not None else </span><span class="s1">hspace)</span>
+        <span class="s1">_wspace = (gs.wspace </span><span class="s2">if </span><span class="s1">gs.wspace </span><span class="s2">is not None else </span><span class="s1">wspace)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">_hspace = (gs._hspace </span><span class="s2">if </span><span class="s1">gs._hspace </span><span class="s2">is not None else </span><span class="s1">hspace)</span>
+        <span class="s1">_wspace = (gs._wspace </span><span class="s2">if </span><span class="s1">gs._wspace </span><span class="s2">is not None else </span><span class="s1">wspace)</span>
+
+    <span class="s1">_wspace = _wspace / </span><span class="s4">2</span>
+    <span class="s1">_hspace = _hspace / </span><span class="s4">2</span>
+
+    <span class="s1">nrows</span><span class="s2">, </span><span class="s1">ncols = gs.get_geometry()</span>
+    <span class="s3"># there are two margins for each direction.  The &quot;cb&quot;</span>
+    <span class="s3"># margins are for pads and colorbars, the non-&quot;cb&quot; are</span>
+    <span class="s3"># for the axes decorations (labels etc).</span>
+    <span class="s1">margin = {</span><span class="s5">'leftcb'</span><span class="s1">: w_pad</span><span class="s2">, </span><span class="s5">'rightcb'</span><span class="s1">: w_pad</span><span class="s2">,</span>
+              <span class="s5">'bottomcb'</span><span class="s1">: h_pad</span><span class="s2">, </span><span class="s5">'topcb'</span><span class="s1">: h_pad</span><span class="s2">,</span>
+              <span class="s5">'left'</span><span class="s1">: </span><span class="s4">0</span><span class="s2">, </span><span class="s5">'right'</span><span class="s1">: </span><span class="s4">0</span><span class="s2">,</span>
+              <span class="s5">'top'</span><span class="s1">: </span><span class="s4">0</span><span class="s2">, </span><span class="s5">'bottom'</span><span class="s1">: </span><span class="s4">0</span><span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">_wspace / ncols &gt; w_pad:</span>
+        <span class="s2">if </span><span class="s1">ss.colspan.start &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">margin[</span><span class="s5">'leftcb'</span><span class="s1">] = _wspace / ncols</span>
+        <span class="s2">if </span><span class="s1">ss.colspan.stop &lt; ncols:</span>
+            <span class="s1">margin[</span><span class="s5">'rightcb'</span><span class="s1">] = _wspace / ncols</span>
+    <span class="s2">if </span><span class="s1">_hspace / nrows &gt; h_pad:</span>
+        <span class="s2">if </span><span class="s1">ss.rowspan.stop &lt; nrows:</span>
+            <span class="s1">margin[</span><span class="s5">'bottomcb'</span><span class="s1">] = _hspace / nrows</span>
+        <span class="s2">if </span><span class="s1">ss.rowspan.start &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">margin[</span><span class="s5">'topcb'</span><span class="s1">] = _hspace / nrows</span>
+
+    <span class="s2">return </span><span class="s1">margin</span>
+
+
+<span class="s2">def </span><span class="s1">make_layout_margins(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">w_pad=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s4">0</span><span class="s2">,</span>
+                        <span class="s1">hspace=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">wspace=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    For each axes, make a margin between the *pos* layoutbox and the 
+    *axes* layoutbox be a minimum size that can accommodate the 
+    decorations on the axis. 
+ 
+    Then make room for colorbars. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:  </span><span class="s3"># recursively make child panel margins</span>
+        <span class="s1">ss = sfig._subplotspec</span>
+        <span class="s1">make_layout_margins(layoutgrids</span><span class="s2">, </span><span class="s1">sfig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">,</span>
+                            <span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                            <span class="s1">hspace=hspace</span><span class="s2">, </span><span class="s1">wspace=wspace)</span>
+
+        <span class="s1">margins = get_margin_from_padding(sfig</span><span class="s2">, </span><span class="s1">w_pad=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s4">0</span><span class="s2">,</span>
+                                          <span class="s1">hspace=hspace</span><span class="s2">, </span><span class="s1">wspace=wspace)</span>
+        <span class="s1">layoutgrids[sfig].parent.edit_outer_margin_mins(margins</span><span class="s2">, </span><span class="s1">ss)</span>
+
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig._localaxes:</span>
+        <span class="s2">if not </span><span class="s1">ax.get_subplotspec() </span><span class="s2">or not </span><span class="s1">ax.get_in_layout():</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">ss = ax.get_subplotspec()</span>
+        <span class="s1">gs = ss.get_gridspec()</span>
+
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">not in </span><span class="s1">layoutgrids:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">margin = get_margin_from_padding(ax</span><span class="s2">, </span><span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                                         <span class="s1">hspace=hspace</span><span class="s2">, </span><span class="s1">wspace=wspace)</span>
+        <span class="s1">pos</span><span class="s2">, </span><span class="s1">bbox = get_pos_and_bbox(ax</span><span class="s2">, </span><span class="s1">renderer)</span>
+        <span class="s3"># the margin is the distance between the bounding box of the axes</span>
+        <span class="s3"># and its position (plus the padding from above)</span>
+        <span class="s1">margin[</span><span class="s5">'left'</span><span class="s1">] += pos.x0 - bbox.x0</span>
+        <span class="s1">margin[</span><span class="s5">'right'</span><span class="s1">] += bbox.x1 - pos.x1</span>
+        <span class="s3"># remember that rows are ordered from top:</span>
+        <span class="s1">margin[</span><span class="s5">'bottom'</span><span class="s1">] += pos.y0 - bbox.y0</span>
+        <span class="s1">margin[</span><span class="s5">'top'</span><span class="s1">] += bbox.y1 - pos.y1</span>
+
+        <span class="s3"># make margin for colorbars.  These margins go in the</span>
+        <span class="s3"># padding margin, versus the margin for axes decorators.</span>
+        <span class="s2">for </span><span class="s1">cbax </span><span class="s2">in </span><span class="s1">ax._colorbars:</span>
+            <span class="s3"># note pad is a fraction of the parent width...</span>
+            <span class="s1">pad = colorbar_get_pad(layoutgrids</span><span class="s2">, </span><span class="s1">cbax)</span>
+            <span class="s3"># colorbars can be child of more than one subplot spec:</span>
+            <span class="s1">cbp_rspan</span><span class="s2">, </span><span class="s1">cbp_cspan = get_cb_parent_spans(cbax)</span>
+            <span class="s1">loc = cbax._colorbar_info[</span><span class="s5">'location'</span><span class="s1">]</span>
+            <span class="s1">cbpos</span><span class="s2">, </span><span class="s1">cbbbox = get_pos_and_bbox(cbax</span><span class="s2">, </span><span class="s1">renderer)</span>
+            <span class="s2">if </span><span class="s1">loc == </span><span class="s5">'right'</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">cbp_cspan.stop == ss.colspan.stop:</span>
+                    <span class="s3"># only increase if the colorbar is on the right edge</span>
+                    <span class="s1">margin[</span><span class="s5">'rightcb'</span><span class="s1">] += cbbbox.width + pad</span>
+            <span class="s2">elif </span><span class="s1">loc == </span><span class="s5">'left'</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">cbp_cspan.start == ss.colspan.start:</span>
+                    <span class="s3"># only increase if the colorbar is on the left edge</span>
+                    <span class="s1">margin[</span><span class="s5">'leftcb'</span><span class="s1">] += cbbbox.width + pad</span>
+            <span class="s2">elif </span><span class="s1">loc == </span><span class="s5">'top'</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">cbp_rspan.start == ss.rowspan.start:</span>
+                    <span class="s1">margin[</span><span class="s5">'topcb'</span><span class="s1">] += cbbbox.height + pad</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">cbp_rspan.stop == ss.rowspan.stop:</span>
+                    <span class="s1">margin[</span><span class="s5">'bottomcb'</span><span class="s1">] += cbbbox.height + pad</span>
+            <span class="s3"># If the colorbars are wider than the parent box in the</span>
+            <span class="s3"># cross direction</span>
+            <span class="s2">if </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">[</span><span class="s5">'top'</span><span class="s2">, </span><span class="s5">'bottom'</span><span class="s1">]:</span>
+                <span class="s2">if </span><span class="s1">(cbp_cspan.start == ss.colspan.start </span><span class="s2">and</span>
+                        <span class="s1">cbbbox.x0 &lt; bbox.x0):</span>
+                    <span class="s1">margin[</span><span class="s5">'left'</span><span class="s1">] += bbox.x0 - cbbbox.x0</span>
+                <span class="s2">if </span><span class="s1">(cbp_cspan.stop == ss.colspan.stop </span><span class="s2">and</span>
+                        <span class="s1">cbbbox.x1 &gt; bbox.x1):</span>
+                    <span class="s1">margin[</span><span class="s5">'right'</span><span class="s1">] += cbbbox.x1 - bbox.x1</span>
+            <span class="s3"># or taller:</span>
+            <span class="s2">if </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">[</span><span class="s5">'left'</span><span class="s2">, </span><span class="s5">'right'</span><span class="s1">]:</span>
+                <span class="s2">if </span><span class="s1">(cbp_rspan.stop == ss.rowspan.stop </span><span class="s2">and</span>
+                        <span class="s1">cbbbox.y0 &lt; bbox.y0):</span>
+                    <span class="s1">margin[</span><span class="s5">'bottom'</span><span class="s1">] += bbox.y0 - cbbbox.y0</span>
+                <span class="s2">if </span><span class="s1">(cbp_rspan.start == ss.rowspan.start </span><span class="s2">and</span>
+                        <span class="s1">cbbbox.y1 &gt; bbox.y1):</span>
+                    <span class="s1">margin[</span><span class="s5">'top'</span><span class="s1">] += cbbbox.y1 - bbox.y1</span>
+        <span class="s3"># pass the new margins down to the layout grid for the solution...</span>
+        <span class="s1">layoutgrids[gs].edit_outer_margin_mins(margin</span><span class="s2">, </span><span class="s1">ss)</span>
+
+    <span class="s3"># make margins for figure-level legends:</span>
+    <span class="s2">for </span><span class="s1">leg </span><span class="s2">in </span><span class="s1">fig.legends:</span>
+        <span class="s1">inv_trans_fig = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">leg._outside_loc </span><span class="s2">and </span><span class="s1">leg._bbox_to_anchor </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">inv_trans_fig </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">inv_trans_fig = fig.transFigure.inverted().transform_bbox</span>
+            <span class="s1">bbox = inv_trans_fig(leg.get_tightbbox(renderer))</span>
+            <span class="s1">w = bbox.width + </span><span class="s4">2 </span><span class="s1">* w_pad</span>
+            <span class="s1">h = bbox.height + </span><span class="s4">2 </span><span class="s1">* h_pad</span>
+            <span class="s1">legendloc = leg._outside_loc</span>
+            <span class="s2">if </span><span class="s1">legendloc == </span><span class="s5">'lower'</span><span class="s1">:</span>
+                <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'bottom'</span><span class="s2">, </span><span class="s1">h)</span>
+            <span class="s2">elif </span><span class="s1">legendloc == </span><span class="s5">'upper'</span><span class="s1">:</span>
+                <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'top'</span><span class="s2">, </span><span class="s1">h)</span>
+            <span class="s2">if </span><span class="s1">legendloc == </span><span class="s5">'right'</span><span class="s1">:</span>
+                <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'right'</span><span class="s2">, </span><span class="s1">w)</span>
+            <span class="s2">elif </span><span class="s1">legendloc == </span><span class="s5">'left'</span><span class="s1">:</span>
+                <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'left'</span><span class="s2">, </span><span class="s1">w)</span>
+
+
+<span class="s2">def </span><span class="s1">make_margin_suptitles(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">w_pad=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s3"># Figure out how large the suptitle is and make the</span>
+    <span class="s3"># top level figure margin larger.</span>
+
+    <span class="s1">inv_trans_fig = fig.transFigure.inverted().transform_bbox</span>
+    <span class="s3"># get the h_pad and w_pad as distances in the local subfigure coordinates:</span>
+    <span class="s1">padbox = mtransforms.Bbox([[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[w_pad</span><span class="s2">, </span><span class="s1">h_pad]])</span>
+    <span class="s1">padbox = (fig.transFigure -</span>
+                   <span class="s1">fig.transSubfigure).transform_bbox(padbox)</span>
+    <span class="s1">h_pad_local = padbox.height</span>
+    <span class="s1">w_pad_local = padbox.width</span>
+
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:</span>
+        <span class="s1">make_margin_suptitles(layoutgrids</span><span class="s2">, </span><span class="s1">sfig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">,</span>
+                              <span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad)</span>
+
+    <span class="s2">if </span><span class="s1">fig._suptitle </span><span class="s2">is not None and </span><span class="s1">fig._suptitle.get_in_layout():</span>
+        <span class="s1">p = fig._suptitle.get_position()</span>
+        <span class="s2">if </span><span class="s1">getattr(fig._suptitle</span><span class="s2">, </span><span class="s5">'_autopos'</span><span class="s2">, False</span><span class="s1">):</span>
+            <span class="s1">fig._suptitle.set_position((p[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s4">1 </span><span class="s1">- h_pad_local))</span>
+            <span class="s1">bbox = inv_trans_fig(fig._suptitle.get_tightbbox(renderer))</span>
+            <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'top'</span><span class="s2">, </span><span class="s1">bbox.height + </span><span class="s4">2 </span><span class="s1">* h_pad)</span>
+
+    <span class="s2">if </span><span class="s1">fig._supxlabel </span><span class="s2">is not None and </span><span class="s1">fig._supxlabel.get_in_layout():</span>
+        <span class="s1">p = fig._supxlabel.get_position()</span>
+        <span class="s2">if </span><span class="s1">getattr(fig._supxlabel</span><span class="s2">, </span><span class="s5">'_autopos'</span><span class="s2">, False</span><span class="s1">):</span>
+            <span class="s1">fig._supxlabel.set_position((p[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">h_pad_local))</span>
+            <span class="s1">bbox = inv_trans_fig(fig._supxlabel.get_tightbbox(renderer))</span>
+            <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'bottom'</span><span class="s2">,</span>
+                                             <span class="s1">bbox.height + </span><span class="s4">2 </span><span class="s1">* h_pad)</span>
+
+    <span class="s2">if </span><span class="s1">fig._supylabel </span><span class="s2">is not None and </span><span class="s1">fig._supylabel.get_in_layout():</span>
+        <span class="s1">p = fig._supylabel.get_position()</span>
+        <span class="s2">if </span><span class="s1">getattr(fig._supylabel</span><span class="s2">, </span><span class="s5">'_autopos'</span><span class="s2">, False</span><span class="s1">):</span>
+            <span class="s1">fig._supylabel.set_position((w_pad_local</span><span class="s2">, </span><span class="s1">p[</span><span class="s4">1</span><span class="s1">]))</span>
+            <span class="s1">bbox = inv_trans_fig(fig._supylabel.get_tightbbox(renderer))</span>
+            <span class="s1">layoutgrids[fig].edit_margin_min(</span><span class="s5">'left'</span><span class="s2">, </span><span class="s1">bbox.width + </span><span class="s4">2 </span><span class="s1">* w_pad)</span>
+
+
+<span class="s2">def </span><span class="s1">match_submerged_margins(layoutgrids</span><span class="s2">, </span><span class="s1">fig):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make the margins that are submerged inside an Axes the same size. 
+ 
+    This allows axes that span two columns (or rows) that are offset 
+    from one another to have the same size. 
+ 
+    This gives the proper layout for something like:: 
+        fig = plt.figure(constrained_layout=True) 
+        axs = fig.subplot_mosaic(&quot;AAAB\nCCDD&quot;) 
+ 
+    Without this routine, the axes D will be wider than C, because the 
+    margin width between the two columns in C has no width by default, 
+    whereas the margins between the two columns of D are set by the 
+    width of the margin between A and B. However, obviously the user would 
+    like C and D to be the same size, so we need to add constraints to these 
+    &quot;submerged&quot; margins. 
+ 
+    This routine makes all the interior margins the same, and the spacing 
+    between the three columns in A and the two column in C are all set to the 
+    margins between the two columns of D. 
+ 
+    See test_constrained_layout::test_constrained_layout12 for an example. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:</span>
+        <span class="s1">match_submerged_margins(layoutgrids</span><span class="s2">, </span><span class="s1">sfig)</span>
+
+    <span class="s1">axs = [a </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">fig.get_axes()</span>
+           <span class="s2">if </span><span class="s1">a.get_subplotspec() </span><span class="s2">is not None and </span><span class="s1">a.get_in_layout()]</span>
+
+    <span class="s2">for </span><span class="s1">ax1 </span><span class="s2">in </span><span class="s1">axs:</span>
+        <span class="s1">ss1 = ax1.get_subplotspec()</span>
+        <span class="s2">if </span><span class="s1">ss1.get_gridspec() </span><span class="s2">not in </span><span class="s1">layoutgrids:</span>
+            <span class="s1">axs.remove(ax1)</span>
+            <span class="s2">continue</span>
+        <span class="s1">lg1 = layoutgrids[ss1.get_gridspec()]</span>
+
+        <span class="s3"># interior columns:</span>
+        <span class="s2">if </span><span class="s1">len(ss1.colspan) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">maxsubl = np.max(</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'left'</span><span class="s1">][ss1.colspan[</span><span class="s4">1</span><span class="s1">:]] +</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'leftcb'</span><span class="s1">][ss1.colspan[</span><span class="s4">1</span><span class="s1">:]]</span>
+            <span class="s1">)</span>
+            <span class="s1">maxsubr = np.max(</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'right'</span><span class="s1">][ss1.colspan[:-</span><span class="s4">1</span><span class="s1">]] +</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'rightcb'</span><span class="s1">][ss1.colspan[:-</span><span class="s4">1</span><span class="s1">]]</span>
+            <span class="s1">)</span>
+            <span class="s2">for </span><span class="s1">ax2 </span><span class="s2">in </span><span class="s1">axs:</span>
+                <span class="s1">ss2 = ax2.get_subplotspec()</span>
+                <span class="s1">lg2 = layoutgrids[ss2.get_gridspec()]</span>
+                <span class="s2">if </span><span class="s1">lg2 </span><span class="s2">is not None and </span><span class="s1">len(ss2.colspan) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                    <span class="s1">maxsubl2 = np.max(</span>
+                        <span class="s1">lg2.margin_vals[</span><span class="s5">'left'</span><span class="s1">][ss2.colspan[</span><span class="s4">1</span><span class="s1">:]] +</span>
+                        <span class="s1">lg2.margin_vals[</span><span class="s5">'leftcb'</span><span class="s1">][ss2.colspan[</span><span class="s4">1</span><span class="s1">:]])</span>
+                    <span class="s2">if </span><span class="s1">maxsubl2 &gt; maxsubl:</span>
+                        <span class="s1">maxsubl = maxsubl2</span>
+                    <span class="s1">maxsubr2 = np.max(</span>
+                        <span class="s1">lg2.margin_vals[</span><span class="s5">'right'</span><span class="s1">][ss2.colspan[:-</span><span class="s4">1</span><span class="s1">]] +</span>
+                        <span class="s1">lg2.margin_vals[</span><span class="s5">'rightcb'</span><span class="s1">][ss2.colspan[:-</span><span class="s4">1</span><span class="s1">]])</span>
+                    <span class="s2">if </span><span class="s1">maxsubr2 &gt; maxsubr:</span>
+                        <span class="s1">maxsubr = maxsubr2</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1.colspan[</span><span class="s4">1</span><span class="s1">:]:</span>
+                <span class="s1">lg1.edit_margin_min(</span><span class="s5">'left'</span><span class="s2">, </span><span class="s1">maxsubl</span><span class="s2">, </span><span class="s1">cell=i)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1.colspan[:-</span><span class="s4">1</span><span class="s1">]:</span>
+                <span class="s1">lg1.edit_margin_min(</span><span class="s5">'right'</span><span class="s2">, </span><span class="s1">maxsubr</span><span class="s2">, </span><span class="s1">cell=i)</span>
+
+        <span class="s3"># interior rows:</span>
+        <span class="s2">if </span><span class="s1">len(ss1.rowspan) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">maxsubt = np.max(</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'top'</span><span class="s1">][ss1.rowspan[</span><span class="s4">1</span><span class="s1">:]] +</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'topcb'</span><span class="s1">][ss1.rowspan[</span><span class="s4">1</span><span class="s1">:]]</span>
+            <span class="s1">)</span>
+            <span class="s1">maxsubb = np.max(</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'bottom'</span><span class="s1">][ss1.rowspan[:-</span><span class="s4">1</span><span class="s1">]] +</span>
+                <span class="s1">lg1.margin_vals[</span><span class="s5">'bottomcb'</span><span class="s1">][ss1.rowspan[:-</span><span class="s4">1</span><span class="s1">]]</span>
+            <span class="s1">)</span>
+
+            <span class="s2">for </span><span class="s1">ax2 </span><span class="s2">in </span><span class="s1">axs:</span>
+                <span class="s1">ss2 = ax2.get_subplotspec()</span>
+                <span class="s1">lg2 = layoutgrids[ss2.get_gridspec()]</span>
+                <span class="s2">if </span><span class="s1">lg2 </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s2">if </span><span class="s1">len(ss2.rowspan) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                        <span class="s1">maxsubt = np.max([np.max(</span>
+                            <span class="s1">lg2.margin_vals[</span><span class="s5">'top'</span><span class="s1">][ss2.rowspan[</span><span class="s4">1</span><span class="s1">:]] +</span>
+                            <span class="s1">lg2.margin_vals[</span><span class="s5">'topcb'</span><span class="s1">][ss2.rowspan[</span><span class="s4">1</span><span class="s1">:]]</span>
+                        <span class="s1">)</span><span class="s2">, </span><span class="s1">maxsubt])</span>
+                        <span class="s1">maxsubb = np.max([np.max(</span>
+                            <span class="s1">lg2.margin_vals[</span><span class="s5">'bottom'</span><span class="s1">][ss2.rowspan[:-</span><span class="s4">1</span><span class="s1">]] +</span>
+                            <span class="s1">lg2.margin_vals[</span><span class="s5">'bottomcb'</span><span class="s1">][ss2.rowspan[:-</span><span class="s4">1</span><span class="s1">]]</span>
+                        <span class="s1">)</span><span class="s2">, </span><span class="s1">maxsubb])</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1.rowspan[</span><span class="s4">1</span><span class="s1">:]:</span>
+                <span class="s1">lg1.edit_margin_min(</span><span class="s5">'top'</span><span class="s2">, </span><span class="s1">maxsubt</span><span class="s2">, </span><span class="s1">cell=i)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1.rowspan[:-</span><span class="s4">1</span><span class="s1">]:</span>
+                <span class="s1">lg1.edit_margin_min(</span><span class="s5">'bottom'</span><span class="s2">, </span><span class="s1">maxsubb</span><span class="s2">, </span><span class="s1">cell=i)</span>
+
+
+<span class="s2">def </span><span class="s1">get_cb_parent_spans(cbax):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Figure out which subplotspecs this colorbar belongs to: 
+    &quot;&quot;&quot;</span>
+    <span class="s1">rowstart = np.inf</span>
+    <span class="s1">rowstop = -np.inf</span>
+    <span class="s1">colstart = np.inf</span>
+    <span class="s1">colstop = -np.inf</span>
+    <span class="s2">for </span><span class="s1">parent </span><span class="s2">in </span><span class="s1">cbax._colorbar_info[</span><span class="s5">'parents'</span><span class="s1">]:</span>
+        <span class="s1">ss = parent.get_subplotspec()</span>
+        <span class="s1">rowstart = min(ss.rowspan.start</span><span class="s2">, </span><span class="s1">rowstart)</span>
+        <span class="s1">rowstop = max(ss.rowspan.stop</span><span class="s2">, </span><span class="s1">rowstop)</span>
+        <span class="s1">colstart = min(ss.colspan.start</span><span class="s2">, </span><span class="s1">colstart)</span>
+        <span class="s1">colstop = max(ss.colspan.stop</span><span class="s2">, </span><span class="s1">colstop)</span>
+
+    <span class="s1">rowspan = range(rowstart</span><span class="s2">, </span><span class="s1">rowstop)</span>
+    <span class="s1">colspan = range(colstart</span><span class="s2">, </span><span class="s1">colstop)</span>
+    <span class="s2">return </span><span class="s1">rowspan</span><span class="s2">, </span><span class="s1">colspan</span>
+
+
+<span class="s2">def </span><span class="s1">get_pos_and_bbox(ax</span><span class="s2">, </span><span class="s1">renderer):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Get the position and the bbox for the axes. 
+ 
+    Parameters 
+    ---------- 
+    ax 
+    renderer 
+ 
+    Returns 
+    ------- 
+    pos : Bbox 
+        Position in figure coordinates. 
+    bbox : Bbox 
+        Tight bounding box in figure coordinates. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fig = ax.figure</span>
+    <span class="s1">pos = ax.get_position(original=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s3"># pos is in panel co-ords, but we need in figure for the layout</span>
+    <span class="s1">pos = pos.transformed(fig.transSubfigure - fig.transFigure)</span>
+    <span class="s1">tightbbox = martist._get_tightbbox_for_layout_only(ax</span><span class="s2">, </span><span class="s1">renderer)</span>
+    <span class="s2">if </span><span class="s1">tightbbox </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">bbox = pos</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">bbox = tightbbox.transformed(fig.transFigure.inverted())</span>
+    <span class="s2">return </span><span class="s1">pos</span><span class="s2">, </span><span class="s1">bbox</span>
+
+
+<span class="s2">def </span><span class="s1">reposition_axes(layoutgrids</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">*</span><span class="s2">,</span>
+                    <span class="s1">w_pad=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">hspace=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">wspace=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Reposition all the axes based on the new inner bounding box. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">trans_fig_to_subfig = fig.transFigure - fig.transSubfigure</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:</span>
+        <span class="s1">bbox = layoutgrids[sfig].get_outer_bbox()</span>
+        <span class="s1">sfig._redo_transform_rel_fig(</span>
+            <span class="s1">bbox=bbox.transformed(trans_fig_to_subfig))</span>
+        <span class="s1">reposition_axes(layoutgrids</span><span class="s2">, </span><span class="s1">sfig</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">,</span>
+                        <span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                        <span class="s1">wspace=wspace</span><span class="s2">, </span><span class="s1">hspace=hspace)</span>
+
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig._localaxes:</span>
+        <span class="s2">if </span><span class="s1">ax.get_subplotspec() </span><span class="s2">is None or not </span><span class="s1">ax.get_in_layout():</span>
+            <span class="s2">continue</span>
+
+        <span class="s3"># grid bbox is in Figure coordinates, but we specify in panel</span>
+        <span class="s3"># coordinates...</span>
+        <span class="s1">ss = ax.get_subplotspec()</span>
+        <span class="s1">gs = ss.get_gridspec()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">not in </span><span class="s1">layoutgrids:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">bbox = layoutgrids[gs].get_inner_bbox(rows=ss.rowspan</span><span class="s2">,</span>
+                                              <span class="s1">cols=ss.colspan)</span>
+
+        <span class="s3"># transform from figure to panel for set_position:</span>
+        <span class="s1">newbbox = trans_fig_to_subfig.transform_bbox(bbox)</span>
+        <span class="s1">ax._set_position(newbbox)</span>
+
+        <span class="s3"># move the colorbars:</span>
+        <span class="s3"># we need to keep track of oldw and oldh if there is more than</span>
+        <span class="s3"># one colorbar:</span>
+        <span class="s1">offset = {</span><span class="s5">'left'</span><span class="s1">: </span><span class="s4">0</span><span class="s2">, </span><span class="s5">'right'</span><span class="s1">: </span><span class="s4">0</span><span class="s2">, </span><span class="s5">'bottom'</span><span class="s1">: </span><span class="s4">0</span><span class="s2">, </span><span class="s5">'top'</span><span class="s1">: </span><span class="s4">0</span><span class="s1">}</span>
+        <span class="s2">for </span><span class="s1">nn</span><span class="s2">, </span><span class="s1">cbax </span><span class="s2">in </span><span class="s1">enumerate(ax._colorbars[::-</span><span class="s4">1</span><span class="s1">]):</span>
+            <span class="s2">if </span><span class="s1">ax == cbax._colorbar_info[</span><span class="s5">'parents'</span><span class="s1">][</span><span class="s4">0</span><span class="s1">]:</span>
+                <span class="s1">reposition_colorbar(layoutgrids</span><span class="s2">, </span><span class="s1">cbax</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">,</span>
+                                    <span class="s1">offset=offset)</span>
+
+
+<span class="s2">def </span><span class="s1">reposition_colorbar(layoutgrids</span><span class="s2">, </span><span class="s1">cbax</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">offset=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Place the colorbar in its new place. 
+ 
+    Parameters 
+    ---------- 
+    cbax : Axes 
+        Axes for the colorbar 
+ 
+    renderer : 
+    w_pad, h_pad : float 
+        width and height padding (in fraction of figure) 
+    hspace, wspace : float 
+        width and height padding as fraction of figure size divided by 
+        number of  columns or rows 
+    margin : array-like 
+        offset the colorbar needs to be pushed to in order to 
+        account for multiple colorbars 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">parents = cbax._colorbar_info[</span><span class="s5">'parents'</span><span class="s1">]</span>
+    <span class="s1">gs = parents[</span><span class="s4">0</span><span class="s1">].get_gridspec()</span>
+    <span class="s1">fig = cbax.figure</span>
+    <span class="s1">trans_fig_to_subfig = fig.transFigure - fig.transSubfigure</span>
+
+    <span class="s1">cb_rspans</span><span class="s2">, </span><span class="s1">cb_cspans = get_cb_parent_spans(cbax)</span>
+    <span class="s1">bboxparent = layoutgrids[gs].get_bbox_for_cb(rows=cb_rspans</span><span class="s2">,</span>
+                                                 <span class="s1">cols=cb_cspans)</span>
+    <span class="s1">pb = layoutgrids[gs].get_inner_bbox(rows=cb_rspans</span><span class="s2">, </span><span class="s1">cols=cb_cspans)</span>
+
+    <span class="s1">location = cbax._colorbar_info[</span><span class="s5">'location'</span><span class="s1">]</span>
+    <span class="s1">anchor = cbax._colorbar_info[</span><span class="s5">'anchor'</span><span class="s1">]</span>
+    <span class="s1">fraction = cbax._colorbar_info[</span><span class="s5">'fraction'</span><span class="s1">]</span>
+    <span class="s1">aspect = cbax._colorbar_info[</span><span class="s5">'aspect'</span><span class="s1">]</span>
+    <span class="s1">shrink = cbax._colorbar_info[</span><span class="s5">'shrink'</span><span class="s1">]</span>
+
+    <span class="s1">cbpos</span><span class="s2">, </span><span class="s1">cbbbox = get_pos_and_bbox(cbax</span><span class="s2">, </span><span class="s1">renderer)</span>
+
+    <span class="s3"># Colorbar gets put at extreme edge of outer bbox of the subplotspec</span>
+    <span class="s3"># It needs to be moved in by: 1) a pad 2) its &quot;margin&quot; 3) by</span>
+    <span class="s3"># any colorbars already added at this location:</span>
+    <span class="s1">cbpad = colorbar_get_pad(layoutgrids</span><span class="s2">, </span><span class="s1">cbax)</span>
+    <span class="s2">if </span><span class="s1">location </span><span class="s2">in </span><span class="s1">(</span><span class="s5">'left'</span><span class="s2">, </span><span class="s5">'right'</span><span class="s1">):</span>
+        <span class="s3"># fraction and shrink are fractions of parent</span>
+        <span class="s1">pbcb = pb.shrunk(fraction</span><span class="s2">, </span><span class="s1">shrink).anchored(anchor</span><span class="s2">, </span><span class="s1">pb)</span>
+        <span class="s3"># The colorbar is at the left side of the parent.  Need</span>
+        <span class="s3"># to translate to right (or left)</span>
+        <span class="s2">if </span><span class="s1">location == </span><span class="s5">'right'</span><span class="s1">:</span>
+            <span class="s1">lmargin = cbpos.x0 - cbbbox.x0</span>
+            <span class="s1">dx = bboxparent.x1 - pbcb.x0 + offset[</span><span class="s5">'right'</span><span class="s1">]</span>
+            <span class="s1">dx += cbpad + lmargin</span>
+            <span class="s1">offset[</span><span class="s5">'right'</span><span class="s1">] += cbbbox.width + cbpad</span>
+            <span class="s1">pbcb = pbcb.translated(dx</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">lmargin = cbpos.x0 - cbbbox.x0</span>
+            <span class="s1">dx = bboxparent.x0 - pbcb.x0  </span><span class="s3"># edge of parent</span>
+            <span class="s1">dx += -cbbbox.width - cbpad + lmargin - offset[</span><span class="s5">'left'</span><span class="s1">]</span>
+            <span class="s1">offset[</span><span class="s5">'left'</span><span class="s1">] += cbbbox.width + cbpad</span>
+            <span class="s1">pbcb = pbcb.translated(dx</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:  </span><span class="s3"># horizontal axes:</span>
+        <span class="s1">pbcb = pb.shrunk(shrink</span><span class="s2">, </span><span class="s1">fraction).anchored(anchor</span><span class="s2">, </span><span class="s1">pb)</span>
+        <span class="s2">if </span><span class="s1">location == </span><span class="s5">'top'</span><span class="s1">:</span>
+            <span class="s1">bmargin = cbpos.y0 - cbbbox.y0</span>
+            <span class="s1">dy = bboxparent.y1 - pbcb.y0 + offset[</span><span class="s5">'top'</span><span class="s1">]</span>
+            <span class="s1">dy += cbpad + bmargin</span>
+            <span class="s1">offset[</span><span class="s5">'top'</span><span class="s1">] += cbbbox.height + cbpad</span>
+            <span class="s1">pbcb = pbcb.translated(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">dy)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">bmargin = cbpos.y0 - cbbbox.y0</span>
+            <span class="s1">dy = bboxparent.y0 - pbcb.y0</span>
+            <span class="s1">dy += -cbbbox.height - cbpad + bmargin - offset[</span><span class="s5">'bottom'</span><span class="s1">]</span>
+            <span class="s1">offset[</span><span class="s5">'bottom'</span><span class="s1">] += cbbbox.height + cbpad</span>
+            <span class="s1">pbcb = pbcb.translated(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">dy)</span>
+
+    <span class="s1">pbcb = trans_fig_to_subfig.transform_bbox(pbcb)</span>
+    <span class="s1">cbax.set_transform(fig.transSubfigure)</span>
+    <span class="s1">cbax._set_position(pbcb)</span>
+    <span class="s1">cbax.set_anchor(anchor)</span>
+    <span class="s2">if </span><span class="s1">location </span><span class="s2">in </span><span class="s1">[</span><span class="s5">'bottom'</span><span class="s2">, </span><span class="s5">'top'</span><span class="s1">]:</span>
+        <span class="s1">aspect = </span><span class="s4">1 </span><span class="s1">/ aspect</span>
+    <span class="s1">cbax.set_box_aspect(aspect)</span>
+    <span class="s1">cbax.set_aspect(</span><span class="s5">'auto'</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">offset</span>
+
+
+<span class="s2">def </span><span class="s1">reset_margins(layoutgrids</span><span class="s2">, </span><span class="s1">fig):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Reset the margins in the layoutboxes of fig. 
+ 
+    Margins are usually set as a minimum, so if the figure gets smaller 
+    the minimum needs to be zero in order for it to grow again. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig.subfigs:</span>
+        <span class="s1">reset_margins(layoutgrids</span><span class="s2">, </span><span class="s1">sfig)</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig.axes:</span>
+        <span class="s2">if </span><span class="s1">ax.get_in_layout():</span>
+            <span class="s1">gs = ax.get_gridspec()</span>
+            <span class="s2">if </span><span class="s1">gs </span><span class="s2">in </span><span class="s1">layoutgrids:  </span><span class="s3"># also implies gs is not None.</span>
+                <span class="s1">layoutgrids[gs].reset_margins()</span>
+    <span class="s1">layoutgrids[fig].reset_margins()</span>
+
+
+<span class="s2">def </span><span class="s1">colorbar_get_pad(layoutgrids</span><span class="s2">, </span><span class="s1">cax):</span>
+    <span class="s1">parents = cax._colorbar_info[</span><span class="s5">'parents'</span><span class="s1">]</span>
+    <span class="s1">gs = parents[</span><span class="s4">0</span><span class="s1">].get_gridspec()</span>
+
+    <span class="s1">cb_rspans</span><span class="s2">, </span><span class="s1">cb_cspans = get_cb_parent_spans(cax)</span>
+    <span class="s1">bboxouter = layoutgrids[gs].get_inner_bbox(rows=cb_rspans</span><span class="s2">, </span><span class="s1">cols=cb_cspans)</span>
+
+    <span class="s2">if </span><span class="s1">cax._colorbar_info[</span><span class="s5">'location'</span><span class="s1">] </span><span class="s2">in </span><span class="s1">[</span><span class="s5">'right'</span><span class="s2">, </span><span class="s5">'left'</span><span class="s1">]:</span>
+        <span class="s1">size = bboxouter.width</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">size = bboxouter.height</span>
+
+    <span class="s2">return </span><span class="s1">cax._colorbar_info[</span><span class="s5">'pad'</span><span class="s1">] * size</span>
+</pre>
+</body>
+</html>

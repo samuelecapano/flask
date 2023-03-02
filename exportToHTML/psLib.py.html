@@ -1,0 +1,408 @@
+<html>
+<head>
+<title>psLib.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #a5c261;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+psLib.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">bytechr</span><span class="s0">, </span><span class="s1">byteord</span><span class="s0">, </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">tobytes</span><span class="s0">, </span><span class="s1">tostr</span>
+<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">eexec</span>
+<span class="s0">from </span><span class="s1">.psOperators </span><span class="s0">import </span><span class="s1">(</span>
+	<span class="s1">PSOperators</span><span class="s0">,</span>
+	<span class="s1">ps_StandardEncoding</span><span class="s0">,</span>
+	<span class="s1">ps_array</span><span class="s0">,</span>
+	<span class="s1">ps_boolean</span><span class="s0">,</span>
+	<span class="s1">ps_dict</span><span class="s0">,</span>
+	<span class="s1">ps_integer</span><span class="s0">,</span>
+	<span class="s1">ps_literal</span><span class="s0">,</span>
+	<span class="s1">ps_mark</span><span class="s0">,</span>
+	<span class="s1">ps_name</span><span class="s0">,</span>
+	<span class="s1">ps_operator</span><span class="s0">,</span>
+	<span class="s1">ps_procedure</span><span class="s0">,</span>
+	<span class="s1">ps_procmark</span><span class="s0">,</span>
+	<span class="s1">ps_real</span><span class="s0">,</span>
+	<span class="s1">ps_string</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Callable</span>
+<span class="s0">from </span><span class="s1">string </span><span class="s0">import </span><span class="s1">whitespace</span>
+<span class="s0">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s1">ps_special = </span><span class="s2">b'()&lt;&gt;[]{}%'	</span><span class="s3"># / is one too, but we take care of that one differently</span>
+
+<span class="s1">skipwhiteRE = re.compile(bytesjoin([</span><span class="s2">b&quot;[&quot;</span><span class="s0">, </span><span class="s1">whitespace</span><span class="s0">, </span><span class="s2">b&quot;]*&quot;</span><span class="s1">]))</span>
+<span class="s1">endofthingPat = bytesjoin([</span><span class="s2">b&quot;[^][(){}&lt;&gt;/%&quot;</span><span class="s0">, </span><span class="s1">whitespace</span><span class="s0">, </span><span class="s2">b&quot;]*&quot;</span><span class="s1">])</span>
+<span class="s1">endofthingRE = re.compile(endofthingPat)</span>
+<span class="s1">commentRE = re.compile(</span><span class="s2">b&quot;%[^</span><span class="s0">\n\r</span><span class="s2">]*&quot;</span><span class="s1">)</span>
+
+<span class="s3"># XXX This not entirely correct as it doesn't allow *nested* embedded parens:</span>
+<span class="s1">stringPat = </span><span class="s2">br&quot;&quot;&quot; 
+    \( 
+        ( 
+            ( 
+                [^()]*   \   [()] 
+            ) 
+            | 
+            ( 
+                [^()]*  \(   [^()]*  \) 
+            ) 
+        )* 
+        [^()]* 
+    \) 
+&quot;&quot;&quot;</span>
+<span class="s1">stringPat = </span><span class="s2">b&quot;&quot;</span><span class="s1">.join(stringPat.split())</span>
+<span class="s1">stringRE = re.compile(stringPat)</span>
+
+<span class="s1">hexstringRE = re.compile(bytesjoin([</span><span class="s2">b&quot;&lt;[&quot;</span><span class="s0">, </span><span class="s1">whitespace</span><span class="s0">, </span><span class="s2">b&quot;0-9A-Fa-f]*&gt;&quot;</span><span class="s1">]))</span>
+
+<span class="s0">class </span><span class="s1">PSTokenError(Exception): </span><span class="s0">pass</span>
+<span class="s0">class </span><span class="s1">PSError(Exception): </span><span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">PSTokenizer(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">buf=</span><span class="s2">b''</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s4">&quot;ascii&quot;</span><span class="s1">):</span>
+		<span class="s3"># Force self.buf to be a byte string</span>
+		<span class="s1">buf = tobytes(buf)</span>
+		<span class="s1">self.buf = buf</span>
+		<span class="s1">self.len = len(buf)</span>
+		<span class="s1">self.pos = </span><span class="s5">0</span>
+		<span class="s1">self.closed = </span><span class="s0">False</span>
+		<span class="s1">self.encoding = encoding</span>
+
+	<span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">n=-</span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s6">&quot;&quot;&quot;Read at most 'n' bytes from the buffer, or less if the read 
+        hits EOF before obtaining 'n' bytes. 
+        If 'n' is negative or omitted, read all data until EOF is reached. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">self.closed:</span>
+			<span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;I/O operation on closed file&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">n </span><span class="s0">is None or </span><span class="s1">n &lt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">newpos = self.len</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">newpos = min(self.pos+n</span><span class="s0">, </span><span class="s1">self.len)</span>
+		<span class="s1">r = self.buf[self.pos:newpos]</span>
+		<span class="s1">self.pos = newpos</span>
+		<span class="s0">return </span><span class="s1">r</span>
+
+	<span class="s0">def </span><span class="s1">close(self):</span>
+		<span class="s0">if not </span><span class="s1">self.closed:</span>
+			<span class="s1">self.closed = </span><span class="s0">True</span>
+			<span class="s0">del </span><span class="s1">self.buf</span><span class="s0">, </span><span class="s1">self.pos</span>
+
+	<span class="s0">def </span><span class="s1">getnexttoken(self</span><span class="s0">,</span>
+			<span class="s3"># localize some stuff, for performance</span>
+			<span class="s1">len=len</span><span class="s0">,</span>
+			<span class="s1">ps_special=ps_special</span><span class="s0">,</span>
+			<span class="s1">stringmatch=stringRE.match</span><span class="s0">,</span>
+			<span class="s1">hexstringmatch=hexstringRE.match</span><span class="s0">,</span>
+			<span class="s1">commentmatch=commentRE.match</span><span class="s0">,</span>
+			<span class="s1">endmatch=endofthingRE.match):</span>
+
+		<span class="s1">self.skipwhite()</span>
+		<span class="s0">if </span><span class="s1">self.pos &gt;= self.len:</span>
+			<span class="s0">return None, None</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">buf = self.buf</span>
+		<span class="s1">char = bytechr(byteord(buf[pos]))</span>
+		<span class="s0">if </span><span class="s1">char </span><span class="s0">in </span><span class="s1">ps_special:</span>
+			<span class="s0">if </span><span class="s1">char </span><span class="s0">in </span><span class="s2">b'{}[]'</span><span class="s1">:</span>
+				<span class="s1">tokentype = </span><span class="s4">'do_special'</span>
+				<span class="s1">token = char</span>
+			<span class="s0">elif </span><span class="s1">char == </span><span class="s2">b'%'</span><span class="s1">:</span>
+				<span class="s1">tokentype = </span><span class="s4">'do_comment'</span>
+				<span class="s1">_</span><span class="s0">, </span><span class="s1">nextpos = commentmatch(buf</span><span class="s0">, </span><span class="s1">pos).span()</span>
+				<span class="s1">token = buf[pos:nextpos]</span>
+			<span class="s0">elif </span><span class="s1">char == </span><span class="s2">b'('</span><span class="s1">:</span>
+				<span class="s1">tokentype = </span><span class="s4">'do_string'</span>
+				<span class="s1">m = stringmatch(buf</span><span class="s0">, </span><span class="s1">pos)</span>
+				<span class="s0">if </span><span class="s1">m </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">PSTokenError(</span><span class="s4">'bad string at character %d' </span><span class="s1">% pos)</span>
+				<span class="s1">_</span><span class="s0">, </span><span class="s1">nextpos = m.span()</span>
+				<span class="s1">token = buf[pos:nextpos]</span>
+			<span class="s0">elif </span><span class="s1">char == </span><span class="s2">b'&lt;'</span><span class="s1">:</span>
+				<span class="s1">tokentype = </span><span class="s4">'do_hexstring'</span>
+				<span class="s1">m = hexstringmatch(buf</span><span class="s0">, </span><span class="s1">pos)</span>
+				<span class="s0">if </span><span class="s1">m </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">PSTokenError(</span><span class="s4">'bad hexstring at character %d' </span><span class="s1">% pos)</span>
+				<span class="s1">_</span><span class="s0">, </span><span class="s1">nextpos = m.span()</span>
+				<span class="s1">token = buf[pos:nextpos]</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">raise </span><span class="s1">PSTokenError(</span><span class="s4">'bad token at character %d' </span><span class="s1">% pos)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">char == </span><span class="s2">b'/'</span><span class="s1">:</span>
+				<span class="s1">tokentype = </span><span class="s4">'do_literal'</span>
+				<span class="s1">m = endmatch(buf</span><span class="s0">, </span><span class="s1">pos+</span><span class="s5">1</span><span class="s1">)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">tokentype = </span><span class="s4">''</span>
+				<span class="s1">m = endmatch(buf</span><span class="s0">, </span><span class="s1">pos)</span>
+			<span class="s0">if </span><span class="s1">m </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s0">raise </span><span class="s1">PSTokenError(</span><span class="s4">'bad token at character %d' </span><span class="s1">% pos)</span>
+			<span class="s1">_</span><span class="s0">, </span><span class="s1">nextpos = m.span()</span>
+			<span class="s1">token = buf[pos:nextpos]</span>
+		<span class="s1">self.pos = pos + len(token)</span>
+		<span class="s1">token = tostr(token</span><span class="s0">, </span><span class="s1">encoding=self.encoding)</span>
+		<span class="s0">return </span><span class="s1">tokentype</span><span class="s0">, </span><span class="s1">token</span>
+
+	<span class="s0">def </span><span class="s1">skipwhite(self</span><span class="s0">, </span><span class="s1">whitematch=skipwhiteRE.match):</span>
+		<span class="s1">_</span><span class="s0">, </span><span class="s1">nextpos = whitematch(self.buf</span><span class="s0">, </span><span class="s1">self.pos).span()</span>
+		<span class="s1">self.pos = nextpos</span>
+
+	<span class="s0">def </span><span class="s1">starteexec(self):</span>
+		<span class="s1">self.pos = self.pos + </span><span class="s5">1</span>
+		<span class="s1">self.dirtybuf = self.buf[self.pos:]</span>
+		<span class="s1">self.buf</span><span class="s0">, </span><span class="s1">R = eexec.decrypt(self.dirtybuf</span><span class="s0">, </span><span class="s5">55665</span><span class="s1">)</span>
+		<span class="s1">self.len = len(self.buf)</span>
+		<span class="s1">self.pos = </span><span class="s5">4</span>
+
+	<span class="s0">def </span><span class="s1">stopeexec(self):</span>
+		<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">'dirtybuf'</span><span class="s1">):</span>
+			<span class="s0">return</span>
+		<span class="s1">self.buf = self.dirtybuf</span>
+		<span class="s0">del </span><span class="s1">self.dirtybuf</span>
+
+
+<span class="s0">class </span><span class="s1">PSInterpreter(PSOperators):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s4">&quot;ascii&quot;</span><span class="s1">):</span>
+		<span class="s1">systemdict = {}</span>
+		<span class="s1">userdict = {}</span>
+		<span class="s1">self.encoding = encoding</span>
+		<span class="s1">self.dictstack = [systemdict</span><span class="s0">, </span><span class="s1">userdict]</span>
+		<span class="s1">self.stack = []</span>
+		<span class="s1">self.proclevel = </span><span class="s5">0</span>
+		<span class="s1">self.procmark = ps_procmark()</span>
+		<span class="s1">self.fillsystemdict()</span>
+
+	<span class="s0">def </span><span class="s1">fillsystemdict(self):</span>
+		<span class="s1">systemdict = self.dictstack[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">systemdict[</span><span class="s4">'['</span><span class="s1">] = systemdict[</span><span class="s4">'mark'</span><span class="s1">] = self.mark = ps_mark()</span>
+		<span class="s1">systemdict[</span><span class="s4">']'</span><span class="s1">] = ps_operator(</span><span class="s4">']'</span><span class="s0">, </span><span class="s1">self.do_makearray)</span>
+		<span class="s1">systemdict[</span><span class="s4">'true'</span><span class="s1">] = ps_boolean(</span><span class="s5">1</span><span class="s1">)</span>
+		<span class="s1">systemdict[</span><span class="s4">'false'</span><span class="s1">] = ps_boolean(</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s1">systemdict[</span><span class="s4">'StandardEncoding'</span><span class="s1">] = ps_array(ps_StandardEncoding)</span>
+		<span class="s1">systemdict[</span><span class="s4">'FontDirectory'</span><span class="s1">] = ps_dict({})</span>
+		<span class="s1">self.suckoperators(systemdict</span><span class="s0">, </span><span class="s1">self.__class__)</span>
+
+	<span class="s0">def </span><span class="s1">suckoperators(self</span><span class="s0">, </span><span class="s1">systemdict</span><span class="s0">, </span><span class="s1">klass):</span>
+		<span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">dir(klass):</span>
+			<span class="s1">attr = getattr(self</span><span class="s0">, </span><span class="s1">name)</span>
+			<span class="s0">if </span><span class="s1">isinstance(attr</span><span class="s0">, </span><span class="s1">Callable) </span><span class="s0">and </span><span class="s1">name[:</span><span class="s5">3</span><span class="s1">] == </span><span class="s4">'ps_'</span><span class="s1">:</span>
+				<span class="s1">name = name[</span><span class="s5">3</span><span class="s1">:]</span>
+				<span class="s1">systemdict[name] = ps_operator(name</span><span class="s0">, </span><span class="s1">attr)</span>
+		<span class="s0">for </span><span class="s1">baseclass </span><span class="s0">in </span><span class="s1">klass.__bases__:</span>
+			<span class="s1">self.suckoperators(systemdict</span><span class="s0">, </span><span class="s1">baseclass)</span>
+
+	<span class="s0">def </span><span class="s1">interpret(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">getattr=getattr):</span>
+		<span class="s1">tokenizer = self.tokenizer = PSTokenizer(data</span><span class="s0">, </span><span class="s1">self.encoding)</span>
+		<span class="s1">getnexttoken = tokenizer.getnexttoken</span>
+		<span class="s1">do_token = self.do_token</span>
+		<span class="s1">handle_object = self.handle_object</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">while </span><span class="s5">1</span><span class="s1">:</span>
+				<span class="s1">tokentype</span><span class="s0">, </span><span class="s1">token = getnexttoken()</span>
+				<span class="s0">if not </span><span class="s1">token:</span>
+					<span class="s0">break</span>
+				<span class="s0">if </span><span class="s1">tokentype:</span>
+					<span class="s1">handler = getattr(self</span><span class="s0">, </span><span class="s1">tokentype)</span>
+					<span class="s1">object = handler(token)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">object = do_token(token)</span>
+				<span class="s0">if </span><span class="s1">object </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">handle_object(object)</span>
+			<span class="s1">tokenizer.close()</span>
+			<span class="s1">self.tokenizer = </span><span class="s0">None</span>
+		<span class="s0">except</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">self.tokenizer </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">log.debug(</span>
+					<span class="s4">'ps error:</span><span class="s0">\n</span><span class="s4">'</span>
+					<span class="s4">'- - - - - - -</span><span class="s0">\n</span><span class="s4">'</span>
+					<span class="s4">'%s</span><span class="s0">\n</span><span class="s4">'</span>
+					<span class="s4">'&gt;&gt;&gt;</span><span class="s0">\n</span><span class="s4">'</span>
+					<span class="s4">'%s</span><span class="s0">\n</span><span class="s4">'</span>
+					<span class="s4">'- - - - - - -'</span><span class="s0">,</span>
+					<span class="s1">self.tokenizer.buf[self.tokenizer.pos-</span><span class="s5">50</span><span class="s1">:self.tokenizer.pos]</span><span class="s0">,</span>
+					<span class="s1">self.tokenizer.buf[self.tokenizer.pos:self.tokenizer.pos+</span><span class="s5">50</span><span class="s1">])</span>
+			<span class="s0">raise</span>
+
+	<span class="s0">def </span><span class="s1">handle_object(self</span><span class="s0">, </span><span class="s1">object):</span>
+		<span class="s0">if not </span><span class="s1">(self.proclevel </span><span class="s0">or </span><span class="s1">object.literal </span><span class="s0">or </span><span class="s1">object.type == </span><span class="s4">'proceduretype'</span><span class="s1">):</span>
+			<span class="s0">if </span><span class="s1">object.type != </span><span class="s4">'operatortype'</span><span class="s1">:</span>
+				<span class="s1">object = self.resolve_name(object.value)</span>
+			<span class="s0">if </span><span class="s1">object.literal:</span>
+				<span class="s1">self.push(object)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">object.type == </span><span class="s4">'proceduretype'</span><span class="s1">:</span>
+					<span class="s1">self.call_procedure(object)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">object.function()</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.push(object)</span>
+
+	<span class="s0">def </span><span class="s1">call_procedure(self</span><span class="s0">, </span><span class="s1">proc):</span>
+		<span class="s1">handle_object = self.handle_object</span>
+		<span class="s0">for </span><span class="s1">item </span><span class="s0">in </span><span class="s1">proc.value:</span>
+			<span class="s1">handle_object(item)</span>
+
+	<span class="s0">def </span><span class="s1">resolve_name(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s1">dictstack = self.dictstack</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(dictstack)-</span><span class="s5">1</span><span class="s0">, </span><span class="s1">-</span><span class="s5">1</span><span class="s0">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">):</span>
+			<span class="s0">if </span><span class="s1">name </span><span class="s0">in </span><span class="s1">dictstack[i]:</span>
+				<span class="s0">return </span><span class="s1">dictstack[i][name]</span>
+		<span class="s0">raise </span><span class="s1">PSError(</span><span class="s4">'name error: ' </span><span class="s1">+ str(name))</span>
+
+	<span class="s0">def </span><span class="s1">do_token(self</span><span class="s0">, </span><span class="s1">token</span><span class="s0">,</span>
+				<span class="s1">int=int</span><span class="s0">,</span>
+				<span class="s1">float=float</span><span class="s0">,</span>
+				<span class="s1">ps_name=ps_name</span><span class="s0">,</span>
+				<span class="s1">ps_integer=ps_integer</span><span class="s0">,</span>
+				<span class="s1">ps_real=ps_real):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">num = int(token)</span>
+		<span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">OverflowError):</span>
+			<span class="s0">try</span><span class="s1">:</span>
+				<span class="s1">num = float(token)</span>
+			<span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">OverflowError):</span>
+				<span class="s0">if </span><span class="s4">'#' </span><span class="s0">in </span><span class="s1">token:</span>
+					<span class="s1">hashpos = token.find(</span><span class="s4">'#'</span><span class="s1">)</span>
+					<span class="s0">try</span><span class="s1">:</span>
+						<span class="s1">base = int(token[:hashpos])</span>
+						<span class="s1">num = int(token[hashpos+</span><span class="s5">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">base)</span>
+					<span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">OverflowError):</span>
+						<span class="s0">return </span><span class="s1">ps_name(token)</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s0">return </span><span class="s1">ps_integer(num)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">return </span><span class="s1">ps_name(token)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">return </span><span class="s1">ps_real(num)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">ps_integer(num)</span>
+
+	<span class="s0">def </span><span class="s1">do_comment(self</span><span class="s0">, </span><span class="s1">token):</span>
+		<span class="s0">pass</span>
+
+	<span class="s0">def </span><span class="s1">do_literal(self</span><span class="s0">, </span><span class="s1">token):</span>
+		<span class="s0">return </span><span class="s1">ps_literal(token[</span><span class="s5">1</span><span class="s1">:])</span>
+
+	<span class="s0">def </span><span class="s1">do_string(self</span><span class="s0">, </span><span class="s1">token):</span>
+		<span class="s0">return </span><span class="s1">ps_string(token[</span><span class="s5">1</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">])</span>
+
+	<span class="s0">def </span><span class="s1">do_hexstring(self</span><span class="s0">, </span><span class="s1">token):</span>
+		<span class="s1">hexStr = </span><span class="s4">&quot;&quot;</span><span class="s1">.join(token[</span><span class="s5">1</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">].split())</span>
+		<span class="s0">if </span><span class="s1">len(hexStr) % </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s1">hexStr = hexStr + </span><span class="s4">'0'</span>
+		<span class="s1">cleanstr = []</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">len(hexStr)</span><span class="s0">, </span><span class="s5">2</span><span class="s1">):</span>
+			<span class="s1">cleanstr.append(chr(int(hexStr[i:i+</span><span class="s5">2</span><span class="s1">]</span><span class="s0">, </span><span class="s5">16</span><span class="s1">)))</span>
+		<span class="s1">cleanstr = </span><span class="s4">&quot;&quot;</span><span class="s1">.join(cleanstr)</span>
+		<span class="s0">return </span><span class="s1">ps_string(cleanstr)</span>
+
+	<span class="s0">def </span><span class="s1">do_special(self</span><span class="s0">, </span><span class="s1">token):</span>
+		<span class="s0">if </span><span class="s1">token == </span><span class="s4">'{'</span><span class="s1">:</span>
+			<span class="s1">self.proclevel = self.proclevel + </span><span class="s5">1</span>
+			<span class="s0">return </span><span class="s1">self.procmark</span>
+		<span class="s0">elif </span><span class="s1">token == </span><span class="s4">'}'</span><span class="s1">:</span>
+			<span class="s1">proc = []</span>
+			<span class="s0">while </span><span class="s5">1</span><span class="s1">:</span>
+				<span class="s1">topobject = self.pop()</span>
+				<span class="s0">if </span><span class="s1">topobject == self.procmark:</span>
+					<span class="s0">break</span>
+				<span class="s1">proc.append(topobject)</span>
+			<span class="s1">self.proclevel = self.proclevel - </span><span class="s5">1</span>
+			<span class="s1">proc.reverse()</span>
+			<span class="s0">return </span><span class="s1">ps_procedure(proc)</span>
+		<span class="s0">elif </span><span class="s1">token == </span><span class="s4">'['</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.mark</span>
+		<span class="s0">elif </span><span class="s1">token == </span><span class="s4">']'</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">ps_name(</span><span class="s4">']'</span><span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">PSTokenError(</span><span class="s4">'huh?'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">push(self</span><span class="s0">, </span><span class="s1">object):</span>
+		<span class="s1">self.stack.append(object)</span>
+
+	<span class="s0">def </span><span class="s1">pop(self</span><span class="s0">, </span><span class="s1">*types):</span>
+		<span class="s1">stack = self.stack</span>
+		<span class="s0">if not </span><span class="s1">stack:</span>
+			<span class="s0">raise </span><span class="s1">PSError(</span><span class="s4">'stack underflow'</span><span class="s1">)</span>
+		<span class="s1">object = stack[-</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s0">if </span><span class="s1">types:</span>
+			<span class="s0">if </span><span class="s1">object.type </span><span class="s0">not in </span><span class="s1">types:</span>
+				<span class="s0">raise </span><span class="s1">PSError(</span><span class="s4">'typecheck, expected %s, found %s' </span><span class="s1">% (repr(types)</span><span class="s0">, </span><span class="s1">object.type))</span>
+		<span class="s0">del </span><span class="s1">stack[-</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s0">return </span><span class="s1">object</span>
+
+	<span class="s0">def </span><span class="s1">do_makearray(self):</span>
+		<span class="s1">array = []</span>
+		<span class="s0">while </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">topobject = self.pop()</span>
+			<span class="s0">if </span><span class="s1">topobject == self.mark:</span>
+				<span class="s0">break</span>
+			<span class="s1">array.append(topobject)</span>
+		<span class="s1">array.reverse()</span>
+		<span class="s1">self.push(ps_array(array))</span>
+
+	<span class="s0">def </span><span class="s1">close(self):</span>
+		<span class="s6">&quot;&quot;&quot;Remove circular references.&quot;&quot;&quot;</span>
+		<span class="s0">del </span><span class="s1">self.stack</span>
+		<span class="s0">del </span><span class="s1">self.dictstack</span>
+
+
+<span class="s0">def </span><span class="s1">unpack_item(item):</span>
+	<span class="s1">tp = type(item.value)</span>
+	<span class="s0">if </span><span class="s1">tp == dict:</span>
+		<span class="s1">newitem = {}</span>
+		<span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">item.value.items():</span>
+			<span class="s1">newitem[key] = unpack_item(value)</span>
+	<span class="s0">elif </span><span class="s1">tp == list:</span>
+		<span class="s1">newitem = [</span><span class="s0">None</span><span class="s1">] * len(item.value)</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(item.value)):</span>
+			<span class="s1">newitem[i] = unpack_item(item.value[i])</span>
+		<span class="s0">if </span><span class="s1">item.type == </span><span class="s4">'proceduretype'</span><span class="s1">:</span>
+			<span class="s1">newitem = tuple(newitem)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">newitem = item.value</span>
+	<span class="s0">return </span><span class="s1">newitem</span>
+
+<span class="s0">def </span><span class="s1">suckfont(data</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s4">&quot;ascii&quot;</span><span class="s1">):</span>
+	<span class="s1">m = re.search(</span><span class="s2">br&quot;/FontName\s+/([^ \t\n\r]+)\s+def&quot;</span><span class="s0">, </span><span class="s1">data)</span>
+	<span class="s0">if </span><span class="s1">m:</span>
+		<span class="s1">fontName = m.group(</span><span class="s5">1</span><span class="s1">)</span>
+		<span class="s1">fontName = fontName.decode()</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">fontName = </span><span class="s0">None</span>
+	<span class="s1">interpreter = PSInterpreter(encoding=encoding)</span>
+	<span class="s1">interpreter.interpret(</span><span class="s2">b&quot;/Helvetica 4 dict dup /Encoding StandardEncoding put definefont pop&quot;</span><span class="s1">)</span>
+	<span class="s1">interpreter.interpret(data)</span>
+	<span class="s1">fontdir = interpreter.dictstack[</span><span class="s5">0</span><span class="s1">][</span><span class="s4">'FontDirectory'</span><span class="s1">].value</span>
+	<span class="s0">if </span><span class="s1">fontName </span><span class="s0">in </span><span class="s1">fontdir:</span>
+		<span class="s1">rawfont = fontdir[fontName]</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s3"># fall back, in case fontName wasn't found</span>
+		<span class="s1">fontNames = list(fontdir.keys())</span>
+		<span class="s0">if </span><span class="s1">len(fontNames) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">fontNames.remove(</span><span class="s4">&quot;Helvetica&quot;</span><span class="s1">)</span>
+		<span class="s1">fontNames.sort()</span>
+		<span class="s1">rawfont = fontdir[fontNames[</span><span class="s5">0</span><span class="s1">]]</span>
+	<span class="s1">interpreter.close()</span>
+	<span class="s0">return </span><span class="s1">unpack_item(rawfont)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,351 @@
+<html>
+<head>
+<title>csrf.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+csrf.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">hashlib</span>
+<span class="s0">import </span><span class="s1">hmac</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">from </span><span class="s1">urllib.parse </span><span class="s0">import </span><span class="s1">urlparse</span>
+
+<span class="s0">from </span><span class="s1">flask </span><span class="s0">import </span><span class="s1">Blueprint</span>
+<span class="s0">from </span><span class="s1">flask </span><span class="s0">import </span><span class="s1">current_app</span>
+<span class="s0">from </span><span class="s1">flask </span><span class="s0">import </span><span class="s1">g</span>
+<span class="s0">from </span><span class="s1">flask </span><span class="s0">import </span><span class="s1">request</span>
+<span class="s0">from </span><span class="s1">flask </span><span class="s0">import </span><span class="s1">session</span>
+<span class="s0">from </span><span class="s1">itsdangerous </span><span class="s0">import </span><span class="s1">BadData</span>
+<span class="s0">from </span><span class="s1">itsdangerous </span><span class="s0">import </span><span class="s1">SignatureExpired</span>
+<span class="s0">from </span><span class="s1">itsdangerous </span><span class="s0">import </span><span class="s1">URLSafeTimedSerializer</span>
+<span class="s0">from </span><span class="s1">werkzeug.exceptions </span><span class="s0">import </span><span class="s1">BadRequest</span>
+<span class="s0">from </span><span class="s1">wtforms </span><span class="s0">import </span><span class="s1">ValidationError</span>
+<span class="s0">from </span><span class="s1">wtforms.csrf.core </span><span class="s0">import </span><span class="s1">CSRF</span>
+
+<span class="s1">__all__ = (</span><span class="s2">&quot;generate_csrf&quot;</span><span class="s0">, </span><span class="s2">&quot;validate_csrf&quot;</span><span class="s0">, </span><span class="s2">&quot;CSRFProtect&quot;</span><span class="s1">)</span>
+<span class="s1">logger = logging.getLogger(__name__)</span>
+
+
+<span class="s0">def </span><span class="s1">generate_csrf(secret_key=</span><span class="s0">None, </span><span class="s1">token_key=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Generate a CSRF token. The token is cached for a request, so multiple 
+    calls to this function will generate the same token. 
+ 
+    During testing, it might be useful to access the signed token in 
+    ``g.csrf_token`` and the raw token in ``session['csrf_token']``. 
+ 
+    :param secret_key: Used to securely sign the token. Default is 
+        ``WTF_CSRF_SECRET_KEY`` or ``SECRET_KEY``. 
+    :param token_key: Key where token is stored in session for comparison. 
+        Default is ``WTF_CSRF_FIELD_NAME`` or ``'csrf_token'``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">secret_key = _get_config(</span>
+        <span class="s1">secret_key</span><span class="s0">,</span>
+        <span class="s2">&quot;WTF_CSRF_SECRET_KEY&quot;</span><span class="s0">,</span>
+        <span class="s1">current_app.secret_key</span><span class="s0">,</span>
+        <span class="s1">message=</span><span class="s2">&quot;A secret key is required to use CSRF.&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">field_name = _get_config(</span>
+        <span class="s1">token_key</span><span class="s0">,</span>
+        <span class="s2">&quot;WTF_CSRF_FIELD_NAME&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;csrf_token&quot;</span><span class="s0">,</span>
+        <span class="s1">message=</span><span class="s2">&quot;A field name is required to use CSRF.&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">field_name </span><span class="s0">not in </span><span class="s1">g:</span>
+        <span class="s1">s = URLSafeTimedSerializer(secret_key</span><span class="s0">, </span><span class="s1">salt=</span><span class="s2">&quot;wtf-csrf-token&quot;</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">field_name </span><span class="s0">not in </span><span class="s1">session:</span>
+            <span class="s1">session[field_name] = hashlib.sha1(os.urandom(</span><span class="s4">64</span><span class="s1">)).hexdigest()</span>
+
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">token = s.dumps(session[field_name])</span>
+        <span class="s0">except </span><span class="s1">TypeError:</span>
+            <span class="s1">session[field_name] = hashlib.sha1(os.urandom(</span><span class="s4">64</span><span class="s1">)).hexdigest()</span>
+            <span class="s1">token = s.dumps(session[field_name])</span>
+
+        <span class="s1">setattr(g</span><span class="s0">, </span><span class="s1">field_name</span><span class="s0">, </span><span class="s1">token)</span>
+
+    <span class="s0">return </span><span class="s1">g.get(field_name)</span>
+
+
+<span class="s0">def </span><span class="s1">validate_csrf(data</span><span class="s0">, </span><span class="s1">secret_key=</span><span class="s0">None, </span><span class="s1">time_limit=</span><span class="s0">None, </span><span class="s1">token_key=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Check if the given data is a valid CSRF token. This compares the given 
+    signed token to the one stored in the session. 
+ 
+    :param data: The signed CSRF token to be checked. 
+    :param secret_key: Used to securely sign the token. Default is 
+        ``WTF_CSRF_SECRET_KEY`` or ``SECRET_KEY``. 
+    :param time_limit: Number of seconds that the token is valid. Default is 
+        ``WTF_CSRF_TIME_LIMIT`` or 3600 seconds (60 minutes). 
+    :param token_key: Key where token is stored in session for comparison. 
+        Default is ``WTF_CSRF_FIELD_NAME`` or ``'csrf_token'``. 
+ 
+    :raises ValidationError: Contains the reason that validation failed. 
+ 
+    .. versionchanged:: 0.14 
+        Raises ``ValidationError`` with a specific error message rather than 
+        returning ``True`` or ``False``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">secret_key = _get_config(</span>
+        <span class="s1">secret_key</span><span class="s0">,</span>
+        <span class="s2">&quot;WTF_CSRF_SECRET_KEY&quot;</span><span class="s0">,</span>
+        <span class="s1">current_app.secret_key</span><span class="s0">,</span>
+        <span class="s1">message=</span><span class="s2">&quot;A secret key is required to use CSRF.&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">field_name = _get_config(</span>
+        <span class="s1">token_key</span><span class="s0">,</span>
+        <span class="s2">&quot;WTF_CSRF_FIELD_NAME&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;csrf_token&quot;</span><span class="s0">,</span>
+        <span class="s1">message=</span><span class="s2">&quot;A field name is required to use CSRF.&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">time_limit = _get_config(time_limit</span><span class="s0">, </span><span class="s2">&quot;WTF_CSRF_TIME_LIMIT&quot;</span><span class="s0">, </span><span class="s4">3600</span><span class="s0">, </span><span class="s1">required=</span><span class="s0">False</span><span class="s1">)</span>
+
+    <span class="s0">if not </span><span class="s1">data:</span>
+        <span class="s0">raise </span><span class="s1">ValidationError(</span><span class="s2">&quot;The CSRF token is missing.&quot;</span><span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">field_name </span><span class="s0">not in </span><span class="s1">session:</span>
+        <span class="s0">raise </span><span class="s1">ValidationError(</span><span class="s2">&quot;The CSRF session token is missing.&quot;</span><span class="s1">)</span>
+
+    <span class="s1">s = URLSafeTimedSerializer(secret_key</span><span class="s0">, </span><span class="s1">salt=</span><span class="s2">&quot;wtf-csrf-token&quot;</span><span class="s1">)</span>
+
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">token = s.loads(data</span><span class="s0">, </span><span class="s1">max_age=time_limit)</span>
+    <span class="s0">except </span><span class="s1">SignatureExpired </span><span class="s0">as </span><span class="s1">e:</span>
+        <span class="s0">raise </span><span class="s1">ValidationError(</span><span class="s2">&quot;The CSRF token has expired.&quot;</span><span class="s1">) </span><span class="s0">from </span><span class="s1">e</span>
+    <span class="s0">except </span><span class="s1">BadData </span><span class="s0">as </span><span class="s1">e:</span>
+        <span class="s0">raise </span><span class="s1">ValidationError(</span><span class="s2">&quot;The CSRF token is invalid.&quot;</span><span class="s1">) </span><span class="s0">from </span><span class="s1">e</span>
+
+    <span class="s0">if not </span><span class="s1">hmac.compare_digest(session[field_name]</span><span class="s0">, </span><span class="s1">token):</span>
+        <span class="s0">raise </span><span class="s1">ValidationError(</span><span class="s2">&quot;The CSRF tokens do not match.&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_get_config(</span>
+    <span class="s1">value</span><span class="s0">, </span><span class="s1">config_name</span><span class="s0">, </span><span class="s1">default=</span><span class="s0">None, </span><span class="s1">required=</span><span class="s0">True, </span><span class="s1">message=</span><span class="s2">&quot;CSRF is not configured.&quot;</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Find config value based on provided value, Flask config, and default 
+    value. 
+ 
+    :param value: already provided config value 
+    :param config_name: Flask ``config`` key 
+    :param default: default value if not provided or configured 
+    :param required: whether the value must not be ``None`` 
+    :param message: error message if required config is not found 
+    :raises KeyError: if required config is not found 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">value = current_app.config.get(config_name</span><span class="s0">, </span><span class="s1">default)</span>
+
+    <span class="s0">if </span><span class="s1">required </span><span class="s0">and </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">RuntimeError(message)</span>
+
+    <span class="s0">return </span><span class="s1">value</span>
+
+
+<span class="s0">class </span><span class="s1">_FlaskFormCSRF(CSRF):</span>
+    <span class="s0">def </span><span class="s1">setup_form(self</span><span class="s0">, </span><span class="s1">form):</span>
+        <span class="s1">self.meta = form.meta</span>
+        <span class="s0">return </span><span class="s1">super().setup_form(form)</span>
+
+    <span class="s0">def </span><span class="s1">generate_csrf_token(self</span><span class="s0">, </span><span class="s1">csrf_token_field):</span>
+        <span class="s0">return </span><span class="s1">generate_csrf(</span>
+            <span class="s1">secret_key=self.meta.csrf_secret</span><span class="s0">, </span><span class="s1">token_key=self.meta.csrf_field_name</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">validate_csrf_token(self</span><span class="s0">, </span><span class="s1">form</span><span class="s0">, </span><span class="s1">field):</span>
+        <span class="s0">if </span><span class="s1">g.get(</span><span class="s2">&quot;csrf_valid&quot;</span><span class="s0">, False</span><span class="s1">):</span>
+            <span class="s5"># already validated by CSRFProtect</span>
+            <span class="s0">return</span>
+
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">validate_csrf(</span>
+                <span class="s1">field.data</span><span class="s0">,</span>
+                <span class="s1">self.meta.csrf_secret</span><span class="s0">,</span>
+                <span class="s1">self.meta.csrf_time_limit</span><span class="s0">,</span>
+                <span class="s1">self.meta.csrf_field_name</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">ValidationError </span><span class="s0">as </span><span class="s1">e:</span>
+            <span class="s1">logger.info(e.args[</span><span class="s4">0</span><span class="s1">])</span>
+            <span class="s0">raise</span>
+
+
+<span class="s0">class </span><span class="s1">CSRFProtect:</span>
+    <span class="s3">&quot;&quot;&quot;Enable CSRF protection globally for a Flask app. 
+ 
+    :: 
+ 
+        app = Flask(__name__) 
+        csrf = CSRFProtect(app) 
+ 
+    Checks the ``csrf_token`` field sent with forms, or the ``X-CSRFToken`` 
+    header sent with JavaScript requests. Render the token in templates using 
+    ``{{ csrf_token() }}``. 
+ 
+    See the :ref:`csrf` documentation. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">app=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">self._exempt_views = set()</span>
+        <span class="s1">self._exempt_blueprints = set()</span>
+
+        <span class="s0">if </span><span class="s1">app:</span>
+            <span class="s1">self.init_app(app)</span>
+
+    <span class="s0">def </span><span class="s1">init_app(self</span><span class="s0">, </span><span class="s1">app):</span>
+        <span class="s1">app.extensions[</span><span class="s2">&quot;csrf&quot;</span><span class="s1">] = self</span>
+
+        <span class="s1">app.config.setdefault(</span><span class="s2">&quot;WTF_CSRF_ENABLED&quot;</span><span class="s0">, True</span><span class="s1">)</span>
+        <span class="s1">app.config.setdefault(</span><span class="s2">&quot;WTF_CSRF_CHECK_DEFAULT&quot;</span><span class="s0">, True</span><span class="s1">)</span>
+        <span class="s1">app.config[</span><span class="s2">&quot;WTF_CSRF_METHODS&quot;</span><span class="s1">] = set(</span>
+            <span class="s1">app.config.get(</span><span class="s2">&quot;WTF_CSRF_METHODS&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s2">&quot;POST&quot;</span><span class="s0">, </span><span class="s2">&quot;PUT&quot;</span><span class="s0">, </span><span class="s2">&quot;PATCH&quot;</span><span class="s0">, </span><span class="s2">&quot;DELETE&quot;</span><span class="s1">])</span>
+        <span class="s1">)</span>
+        <span class="s1">app.config.setdefault(</span><span class="s2">&quot;WTF_CSRF_FIELD_NAME&quot;</span><span class="s0">, </span><span class="s2">&quot;csrf_token&quot;</span><span class="s1">)</span>
+        <span class="s1">app.config.setdefault(</span><span class="s2">&quot;WTF_CSRF_HEADERS&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s2">&quot;X-CSRFToken&quot;</span><span class="s0">, </span><span class="s2">&quot;X-CSRF-Token&quot;</span><span class="s1">])</span>
+        <span class="s1">app.config.setdefault(</span><span class="s2">&quot;WTF_CSRF_TIME_LIMIT&quot;</span><span class="s0">, </span><span class="s4">3600</span><span class="s1">)</span>
+        <span class="s1">app.config.setdefault(</span><span class="s2">&quot;WTF_CSRF_SSL_STRICT&quot;</span><span class="s0">, True</span><span class="s1">)</span>
+
+        <span class="s1">app.jinja_env.globals[</span><span class="s2">&quot;csrf_token&quot;</span><span class="s1">] = generate_csrf</span>
+        <span class="s1">app.context_processor(</span><span class="s0">lambda</span><span class="s1">: {</span><span class="s2">&quot;csrf_token&quot;</span><span class="s1">: generate_csrf})</span>
+
+        <span class="s1">@app.before_request</span>
+        <span class="s0">def </span><span class="s1">csrf_protect():</span>
+            <span class="s0">if not </span><span class="s1">app.config[</span><span class="s2">&quot;WTF_CSRF_ENABLED&quot;</span><span class="s1">]:</span>
+                <span class="s0">return</span>
+
+            <span class="s0">if not </span><span class="s1">app.config[</span><span class="s2">&quot;WTF_CSRF_CHECK_DEFAULT&quot;</span><span class="s1">]:</span>
+                <span class="s0">return</span>
+
+            <span class="s0">if </span><span class="s1">request.method </span><span class="s0">not in </span><span class="s1">app.config[</span><span class="s2">&quot;WTF_CSRF_METHODS&quot;</span><span class="s1">]:</span>
+                <span class="s0">return</span>
+
+            <span class="s0">if not </span><span class="s1">request.endpoint:</span>
+                <span class="s0">return</span>
+
+            <span class="s0">if </span><span class="s1">request.blueprint </span><span class="s0">in </span><span class="s1">self._exempt_blueprints:</span>
+                <span class="s0">return</span>
+
+            <span class="s1">view = app.view_functions.get(request.endpoint)</span>
+            <span class="s1">dest = </span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">view.__module__</span><span class="s0">}</span><span class="s2">.</span><span class="s0">{</span><span class="s1">view.__name__</span><span class="s0">}</span><span class="s2">&quot;</span>
+
+            <span class="s0">if </span><span class="s1">dest </span><span class="s0">in </span><span class="s1">self._exempt_views:</span>
+                <span class="s0">return</span>
+
+            <span class="s1">self.protect()</span>
+
+    <span class="s0">def </span><span class="s1">_get_csrf_token(self):</span>
+        <span class="s5"># find the token in the form data</span>
+        <span class="s1">field_name = current_app.config[</span><span class="s2">&quot;WTF_CSRF_FIELD_NAME&quot;</span><span class="s1">]</span>
+        <span class="s1">base_token = request.form.get(field_name)</span>
+
+        <span class="s0">if </span><span class="s1">base_token:</span>
+            <span class="s0">return </span><span class="s1">base_token</span>
+
+        <span class="s5"># if the form has a prefix, the name will be {prefix}-csrf_token</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">request.form:</span>
+            <span class="s0">if </span><span class="s1">key.endswith(field_name):</span>
+                <span class="s1">csrf_token = request.form[key]</span>
+
+                <span class="s0">if </span><span class="s1">csrf_token:</span>
+                    <span class="s0">return </span><span class="s1">csrf_token</span>
+
+        <span class="s5"># find the token in the headers</span>
+        <span class="s0">for </span><span class="s1">header_name </span><span class="s0">in </span><span class="s1">current_app.config[</span><span class="s2">&quot;WTF_CSRF_HEADERS&quot;</span><span class="s1">]:</span>
+            <span class="s1">csrf_token = request.headers.get(header_name)</span>
+
+            <span class="s0">if </span><span class="s1">csrf_token:</span>
+                <span class="s0">return </span><span class="s1">csrf_token</span>
+
+        <span class="s0">return None</span>
+
+    <span class="s0">def </span><span class="s1">protect(self):</span>
+        <span class="s0">if </span><span class="s1">request.method </span><span class="s0">not in </span><span class="s1">current_app.config[</span><span class="s2">&quot;WTF_CSRF_METHODS&quot;</span><span class="s1">]:</span>
+            <span class="s0">return</span>
+
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">validate_csrf(self._get_csrf_token())</span>
+        <span class="s0">except </span><span class="s1">ValidationError </span><span class="s0">as </span><span class="s1">e:</span>
+            <span class="s1">logger.info(e.args[</span><span class="s4">0</span><span class="s1">])</span>
+            <span class="s1">self._error_response(e.args[</span><span class="s4">0</span><span class="s1">])</span>
+
+        <span class="s0">if </span><span class="s1">request.is_secure </span><span class="s0">and </span><span class="s1">current_app.config[</span><span class="s2">&quot;WTF_CSRF_SSL_STRICT&quot;</span><span class="s1">]:</span>
+            <span class="s0">if not </span><span class="s1">request.referrer:</span>
+                <span class="s1">self._error_response(</span><span class="s2">&quot;The referrer header is missing.&quot;</span><span class="s1">)</span>
+
+            <span class="s1">good_referrer = </span><span class="s2">f&quot;https://</span><span class="s0">{</span><span class="s1">request.host</span><span class="s0">}</span><span class="s2">/&quot;</span>
+
+            <span class="s0">if not </span><span class="s1">same_origin(request.referrer</span><span class="s0">, </span><span class="s1">good_referrer):</span>
+                <span class="s1">self._error_response(</span><span class="s2">&quot;The referrer does not match the host.&quot;</span><span class="s1">)</span>
+
+        <span class="s1">g.csrf_valid = </span><span class="s0">True  </span><span class="s5"># mark this request as CSRF valid</span>
+
+    <span class="s0">def </span><span class="s1">exempt(self</span><span class="s0">, </span><span class="s1">view):</span>
+        <span class="s3">&quot;&quot;&quot;Mark a view or blueprint to be excluded from CSRF protection. 
+ 
+        :: 
+ 
+            @app.route('/some-view', methods=['POST']) 
+            @csrf.exempt 
+            def some_view(): 
+                ... 
+ 
+        :: 
+ 
+            bp = Blueprint(...) 
+            csrf.exempt(bp) 
+ 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">isinstance(view</span><span class="s0">, </span><span class="s1">Blueprint):</span>
+            <span class="s1">self._exempt_blueprints.add(view.name)</span>
+            <span class="s0">return </span><span class="s1">view</span>
+
+        <span class="s0">if </span><span class="s1">isinstance(view</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">view_location = view</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">view_location = </span><span class="s2">&quot;.&quot;</span><span class="s1">.join((view.__module__</span><span class="s0">, </span><span class="s1">view.__name__))</span>
+
+        <span class="s1">self._exempt_views.add(view_location)</span>
+        <span class="s0">return </span><span class="s1">view</span>
+
+    <span class="s0">def </span><span class="s1">_error_response(self</span><span class="s0">, </span><span class="s1">reason):</span>
+        <span class="s0">raise </span><span class="s1">CSRFError(reason)</span>
+
+
+<span class="s0">class </span><span class="s1">CSRFError(BadRequest):</span>
+    <span class="s3">&quot;&quot;&quot;Raise if the client sends invalid CSRF data with the request. 
+ 
+    Generates a 400 Bad Request response with the failure reason by default. 
+    Customize the response by registering a handler with 
+    :meth:`flask.Flask.errorhandler`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s2">&quot;CSRF validation failed.&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">same_origin(current_uri</span><span class="s0">, </span><span class="s1">compare_uri):</span>
+    <span class="s1">current = urlparse(current_uri)</span>
+    <span class="s1">compare = urlparse(compare_uri)</span>
+
+    <span class="s0">return </span><span class="s1">(</span>
+        <span class="s1">current.scheme == compare.scheme</span>
+        <span class="s0">and </span><span class="s1">current.hostname == compare.hostname</span>
+        <span class="s0">and </span><span class="s1">current.port == compare.port</span>
+    <span class="s1">)</span>
+</pre>
+</body>
+</html>

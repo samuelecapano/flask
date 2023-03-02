@@ -1,0 +1,651 @@
+<html>
+<head>
+<title>E_B_L_C_.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+E_B_L_C_.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">sstruct</span>
+<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">safeEval</span>
+<span class="s0">from </span><span class="s1">.BitmapGlyphMetrics </span><span class="s0">import </span><span class="s1">BigGlyphMetrics</span><span class="s0">, </span><span class="s1">bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">SmallGlyphMetrics</span><span class="s0">, </span><span class="s1">smallGlyphMetricsFormat</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">deque</span>
+<span class="s0">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s1">eblcHeaderFormat = </span><span class="s2">&quot;&quot;&quot; 
+    &gt; # big endian 
+    version:  16.16F 
+    numSizes: I 
+&quot;&quot;&quot;</span>
+<span class="s3"># The table format string is split to handle sbitLineMetrics simply.</span>
+<span class="s1">bitmapSizeTableFormatPart1 = </span><span class="s2">&quot;&quot;&quot; 
+    &gt; # big endian 
+    indexSubTableArrayOffset: I 
+    indexTablesSize:          I 
+    numberOfIndexSubTables:   I 
+    colorRef:                 I 
+&quot;&quot;&quot;</span>
+<span class="s3"># The compound type for hori and vert.</span>
+<span class="s1">sbitLineMetricsFormat = </span><span class="s2">&quot;&quot;&quot; 
+    &gt; # big endian 
+    ascender:              b 
+    descender:             b 
+    widthMax:              B 
+    caretSlopeNumerator:   b 
+    caretSlopeDenominator: b 
+    caretOffset:           b 
+    minOriginSB:           b 
+    minAdvanceSB:          b 
+    maxBeforeBL:           b 
+    minAfterBL:            b 
+    pad1:                  b 
+    pad2:                  b 
+&quot;&quot;&quot;</span>
+<span class="s3"># hori and vert go between the two parts.</span>
+<span class="s1">bitmapSizeTableFormatPart2 = </span><span class="s2">&quot;&quot;&quot; 
+    &gt; # big endian 
+    startGlyphIndex: H 
+    endGlyphIndex:   H 
+    ppemX:           B 
+    ppemY:           B 
+    bitDepth:        B 
+    flags:           b 
+&quot;&quot;&quot;</span>
+
+<span class="s1">indexSubTableArrayFormat = </span><span class="s2">&quot;&gt;HHL&quot;</span>
+<span class="s1">indexSubTableArraySize = struct.calcsize(indexSubTableArrayFormat)</span>
+
+<span class="s1">indexSubHeaderFormat = </span><span class="s2">&quot;&gt;HHL&quot;</span>
+<span class="s1">indexSubHeaderSize = struct.calcsize(indexSubHeaderFormat)</span>
+
+<span class="s1">codeOffsetPairFormat = </span><span class="s2">&quot;&gt;HH&quot;</span>
+<span class="s1">codeOffsetPairSize = struct.calcsize(codeOffsetPairFormat)</span>
+
+<span class="s0">class </span><span class="s1">table_E_B_L_C_(DefaultTable.DefaultTable):</span>
+
+	<span class="s1">dependencies = [</span><span class="s2">'EBDT'</span><span class="s1">]</span>
+
+	<span class="s3"># This method can be overridden in subclasses to support new formats</span>
+	<span class="s3"># without changing the other implementation. Also can be used as a</span>
+	<span class="s3"># convenience method for coverting a font file to an alternative format.</span>
+	<span class="s0">def </span><span class="s1">getIndexFormatClass(self</span><span class="s0">, </span><span class="s1">indexFormat):</span>
+		<span class="s0">return </span><span class="s1">eblc_sub_table_classes[indexFormat]</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+
+		<span class="s3"># Save the original data because offsets are from the start of the table.</span>
+		<span class="s1">origData = data</span>
+		<span class="s1">i = </span><span class="s4">0</span><span class="s1">;</span>
+
+		<span class="s1">dummy = sstruct.unpack(eblcHeaderFormat</span><span class="s0">, </span><span class="s1">data[:</span><span class="s4">8</span><span class="s1">]</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">i += </span><span class="s4">8</span><span class="s1">;</span>
+
+		<span class="s1">self.strikes = []</span>
+		<span class="s0">for </span><span class="s1">curStrikeIndex </span><span class="s0">in </span><span class="s1">range(self.numSizes):</span>
+			<span class="s1">curStrike = Strike()</span>
+			<span class="s1">self.strikes.append(curStrike)</span>
+			<span class="s1">curTable = curStrike.bitmapSizeTable</span>
+			<span class="s1">dummy = sstruct.unpack2(bitmapSizeTableFormatPart1</span><span class="s0">, </span><span class="s1">data[i:i+</span><span class="s4">16</span><span class="s1">]</span><span class="s0">, </span><span class="s1">curTable)</span>
+			<span class="s1">i += </span><span class="s4">16</span>
+			<span class="s0">for </span><span class="s1">metric </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'hori'</span><span class="s0">, </span><span class="s2">'vert'</span><span class="s1">):</span>
+				<span class="s1">metricObj = SbitLineMetrics()</span>
+				<span class="s1">vars(curTable)[metric] = metricObj</span>
+				<span class="s1">dummy = sstruct.unpack2(sbitLineMetricsFormat</span><span class="s0">, </span><span class="s1">data[i:i+</span><span class="s4">12</span><span class="s1">]</span><span class="s0">, </span><span class="s1">metricObj)</span>
+				<span class="s1">i += </span><span class="s4">12</span>
+			<span class="s1">dummy = sstruct.unpack(bitmapSizeTableFormatPart2</span><span class="s0">, </span><span class="s1">data[i:i+</span><span class="s4">8</span><span class="s1">]</span><span class="s0">, </span><span class="s1">curTable)</span>
+			<span class="s1">i += </span><span class="s4">8</span>
+
+		<span class="s0">for </span><span class="s1">curStrike </span><span class="s0">in </span><span class="s1">self.strikes:</span>
+			<span class="s1">curTable = curStrike.bitmapSizeTable</span>
+			<span class="s0">for </span><span class="s1">subtableIndex </span><span class="s0">in </span><span class="s1">range(curTable.numberOfIndexSubTables):</span>
+				<span class="s1">i = curTable.indexSubTableArrayOffset + subtableIndex * indexSubTableArraySize</span>
+
+				<span class="s1">tup = struct.unpack(indexSubTableArrayFormat</span><span class="s0">, </span><span class="s1">data[i:i+indexSubTableArraySize])</span>
+				<span class="s1">(firstGlyphIndex</span><span class="s0">, </span><span class="s1">lastGlyphIndex</span><span class="s0">, </span><span class="s1">additionalOffsetToIndexSubtable) = tup</span>
+				<span class="s1">i = curTable.indexSubTableArrayOffset + additionalOffsetToIndexSubtable</span>
+
+				<span class="s1">tup = struct.unpack(indexSubHeaderFormat</span><span class="s0">, </span><span class="s1">data[i:i+indexSubHeaderSize])</span>
+				<span class="s1">(indexFormat</span><span class="s0">, </span><span class="s1">imageFormat</span><span class="s0">, </span><span class="s1">imageDataOffset) = tup</span>
+
+				<span class="s1">indexFormatClass = self.getIndexFormatClass(indexFormat)</span>
+				<span class="s1">indexSubTable = indexFormatClass(data[i+indexSubHeaderSize:]</span><span class="s0">, </span><span class="s1">ttFont)</span>
+				<span class="s1">indexSubTable.firstGlyphIndex = firstGlyphIndex</span>
+				<span class="s1">indexSubTable.lastGlyphIndex = lastGlyphIndex</span>
+				<span class="s1">indexSubTable.additionalOffsetToIndexSubtable = additionalOffsetToIndexSubtable</span>
+				<span class="s1">indexSubTable.indexFormat = indexFormat</span>
+				<span class="s1">indexSubTable.imageFormat = imageFormat</span>
+				<span class="s1">indexSubTable.imageDataOffset = imageDataOffset</span>
+				<span class="s1">indexSubTable.decompile() </span><span class="s3"># https://github.com/fonttools/fonttools/issues/317</span>
+				<span class="s1">curStrike.indexSubTables.append(indexSubTable)</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+
+		<span class="s1">dataList = []</span>
+		<span class="s1">self.numSizes = len(self.strikes)</span>
+		<span class="s1">dataList.append(sstruct.pack(eblcHeaderFormat</span><span class="s0">, </span><span class="s1">self))</span>
+
+		<span class="s3"># Data size of the header + bitmapSizeTable needs to be calculated</span>
+		<span class="s3"># in order to form offsets. This value will hold the size of the data</span>
+		<span class="s3"># in dataList after all the data is consolidated in dataList.</span>
+		<span class="s1">dataSize = len(dataList[</span><span class="s4">0</span><span class="s1">])</span>
+
+		<span class="s3"># The table will be structured in the following order:</span>
+		<span class="s3"># (0) header</span>
+		<span class="s3"># (1) Each bitmapSizeTable [1 ... self.numSizes]</span>
+		<span class="s3"># (2) Alternate between indexSubTableArray and indexSubTable</span>
+		<span class="s3">#     for each bitmapSizeTable present.</span>
+		<span class="s3">#</span>
+		<span class="s3"># The issue is maintaining the proper offsets when table information</span>
+		<span class="s3"># gets moved around. All offsets and size information must be recalculated</span>
+		<span class="s3"># when building the table to allow editing within ttLib and also allow easy</span>
+		<span class="s3"># import/export to and from XML. All of this offset information is lost</span>
+		<span class="s3"># when exporting to XML so everything must be calculated fresh so importing</span>
+		<span class="s3"># from XML will work cleanly. Only byte offset and size information is</span>
+		<span class="s3"># calculated fresh. Count information like numberOfIndexSubTables is</span>
+		<span class="s3"># checked through assertions. If the information in this table was not</span>
+		<span class="s3"># touched or was changed properly then these types of values should match.</span>
+		<span class="s3">#</span>
+		<span class="s3"># The table will be rebuilt the following way:</span>
+		<span class="s3"># (0) Precompute the size of all the bitmapSizeTables. This is needed to</span>
+		<span class="s3">#     compute the offsets properly.</span>
+		<span class="s3"># (1) For each bitmapSizeTable compute the indexSubTable and</span>
+		<span class="s3">#       indexSubTableArray pair. The indexSubTable must be computed first</span>
+		<span class="s3">#     so that the offset information in indexSubTableArray can be</span>
+		<span class="s3">#     calculated. Update the data size after each pairing.</span>
+		<span class="s3"># (2) Build each bitmapSizeTable.</span>
+		<span class="s3"># (3) Consolidate all the data into the main dataList in the correct order.</span>
+
+		<span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">self.strikes:</span>
+			<span class="s1">dataSize += sstruct.calcsize(bitmapSizeTableFormatPart1)</span>
+			<span class="s1">dataSize += len((</span><span class="s2">'hori'</span><span class="s0">, </span><span class="s2">'vert'</span><span class="s1">)) * sstruct.calcsize(sbitLineMetricsFormat)</span>
+			<span class="s1">dataSize += sstruct.calcsize(bitmapSizeTableFormatPart2)</span>
+
+		<span class="s1">indexSubTablePairDataList = []</span>
+		<span class="s0">for </span><span class="s1">curStrike </span><span class="s0">in </span><span class="s1">self.strikes:</span>
+			<span class="s1">curTable = curStrike.bitmapSizeTable</span>
+			<span class="s1">curTable.numberOfIndexSubTables = len(curStrike.indexSubTables)</span>
+			<span class="s1">curTable.indexSubTableArrayOffset = dataSize</span>
+
+			<span class="s3"># Precompute the size of the indexSubTableArray. This information</span>
+			<span class="s3"># is important for correctly calculating the new value for</span>
+			<span class="s3"># additionalOffsetToIndexSubtable.</span>
+			<span class="s1">sizeOfSubTableArray = curTable.numberOfIndexSubTables * indexSubTableArraySize</span>
+			<span class="s1">lowerBound = dataSize</span>
+			<span class="s1">dataSize += sizeOfSubTableArray</span>
+			<span class="s1">upperBound = dataSize</span>
+
+			<span class="s1">indexSubTableDataList = []</span>
+			<span class="s0">for </span><span class="s1">indexSubTable </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables:</span>
+				<span class="s1">indexSubTable.additionalOffsetToIndexSubtable = dataSize - curTable.indexSubTableArrayOffset</span>
+				<span class="s1">glyphIds = list(map(ttFont.getGlyphID</span><span class="s0">, </span><span class="s1">indexSubTable.names))</span>
+				<span class="s1">indexSubTable.firstGlyphIndex = min(glyphIds)</span>
+				<span class="s1">indexSubTable.lastGlyphIndex = max(glyphIds)</span>
+				<span class="s1">data = indexSubTable.compile(ttFont)</span>
+				<span class="s1">indexSubTableDataList.append(data)</span>
+				<span class="s1">dataSize += len(data)</span>
+			<span class="s1">curTable.startGlyphIndex = min(ist.firstGlyphIndex </span><span class="s0">for </span><span class="s1">ist </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables)</span>
+			<span class="s1">curTable.endGlyphIndex = max(ist.lastGlyphIndex </span><span class="s0">for </span><span class="s1">ist </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables)</span>
+
+			<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables:</span>
+				<span class="s1">data = struct.pack(indexSubHeaderFormat</span><span class="s0">, </span><span class="s1">i.firstGlyphIndex</span><span class="s0">, </span><span class="s1">i.lastGlyphIndex</span><span class="s0">, </span><span class="s1">i.additionalOffsetToIndexSubtable)</span>
+				<span class="s1">indexSubTablePairDataList.append(data)</span>
+			<span class="s1">indexSubTablePairDataList.extend(indexSubTableDataList)</span>
+			<span class="s1">curTable.indexTablesSize = dataSize - curTable.indexSubTableArrayOffset</span>
+
+		<span class="s0">for </span><span class="s1">curStrike </span><span class="s0">in </span><span class="s1">self.strikes:</span>
+			<span class="s1">curTable = curStrike.bitmapSizeTable</span>
+			<span class="s1">data = sstruct.pack(bitmapSizeTableFormatPart1</span><span class="s0">, </span><span class="s1">curTable)</span>
+			<span class="s1">dataList.append(data)</span>
+			<span class="s0">for </span><span class="s1">metric </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'hori'</span><span class="s0">, </span><span class="s2">'vert'</span><span class="s1">):</span>
+				<span class="s1">metricObj = vars(curTable)[metric]</span>
+				<span class="s1">data = sstruct.pack(sbitLineMetricsFormat</span><span class="s0">, </span><span class="s1">metricObj)</span>
+				<span class="s1">dataList.append(data)</span>
+			<span class="s1">data = sstruct.pack(bitmapSizeTableFormatPart2</span><span class="s0">, </span><span class="s1">curTable)</span>
+			<span class="s1">dataList.append(data)</span>
+		<span class="s1">dataList.extend(indexSubTablePairDataList)</span>
+
+		<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.simpletag(</span><span class="s2">'header'</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'version'</span><span class="s0">, </span><span class="s1">self.version)])</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">curIndex</span><span class="s0">, </span><span class="s1">curStrike </span><span class="s0">in </span><span class="s1">enumerate(self.strikes):</span>
+			<span class="s1">curStrike.toXML(curIndex</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s2">'header'</span><span class="s1">:</span>
+			<span class="s1">self.version = safeEval(attrs[</span><span class="s2">'version'</span><span class="s1">])</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s2">'strike'</span><span class="s1">:</span>
+			<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s2">'strikes'</span><span class="s1">):</span>
+				<span class="s1">self.strikes = []</span>
+			<span class="s1">strikeIndex = safeEval(attrs[</span><span class="s2">'index'</span><span class="s1">])</span>
+			<span class="s1">curStrike = Strike()</span>
+			<span class="s1">curStrike.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont</span><span class="s0">, </span><span class="s1">self)</span>
+
+			<span class="s3"># Grow the strike array to the appropriate size. The XML format</span>
+			<span class="s3"># allows for the strike index value to be out of order.</span>
+			<span class="s0">if </span><span class="s1">strikeIndex &gt;= len(self.strikes):</span>
+				<span class="s1">self.strikes += [</span><span class="s0">None</span><span class="s1">] * (strikeIndex + </span><span class="s4">1 </span><span class="s1">- len(self.strikes))</span>
+			<span class="s0">assert </span><span class="s1">self.strikes[strikeIndex] </span><span class="s0">is None, </span><span class="s2">&quot;Duplicate strike EBLC indices.&quot;</span>
+			<span class="s1">self.strikes[strikeIndex] = curStrike</span>
+
+<span class="s0">class </span><span class="s1">Strike(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.bitmapSizeTable = BitmapSizeTable()</span>
+		<span class="s1">self.indexSubTables = []</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">strikeIndex</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(</span><span class="s2">'strike'</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'index'</span><span class="s0">, </span><span class="s1">strikeIndex)])</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">self.bitmapSizeTable.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s1">writer.comment(</span><span class="s2">'GlyphIds are written but not read. The firstGlyphIndex and</span><span class="s0">\n</span><span class="s2">lastGlyphIndex values will be recalculated by the compiler.'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">indexSubTable </span><span class="s0">in </span><span class="s1">self.indexSubTables:</span>
+			<span class="s1">indexSubTable.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s1">writer.endtag(</span><span class="s2">'strike'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont</span><span class="s0">, </span><span class="s1">locator):</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name == </span><span class="s2">'bitmapSizeTable'</span><span class="s1">:</span>
+				<span class="s1">self.bitmapSizeTable.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+			<span class="s0">elif </span><span class="s1">name.startswith(_indexSubTableSubclassPrefix):</span>
+				<span class="s1">indexFormat = safeEval(name[len(_indexSubTableSubclassPrefix):])</span>
+				<span class="s1">indexFormatClass = locator.getIndexFormatClass(indexFormat)</span>
+				<span class="s1">indexSubTable = indexFormatClass(</span><span class="s0">None, None</span><span class="s1">)</span>
+				<span class="s1">indexSubTable.indexFormat = indexFormat</span>
+				<span class="s1">indexSubTable.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+				<span class="s1">self.indexSubTables.append(indexSubTable)</span>
+
+
+<span class="s0">class </span><span class="s1">BitmapSizeTable(object):</span>
+
+	<span class="s3"># Returns all the simple metric names that bitmap size table</span>
+	<span class="s3"># cares about in terms of XML creation.</span>
+	<span class="s0">def </span><span class="s1">_getXMLMetricNames(self):</span>
+		<span class="s1">dataNames = sstruct.getformat(bitmapSizeTableFormatPart1)[</span><span class="s4">1</span><span class="s1">]</span>
+		<span class="s1">dataNames = dataNames + sstruct.getformat(bitmapSizeTableFormatPart2)[</span><span class="s4">1</span><span class="s1">]</span>
+		<span class="s3"># Skip the first 3 data names because they are byte offsets and counts.</span>
+		<span class="s0">return </span><span class="s1">dataNames[</span><span class="s4">3</span><span class="s1">:]</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(</span><span class="s2">'bitmapSizeTable'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">metric </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'hori'</span><span class="s0">, </span><span class="s2">'vert'</span><span class="s1">):</span>
+			<span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">metric).toXML(metric</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s0">for </span><span class="s1">metricName </span><span class="s0">in </span><span class="s1">self._getXMLMetricNames():</span>
+			<span class="s1">writer.simpletag(metricName</span><span class="s0">, </span><span class="s1">value=getattr(self</span><span class="s0">, </span><span class="s1">metricName))</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">writer.endtag(</span><span class="s2">'bitmapSizeTable'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s3"># Create a lookup for all the simple names that make sense to</span>
+		<span class="s3"># bitmap size table. Only read the information from these names.</span>
+		<span class="s1">dataNames = set(self._getXMLMetricNames())</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name == </span><span class="s2">'sbitLineMetrics'</span><span class="s1">:</span>
+				<span class="s1">direction = attrs[</span><span class="s2">'direction'</span><span class="s1">]</span>
+				<span class="s0">assert </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'hori'</span><span class="s0">, </span><span class="s2">'vert'</span><span class="s1">)</span><span class="s0">, </span><span class="s2">&quot;SbitLineMetrics direction specified invalid.&quot;</span>
+				<span class="s1">metricObj = SbitLineMetrics()</span>
+				<span class="s1">metricObj.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+				<span class="s1">vars(self)[direction] = metricObj</span>
+			<span class="s0">elif </span><span class="s1">name </span><span class="s0">in </span><span class="s1">dataNames:</span>
+				<span class="s1">vars(self)[name] = safeEval(attrs[</span><span class="s2">'value'</span><span class="s1">])</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">log.warning(</span><span class="s2">&quot;unknown name '%s' being ignored in BitmapSizeTable.&quot;</span><span class="s0">, </span><span class="s1">name)</span>
+
+
+<span class="s0">class </span><span class="s1">SbitLineMetrics(object):</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(</span><span class="s2">'sbitLineMetrics'</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'direction'</span><span class="s0">, </span><span class="s1">name)])</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">metricName </span><span class="s0">in </span><span class="s1">sstruct.getformat(sbitLineMetricsFormat)[</span><span class="s4">1</span><span class="s1">]:</span>
+			<span class="s1">writer.simpletag(metricName</span><span class="s0">, </span><span class="s1">value=getattr(self</span><span class="s0">, </span><span class="s1">metricName))</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">writer.endtag(</span><span class="s2">'sbitLineMetrics'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">metricNames = set(sstruct.getformat(sbitLineMetricsFormat)[</span><span class="s4">1</span><span class="s1">])</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name </span><span class="s0">in </span><span class="s1">metricNames:</span>
+				<span class="s1">vars(self)[name] = safeEval(attrs[</span><span class="s2">'value'</span><span class="s1">])</span>
+
+<span class="s3"># Important information about the naming scheme. Used for identifying subtables.</span>
+<span class="s1">_indexSubTableSubclassPrefix = </span><span class="s2">'eblc_index_sub_table_'</span>
+
+<span class="s0">class </span><span class="s1">EblcIndexSubTable(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.data = data</span>
+		<span class="s1">self.ttFont = ttFont</span>
+		<span class="s3"># TODO Currently non-lazy decompiling doesn't work for this class...</span>
+		<span class="s3">#if not ttFont.lazy:</span>
+		<span class="s3">#   self.decompile()</span>
+		<span class="s3">#   del self.data, self.ttFont</span>
+
+	<span class="s0">def </span><span class="s1">__getattr__(self</span><span class="s0">, </span><span class="s1">attr):</span>
+		<span class="s3"># Allow lazy decompile.</span>
+		<span class="s0">if </span><span class="s1">attr[:</span><span class="s4">2</span><span class="s1">] == </span><span class="s2">'__'</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">AttributeError(attr)</span>
+		<span class="s0">if </span><span class="s1">attr == </span><span class="s2">&quot;data&quot;</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">AttributeError(attr)</span>
+		<span class="s1">self.decompile()</span>
+		<span class="s0">return </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">attr)</span>
+
+	<span class="s0">def </span><span class="s1">ensureDecompiled(self</span><span class="s0">, </span><span class="s1">recurse=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s2">&quot;data&quot;</span><span class="s1">):</span>
+			<span class="s1">self.decompile()</span>
+
+	<span class="s3"># This method just takes care of the indexSubHeader. Implementing subclasses</span>
+	<span class="s3"># should call it to compile the indexSubHeader and then continue compiling</span>
+	<span class="s3"># the remainder of their unique format.</span>
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">return </span><span class="s1">struct.pack(indexSubHeaderFormat</span><span class="s0">, </span><span class="s1">self.indexFormat</span><span class="s0">, </span><span class="s1">self.imageFormat</span><span class="s0">, </span><span class="s1">self.imageDataOffset)</span>
+
+	<span class="s3"># Creates the XML for bitmap glyphs. Each index sub table basically makes</span>
+	<span class="s3"># the same XML except for specific metric information that is written</span>
+	<span class="s3"># out via a method call that a subclass implements optionally.</span>
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(self.__class__.__name__</span><span class="s0">, </span><span class="s1">[</span>
+				<span class="s1">(</span><span class="s2">'imageFormat'</span><span class="s0">, </span><span class="s1">self.imageFormat)</span><span class="s0">,</span>
+				<span class="s1">(</span><span class="s2">'firstGlyphIndex'</span><span class="s0">, </span><span class="s1">self.firstGlyphIndex)</span><span class="s0">,</span>
+				<span class="s1">(</span><span class="s2">'lastGlyphIndex'</span><span class="s0">, </span><span class="s1">self.lastGlyphIndex)</span><span class="s0">,</span>
+				<span class="s1">])</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">self.writeMetrics(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s3"># Write out the names as thats all thats needed to rebuild etc.</span>
+		<span class="s3"># For font debugging of consecutive formats the ids are also written.</span>
+		<span class="s3"># The ids are not read when moving from the XML format.</span>
+		<span class="s1">glyphIds = map(ttFont.getGlyphID</span><span class="s0">, </span><span class="s1">self.names)</span>
+		<span class="s0">for </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">glyphId </span><span class="s0">in </span><span class="s1">zip(self.names</span><span class="s0">, </span><span class="s1">glyphIds):</span>
+			<span class="s1">writer.simpletag(</span><span class="s2">'glyphLoc'</span><span class="s0">, </span><span class="s1">name=glyphName</span><span class="s0">, </span><span class="s1">id=glyphId)</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">writer.endtag(self.__class__.__name__)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s3"># Read all the attributes. Even though the glyph indices are</span>
+		<span class="s3"># recalculated, they are still read in case there needs to</span>
+		<span class="s3"># be an immediate export of the data.</span>
+		<span class="s1">self.imageFormat = safeEval(attrs[</span><span class="s2">'imageFormat'</span><span class="s1">])</span>
+		<span class="s1">self.firstGlyphIndex = safeEval(attrs[</span><span class="s2">'firstGlyphIndex'</span><span class="s1">])</span>
+		<span class="s1">self.lastGlyphIndex = safeEval(attrs[</span><span class="s2">'lastGlyphIndex'</span><span class="s1">])</span>
+
+		<span class="s1">self.readMetrics(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+		<span class="s1">self.names = []</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name == </span><span class="s2">'glyphLoc'</span><span class="s1">:</span>
+				<span class="s1">self.names.append(attrs[</span><span class="s2">'name'</span><span class="s1">])</span>
+
+	<span class="s3"># A helper method that writes the metrics for the index sub table. It also</span>
+	<span class="s3"># is responsible for writing the image size for fixed size data since fixed</span>
+	<span class="s3"># size is not recalculated on compile. Default behavior is to do nothing.</span>
+	<span class="s0">def </span><span class="s1">writeMetrics(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">pass</span>
+
+	<span class="s3"># A helper method that is the inverse of writeMetrics.</span>
+	<span class="s0">def </span><span class="s1">readMetrics(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">pass</span>
+
+	<span class="s3"># This method is for fixed glyph data sizes. There are formats where</span>
+	<span class="s3"># the glyph data is fixed but are actually composite glyphs. To handle</span>
+	<span class="s3"># this the font spec in indexSubTable makes the data the size of the</span>
+	<span class="s3"># fixed size by padding the component arrays. This function abstracts</span>
+	<span class="s3"># out this padding process. Input is data unpadded. Output is data</span>
+	<span class="s3"># padded only in fixed formats. Default behavior is to return the data.</span>
+	<span class="s0">def </span><span class="s1">padBitmapData(self</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s3"># Remove any of the glyph locations and names that are flagged as skipped.</span>
+	<span class="s3"># This only occurs in formats {1,3}.</span>
+	<span class="s0">def </span><span class="s1">removeSkipGlyphs(self):</span>
+		<span class="s3"># Determines if a name, location pair is a valid data location.</span>
+		<span class="s3"># Skip glyphs are marked when the size is equal to zero.</span>
+		<span class="s0">def </span><span class="s1">isValidLocation(args):</span>
+			<span class="s1">(name</span><span class="s0">, </span><span class="s1">(startByte</span><span class="s0">, </span><span class="s1">endByte)) = args</span>
+			<span class="s0">return </span><span class="s1">startByte &lt; endByte</span>
+		<span class="s3"># Remove all skip glyphs.</span>
+		<span class="s1">dataPairs = list(filter(isValidLocation</span><span class="s0">, </span><span class="s1">zip(self.names</span><span class="s0">, </span><span class="s1">self.locations)))</span>
+		<span class="s1">self.names</span><span class="s0">, </span><span class="s1">self.locations = list(map(list</span><span class="s0">, </span><span class="s1">zip(*dataPairs)))</span>
+
+<span class="s3"># A closure for creating a custom mixin. This is done because formats 1 and 3</span>
+<span class="s3"># are very similar. The only difference between them is the size per offset</span>
+<span class="s3"># value. Code put in here should handle both cases generally.</span>
+<span class="s0">def </span><span class="s1">_createOffsetArrayIndexSubTableMixin(formatStringForDataType):</span>
+
+	<span class="s3"># Prep the data size for the offset array data format.</span>
+	<span class="s1">dataFormat = </span><span class="s2">'&gt;'</span><span class="s1">+formatStringForDataType</span>
+	<span class="s1">offsetDataSize = struct.calcsize(dataFormat)</span>
+
+	<span class="s0">class </span><span class="s1">OffsetArrayIndexSubTableMixin(object):</span>
+
+		<span class="s0">def </span><span class="s1">decompile(self):</span>
+
+			<span class="s1">numGlyphs = self.lastGlyphIndex - self.firstGlyphIndex + </span><span class="s4">1</span>
+			<span class="s1">indexingOffsets = [glyphIndex * offsetDataSize </span><span class="s0">for </span><span class="s1">glyphIndex </span><span class="s0">in </span><span class="s1">range(numGlyphs+</span><span class="s4">2</span><span class="s1">)]</span>
+			<span class="s1">indexingLocations = zip(indexingOffsets</span><span class="s0">, </span><span class="s1">indexingOffsets[</span><span class="s4">1</span><span class="s1">:])</span>
+			<span class="s1">offsetArray = [struct.unpack(dataFormat</span><span class="s0">, </span><span class="s1">self.data[slice(*loc)])[</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">loc </span><span class="s0">in </span><span class="s1">indexingLocations]</span>
+
+			<span class="s1">glyphIds = list(range(self.firstGlyphIndex</span><span class="s0">, </span><span class="s1">self.lastGlyphIndex+</span><span class="s4">1</span><span class="s1">))</span>
+			<span class="s1">modifiedOffsets = [offset + self.imageDataOffset </span><span class="s0">for </span><span class="s1">offset </span><span class="s0">in </span><span class="s1">offsetArray]</span>
+			<span class="s1">self.locations = list(zip(modifiedOffsets</span><span class="s0">, </span><span class="s1">modifiedOffsets[</span><span class="s4">1</span><span class="s1">:]))</span>
+
+			<span class="s1">self.names = list(map(self.ttFont.getGlyphName</span><span class="s0">, </span><span class="s1">glyphIds))</span>
+			<span class="s1">self.removeSkipGlyphs()</span>
+			<span class="s0">del </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.ttFont</span>
+
+		<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+			<span class="s3"># First make sure that all the data lines up properly. Formats 1 and 3</span>
+			<span class="s3"># must have all its data lined up consecutively. If not this will fail.</span>
+			<span class="s0">for </span><span class="s1">curLoc</span><span class="s0">, </span><span class="s1">nxtLoc </span><span class="s0">in </span><span class="s1">zip(self.locations</span><span class="s0">, </span><span class="s1">self.locations[</span><span class="s4">1</span><span class="s1">:]):</span>
+				<span class="s0">assert </span><span class="s1">curLoc[</span><span class="s4">1</span><span class="s1">] == nxtLoc[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s2">&quot;Data must be consecutive in indexSubTable offset formats&quot;</span>
+
+			<span class="s1">glyphIds = list(map(ttFont.getGlyphID</span><span class="s0">, </span><span class="s1">self.names))</span>
+			<span class="s3"># Make sure that all ids are sorted strictly increasing.</span>
+			<span class="s0">assert </span><span class="s1">all(glyphIds[i] &lt; glyphIds[i+</span><span class="s4">1</span><span class="s1">] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(glyphIds)-</span><span class="s4">1</span><span class="s1">))</span>
+
+			<span class="s3"># Run a simple algorithm to add skip glyphs to the data locations at</span>
+			<span class="s3"># the places where an id is not present.</span>
+			<span class="s1">idQueue = deque(glyphIds)</span>
+			<span class="s1">locQueue = deque(self.locations)</span>
+			<span class="s1">allGlyphIds = list(range(self.firstGlyphIndex</span><span class="s0">, </span><span class="s1">self.lastGlyphIndex+</span><span class="s4">1</span><span class="s1">))</span>
+			<span class="s1">allLocations = []</span>
+			<span class="s0">for </span><span class="s1">curId </span><span class="s0">in </span><span class="s1">allGlyphIds:</span>
+				<span class="s0">if </span><span class="s1">curId != idQueue[</span><span class="s4">0</span><span class="s1">]:</span>
+					<span class="s1">allLocations.append((locQueue[</span><span class="s4">0</span><span class="s1">][</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">locQueue[</span><span class="s4">0</span><span class="s1">][</span><span class="s4">0</span><span class="s1">]))</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">idQueue.popleft()</span>
+					<span class="s1">allLocations.append(locQueue.popleft())</span>
+
+			<span class="s3"># Now that all the locations are collected, pack them appropriately into</span>
+			<span class="s3"># offsets. This is the form where offset[i] is the location and</span>
+			<span class="s3"># offset[i+1]-offset[i] is the size of the data location.</span>
+			<span class="s1">offsets = list(allLocations[</span><span class="s4">0</span><span class="s1">]) + [loc[</span><span class="s4">1</span><span class="s1">] </span><span class="s0">for </span><span class="s1">loc </span><span class="s0">in </span><span class="s1">allLocations[</span><span class="s4">1</span><span class="s1">:]]</span>
+			<span class="s3"># Image data offset must be less than or equal to the minimum of locations.</span>
+			<span class="s3"># This offset may change the value for round tripping but is safer and</span>
+			<span class="s3"># allows imageDataOffset to not be required to be in the XML version.</span>
+			<span class="s1">self.imageDataOffset = min(offsets)</span>
+			<span class="s1">offsetArray = [offset - self.imageDataOffset </span><span class="s0">for </span><span class="s1">offset </span><span class="s0">in </span><span class="s1">offsets]</span>
+
+			<span class="s1">dataList = [EblcIndexSubTable.compile(self</span><span class="s0">, </span><span class="s1">ttFont)]</span>
+			<span class="s1">dataList += [struct.pack(dataFormat</span><span class="s0">, </span><span class="s1">offsetValue) </span><span class="s0">for </span><span class="s1">offsetValue </span><span class="s0">in </span><span class="s1">offsetArray]</span>
+			<span class="s3"># Take care of any padding issues. Only occurs in format 3.</span>
+			<span class="s0">if </span><span class="s1">offsetDataSize * len(offsetArray) % </span><span class="s4">4 </span><span class="s1">!= </span><span class="s4">0</span><span class="s1">:</span>
+				<span class="s1">dataList.append(struct.pack(dataFormat</span><span class="s0">, </span><span class="s4">0</span><span class="s1">))</span>
+			<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+	<span class="s0">return </span><span class="s1">OffsetArrayIndexSubTableMixin</span>
+
+<span class="s3"># A Mixin for functionality shared between the different kinds</span>
+<span class="s3"># of fixed sized data handling. Both kinds have big metrics so</span>
+<span class="s3"># that kind of special processing is also handled in this mixin.</span>
+<span class="s0">class </span><span class="s1">FixedSizeIndexSubTableMixin(object):</span>
+
+	<span class="s0">def </span><span class="s1">writeMetrics(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.simpletag(</span><span class="s2">'imageSize'</span><span class="s0">, </span><span class="s1">value=self.imageSize)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">self.metrics.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+	<span class="s0">def </span><span class="s1">readMetrics(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name == </span><span class="s2">'imageSize'</span><span class="s1">:</span>
+				<span class="s1">self.imageSize = safeEval(attrs[</span><span class="s2">'value'</span><span class="s1">])</span>
+			<span class="s0">elif </span><span class="s1">name == BigGlyphMetrics.__name__:</span>
+				<span class="s1">self.metrics = BigGlyphMetrics()</span>
+				<span class="s1">self.metrics.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+			<span class="s0">elif </span><span class="s1">name == SmallGlyphMetrics.__name__:</span>
+				<span class="s1">log.warning(</span><span class="s2">&quot;SmallGlyphMetrics being ignored in format %d.&quot;</span><span class="s0">, </span><span class="s1">self.indexFormat)</span>
+
+	<span class="s0">def </span><span class="s1">padBitmapData(self</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s3"># Make sure that the data isn't bigger than the fixed size.</span>
+		<span class="s0">assert </span><span class="s1">len(data) &lt;= self.imageSize</span><span class="s0">, </span><span class="s2">&quot;Data in indexSubTable format %d must be less than the fixed size.&quot; </span><span class="s1">% self.indexFormat</span>
+		<span class="s3"># Pad the data so that it matches the fixed size.</span>
+		<span class="s1">pad = (self.imageSize - len(data)) * </span><span class="s5">b'</span><span class="s0">\0</span><span class="s5">'</span>
+		<span class="s0">return </span><span class="s1">data + pad</span>
+
+<span class="s0">class </span><span class="s1">eblc_index_sub_table_1(_createOffsetArrayIndexSubTableMixin(</span><span class="s2">'L'</span><span class="s1">)</span><span class="s0">, </span><span class="s1">EblcIndexSubTable):</span>
+	<span class="s0">pass</span>
+
+<span class="s0">class </span><span class="s1">eblc_index_sub_table_2(FixedSizeIndexSubTableMixin</span><span class="s0">, </span><span class="s1">EblcIndexSubTable):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">(self.imageSize</span><span class="s0">,</span><span class="s1">) = struct.unpack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">self.data[:</span><span class="s4">4</span><span class="s1">])</span>
+		<span class="s1">self.metrics = BigGlyphMetrics()</span>
+		<span class="s1">sstruct.unpack2(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data[</span><span class="s4">4</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">glyphIds = list(range(self.firstGlyphIndex</span><span class="s0">, </span><span class="s1">self.lastGlyphIndex+</span><span class="s4">1</span><span class="s1">))</span>
+		<span class="s1">offsets = [self.imageSize * i + self.imageDataOffset </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(glyphIds)+</span><span class="s4">1</span><span class="s1">)]</span>
+		<span class="s1">self.locations = list(zip(offsets</span><span class="s0">, </span><span class="s1">offsets[</span><span class="s4">1</span><span class="s1">:]))</span>
+		<span class="s1">self.names = list(map(self.ttFont.getGlyphName</span><span class="s0">, </span><span class="s1">glyphIds))</span>
+		<span class="s0">del </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.ttFont</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">glyphIds = list(map(ttFont.getGlyphID</span><span class="s0">, </span><span class="s1">self.names))</span>
+		<span class="s3"># Make sure all the ids are consecutive. This is required by Format 2.</span>
+		<span class="s0">assert </span><span class="s1">glyphIds == list(range(self.firstGlyphIndex</span><span class="s0">, </span><span class="s1">self.lastGlyphIndex+</span><span class="s4">1</span><span class="s1">))</span><span class="s0">, </span><span class="s2">&quot;Format 2 ids must be consecutive.&quot;</span>
+		<span class="s1">self.imageDataOffset = min(next(iter(zip(*self.locations))))</span>
+
+		<span class="s1">dataList = [EblcIndexSubTable.compile(self</span><span class="s0">, </span><span class="s1">ttFont)]</span>
+		<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">self.imageSize))</span>
+		<span class="s1">dataList.append(sstruct.pack(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics))</span>
+		<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+<span class="s0">class </span><span class="s1">eblc_index_sub_table_3(_createOffsetArrayIndexSubTableMixin(</span><span class="s2">'H'</span><span class="s1">)</span><span class="s0">, </span><span class="s1">EblcIndexSubTable):</span>
+	<span class="s0">pass</span>
+
+<span class="s0">class </span><span class="s1">eblc_index_sub_table_4(EblcIndexSubTable):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+
+		<span class="s1">(numGlyphs</span><span class="s0">,</span><span class="s1">) = struct.unpack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">self.data[:</span><span class="s4">4</span><span class="s1">])</span>
+		<span class="s1">data = self.data[</span><span class="s4">4</span><span class="s1">:]</span>
+		<span class="s1">indexingOffsets = [glyphIndex * codeOffsetPairSize </span><span class="s0">for </span><span class="s1">glyphIndex </span><span class="s0">in </span><span class="s1">range(numGlyphs+</span><span class="s4">2</span><span class="s1">)]</span>
+		<span class="s1">indexingLocations = zip(indexingOffsets</span><span class="s0">, </span><span class="s1">indexingOffsets[</span><span class="s4">1</span><span class="s1">:])</span>
+		<span class="s1">glyphArray = [struct.unpack(codeOffsetPairFormat</span><span class="s0">, </span><span class="s1">data[slice(*loc)]) </span><span class="s0">for </span><span class="s1">loc </span><span class="s0">in </span><span class="s1">indexingLocations]</span>
+		<span class="s1">glyphIds</span><span class="s0">, </span><span class="s1">offsets = list(map(list</span><span class="s0">, </span><span class="s1">zip(*glyphArray)))</span>
+		<span class="s3"># There are one too many glyph ids. Get rid of the last one.</span>
+		<span class="s1">glyphIds.pop()</span>
+
+		<span class="s1">offsets = [offset + self.imageDataOffset </span><span class="s0">for </span><span class="s1">offset </span><span class="s0">in </span><span class="s1">offsets]</span>
+		<span class="s1">self.locations = list(zip(offsets</span><span class="s0">, </span><span class="s1">offsets[</span><span class="s4">1</span><span class="s1">:]))</span>
+		<span class="s1">self.names = list(map(self.ttFont.getGlyphName</span><span class="s0">, </span><span class="s1">glyphIds))</span>
+		<span class="s0">del </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.ttFont</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s3"># First make sure that all the data lines up properly. Format 4</span>
+		<span class="s3"># must have all its data lined up consecutively. If not this will fail.</span>
+		<span class="s0">for </span><span class="s1">curLoc</span><span class="s0">, </span><span class="s1">nxtLoc </span><span class="s0">in </span><span class="s1">zip(self.locations</span><span class="s0">, </span><span class="s1">self.locations[</span><span class="s4">1</span><span class="s1">:]):</span>
+			<span class="s0">assert </span><span class="s1">curLoc[</span><span class="s4">1</span><span class="s1">] == nxtLoc[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s2">&quot;Data must be consecutive in indexSubTable format 4&quot;</span>
+
+		<span class="s1">offsets = list(self.locations[</span><span class="s4">0</span><span class="s1">]) + [loc[</span><span class="s4">1</span><span class="s1">] </span><span class="s0">for </span><span class="s1">loc </span><span class="s0">in </span><span class="s1">self.locations[</span><span class="s4">1</span><span class="s1">:]]</span>
+		<span class="s3"># Image data offset must be less than or equal to the minimum of locations.</span>
+		<span class="s3"># Resetting this offset may change the value for round tripping but is safer</span>
+		<span class="s3"># and allows imageDataOffset to not be required to be in the XML version.</span>
+		<span class="s1">self.imageDataOffset = min(offsets)</span>
+		<span class="s1">offsets = [offset - self.imageDataOffset </span><span class="s0">for </span><span class="s1">offset </span><span class="s0">in </span><span class="s1">offsets]</span>
+		<span class="s1">glyphIds = list(map(ttFont.getGlyphID</span><span class="s0">, </span><span class="s1">self.names))</span>
+		<span class="s3"># Create an iterator over the ids plus a padding value.</span>
+		<span class="s1">idsPlusPad = list(itertools.chain(glyphIds</span><span class="s0">, </span><span class="s1">[</span><span class="s4">0</span><span class="s1">]))</span>
+
+		<span class="s1">dataList = [EblcIndexSubTable.compile(self</span><span class="s0">, </span><span class="s1">ttFont)]</span>
+		<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">len(glyphIds)))</span>
+		<span class="s1">tmp = [struct.pack(codeOffsetPairFormat</span><span class="s0">, </span><span class="s1">*cop) </span><span class="s0">for </span><span class="s1">cop </span><span class="s0">in </span><span class="s1">zip(idsPlusPad</span><span class="s0">, </span><span class="s1">offsets)]</span>
+		<span class="s1">dataList += tmp</span>
+		<span class="s1">data = bytesjoin(dataList)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+<span class="s0">class </span><span class="s1">eblc_index_sub_table_5(FixedSizeIndexSubTableMixin</span><span class="s0">, </span><span class="s1">EblcIndexSubTable):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.origDataLen = </span><span class="s4">0</span>
+		<span class="s1">(self.imageSize</span><span class="s0">,</span><span class="s1">) = struct.unpack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">self.data[:</span><span class="s4">4</span><span class="s1">])</span>
+		<span class="s1">data = self.data[</span><span class="s4">4</span><span class="s1">:]</span>
+		<span class="s1">self.metrics</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">BigGlyphMetrics())</span>
+		<span class="s1">(numGlyphs</span><span class="s0">,</span><span class="s1">) = struct.unpack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s4">4</span><span class="s1">])</span>
+		<span class="s1">data = data[</span><span class="s4">4</span><span class="s1">:]</span>
+		<span class="s1">glyphIds = [struct.unpack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">data[</span><span class="s4">2</span><span class="s1">*i:</span><span class="s4">2</span><span class="s1">*(i+</span><span class="s4">1</span><span class="s1">)])[</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numGlyphs)]</span>
+
+		<span class="s1">offsets = [self.imageSize * i + self.imageDataOffset </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(glyphIds)+</span><span class="s4">1</span><span class="s1">)]</span>
+		<span class="s1">self.locations = list(zip(offsets</span><span class="s0">, </span><span class="s1">offsets[</span><span class="s4">1</span><span class="s1">:]))</span>
+		<span class="s1">self.names = list(map(self.ttFont.getGlyphName</span><span class="s0">, </span><span class="s1">glyphIds))</span>
+		<span class="s0">del </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.ttFont</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.imageDataOffset = min(next(iter(zip(*self.locations))))</span>
+		<span class="s1">dataList = [EblcIndexSubTable.compile(self</span><span class="s0">, </span><span class="s1">ttFont)]</span>
+		<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">self.imageSize))</span>
+		<span class="s1">dataList.append(sstruct.pack(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics))</span>
+		<span class="s1">glyphIds = list(map(ttFont.getGlyphID</span><span class="s0">, </span><span class="s1">self.names))</span>
+		<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">len(glyphIds)))</span>
+		<span class="s1">dataList += [struct.pack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">curId) </span><span class="s0">for </span><span class="s1">curId </span><span class="s0">in </span><span class="s1">glyphIds]</span>
+		<span class="s0">if </span><span class="s1">len(glyphIds) % </span><span class="s4">2 </span><span class="s1">== </span><span class="s4">1</span><span class="s1">:</span>
+			<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s4">0</span><span class="s1">))</span>
+		<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+<span class="s3"># Dictionary of indexFormat to the class representing that format.</span>
+<span class="s1">eblc_sub_table_classes = {</span>
+		<span class="s4">1</span><span class="s1">: eblc_index_sub_table_1</span><span class="s0">,</span>
+		<span class="s4">2</span><span class="s1">: eblc_index_sub_table_2</span><span class="s0">,</span>
+		<span class="s4">3</span><span class="s1">: eblc_index_sub_table_3</span><span class="s0">,</span>
+		<span class="s4">4</span><span class="s1">: eblc_index_sub_table_4</span><span class="s0">,</span>
+		<span class="s4">5</span><span class="s1">: eblc_index_sub_table_5</span><span class="s0">,</span>
+	<span class="s1">}</span>
+</pre>
+</body>
+</html>

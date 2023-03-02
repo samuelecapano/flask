@@ -1,0 +1,162 @@
+<html>
+<head>
+<title>_backend_pdf_ps.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_backend_pdf_ps.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Common functionality between the PDF and PS backends. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">BytesIO</span>
+<span class="s2">import </span><span class="s1">functools</span>
+
+<span class="s2">from </span><span class="s1">fontTools </span><span class="s2">import </span><span class="s1">subset</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">.. </span><span class="s2">import </span><span class="s1">font_manager</span><span class="s2">, </span><span class="s1">ft2font</span>
+<span class="s2">from </span><span class="s1">.._afm </span><span class="s2">import </span><span class="s1">AFM</span>
+<span class="s2">from </span><span class="s1">..backend_bases </span><span class="s2">import </span><span class="s1">RendererBase</span>
+
+
+<span class="s1">@functools.lru_cache(</span><span class="s3">50</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">_cached_get_afm_from_fname(fname):</span>
+    <span class="s2">with </span><span class="s1">open(fname</span><span class="s2">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">fh:</span>
+        <span class="s2">return </span><span class="s1">AFM(fh)</span>
+
+
+<span class="s2">def </span><span class="s1">get_glyphs_subset(fontfile</span><span class="s2">, </span><span class="s1">characters):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Subset a TTF font 
+ 
+    Reads the named fontfile and restricts the font to the characters. 
+    Returns a serialization of the subset font as file-like object. 
+ 
+    Parameters 
+    ---------- 
+    symbol : str 
+        Path to the font file 
+    characters : str 
+        Continuous set of characters to include in subset 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">options = subset.Options(glyph_names=</span><span class="s2">True, </span><span class="s1">recommended_glyphs=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s5"># prevent subsetting FontForge Timestamp and other tables</span>
+    <span class="s1">options.drop_tables += [</span><span class="s4">'FFTM'</span><span class="s2">, </span><span class="s4">'PfEd'</span><span class="s2">, </span><span class="s4">'BDF'</span><span class="s1">]</span>
+
+    <span class="s5"># if fontfile is a ttc, specify font number</span>
+    <span class="s2">if </span><span class="s1">fontfile.endswith(</span><span class="s4">&quot;.ttc&quot;</span><span class="s1">):</span>
+        <span class="s1">options.font_number = </span><span class="s3">0</span>
+
+    <span class="s2">with </span><span class="s1">subset.load_font(fontfile</span><span class="s2">, </span><span class="s1">options) </span><span class="s2">as </span><span class="s1">font:</span>
+        <span class="s1">subsetter = subset.Subsetter(options=options)</span>
+        <span class="s1">subsetter.populate(text=characters)</span>
+        <span class="s1">subsetter.subset(font)</span>
+        <span class="s1">fh = BytesIO()</span>
+        <span class="s1">font.save(fh</span><span class="s2">, </span><span class="s1">reorderTables=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">fh</span>
+
+
+<span class="s2">class </span><span class="s1">CharacterTracker:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Helper for font subsetting by the pdf and ps backends. 
+ 
+    Maintains a mapping of font paths to the set of character codepoints that 
+    are being used from that font. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self.used = {}</span>
+
+    <span class="s2">def </span><span class="s1">track(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s0">&quot;&quot;&quot;Record that string *s* is being typeset using font *font*.&quot;&quot;&quot;</span>
+        <span class="s1">char_to_font = font._get_fontmap(s)</span>
+        <span class="s2">for </span><span class="s1">_c</span><span class="s2">, </span><span class="s1">_f </span><span class="s2">in </span><span class="s1">char_to_font.items():</span>
+            <span class="s1">self.used.setdefault(_f.fname</span><span class="s2">, </span><span class="s1">set()).add(ord(_c))</span>
+
+    <span class="s2">def </span><span class="s1">track_glyph(self</span><span class="s2">, </span><span class="s1">font</span><span class="s2">, </span><span class="s1">glyph):</span>
+        <span class="s0">&quot;&quot;&quot;Record that codepoint *glyph* is being typeset using font *font*.&quot;&quot;&quot;</span>
+        <span class="s1">self.used.setdefault(font.fname</span><span class="s2">, </span><span class="s1">set()).add(glyph)</span>
+
+
+<span class="s2">class </span><span class="s1">RendererPDFPSBase(RendererBase):</span>
+    <span class="s5"># The following attributes must be defined by the subclasses:</span>
+    <span class="s5"># - _afm_font_dir</span>
+    <span class="s5"># - _use_afm_rc_name</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.width = width</span>
+        <span class="s1">self.height = height</span>
+
+    <span class="s2">def </span><span class="s1">flipy(self):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s2">return False  </span><span class="s5"># y increases from bottom to top.</span>
+
+    <span class="s2">def </span><span class="s1">option_scale_image(self):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s2">return True  </span><span class="s5"># PDF and PS support arbitrary image scaling.</span>
+
+    <span class="s2">def </span><span class="s1">option_image_nocomposite(self):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s5"># Decide whether to composite image based on rcParam value.</span>
+        <span class="s2">return not </span><span class="s1">mpl.rcParams[</span><span class="s4">&quot;image.composite_image&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_canvas_width_height(self):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">self.width * </span><span class="s3">72.0</span><span class="s2">, </span><span class="s1">self.height * </span><span class="s3">72.0</span>
+
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent(self</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s2">if </span><span class="s1">ismath == </span><span class="s4">&quot;TeX&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">super().get_text_width_height_descent(s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath)</span>
+        <span class="s2">elif </span><span class="s1">ismath:</span>
+            <span class="s1">parse = self._text2path.mathtext_parser.parse(s</span><span class="s2">, </span><span class="s3">72</span><span class="s2">, </span><span class="s1">prop)</span>
+            <span class="s2">return </span><span class="s1">parse.width</span><span class="s2">, </span><span class="s1">parse.height</span><span class="s2">, </span><span class="s1">parse.depth</span>
+        <span class="s2">elif </span><span class="s1">mpl.rcParams[self._use_afm_rc_name]:</span>
+            <span class="s1">font = self._get_font_afm(prop)</span>
+            <span class="s1">l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">d = font.get_str_bbox_and_descent(s)</span>
+            <span class="s1">scale = prop.get_size_in_points() / </span><span class="s3">1000</span>
+            <span class="s1">w *= scale</span>
+            <span class="s1">h *= scale</span>
+            <span class="s1">d *= scale</span>
+            <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">d</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">font = self._get_font_ttf(prop)</span>
+            <span class="s1">font.set_text(s</span><span class="s2">, </span><span class="s3">0.0</span><span class="s2">, </span><span class="s1">flags=ft2font.LOAD_NO_HINTING)</span>
+            <span class="s1">w</span><span class="s2">, </span><span class="s1">h = font.get_width_height()</span>
+            <span class="s1">d = font.get_descent()</span>
+            <span class="s1">scale = </span><span class="s3">1 </span><span class="s1">/ </span><span class="s3">64</span>
+            <span class="s1">w *= scale</span>
+            <span class="s1">h *= scale</span>
+            <span class="s1">d *= scale</span>
+            <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">d</span>
+
+    <span class="s2">def </span><span class="s1">_get_font_afm(self</span><span class="s2">, </span><span class="s1">prop):</span>
+        <span class="s1">fname = font_manager.findfont(</span>
+            <span class="s1">prop</span><span class="s2">, </span><span class="s1">fontext=</span><span class="s4">&quot;afm&quot;</span><span class="s2">, </span><span class="s1">directory=self._afm_font_dir)</span>
+        <span class="s2">return </span><span class="s1">_cached_get_afm_from_fname(fname)</span>
+
+    <span class="s2">def </span><span class="s1">_get_font_ttf(self</span><span class="s2">, </span><span class="s1">prop):</span>
+        <span class="s1">fnames = font_manager.fontManager._find_fonts_by_props(prop)</span>
+        <span class="s1">font = font_manager.get_font(fnames)</span>
+        <span class="s1">font.clear()</span>
+        <span class="s1">font.set_size(prop.get_size_in_points()</span><span class="s2">, </span><span class="s3">72</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">font</span>
+</pre>
+</body>
+</html>

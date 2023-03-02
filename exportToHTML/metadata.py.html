@@ -1,0 +1,890 @@
+<html>
+<head>
+<title>metadata.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+metadata.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2022 The MediaPipe Authors. All Rights Reserved.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#     http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+<span class="s0"># ==============================================================================</span>
+<span class="s2">&quot;&quot;&quot;TensorFlow Lite metadata tools.&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">copy</span>
+<span class="s3">import </span><span class="s1">inspect</span>
+<span class="s3">import </span><span class="s1">io</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">shutil</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">tempfile</span>
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">import </span><span class="s1">zipfile</span>
+
+<span class="s3">import </span><span class="s1">flatbuffers</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.cc.metadata.python </span><span class="s3">import </span><span class="s1">_pywrap_metadata_version</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.metadata </span><span class="s3">import </span><span class="s1">metadata_schema_py_generated </span><span class="s3">as </span><span class="s1">_metadata_fb</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.metadata </span><span class="s3">import </span><span class="s1">schema_py_generated </span><span class="s3">as </span><span class="s1">_schema_fb</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.python.metadata.flatbuffers_lib </span><span class="s3">import </span><span class="s1">_pywrap_flatbuffers</span>
+
+<span class="s3">try</span><span class="s1">:</span>
+  <span class="s0"># If exists, optionally use TensorFlow to open and check files. Used to</span>
+  <span class="s0"># support more than local file systems.</span>
+  <span class="s0"># In pip requirements, we doesn't necessarily need tensorflow as a dep.</span>
+  <span class="s3">import </span><span class="s1">tensorflow </span><span class="s3">as </span><span class="s1">tf</span>
+  <span class="s1">_open_file = tf.io.gfile.GFile</span>
+  <span class="s1">_exists_file = tf.io.gfile.exists</span>
+<span class="s3">except </span><span class="s1">ImportError </span><span class="s3">as </span><span class="s1">e:</span>
+  <span class="s0"># If TensorFlow package doesn't exist, fall back to original open and exists.</span>
+  <span class="s1">_open_file = open</span>
+  <span class="s1">_exists_file = os.path.exists</span>
+
+
+<span class="s3">def </span><span class="s1">_maybe_open_as_binary(filename</span><span class="s3">, </span><span class="s1">mode):</span>
+  <span class="s2">&quot;&quot;&quot;Maybe open the binary file, and returns a file-like.&quot;&quot;&quot;</span>
+  <span class="s3">if </span><span class="s1">hasattr(filename</span><span class="s3">, </span><span class="s4">&quot;read&quot;</span><span class="s1">):  </span><span class="s0"># A file-like has read().</span>
+    <span class="s3">return </span><span class="s1">filename</span>
+  <span class="s1">openmode = mode </span><span class="s3">if </span><span class="s4">&quot;b&quot; </span><span class="s3">in </span><span class="s1">mode </span><span class="s3">else </span><span class="s1">mode + </span><span class="s4">&quot;b&quot;  </span><span class="s0"># Add binary explicitly.</span>
+  <span class="s3">return </span><span class="s1">_open_file(filename</span><span class="s3">, </span><span class="s1">openmode)</span>
+
+
+<span class="s3">def </span><span class="s1">_open_as_zipfile(filename</span><span class="s3">, </span><span class="s1">mode=</span><span class="s4">&quot;r&quot;</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Open file as a zipfile. 
+ 
+  Args: 
+    filename: str or file-like or path-like, to the zipfile. 
+    mode: str, common file mode for zip. 
+          (See: https://docs.python.org/3/library/zipfile.html) 
+ 
+  Returns: 
+    A ZipFile object. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">file_like = _maybe_open_as_binary(filename</span><span class="s3">, </span><span class="s1">mode)</span>
+  <span class="s3">return </span><span class="s1">zipfile.ZipFile(file_like</span><span class="s3">, </span><span class="s1">mode)</span>
+
+
+<span class="s3">def </span><span class="s1">_is_zipfile(filename):</span>
+  <span class="s2">&quot;&quot;&quot;Checks whether it is a zipfile.&quot;&quot;&quot;</span>
+  <span class="s3">with </span><span class="s1">_maybe_open_as_binary(filename</span><span class="s3">, </span><span class="s4">&quot;r&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+    <span class="s3">return </span><span class="s1">zipfile.is_zipfile(f)</span>
+
+
+<span class="s3">def </span><span class="s1">get_path_to_datafile(path):</span>
+  <span class="s2">&quot;&quot;&quot;Gets the path to the specified file in the data dependencies. 
+ 
+  The path is relative to the file calling the function. 
+ 
+  It's a simple replacement of 
+  &quot;tensorflow.python.platform.resource_loader.get_path_to_datafile&quot;. 
+ 
+  Args: 
+    path: a string resource path relative to the calling file. 
+ 
+  Returns: 
+    The path to the specified file present in the data attribute of py_test 
+    or py_binary. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">data_files_path = os.path.dirname(inspect.getfile(sys._getframe(</span><span class="s5">1</span><span class="s1">)))  </span><span class="s0"># pylint: disable=protected-access</span>
+  <span class="s3">return </span><span class="s1">os.path.join(data_files_path</span><span class="s3">, </span><span class="s1">path)</span>
+
+
+<span class="s1">_FLATC_TFLITE_METADATA_SCHEMA_FILE = get_path_to_datafile(</span>
+    <span class="s4">&quot;../../metadata/metadata_schema.fbs&quot;</span><span class="s1">)</span>
+
+
+<span class="s0"># TODO: add delete method for associated files.</span>
+<span class="s3">class </span><span class="s1">MetadataPopulator(object):</span>
+  <span class="s2">&quot;&quot;&quot;Packs metadata and associated files into TensorFlow Lite model file. 
+ 
+  MetadataPopulator can be used to populate metadata and model associated files 
+  into a model file or a model buffer (in bytearray). It can also help to 
+  inspect list of files that have been packed into the model or are supposed to 
+  be packed into the model. 
+ 
+  The metadata file (or buffer) should be generated based on the metadata 
+  schema: 
+  mediapipe/tasks/metadata/metadata_schema.fbs 
+ 
+  Example usage: 
+  Populate matadata and label file into an image classifier model. 
+ 
+  First, based on metadata_schema.fbs, generate the metadata for this image 
+  classifer model using Flatbuffers API. Attach the label file onto the ouput 
+  tensor (the tensor of probabilities) in the metadata. 
+ 
+  Then, pack the metadata and label file into the model as follows. 
+ 
+    ```python 
+    # Populating a metadata file (or a metadta buffer) and associated files to 
+    a model file: 
+    populator = MetadataPopulator.with_model_file(model_file) 
+    # For metadata buffer (bytearray read from the metadata file), use: 
+    # populator.load_metadata_buffer(metadata_buf) 
+    populator.load_metadata_file(metadata_file) 
+    populator.load_associated_files([label.txt]) 
+    # For associated file buffer (bytearray read from the file), use: 
+    # populator.load_associated_file_buffers({&quot;label.txt&quot;: b&quot;file content&quot;}) 
+    populator.populate() 
+ 
+    # Populating a metadata file (or a metadata buffer) and associated files to 
+    a model buffer: 
+    populator = MetadataPopulator.with_model_buffer(model_buf) 
+    populator.load_metadata_file(metadata_file) 
+    populator.load_associated_files([label.txt]) 
+    populator.populate() 
+    # Writing the updated model buffer into a file. 
+    updated_model_buf = populator.get_model_buffer() 
+    with open(&quot;updated_model.tflite&quot;, &quot;wb&quot;) as f: 
+      f.write(updated_model_buf) 
+ 
+    # Transferring metadata and associated files from another TFLite model: 
+    populator = MetadataPopulator.with_model_buffer(model_buf) 
+    populator_dst.load_metadata_and_associated_files(src_model_buf) 
+    populator_dst.populate() 
+    updated_model_buf = populator.get_model_buffer() 
+    with open(&quot;updated_model.tflite&quot;, &quot;wb&quot;) as f: 
+      f.write(updated_model_buf) 
+    ``` 
+ 
+  Note that existing metadata buffer (if applied) will be overridden by the new 
+  metadata buffer. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># As Zip API is used to concatenate associated files after tflite model file,</span>
+  <span class="s0"># the populating operation is developed based on a model file. For in-memory</span>
+  <span class="s0"># model buffer, we create a tempfile to serve the populating operation.</span>
+  <span class="s0"># Creating the deleting such a tempfile is handled by the class,</span>
+  <span class="s0"># _MetadataPopulatorWithBuffer.</span>
+
+  <span class="s1">METADATA_FIELD_NAME = </span><span class="s4">&quot;TFLITE_METADATA&quot;</span>
+  <span class="s1">TFLITE_FILE_IDENTIFIER = </span><span class="s6">b&quot;TFL3&quot;</span>
+  <span class="s1">METADATA_FILE_IDENTIFIER = </span><span class="s6">b&quot;M001&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model_file):</span>
+    <span class="s2">&quot;&quot;&quot;Constructor for MetadataPopulator. 
+ 
+    Args: 
+      model_file: valid path to a TensorFlow Lite model file. 
+ 
+    Raises: 
+      IOError: File not found. 
+      ValueError: the model does not have the expected flatbuffer identifer. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_assert_model_file_identifier(model_file)</span>
+    <span class="s1">self._model_file = model_file</span>
+    <span class="s1">self._metadata_buf = </span><span class="s3">None</span>
+    <span class="s0"># _associated_files is a dict of file name and file buffer.</span>
+    <span class="s1">self._associated_files = {}</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">with_model_file(cls</span><span class="s3">, </span><span class="s1">model_file):</span>
+    <span class="s2">&quot;&quot;&quot;Creates a MetadataPopulator object that populates data to a model file. 
+ 
+    Args: 
+      model_file: valid path to a TensorFlow Lite model file. 
+ 
+    Returns: 
+      MetadataPopulator object. 
+ 
+    Raises: 
+      IOError: File not found. 
+      ValueError: the model does not have the expected flatbuffer identifer. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">cls(model_file)</span>
+
+  <span class="s0"># TODO: investigate if type check can be applied to model_buf for</span>
+  <span class="s0"># FB.</span>
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">with_model_buffer(cls</span><span class="s3">, </span><span class="s1">model_buf):</span>
+    <span class="s2">&quot;&quot;&quot;Creates a MetadataPopulator object that populates data to a model buffer. 
+ 
+    Args: 
+      model_buf: TensorFlow Lite model buffer in bytearray. 
+ 
+    Returns: 
+      A MetadataPopulator(_MetadataPopulatorWithBuffer) object. 
+ 
+    Raises: 
+      ValueError: the model does not have the expected flatbuffer identifer. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">_MetadataPopulatorWithBuffer(model_buf)</span>
+
+  <span class="s3">def </span><span class="s1">get_model_buffer(self):</span>
+    <span class="s2">&quot;&quot;&quot;Gets the buffer of the model with packed metadata and associated files. 
+ 
+    Returns: 
+      Model buffer (in bytearray). 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s3">return </span><span class="s1">f.read()</span>
+
+  <span class="s3">def </span><span class="s1">get_packed_associated_file_list(self):</span>
+    <span class="s2">&quot;&quot;&quot;Gets a list of associated files packed to the model file. 
+ 
+    Returns: 
+      List of packed associated files. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">_is_zipfile(self._model_file):</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+
+    <span class="s3">with </span><span class="s1">_open_as_zipfile(self._model_file</span><span class="s3">, </span><span class="s4">&quot;r&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">zf:</span>
+      <span class="s3">return </span><span class="s1">zf.namelist()</span>
+
+  <span class="s3">def </span><span class="s1">get_recorded_associated_file_list(self):</span>
+    <span class="s2">&quot;&quot;&quot;Gets a list of associated files recorded in metadata of the model file. 
+ 
+    Associated files may be attached to a model, a subgraph, or an input/output 
+    tensor. 
+ 
+    Returns: 
+      List of recorded associated files. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">self._metadata_buf:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+
+    <span class="s1">metadata = _metadata_fb.ModelMetadataT.InitFromObj(</span>
+        <span class="s1">_metadata_fb.ModelMetadata.GetRootAsModelMetadata(</span>
+            <span class="s1">self._metadata_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">))</span>
+
+    <span class="s3">return </span><span class="s1">[</span>
+        <span class="s1">file.name.decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">)</span>
+        <span class="s3">for </span><span class="s1">file </span><span class="s3">in </span><span class="s1">self._get_recorded_associated_file_object_list(metadata)</span>
+    <span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">load_associated_file_buffers(self</span><span class="s3">, </span><span class="s1">associated_files):</span>
+    <span class="s2">&quot;&quot;&quot;Loads the associated file buffers (in bytearray) to be populated. 
+ 
+    Args: 
+      associated_files: a dictionary of associated file names and corresponding 
+        file buffers, such as {&quot;file.txt&quot;: b&quot;file content&quot;}. If pass in file 
+          paths for the file name, only the basename will be populated. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">self._associated_files.update({</span>
+        <span class="s1">os.path.basename(name): buffers</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">buffers </span><span class="s3">in </span><span class="s1">associated_files.items()</span>
+    <span class="s1">})</span>
+
+  <span class="s3">def </span><span class="s1">load_associated_files(self</span><span class="s3">, </span><span class="s1">associated_files):</span>
+    <span class="s2">&quot;&quot;&quot;Loads associated files that to be concatenated after the model file. 
+ 
+    Args: 
+      associated_files: list of file paths. 
+ 
+    Raises: 
+      IOError: 
+        File not found. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">for </span><span class="s1">af_name </span><span class="s3">in </span><span class="s1">associated_files:</span>
+      <span class="s1">_assert_file_exist(af_name)</span>
+      <span class="s3">with </span><span class="s1">_open_file(af_name</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">af:</span>
+        <span class="s1">self.load_associated_file_buffers({af_name: af.read()})</span>
+
+  <span class="s3">def </span><span class="s1">load_metadata_buffer(self</span><span class="s3">, </span><span class="s1">metadata_buf):</span>
+    <span class="s2">&quot;&quot;&quot;Loads the metadata buffer (in bytearray) to be populated. 
+ 
+    Args: 
+      metadata_buf: metadata buffer (in bytearray) to be populated. 
+ 
+    Raises: 
+      ValueError: The metadata to be populated is empty. 
+      ValueError: The metadata does not have the expected flatbuffer identifer. 
+      ValueError: Cannot get minimum metadata parser version. 
+      ValueError: The number of SubgraphMetadata is not 1. 
+      ValueError: The number of input/output tensors does not match the number 
+        of input/output tensor metadata. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">metadata_buf:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;The metadata to be populated is empty.&quot;</span><span class="s1">)</span>
+
+    <span class="s1">self._validate_metadata(metadata_buf)</span>
+
+    <span class="s0"># Gets the minimum metadata parser version of the metadata_buf.</span>
+    <span class="s1">min_version = _pywrap_metadata_version.GetMinimumMetadataParserVersion(</span>
+        <span class="s1">bytes(metadata_buf))</span>
+
+    <span class="s0"># Inserts in the minimum metadata parser version into the metadata_buf.</span>
+    <span class="s1">metadata = _metadata_fb.ModelMetadataT.InitFromObj(</span>
+        <span class="s1">_metadata_fb.ModelMetadata.GetRootAsModelMetadata(metadata_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">))</span>
+    <span class="s1">metadata.minParserVersion = min_version</span>
+
+    <span class="s0"># Remove local file directory in the `name` field of `AssociatedFileT`, and</span>
+    <span class="s0"># make it consistent with the name of the actual file packed in the model.</span>
+    <span class="s1">self._use_basename_for_associated_files_in_metadata(metadata)</span>
+
+    <span class="s1">b = flatbuffers.Builder(</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">b.Finish(metadata.Pack(b)</span><span class="s3">, </span><span class="s1">self.METADATA_FILE_IDENTIFIER)</span>
+    <span class="s1">metadata_buf_with_version = b.Output()</span>
+
+    <span class="s1">self._metadata_buf = metadata_buf_with_version</span>
+
+  <span class="s3">def </span><span class="s1">load_metadata_file(self</span><span class="s3">, </span><span class="s1">metadata_file):</span>
+    <span class="s2">&quot;&quot;&quot;Loads the metadata file to be populated. 
+ 
+    Args: 
+      metadata_file: path to the metadata file to be populated. 
+ 
+    Raises: 
+      IOError: File not found. 
+      ValueError: The metadata to be populated is empty. 
+      ValueError: The metadata does not have the expected flatbuffer identifer. 
+      ValueError: Cannot get minimum metadata parser version. 
+      ValueError: The number of SubgraphMetadata is not 1. 
+      ValueError: The number of input/output tensors does not match the number 
+        of input/output tensor metadata. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_assert_file_exist(metadata_file)</span>
+    <span class="s3">with </span><span class="s1">_open_file(metadata_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s1">metadata_buf = f.read()</span>
+    <span class="s1">self.load_metadata_buffer(bytearray(metadata_buf))</span>
+
+  <span class="s3">def </span><span class="s1">load_metadata_and_associated_files(self</span><span class="s3">, </span><span class="s1">src_model_buf):</span>
+    <span class="s2">&quot;&quot;&quot;Loads the metadata and associated files from another model buffer. 
+ 
+    Args: 
+      src_model_buf: source model buffer (in bytearray) with metadata and 
+        associated files. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Load the model metadata from src_model_buf if exist.</span>
+    <span class="s1">metadata_buffer = get_metadata_buffer(src_model_buf)</span>
+    <span class="s3">if </span><span class="s1">metadata_buffer:</span>
+      <span class="s1">self.load_metadata_buffer(metadata_buffer)</span>
+
+    <span class="s0"># Load the associated files from src_model_buf if exist.</span>
+    <span class="s3">if </span><span class="s1">_is_zipfile(io.BytesIO(src_model_buf)):</span>
+      <span class="s3">with </span><span class="s1">_open_as_zipfile(io.BytesIO(src_model_buf)) </span><span class="s3">as </span><span class="s1">zf:</span>
+        <span class="s1">self.load_associated_file_buffers(</span>
+            <span class="s1">{f: zf.read(f) </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">zf.namelist()})</span>
+
+  <span class="s3">def </span><span class="s1">populate(self):</span>
+    <span class="s2">&quot;&quot;&quot;Populates loaded metadata and associated files into the model file.&quot;&quot;&quot;</span>
+    <span class="s1">self._assert_validate()</span>
+    <span class="s1">self._populate_metadata_buffer()</span>
+    <span class="s1">self._populate_associated_files()</span>
+
+  <span class="s3">def </span><span class="s1">_assert_validate(self):</span>
+    <span class="s2">&quot;&quot;&quot;Validates the metadata and associated files to be populated. 
+ 
+    Raises: 
+      ValueError: 
+        File is recorded in the metadata, but is not going to be populated. 
+        File has already been packed. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Gets files that are recorded in metadata.</span>
+    <span class="s1">recorded_files = self.get_recorded_associated_file_list()</span>
+
+    <span class="s0"># Gets files that have been packed to self._model_file.</span>
+    <span class="s1">packed_files = self.get_packed_associated_file_list()</span>
+
+    <span class="s0"># Gets the file name of those associated files to be populated.</span>
+    <span class="s1">to_be_populated_files = self._associated_files.keys()</span>
+
+    <span class="s0"># Checks all files recorded in the metadata will be populated.</span>
+    <span class="s3">for </span><span class="s1">rf </span><span class="s3">in </span><span class="s1">recorded_files:</span>
+      <span class="s3">if </span><span class="s1">rf </span><span class="s3">not in </span><span class="s1">to_be_populated_files </span><span class="s3">and </span><span class="s1">rf </span><span class="s3">not in </span><span class="s1">packed_files:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;File, '{0}', is recorded in the metadata, but has &quot;</span>
+                         <span class="s4">&quot;not been loaded into the populator.&quot;</span><span class="s1">.format(rf))</span>
+
+    <span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">to_be_populated_files:</span>
+      <span class="s3">if </span><span class="s1">f </span><span class="s3">in </span><span class="s1">packed_files:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;File, '{0}', has already been packed.&quot;</span><span class="s1">.format(f))</span>
+
+      <span class="s3">if </span><span class="s1">f </span><span class="s3">not in </span><span class="s1">recorded_files:</span>
+        <span class="s1">warnings.warn(</span>
+            <span class="s4">&quot;File, '{0}', does not exist in the metadata. But packing it to &quot;</span>
+            <span class="s4">&quot;tflite model is still allowed.&quot;</span><span class="s1">.format(f))</span>
+
+  <span class="s3">def </span><span class="s1">_copy_archived_files(self</span><span class="s3">, </span><span class="s1">src_zip</span><span class="s3">, </span><span class="s1">file_list</span><span class="s3">, </span><span class="s1">dst_zip):</span>
+    <span class="s2">&quot;&quot;&quot;Copy archieved files in file_list from src_zip ro dst_zip.&quot;&quot;&quot;</span>
+
+    <span class="s3">if not </span><span class="s1">_is_zipfile(src_zip):</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;File, '{0}', is not a zipfile.&quot;</span><span class="s1">.format(src_zip))</span>
+
+    <span class="s3">with </span><span class="s1">_open_as_zipfile(src_zip</span><span class="s3">, </span><span class="s4">&quot;r&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">src_zf</span><span class="s3">, </span><span class="s1">\</span>
+         <span class="s1">_open_as_zipfile(dst_zip</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">dst_zf:</span>
+      <span class="s1">src_list = src_zf.namelist()</span>
+      <span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">file_list:</span>
+        <span class="s3">if </span><span class="s1">f </span><span class="s3">not in </span><span class="s1">src_list:</span>
+          <span class="s3">raise </span><span class="s1">ValueError(</span>
+              <span class="s4">&quot;File, '{0}', does not exist in the zipfile, {1}.&quot;</span><span class="s1">.format(</span>
+                  <span class="s1">f</span><span class="s3">, </span><span class="s1">src_zip))</span>
+        <span class="s1">file_buffer = src_zf.read(f)</span>
+        <span class="s1">dst_zf.writestr(f</span><span class="s3">, </span><span class="s1">file_buffer)</span>
+
+  <span class="s3">def </span><span class="s1">_get_associated_files_from_process_units(self</span><span class="s3">, </span><span class="s1">table</span><span class="s3">, </span><span class="s1">field_name):</span>
+    <span class="s2">&quot;&quot;&quot;Gets the files that are attached the process units field of a table. 
+ 
+    Args: 
+      table: a Flatbuffers table object that contains fields of an array of 
+        ProcessUnit, such as TensorMetadata and SubGraphMetadata. 
+      field_name: the name of the field in the table that represents an array of 
+        ProcessUnit. If the table is TensorMetadata, field_name can be 
+        &quot;ProcessUnits&quot;. If the table is SubGraphMetadata, field_name can be 
+        either &quot;InputProcessUnits&quot; or &quot;OutputProcessUnits&quot;. 
+ 
+    Returns: 
+      A list of AssociatedFileT objects. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">table </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+
+    <span class="s1">file_list = []</span>
+    <span class="s1">process_units = getattr(table</span><span class="s3">, </span><span class="s1">field_name)</span>
+    <span class="s0"># If the process_units field is not populated, it will be None. Use an</span>
+    <span class="s0"># empty list to skip the check.</span>
+    <span class="s3">for </span><span class="s1">process_unit </span><span class="s3">in </span><span class="s1">process_units </span><span class="s3">or </span><span class="s1">[]:</span>
+      <span class="s1">options = process_unit.options</span>
+      <span class="s3">if </span><span class="s1">isinstance(options</span><span class="s3">, </span><span class="s1">(_metadata_fb.BertTokenizerOptionsT</span><span class="s3">,</span>
+                              <span class="s1">_metadata_fb.RegexTokenizerOptionsT)):</span>
+        <span class="s1">file_list += self._get_associated_files_from_table(options</span><span class="s3">, </span><span class="s4">&quot;vocabFile&quot;</span><span class="s1">)</span>
+      <span class="s3">elif </span><span class="s1">isinstance(options</span><span class="s3">, </span><span class="s1">_metadata_fb.SentencePieceTokenizerOptionsT):</span>
+        <span class="s1">file_list += self._get_associated_files_from_table(</span>
+            <span class="s1">options</span><span class="s3">, </span><span class="s4">&quot;sentencePieceModel&quot;</span><span class="s1">)</span>
+        <span class="s1">file_list += self._get_associated_files_from_table(options</span><span class="s3">, </span><span class="s4">&quot;vocabFile&quot;</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">file_list</span>
+
+  <span class="s3">def </span><span class="s1">_get_associated_files_from_table(self</span><span class="s3">, </span><span class="s1">table</span><span class="s3">, </span><span class="s1">field_name):</span>
+    <span class="s2">&quot;&quot;&quot;Gets the associated files that are attached a table directly. 
+ 
+    Args: 
+      table: a Flatbuffers table object that contains fields of an array of 
+        AssociatedFile, such as TensorMetadata and BertTokenizerOptions. 
+      field_name: the name of the field in the table that represents an array of 
+        ProcessUnit. If the table is TensorMetadata, field_name can be 
+        &quot;AssociatedFiles&quot;. If the table is BertTokenizerOptions, field_name can 
+        be &quot;VocabFile&quot;. 
+ 
+    Returns: 
+      A list of AssociatedFileT objects. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">table </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+
+    <span class="s0"># If the associated file field is not populated,</span>
+    <span class="s0"># `getattr(table, field_name)` will be None. Return an empty list.</span>
+    <span class="s3">return </span><span class="s1">getattr(table</span><span class="s3">, </span><span class="s1">field_name) </span><span class="s3">or </span><span class="s1">[]</span>
+
+  <span class="s3">def </span><span class="s1">_get_recorded_associated_file_object_list(self</span><span class="s3">, </span><span class="s1">metadata):</span>
+    <span class="s2">&quot;&quot;&quot;Gets a list of AssociatedFileT objects recorded in the metadata. 
+ 
+    Associated files may be attached to a model, a subgraph, or an input/output 
+    tensor. 
+ 
+    Args: 
+      metadata: the ModelMetadataT object. 
+ 
+    Returns: 
+      List of recorded AssociatedFileT objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">recorded_files = []</span>
+
+    <span class="s0"># Add associated files attached to ModelMetadata.</span>
+    <span class="s1">recorded_files += self._get_associated_files_from_table(</span>
+        <span class="s1">metadata</span><span class="s3">, </span><span class="s4">&quot;associatedFiles&quot;</span><span class="s1">)</span>
+
+    <span class="s0"># Add associated files attached to each SubgraphMetadata.</span>
+    <span class="s3">for </span><span class="s1">subgraph </span><span class="s3">in </span><span class="s1">metadata.subgraphMetadata </span><span class="s3">or </span><span class="s1">[]:</span>
+      <span class="s1">recorded_files += self._get_associated_files_from_table(</span>
+          <span class="s1">subgraph</span><span class="s3">, </span><span class="s4">&quot;associatedFiles&quot;</span><span class="s1">)</span>
+
+      <span class="s0"># Add associated files attached to each input tensor.</span>
+      <span class="s3">for </span><span class="s1">tensor_metadata </span><span class="s3">in </span><span class="s1">subgraph.inputTensorMetadata </span><span class="s3">or </span><span class="s1">[]:</span>
+        <span class="s1">recorded_files += self._get_associated_files_from_table(</span>
+            <span class="s1">tensor_metadata</span><span class="s3">, </span><span class="s4">&quot;associatedFiles&quot;</span><span class="s1">)</span>
+        <span class="s1">recorded_files += self._get_associated_files_from_process_units(</span>
+            <span class="s1">tensor_metadata</span><span class="s3">, </span><span class="s4">&quot;processUnits&quot;</span><span class="s1">)</span>
+
+      <span class="s0"># Add associated files attached to each output tensor.</span>
+      <span class="s3">for </span><span class="s1">tensor_metadata </span><span class="s3">in </span><span class="s1">subgraph.outputTensorMetadata </span><span class="s3">or </span><span class="s1">[]:</span>
+        <span class="s1">recorded_files += self._get_associated_files_from_table(</span>
+            <span class="s1">tensor_metadata</span><span class="s3">, </span><span class="s4">&quot;associatedFiles&quot;</span><span class="s1">)</span>
+        <span class="s1">recorded_files += self._get_associated_files_from_process_units(</span>
+            <span class="s1">tensor_metadata</span><span class="s3">, </span><span class="s4">&quot;processUnits&quot;</span><span class="s1">)</span>
+
+      <span class="s0"># Add associated files attached to the input_process_units.</span>
+      <span class="s1">recorded_files += self._get_associated_files_from_process_units(</span>
+          <span class="s1">subgraph</span><span class="s3">, </span><span class="s4">&quot;inputProcessUnits&quot;</span><span class="s1">)</span>
+
+      <span class="s0"># Add associated files attached to the output_process_units.</span>
+      <span class="s1">recorded_files += self._get_associated_files_from_process_units(</span>
+          <span class="s1">subgraph</span><span class="s3">, </span><span class="s4">&quot;outputProcessUnits&quot;</span><span class="s1">)</span>
+
+    <span class="s3">return </span><span class="s1">recorded_files</span>
+
+  <span class="s3">def </span><span class="s1">_populate_associated_files(self):</span>
+    <span class="s2">&quot;&quot;&quot;Concatenates associated files after TensorFlow Lite model file. 
+ 
+    If the MetadataPopulator object is created using the method, 
+    with_model_file(model_file), the model file will be updated. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Opens up the model file in &quot;appending&quot; mode.</span>
+    <span class="s0"># If self._model_file already has pack files, zipfile will concatenate</span>
+    <span class="s0"># addition files after self._model_file. For example, suppose we have</span>
+    <span class="s0"># self._model_file = old_tflite_file | label1.txt | label2.txt</span>
+    <span class="s0"># Then after trigger populate() to add label3.txt, self._model_file becomes</span>
+    <span class="s0"># self._model_file = old_tflite_file | label1.txt | label2.txt | label3.txt</span>
+    <span class="s3">with </span><span class="s1">tempfile.SpooledTemporaryFile() </span><span class="s3">as </span><span class="s1">temp:</span>
+      <span class="s0"># (1) Copy content from model file of to temp file.</span>
+      <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+        <span class="s1">shutil.copyfileobj(f</span><span class="s3">, </span><span class="s1">temp)</span>
+
+      <span class="s0"># (2) Append of to a temp file as a zip.</span>
+      <span class="s3">with </span><span class="s1">_open_as_zipfile(temp</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">zf:</span>
+        <span class="s3">for </span><span class="s1">file_name</span><span class="s3">, </span><span class="s1">file_buffer </span><span class="s3">in </span><span class="s1">self._associated_files.items():</span>
+          <span class="s1">zf.writestr(file_name</span><span class="s3">, </span><span class="s1">file_buffer)</span>
+
+      <span class="s0"># (3) Copy temp file to model file.</span>
+      <span class="s1">temp.seek(</span><span class="s5">0</span><span class="s1">)</span>
+      <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;wb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+        <span class="s1">shutil.copyfileobj(temp</span><span class="s3">, </span><span class="s1">f)</span>
+
+  <span class="s3">def </span><span class="s1">_populate_metadata_buffer(self):</span>
+    <span class="s2">&quot;&quot;&quot;Populates the metadata buffer (in bytearray) into the model file. 
+ 
+    Inserts metadata_buf into the metadata field of schema.Model. If the 
+    MetadataPopulator object is created using the method, 
+    with_model_file(model_file), the model file will be updated. 
+ 
+    Existing metadata buffer (if applied) will be overridden by the new metadata 
+    buffer. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s1">model_buf = f.read()</span>
+
+    <span class="s1">model = _schema_fb.ModelT.InitFromObj(</span>
+        <span class="s1">_schema_fb.Model.GetRootAsModel(model_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">))</span>
+    <span class="s1">buffer_field = _schema_fb.BufferT()</span>
+    <span class="s1">buffer_field.data = self._metadata_buf</span>
+
+    <span class="s1">is_populated = </span><span class="s3">False</span>
+    <span class="s3">if not </span><span class="s1">model.metadata:</span>
+      <span class="s1">model.metadata = []</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s0"># Check if metadata has already been populated.</span>
+      <span class="s3">for </span><span class="s1">meta </span><span class="s3">in </span><span class="s1">model.metadata:</span>
+        <span class="s3">if </span><span class="s1">meta.name.decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">) == self.METADATA_FIELD_NAME:</span>
+          <span class="s1">is_populated = </span><span class="s3">True</span>
+          <span class="s1">model.buffers[meta.buffer] = buffer_field</span>
+
+    <span class="s3">if not </span><span class="s1">is_populated:</span>
+      <span class="s3">if not </span><span class="s1">model.buffers:</span>
+        <span class="s1">model.buffers = []</span>
+      <span class="s1">model.buffers.append(buffer_field)</span>
+      <span class="s0"># Creates a new metadata field.</span>
+      <span class="s1">metadata_field = _schema_fb.MetadataT()</span>
+      <span class="s1">metadata_field.name = self.METADATA_FIELD_NAME</span>
+      <span class="s1">metadata_field.buffer = len(model.buffers) - </span><span class="s5">1</span>
+      <span class="s1">model.metadata.append(metadata_field)</span>
+
+    <span class="s0"># Packs model back to a flatbuffer binaray file.</span>
+    <span class="s1">b = flatbuffers.Builder(</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">b.Finish(model.Pack(b)</span><span class="s3">, </span><span class="s1">self.TFLITE_FILE_IDENTIFIER)</span>
+    <span class="s1">model_buf = b.Output()</span>
+
+    <span class="s0"># Saves the updated model buffer to model file.</span>
+    <span class="s0"># Gets files that have been packed to self._model_file.</span>
+    <span class="s1">packed_files = self.get_packed_associated_file_list()</span>
+    <span class="s3">if </span><span class="s1">packed_files:</span>
+      <span class="s0"># Writes the updated model buffer and associated files into a new model</span>
+      <span class="s0"># file (in memory). Then overwrites the original model file.</span>
+      <span class="s3">with </span><span class="s1">tempfile.SpooledTemporaryFile() </span><span class="s3">as </span><span class="s1">temp:</span>
+        <span class="s1">temp.write(model_buf)</span>
+        <span class="s1">self._copy_archived_files(self._model_file</span><span class="s3">, </span><span class="s1">packed_files</span><span class="s3">, </span><span class="s1">temp)</span>
+        <span class="s1">temp.seek(</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;wb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+          <span class="s1">shutil.copyfileobj(temp</span><span class="s3">, </span><span class="s1">f)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;wb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+        <span class="s1">f.write(model_buf)</span>
+
+  <span class="s3">def </span><span class="s1">_use_basename_for_associated_files_in_metadata(self</span><span class="s3">, </span><span class="s1">metadata):</span>
+    <span class="s2">&quot;&quot;&quot;Removes any associated file local directory (if exists).&quot;&quot;&quot;</span>
+    <span class="s3">for </span><span class="s1">file </span><span class="s3">in </span><span class="s1">self._get_recorded_associated_file_object_list(metadata):</span>
+      <span class="s1">file.name = os.path.basename(file.name)</span>
+
+  <span class="s3">def </span><span class="s1">_validate_metadata(self</span><span class="s3">, </span><span class="s1">metadata_buf):</span>
+    <span class="s2">&quot;&quot;&quot;Validates the metadata to be populated.&quot;&quot;&quot;</span>
+    <span class="s1">_assert_metadata_buffer_identifier(metadata_buf)</span>
+
+    <span class="s0"># Verify the number of SubgraphMetadata is exactly one.</span>
+    <span class="s0"># TFLite currently only support one subgraph.</span>
+    <span class="s1">model_meta = _metadata_fb.ModelMetadata.GetRootAsModelMetadata(</span>
+        <span class="s1">metadata_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">model_meta.SubgraphMetadataLength() != </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;The number of SubgraphMetadata should be exactly one, &quot;</span>
+                       <span class="s4">&quot;but got {0}.&quot;</span><span class="s1">.format(</span>
+                           <span class="s1">model_meta.SubgraphMetadataLength()))</span>
+
+    <span class="s0"># Verify if the number of tensor metadata matches the number of tensors.</span>
+    <span class="s3">with </span><span class="s1">_open_file(self._model_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s1">model_buf = f.read()</span>
+    <span class="s1">model = _schema_fb.Model.GetRootAsModel(model_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span>
+
+    <span class="s1">num_input_tensors = model.Subgraphs(</span><span class="s5">0</span><span class="s1">).InputsLength()</span>
+    <span class="s1">num_input_meta = model_meta.SubgraphMetadata(</span><span class="s5">0</span><span class="s1">).InputTensorMetadataLength()</span>
+    <span class="s3">if </span><span class="s1">num_input_tensors != num_input_meta:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">&quot;The number of input tensors ({0}) should match the number of &quot;</span>
+          <span class="s4">&quot;input tensor metadata ({1})&quot;</span><span class="s1">.format(num_input_tensors</span><span class="s3">,</span>
+                                               <span class="s1">num_input_meta))</span>
+    <span class="s1">num_output_tensors = model.Subgraphs(</span><span class="s5">0</span><span class="s1">).OutputsLength()</span>
+    <span class="s1">num_output_meta = model_meta.SubgraphMetadata(</span>
+        <span class="s5">0</span><span class="s1">).OutputTensorMetadataLength()</span>
+    <span class="s3">if </span><span class="s1">num_output_tensors != num_output_meta:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">&quot;The number of output tensors ({0}) should match the number of &quot;</span>
+          <span class="s4">&quot;output tensor metadata ({1})&quot;</span><span class="s1">.format(num_output_tensors</span><span class="s3">,</span>
+                                                <span class="s1">num_output_meta))</span>
+
+
+<span class="s3">class </span><span class="s1">_MetadataPopulatorWithBuffer(MetadataPopulator):</span>
+  <span class="s2">&quot;&quot;&quot;Subclass of MetadtaPopulator that populates metadata to a model buffer. 
+ 
+  This class is used to populate metadata into a in-memory model buffer. As we 
+  use Zip API to concatenate associated files after tflite model file, the 
+  populating operation is developed based on a model file. For in-memory model 
+  buffer, we create a tempfile to serve the populating operation. This class is 
+  then used to generate this tempfile, and delete the file when the 
+  MetadataPopulator object is deleted. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model_buf):</span>
+    <span class="s2">&quot;&quot;&quot;Constructor for _MetadataPopulatorWithBuffer. 
+ 
+    Args: 
+      model_buf: TensorFlow Lite model buffer in bytearray. 
+ 
+    Raises: 
+      ValueError: model_buf is empty. 
+      ValueError: model_buf does not have the expected flatbuffer identifer. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">model_buf:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;model_buf cannot be empty.&quot;</span><span class="s1">)</span>
+
+    <span class="s3">with </span><span class="s1">tempfile.NamedTemporaryFile() </span><span class="s3">as </span><span class="s1">temp:</span>
+      <span class="s1">model_file = temp.name</span>
+
+    <span class="s3">with </span><span class="s1">_open_file(model_file</span><span class="s3">, </span><span class="s4">&quot;wb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s1">f.write(model_buf)</span>
+
+    <span class="s1">super().__init__(model_file)</span>
+
+  <span class="s3">def </span><span class="s1">__del__(self):</span>
+    <span class="s2">&quot;&quot;&quot;Destructor of _MetadataPopulatorWithBuffer. 
+ 
+    Deletes the tempfile. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">os.path.exists(self._model_file):</span>
+      <span class="s1">os.remove(self._model_file)</span>
+
+
+<span class="s3">class </span><span class="s1">MetadataDisplayer(object):</span>
+  <span class="s2">&quot;&quot;&quot;Displays metadata and associated file info in human-readable format.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model_buffer</span><span class="s3">, </span><span class="s1">metadata_buffer</span><span class="s3">, </span><span class="s1">associated_file_list):</span>
+    <span class="s2">&quot;&quot;&quot;Constructor for MetadataDisplayer. 
+ 
+    Args: 
+      model_buffer: valid buffer of the model file. 
+      metadata_buffer: valid buffer of the metadata file. 
+      associated_file_list: list of associate files in the model file. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_assert_model_buffer_identifier(model_buffer)</span>
+    <span class="s1">_assert_metadata_buffer_identifier(metadata_buffer)</span>
+    <span class="s1">self._model_buffer = model_buffer</span>
+    <span class="s1">self._metadata_buffer = metadata_buffer</span>
+    <span class="s1">self._associated_file_list = associated_file_list</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">with_model_file(cls</span><span class="s3">, </span><span class="s1">model_file):</span>
+    <span class="s2">&quot;&quot;&quot;Creates a MetadataDisplayer object for the model file. 
+ 
+    Args: 
+      model_file: valid path to a TensorFlow Lite model file. 
+ 
+    Returns: 
+      MetadataDisplayer object. 
+ 
+    Raises: 
+      IOError: File not found. 
+      ValueError: The model does not have metadata. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_assert_file_exist(model_file)</span>
+    <span class="s3">with </span><span class="s1">_open_file(model_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s3">return </span><span class="s1">cls.with_model_buffer(f.read())</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">with_model_buffer(cls</span><span class="s3">, </span><span class="s1">model_buffer):</span>
+    <span class="s2">&quot;&quot;&quot;Creates a MetadataDisplayer object for a file buffer. 
+ 
+    Args: 
+      model_buffer: TensorFlow Lite model buffer in bytearray. 
+ 
+    Returns: 
+      MetadataDisplayer object. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">model_buffer:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;model_buffer cannot be empty.&quot;</span><span class="s1">)</span>
+    <span class="s1">metadata_buffer = get_metadata_buffer(model_buffer)</span>
+    <span class="s3">if not </span><span class="s1">metadata_buffer:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;The model does not have metadata.&quot;</span><span class="s1">)</span>
+    <span class="s1">associated_file_list = cls._parse_packed_associted_file_list(model_buffer)</span>
+    <span class="s3">return </span><span class="s1">cls(model_buffer</span><span class="s3">, </span><span class="s1">metadata_buffer</span><span class="s3">, </span><span class="s1">associated_file_list)</span>
+
+  <span class="s3">def </span><span class="s1">get_associated_file_buffer(self</span><span class="s3">, </span><span class="s1">filename):</span>
+    <span class="s2">&quot;&quot;&quot;Get the specified associated file content in bytearray. 
+ 
+    Args: 
+      filename: name of the file to be extracted. 
+ 
+    Returns: 
+      The file content in bytearray. 
+ 
+    Raises: 
+      ValueError: if the file does not exist in the model. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">filename </span><span class="s3">not in </span><span class="s1">self._associated_file_list:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">&quot;The file, {}, does not exist in the model.&quot;</span><span class="s1">.format(filename))</span>
+
+    <span class="s3">with </span><span class="s1">_open_as_zipfile(io.BytesIO(self._model_buffer)) </span><span class="s3">as </span><span class="s1">zf:</span>
+      <span class="s3">return </span><span class="s1">zf.read(filename)</span>
+
+  <span class="s3">def </span><span class="s1">get_metadata_buffer(self):</span>
+    <span class="s2">&quot;&quot;&quot;Get the metadata buffer in bytearray out from the model.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">copy.deepcopy(self._metadata_buffer)</span>
+
+  <span class="s3">def </span><span class="s1">get_metadata_json(self):</span>
+    <span class="s2">&quot;&quot;&quot;Converts the metadata into a json string.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">convert_to_json(self._metadata_buffer)</span>
+
+  <span class="s3">def </span><span class="s1">get_packed_associated_file_list(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a list of associated files that are packed in the model. 
+ 
+    Returns: 
+      A name list of associated files. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">copy.deepcopy(self._associated_file_list)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">_parse_packed_associted_file_list(model_buf):</span>
+    <span class="s2">&quot;&quot;&quot;Gets a list of associated files packed to the model file. 
+ 
+    Args: 
+      model_buf: valid file buffer. 
+ 
+    Returns: 
+      List of packed associated files. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s3">with </span><span class="s1">_open_as_zipfile(io.BytesIO(model_buf)) </span><span class="s3">as </span><span class="s1">zf:</span>
+        <span class="s3">return </span><span class="s1">zf.namelist()</span>
+    <span class="s3">except </span><span class="s1">zipfile.BadZipFile:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+
+
+<span class="s0"># Create an individual method for getting the metadata json file, so that it can</span>
+<span class="s0"># be used as a standalone util.</span>
+<span class="s3">def </span><span class="s1">convert_to_json(metadata_buffer):</span>
+  <span class="s2">&quot;&quot;&quot;Converts the metadata into a json string. 
+ 
+  Args: 
+    metadata_buffer: valid metadata buffer in bytes. 
+ 
+  Returns: 
+    Metadata in JSON format. 
+ 
+  Raises: 
+    ValueError: error occured when parsing the metadata schema file. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">opt = _pywrap_flatbuffers.IDLOptions()</span>
+  <span class="s1">opt.strict_json = </span><span class="s3">True</span>
+  <span class="s1">parser = _pywrap_flatbuffers.Parser(opt)</span>
+  <span class="s3">with </span><span class="s1">_open_file(_FLATC_TFLITE_METADATA_SCHEMA_FILE) </span><span class="s3">as </span><span class="s1">f:</span>
+    <span class="s1">metadata_schema_content = f.read()</span>
+  <span class="s3">if not </span><span class="s1">parser.parse(metadata_schema_content):</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Cannot parse metadata schema. Reason: &quot; </span><span class="s1">+ parser.error)</span>
+  <span class="s3">return </span><span class="s1">_pywrap_flatbuffers.generate_text(parser</span><span class="s3">, </span><span class="s1">metadata_buffer)</span>
+
+
+<span class="s3">def </span><span class="s1">_assert_file_exist(filename):</span>
+  <span class="s2">&quot;&quot;&quot;Checks if a file exists.&quot;&quot;&quot;</span>
+  <span class="s3">if not </span><span class="s1">_exists_file(filename):</span>
+    <span class="s3">raise </span><span class="s1">IOError(</span><span class="s4">&quot;File, '{0}', does not exist.&quot;</span><span class="s1">.format(filename))</span>
+
+
+<span class="s3">def </span><span class="s1">_assert_model_file_identifier(model_file):</span>
+  <span class="s2">&quot;&quot;&quot;Checks if a model file has the expected TFLite schema identifier.&quot;&quot;&quot;</span>
+  <span class="s1">_assert_file_exist(model_file)</span>
+  <span class="s3">with </span><span class="s1">_open_file(model_file</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+    <span class="s1">_assert_model_buffer_identifier(f.read())</span>
+
+
+<span class="s3">def </span><span class="s1">_assert_model_buffer_identifier(model_buf):</span>
+  <span class="s3">if not </span><span class="s1">_schema_fb.Model.ModelBufferHasIdentifier(model_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span>
+        <span class="s4">&quot;The model provided does not have the expected identifier, and &quot;</span>
+        <span class="s4">&quot;may not be a valid TFLite model.&quot;</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">_assert_metadata_buffer_identifier(metadata_buf):</span>
+  <span class="s2">&quot;&quot;&quot;Checks if a metadata buffer has the expected Metadata schema identifier.&quot;&quot;&quot;</span>
+  <span class="s3">if not </span><span class="s1">_metadata_fb.ModelMetadata.ModelMetadataBufferHasIdentifier(</span>
+      <span class="s1">metadata_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span>
+        <span class="s4">&quot;The metadata buffer does not have the expected identifier, and may not&quot;</span>
+        <span class="s4">&quot; be a valid TFLite Metadata.&quot;</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">get_metadata_buffer(model_buf):</span>
+  <span class="s2">&quot;&quot;&quot;Returns the metadata in the model file as a buffer. 
+ 
+  Args: 
+    model_buf: valid buffer of the model file. 
+ 
+  Returns: 
+    Metadata buffer. Returns `None` if the model does not have metadata. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">tflite_model = _schema_fb.Model.GetRootAsModel(model_buf</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span>
+
+  <span class="s0"># Gets metadata from the model file.</span>
+  <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(tflite_model.MetadataLength()):</span>
+    <span class="s1">meta = tflite_model.Metadata(i)</span>
+    <span class="s3">if </span><span class="s1">meta.Name().decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">) == MetadataPopulator.METADATA_FIELD_NAME:</span>
+      <span class="s1">buffer_index = meta.Buffer()</span>
+      <span class="s1">metadata = tflite_model.Buffers(buffer_index)</span>
+      <span class="s3">if </span><span class="s1">metadata.DataLength() == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s3">continue</span>
+      <span class="s3">return </span><span class="s1">metadata.DataAsNumpy().tobytes()</span>
+
+  <span class="s3">return None</span>
+</pre>
+</body>
+</html>

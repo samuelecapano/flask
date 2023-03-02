@@ -1,0 +1,1247 @@
+<html>
+<head>
+<title>descriptor.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+descriptor.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Protocol Buffers - Google's data interchange format</span>
+<span class="s0"># Copyright 2008 Google Inc.  All rights reserved.</span>
+<span class="s0"># https://developers.google.com/protocol-buffers/</span>
+<span class="s0">#</span>
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are</span>
+<span class="s0"># met:</span>
+<span class="s0">#</span>
+<span class="s0">#     * Redistributions of source code must retain the above copyright</span>
+<span class="s0"># notice, this list of conditions and the following disclaimer.</span>
+<span class="s0">#     * Redistributions in binary form must reproduce the above</span>
+<span class="s0"># copyright notice, this list of conditions and the following disclaimer</span>
+<span class="s0"># in the documentation and/or other materials provided with the</span>
+<span class="s0"># distribution.</span>
+<span class="s0">#     * Neither the name of Google Inc. nor the names of its</span>
+<span class="s0"># contributors may be used to endorse or promote products derived from</span>
+<span class="s0"># this software without specific prior written permission.</span>
+<span class="s0">#</span>
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</span>
+<span class="s0"># &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</span>
+<span class="s0"># A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</span>
+<span class="s0"># OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</span>
+<span class="s0"># SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</span>
+<span class="s0"># DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</span>
+<span class="s0"># THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</span>
+<span class="s0"># (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</span>
+<span class="s0"># OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</span>
+
+<span class="s2">&quot;&quot;&quot;Descriptors essentially contain exactly the information found in a .proto 
+file, in types that make this information accessible in Python. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">__author__ = </span><span class="s3">'robinson@google.com (Will Robinson)'</span>
+
+<span class="s4">import </span><span class="s1">threading</span>
+<span class="s4">import </span><span class="s1">warnings</span>
+
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">api_implementation</span>
+
+<span class="s1">_USE_C_DESCRIPTORS = </span><span class="s4">False</span>
+<span class="s4">if </span><span class="s1">api_implementation.Type() == </span><span class="s3">'cpp'</span><span class="s1">:</span>
+  <span class="s0"># Used by MakeDescriptor in cpp mode</span>
+  <span class="s4">import </span><span class="s1">binascii</span>
+  <span class="s4">import </span><span class="s1">os</span>
+  <span class="s4">from </span><span class="s1">google.protobuf.pyext </span><span class="s4">import </span><span class="s1">_message</span>
+  <span class="s1">_USE_C_DESCRIPTORS = </span><span class="s4">True</span>
+
+
+<span class="s4">class </span><span class="s1">Error(Exception):</span>
+  <span class="s2">&quot;&quot;&quot;Base error for this module.&quot;&quot;&quot;</span>
+
+
+<span class="s4">class </span><span class="s1">TypeTransformationError(Error):</span>
+  <span class="s2">&quot;&quot;&quot;Error transforming between python proto type and corresponding C++ type.&quot;&quot;&quot;</span>
+
+
+<span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+  <span class="s0"># This metaclass allows to override the behavior of code like</span>
+  <span class="s0">#     isinstance(my_descriptor, FieldDescriptor)</span>
+  <span class="s0"># and make it return True when the descriptor is an instance of the extension</span>
+  <span class="s0"># type written in C++.</span>
+  <span class="s4">class </span><span class="s1">DescriptorMetaclass(type):</span>
+    <span class="s4">def </span><span class="s1">__instancecheck__(cls</span><span class="s4">, </span><span class="s1">obj):</span>
+      <span class="s4">if </span><span class="s1">super(DescriptorMetaclass</span><span class="s4">, </span><span class="s1">cls).__instancecheck__(obj):</span>
+        <span class="s4">return True</span>
+      <span class="s4">if </span><span class="s1">isinstance(obj</span><span class="s4">, </span><span class="s1">cls._C_DESCRIPTOR_CLASS):</span>
+        <span class="s4">return True</span>
+      <span class="s4">return False</span>
+<span class="s4">else</span><span class="s1">:</span>
+  <span class="s0"># The standard metaclass; nothing changes.</span>
+  <span class="s1">DescriptorMetaclass = type</span>
+
+
+<span class="s4">class </span><span class="s1">_Lock(object):</span>
+  <span class="s2">&quot;&quot;&quot;Wrapper class of threading.Lock(), which is allowed by 'with'.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__new__(cls):</span>
+    <span class="s1">self = object.__new__(cls)</span>
+    <span class="s1">self._lock = threading.Lock()  </span><span class="s0"># pylint: disable=protected-access</span>
+    <span class="s4">return </span><span class="s1">self</span>
+
+  <span class="s4">def </span><span class="s1">__enter__(self):</span>
+    <span class="s1">self._lock.acquire()</span>
+
+  <span class="s4">def </span><span class="s1">__exit__(self</span><span class="s4">, </span><span class="s1">exc_type</span><span class="s4">, </span><span class="s1">exc_value</span><span class="s4">, </span><span class="s1">exc_tb):</span>
+    <span class="s1">self._lock.release()</span>
+
+
+<span class="s1">_lock = threading.Lock()</span>
+
+
+<span class="s4">def </span><span class="s1">_Deprecated(name):</span>
+  <span class="s4">if </span><span class="s1">_Deprecated.count &gt; </span><span class="s5">0</span><span class="s1">:</span>
+    <span class="s1">_Deprecated.count -= </span><span class="s5">1</span>
+    <span class="s1">warnings.warn(</span>
+        <span class="s3">'Call to deprecated create function %s(). Note: Create unlinked '</span>
+        <span class="s3">'descriptors is going to go away. Please use get/find descriptors from '</span>
+        <span class="s3">'generated code or query the descriptor_pool.'</span>
+        <span class="s1">% name</span><span class="s4">,</span>
+        <span class="s1">category=DeprecationWarning</span><span class="s4">, </span><span class="s1">stacklevel=</span><span class="s5">3</span><span class="s1">)</span>
+
+
+<span class="s0"># Deprecated warnings will print 100 times at most which should be enough for</span>
+<span class="s0"># users to notice and do not cause timeout.</span>
+<span class="s1">_Deprecated.count = </span><span class="s5">100</span>
+
+
+<span class="s1">_internal_create_key = object()</span>
+
+
+<span class="s4">class </span><span class="s1">DescriptorBase(metaclass=DescriptorMetaclass):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptors base class. 
+ 
+  This class is the base of all descriptor classes. It provides common options 
+  related functionality. 
+ 
+  Attributes: 
+    has_options:  True if the descriptor has non-default options.  Usually it 
+        is not necessary to read this -- just call GetOptions() which will 
+        happily return the default instance.  However, it's sometimes useful 
+        for efficiency, and also useful inside the protobuf implementation to 
+        avoid some bootstrapping issues. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s0"># The class, or tuple of classes, that are considered as &quot;virtual</span>
+    <span class="s0"># subclasses&quot; of this descriptor class.</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = ()</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s1">options_class_name):</span>
+    <span class="s2">&quot;&quot;&quot;Initialize the descriptor given its options message and the name of the 
+    class of the options message. The name of the class is required in case 
+    the options message is None and has to be created. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self._options = options</span>
+    <span class="s1">self._options_class_name = options_class_name</span>
+    <span class="s1">self._serialized_options = serialized_options</span>
+
+    <span class="s0"># Does this descriptor have non-default options?</span>
+    <span class="s1">self.has_options = (options </span><span class="s4">is not None</span><span class="s1">) </span><span class="s4">or </span><span class="s1">(serialized_options </span><span class="s4">is not None</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">_SetOptions(self</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">options_class_name):</span>
+    <span class="s2">&quot;&quot;&quot;Sets the descriptor's options 
+ 
+    This function is used in generated proto2 files to update descriptor 
+    options. It must not be used outside proto2. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self._options = options</span>
+    <span class="s1">self._options_class_name = options_class_name</span>
+
+    <span class="s0"># Does this descriptor have non-default options?</span>
+    <span class="s1">self.has_options = options </span><span class="s4">is not None</span>
+
+  <span class="s4">def </span><span class="s1">GetOptions(self):</span>
+    <span class="s2">&quot;&quot;&quot;Retrieves descriptor options. 
+ 
+    This method returns the options set or creates the default options for the 
+    descriptor. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self._options:</span>
+      <span class="s4">return </span><span class="s1">self._options</span>
+
+    <span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor_pb2</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">options_class = getattr(descriptor_pb2</span><span class="s4">,</span>
+                              <span class="s1">self._options_class_name)</span>
+    <span class="s4">except </span><span class="s1">AttributeError:</span>
+      <span class="s4">raise </span><span class="s1">RuntimeError(</span><span class="s3">'Unknown options class name %s!' </span><span class="s1">%</span>
+                         <span class="s1">(self._options_class_name))</span>
+
+    <span class="s4">with </span><span class="s1">_lock:</span>
+      <span class="s4">if </span><span class="s1">self._serialized_options </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">self._options = options_class()</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">self._options = _ParseOptions(options_class()</span><span class="s4">,</span>
+                                      <span class="s1">self._serialized_options)</span>
+
+      <span class="s4">return </span><span class="s1">self._options</span>
+
+
+<span class="s4">class </span><span class="s1">_NestedDescriptorBase(DescriptorBase):</span>
+  <span class="s2">&quot;&quot;&quot;Common class for descriptors that can be nested.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">options_class_name</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">,</span>
+               <span class="s1">file</span><span class="s4">, </span><span class="s1">containing_type</span><span class="s4">, </span><span class="s1">serialized_start=</span><span class="s4">None,</span>
+               <span class="s1">serialized_end=</span><span class="s4">None, </span><span class="s1">serialized_options=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Constructor. 
+ 
+    Args: 
+      options: Protocol message options or None 
+        to use default message options. 
+      options_class_name (str): The class name of the above options. 
+      name (str): Name of this protocol message type. 
+      full_name (str): Fully-qualified name of this protocol message type, 
+        which will include protocol &quot;package&quot; name and the name of any 
+        enclosing types. 
+      file (FileDescriptor): Reference to file info. 
+      containing_type: if provided, this is a nested descriptor, with this 
+        descriptor as parent, otherwise None. 
+      serialized_start: The start index (inclusive) in block in the 
+        file.serialized_pb that describes this descriptor. 
+      serialized_end: The end index (exclusive) in block in the 
+        file.serialized_pb that describes this descriptor. 
+      serialized_options: Protocol message serialized options or None. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">super(_NestedDescriptorBase</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s1">options_class_name)</span>
+
+    <span class="s1">self.name = name</span>
+    <span class="s0"># TODO(falk): Add function to calculate full_name instead of having it in</span>
+    <span class="s0">#             memory?</span>
+    <span class="s1">self.full_name = full_name</span>
+    <span class="s1">self.file = file</span>
+    <span class="s1">self.containing_type = containing_type</span>
+
+    <span class="s1">self._serialized_start = serialized_start</span>
+    <span class="s1">self._serialized_end = serialized_end</span>
+
+  <span class="s4">def </span><span class="s1">CopyToProto(self</span><span class="s4">, </span><span class="s1">proto):</span>
+    <span class="s2">&quot;&quot;&quot;Copies this to the matching proto in descriptor_pb2. 
+ 
+    Args: 
+      proto: An empty proto instance from descriptor_pb2. 
+ 
+    Raises: 
+      Error: If self couldn't be serialized, due to to few constructor 
+        arguments. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">(self.file </span><span class="s4">is not None and</span>
+        <span class="s1">self._serialized_start </span><span class="s4">is not None and</span>
+        <span class="s1">self._serialized_end </span><span class="s4">is not None</span><span class="s1">):</span>
+      <span class="s1">proto.ParseFromString(self.file.serialized_pb[</span>
+          <span class="s1">self._serialized_start:self._serialized_end])</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">Error(</span><span class="s3">'Descriptor does not contain serialization.'</span><span class="s1">)</span>
+
+
+<span class="s4">class </span><span class="s1">Descriptor(_NestedDescriptorBase):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptor for a protocol message type. 
+ 
+  Attributes: 
+      name (str): Name of this protocol message type. 
+      full_name (str): Fully-qualified name of this protocol message type, 
+          which will include protocol &quot;package&quot; name and the name of any 
+          enclosing types. 
+      containing_type (Descriptor): Reference to the descriptor of the type 
+          containing us, or None if this is top-level. 
+      fields (list[FieldDescriptor]): Field descriptors for all fields in 
+          this type. 
+      fields_by_number (dict(int, FieldDescriptor)): Same 
+          :class:`FieldDescriptor` objects as in :attr:`fields`, but indexed 
+          by &quot;number&quot; attribute in each FieldDescriptor. 
+      fields_by_name (dict(str, FieldDescriptor)): Same 
+          :class:`FieldDescriptor` objects as in :attr:`fields`, but indexed by 
+          &quot;name&quot; attribute in each :class:`FieldDescriptor`. 
+      nested_types (list[Descriptor]): Descriptor references 
+          for all protocol message types nested within this one. 
+      nested_types_by_name (dict(str, Descriptor)): Same Descriptor 
+          objects as in :attr:`nested_types`, but indexed by &quot;name&quot; attribute 
+          in each Descriptor. 
+      enum_types (list[EnumDescriptor]): :class:`EnumDescriptor` references 
+          for all enums contained within this type. 
+      enum_types_by_name (dict(str, EnumDescriptor)): Same 
+          :class:`EnumDescriptor` objects as in :attr:`enum_types`, but 
+          indexed by &quot;name&quot; attribute in each EnumDescriptor. 
+      enum_values_by_name (dict(str, EnumValueDescriptor)): Dict mapping 
+          from enum value name to :class:`EnumValueDescriptor` for that value. 
+      extensions (list[FieldDescriptor]): All extensions defined directly 
+          within this message type (NOT within a nested type). 
+      extensions_by_name (dict(str, FieldDescriptor)): Same FieldDescriptor 
+          objects as :attr:`extensions`, but indexed by &quot;name&quot; attribute of each 
+          FieldDescriptor. 
+      is_extendable (bool):  Does this type define any extension ranges? 
+      oneofs (list[OneofDescriptor]): The list of descriptors for oneof fields 
+          in this message. 
+      oneofs_by_name (dict(str, OneofDescriptor)): Same objects as in 
+          :attr:`oneofs`, but indexed by &quot;name&quot; attribute. 
+      file (FileDescriptor): Reference to file descriptor. 
+ 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.Descriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(</span>
+        <span class="s1">cls</span><span class="s4">,</span>
+        <span class="s1">name=</span><span class="s4">None,</span>
+        <span class="s1">full_name=</span><span class="s4">None,</span>
+        <span class="s1">filename=</span><span class="s4">None,</span>
+        <span class="s1">containing_type=</span><span class="s4">None,</span>
+        <span class="s1">fields=</span><span class="s4">None,</span>
+        <span class="s1">nested_types=</span><span class="s4">None,</span>
+        <span class="s1">enum_types=</span><span class="s4">None,</span>
+        <span class="s1">extensions=</span><span class="s4">None,</span>
+        <span class="s1">options=</span><span class="s4">None,</span>
+        <span class="s1">serialized_options=</span><span class="s4">None,</span>
+        <span class="s1">is_extendable=</span><span class="s4">True,</span>
+        <span class="s1">extension_ranges=</span><span class="s4">None,</span>
+        <span class="s1">oneofs=</span><span class="s4">None,</span>
+        <span class="s1">file=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+        <span class="s1">serialized_start=</span><span class="s4">None,</span>
+        <span class="s1">serialized_end=</span><span class="s4">None,</span>
+        <span class="s1">syntax=</span><span class="s4">None,</span>
+        <span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()</span>
+      <span class="s4">return </span><span class="s1">_message.default_pool.FindMessageTypeByName(full_name)</span>
+
+  <span class="s0"># NOTE(tmarek): The file argument redefining a builtin is nothing we can</span>
+  <span class="s0"># fix right now since we don't know how many clients already rely on the</span>
+  <span class="s0"># name of the argument.</span>
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">containing_type</span><span class="s4">, </span><span class="s1">fields</span><span class="s4">,</span>
+               <span class="s1">nested_types</span><span class="s4">, </span><span class="s1">enum_types</span><span class="s4">, </span><span class="s1">extensions</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+               <span class="s1">serialized_options=</span><span class="s4">None,</span>
+               <span class="s1">is_extendable=</span><span class="s4">True, </span><span class="s1">extension_ranges=</span><span class="s4">None, </span><span class="s1">oneofs=</span><span class="s4">None,</span>
+               <span class="s1">file=</span><span class="s4">None, </span><span class="s1">serialized_start=</span><span class="s4">None, </span><span class="s1">serialized_end=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+               <span class="s1">syntax=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Arguments to __init__() are as described in the description 
+    of Descriptor fields above. 
+ 
+    Note that filename is an obsolete argument, that is not used anymore. 
+    Please use file.name to access this as an attribute. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'Descriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(Descriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s3">'MessageOptions'</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">file</span><span class="s4">,</span>
+        <span class="s1">containing_type</span><span class="s4">, </span><span class="s1">serialized_start=serialized_start</span><span class="s4">,</span>
+        <span class="s1">serialized_end=serialized_end</span><span class="s4">, </span><span class="s1">serialized_options=serialized_options)</span>
+
+    <span class="s0"># We have fields in addition to fields_by_name and fields_by_number,</span>
+    <span class="s0"># so that:</span>
+    <span class="s0">#   1. Clients can index fields by &quot;order in which they're listed.&quot;</span>
+    <span class="s0">#   2. Clients can easily iterate over all fields with the terse</span>
+    <span class="s0">#      syntax: for f in descriptor.fields: ...</span>
+    <span class="s1">self.fields = fields</span>
+    <span class="s4">for </span><span class="s1">field </span><span class="s4">in </span><span class="s1">self.fields:</span>
+      <span class="s1">field.containing_type = self</span>
+    <span class="s1">self.fields_by_number = dict((f.number</span><span class="s4">, </span><span class="s1">f) </span><span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">fields)</span>
+    <span class="s1">self.fields_by_name = dict((f.name</span><span class="s4">, </span><span class="s1">f) </span><span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">fields)</span>
+    <span class="s1">self._fields_by_camelcase_name = </span><span class="s4">None</span>
+
+    <span class="s1">self.nested_types = nested_types</span>
+    <span class="s4">for </span><span class="s1">nested_type </span><span class="s4">in </span><span class="s1">nested_types:</span>
+      <span class="s1">nested_type.containing_type = self</span>
+    <span class="s1">self.nested_types_by_name = dict((t.name</span><span class="s4">, </span><span class="s1">t) </span><span class="s4">for </span><span class="s1">t </span><span class="s4">in </span><span class="s1">nested_types)</span>
+
+    <span class="s1">self.enum_types = enum_types</span>
+    <span class="s4">for </span><span class="s1">enum_type </span><span class="s4">in </span><span class="s1">self.enum_types:</span>
+      <span class="s1">enum_type.containing_type = self</span>
+    <span class="s1">self.enum_types_by_name = dict((t.name</span><span class="s4">, </span><span class="s1">t) </span><span class="s4">for </span><span class="s1">t </span><span class="s4">in </span><span class="s1">enum_types)</span>
+    <span class="s1">self.enum_values_by_name = dict(</span>
+        <span class="s1">(v.name</span><span class="s4">, </span><span class="s1">v) </span><span class="s4">for </span><span class="s1">t </span><span class="s4">in </span><span class="s1">enum_types </span><span class="s4">for </span><span class="s1">v </span><span class="s4">in </span><span class="s1">t.values)</span>
+
+    <span class="s1">self.extensions = extensions</span>
+    <span class="s4">for </span><span class="s1">extension </span><span class="s4">in </span><span class="s1">self.extensions:</span>
+      <span class="s1">extension.extension_scope = self</span>
+    <span class="s1">self.extensions_by_name = dict((f.name</span><span class="s4">, </span><span class="s1">f) </span><span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">extensions)</span>
+    <span class="s1">self.is_extendable = is_extendable</span>
+    <span class="s1">self.extension_ranges = extension_ranges</span>
+    <span class="s1">self.oneofs = oneofs </span><span class="s4">if </span><span class="s1">oneofs </span><span class="s4">is not None else </span><span class="s1">[]</span>
+    <span class="s1">self.oneofs_by_name = dict((o.name</span><span class="s4">, </span><span class="s1">o) </span><span class="s4">for </span><span class="s1">o </span><span class="s4">in </span><span class="s1">self.oneofs)</span>
+    <span class="s4">for </span><span class="s1">oneof </span><span class="s4">in </span><span class="s1">self.oneofs:</span>
+      <span class="s1">oneof.containing_type = self</span>
+    <span class="s1">self.syntax = syntax </span><span class="s4">or </span><span class="s3">&quot;proto2&quot;</span>
+
+  <span class="s1">@property</span>
+  <span class="s4">def </span><span class="s1">fields_by_camelcase_name(self):</span>
+    <span class="s2">&quot;&quot;&quot;Same FieldDescriptor objects as in :attr:`fields`, but indexed by 
+    :attr:`FieldDescriptor.camelcase_name`. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self._fields_by_camelcase_name </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s1">self._fields_by_camelcase_name = dict(</span>
+          <span class="s1">(f.camelcase_name</span><span class="s4">, </span><span class="s1">f) </span><span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">self.fields)</span>
+    <span class="s4">return </span><span class="s1">self._fields_by_camelcase_name</span>
+
+  <span class="s4">def </span><span class="s1">EnumValueName(self</span><span class="s4">, </span><span class="s1">enum</span><span class="s4">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the string name of an enum value. 
+ 
+    This is just a small helper method to simplify a common operation. 
+ 
+    Args: 
+      enum: string name of the Enum. 
+      value: int, value of the enum. 
+ 
+    Returns: 
+      string name of the enum value. 
+ 
+    Raises: 
+      KeyError if either the Enum doesn't exist or the value is not a valid 
+        value for the enum. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">return </span><span class="s1">self.enum_types_by_name[enum].values_by_number[value].name</span>
+
+  <span class="s4">def </span><span class="s1">CopyToProto(self</span><span class="s4">, </span><span class="s1">proto):</span>
+    <span class="s2">&quot;&quot;&quot;Copies this to a descriptor_pb2.DescriptorProto. 
+ 
+    Args: 
+      proto: An empty descriptor_pb2.DescriptorProto. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># This function is overridden to give a better doc comment.</span>
+    <span class="s1">super(Descriptor</span><span class="s4">, </span><span class="s1">self).CopyToProto(proto)</span>
+
+
+<span class="s0"># TODO(robinson): We should have aggressive checking here,</span>
+<span class="s0"># for example:</span>
+<span class="s0">#   * If you specify a repeated field, you should not be allowed</span>
+<span class="s0">#     to specify a default value.</span>
+<span class="s0">#   * [Other examples here as needed].</span>
+<span class="s0">#</span>
+<span class="s0"># TODO(robinson): for this and other *Descriptor classes, we</span>
+<span class="s0"># might also want to lock things down aggressively (e.g.,</span>
+<span class="s0"># prevent clients from setting the attributes).  Having</span>
+<span class="s0"># stronger invariants here in general will reduce the number</span>
+<span class="s0"># of runtime checks we must do in reflection.py...</span>
+<span class="s4">class </span><span class="s1">FieldDescriptor(DescriptorBase):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptor for a single field in a .proto file. 
+ 
+  Attributes: 
+    name (str): Name of this field, exactly as it appears in .proto. 
+    full_name (str): Name of this field, including containing scope.  This is 
+      particularly relevant for extensions. 
+    index (int): Dense, 0-indexed index giving the order that this 
+      field textually appears within its message in the .proto file. 
+    number (int): Tag number declared for this field in the .proto file. 
+ 
+    type (int): (One of the TYPE_* constants below) Declared type. 
+    cpp_type (int): (One of the CPPTYPE_* constants below) C++ type used to 
+      represent this field. 
+ 
+    label (int): (One of the LABEL_* constants below) Tells whether this 
+      field is optional, required, or repeated. 
+    has_default_value (bool): True if this field has a default value defined, 
+      otherwise false. 
+    default_value (Varies): Default value of this field.  Only 
+      meaningful for non-repeated scalar fields.  Repeated fields 
+      should always set this to [], and non-repeated composite 
+      fields should always set this to None. 
+ 
+    containing_type (Descriptor): Descriptor of the protocol message 
+      type that contains this field.  Set by the Descriptor constructor 
+      if we're passed into one. 
+      Somewhat confusingly, for extension fields, this is the 
+      descriptor of the EXTENDED message, not the descriptor 
+      of the message containing this field.  (See is_extension and 
+      extension_scope below). 
+    message_type (Descriptor): If a composite field, a descriptor 
+      of the message type contained in this field.  Otherwise, this is None. 
+    enum_type (EnumDescriptor): If this field contains an enum, a 
+      descriptor of that enum.  Otherwise, this is None. 
+ 
+    is_extension: True iff this describes an extension field. 
+    extension_scope (Descriptor): Only meaningful if is_extension is True. 
+      Gives the message that immediately contains this extension field. 
+      Will be None iff we're a top-level (file-level) extension field. 
+ 
+    options (descriptor_pb2.FieldOptions): Protocol message field options or 
+      None to use default field options. 
+ 
+    containing_oneof (OneofDescriptor): If the field is a member of a oneof 
+      union, contains its descriptor. Otherwise, None. 
+ 
+    file (FileDescriptor): Reference to file descriptor. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s0"># Must be consistent with C++ FieldDescriptor::Type enum in</span>
+  <span class="s0"># descriptor.h.</span>
+  <span class="s0">#</span>
+  <span class="s0"># TODO(robinson): Find a way to eliminate this repetition.</span>
+  <span class="s1">TYPE_DOUBLE         = </span><span class="s5">1</span>
+  <span class="s1">TYPE_FLOAT          = </span><span class="s5">2</span>
+  <span class="s1">TYPE_INT64          = </span><span class="s5">3</span>
+  <span class="s1">TYPE_UINT64         = </span><span class="s5">4</span>
+  <span class="s1">TYPE_INT32          = </span><span class="s5">5</span>
+  <span class="s1">TYPE_FIXED64        = </span><span class="s5">6</span>
+  <span class="s1">TYPE_FIXED32        = </span><span class="s5">7</span>
+  <span class="s1">TYPE_BOOL           = </span><span class="s5">8</span>
+  <span class="s1">TYPE_STRING         = </span><span class="s5">9</span>
+  <span class="s1">TYPE_GROUP          = </span><span class="s5">10</span>
+  <span class="s1">TYPE_MESSAGE        = </span><span class="s5">11</span>
+  <span class="s1">TYPE_BYTES          = </span><span class="s5">12</span>
+  <span class="s1">TYPE_UINT32         = </span><span class="s5">13</span>
+  <span class="s1">TYPE_ENUM           = </span><span class="s5">14</span>
+  <span class="s1">TYPE_SFIXED32       = </span><span class="s5">15</span>
+  <span class="s1">TYPE_SFIXED64       = </span><span class="s5">16</span>
+  <span class="s1">TYPE_SINT32         = </span><span class="s5">17</span>
+  <span class="s1">TYPE_SINT64         = </span><span class="s5">18</span>
+  <span class="s1">MAX_TYPE            = </span><span class="s5">18</span>
+
+  <span class="s0"># Must be consistent with C++ FieldDescriptor::CppType enum in</span>
+  <span class="s0"># descriptor.h.</span>
+  <span class="s0">#</span>
+  <span class="s0"># TODO(robinson): Find a way to eliminate this repetition.</span>
+  <span class="s1">CPPTYPE_INT32       = </span><span class="s5">1</span>
+  <span class="s1">CPPTYPE_INT64       = </span><span class="s5">2</span>
+  <span class="s1">CPPTYPE_UINT32      = </span><span class="s5">3</span>
+  <span class="s1">CPPTYPE_UINT64      = </span><span class="s5">4</span>
+  <span class="s1">CPPTYPE_DOUBLE      = </span><span class="s5">5</span>
+  <span class="s1">CPPTYPE_FLOAT       = </span><span class="s5">6</span>
+  <span class="s1">CPPTYPE_BOOL        = </span><span class="s5">7</span>
+  <span class="s1">CPPTYPE_ENUM        = </span><span class="s5">8</span>
+  <span class="s1">CPPTYPE_STRING      = </span><span class="s5">9</span>
+  <span class="s1">CPPTYPE_MESSAGE     = </span><span class="s5">10</span>
+  <span class="s1">MAX_CPPTYPE         = </span><span class="s5">10</span>
+
+  <span class="s1">_PYTHON_TO_CPP_PROTO_TYPE_MAP = {</span>
+      <span class="s1">TYPE_DOUBLE: CPPTYPE_DOUBLE</span><span class="s4">,</span>
+      <span class="s1">TYPE_FLOAT: CPPTYPE_FLOAT</span><span class="s4">,</span>
+      <span class="s1">TYPE_ENUM: CPPTYPE_ENUM</span><span class="s4">,</span>
+      <span class="s1">TYPE_INT64: CPPTYPE_INT64</span><span class="s4">,</span>
+      <span class="s1">TYPE_SINT64: CPPTYPE_INT64</span><span class="s4">,</span>
+      <span class="s1">TYPE_SFIXED64: CPPTYPE_INT64</span><span class="s4">,</span>
+      <span class="s1">TYPE_UINT64: CPPTYPE_UINT64</span><span class="s4">,</span>
+      <span class="s1">TYPE_FIXED64: CPPTYPE_UINT64</span><span class="s4">,</span>
+      <span class="s1">TYPE_INT32: CPPTYPE_INT32</span><span class="s4">,</span>
+      <span class="s1">TYPE_SFIXED32: CPPTYPE_INT32</span><span class="s4">,</span>
+      <span class="s1">TYPE_SINT32: CPPTYPE_INT32</span><span class="s4">,</span>
+      <span class="s1">TYPE_UINT32: CPPTYPE_UINT32</span><span class="s4">,</span>
+      <span class="s1">TYPE_FIXED32: CPPTYPE_UINT32</span><span class="s4">,</span>
+      <span class="s1">TYPE_BYTES: CPPTYPE_STRING</span><span class="s4">,</span>
+      <span class="s1">TYPE_STRING: CPPTYPE_STRING</span><span class="s4">,</span>
+      <span class="s1">TYPE_BOOL: CPPTYPE_BOOL</span><span class="s4">,</span>
+      <span class="s1">TYPE_MESSAGE: CPPTYPE_MESSAGE</span><span class="s4">,</span>
+      <span class="s1">TYPE_GROUP: CPPTYPE_MESSAGE</span>
+      <span class="s1">}</span>
+
+  <span class="s0"># Must be consistent with C++ FieldDescriptor::Label enum in</span>
+  <span class="s0"># descriptor.h.</span>
+  <span class="s0">#</span>
+  <span class="s0"># TODO(robinson): Find a way to eliminate this repetition.</span>
+  <span class="s1">LABEL_OPTIONAL      = </span><span class="s5">1</span>
+  <span class="s1">LABEL_REQUIRED      = </span><span class="s5">2</span>
+  <span class="s1">LABEL_REPEATED      = </span><span class="s5">3</span>
+  <span class="s1">MAX_LABEL           = </span><span class="s5">3</span>
+
+  <span class="s0"># Must be consistent with C++ constants kMaxNumber, kFirstReservedNumber,</span>
+  <span class="s0"># and kLastReservedNumber in descriptor.h</span>
+  <span class="s1">MAX_FIELD_NUMBER = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">29</span><span class="s1">) - </span><span class="s5">1</span>
+  <span class="s1">FIRST_RESERVED_FIELD_NUMBER = </span><span class="s5">19000</span>
+  <span class="s1">LAST_RESERVED_FIELD_NUMBER = </span><span class="s5">19999</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.FieldDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(cls</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">number</span><span class="s4">, </span><span class="s1">type</span><span class="s4">, </span><span class="s1">cpp_type</span><span class="s4">, </span><span class="s1">label</span><span class="s4">,</span>
+                <span class="s1">default_value</span><span class="s4">, </span><span class="s1">message_type</span><span class="s4">, </span><span class="s1">enum_type</span><span class="s4">, </span><span class="s1">containing_type</span><span class="s4">,</span>
+                <span class="s1">is_extension</span><span class="s4">, </span><span class="s1">extension_scope</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+                <span class="s1">serialized_options=</span><span class="s4">None,</span>
+                <span class="s1">has_default_value=</span><span class="s4">True, </span><span class="s1">containing_oneof=</span><span class="s4">None, </span><span class="s1">json_name=</span><span class="s4">None,</span>
+                <span class="s1">file=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()</span>
+      <span class="s4">if </span><span class="s1">is_extension:</span>
+        <span class="s4">return </span><span class="s1">_message.default_pool.FindExtensionByName(full_name)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">_message.default_pool.FindFieldByName(full_name)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">number</span><span class="s4">, </span><span class="s1">type</span><span class="s4">, </span><span class="s1">cpp_type</span><span class="s4">, </span><span class="s1">label</span><span class="s4">,</span>
+               <span class="s1">default_value</span><span class="s4">, </span><span class="s1">message_type</span><span class="s4">, </span><span class="s1">enum_type</span><span class="s4">, </span><span class="s1">containing_type</span><span class="s4">,</span>
+               <span class="s1">is_extension</span><span class="s4">, </span><span class="s1">extension_scope</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+               <span class="s1">serialized_options=</span><span class="s4">None,</span>
+               <span class="s1">has_default_value=</span><span class="s4">True, </span><span class="s1">containing_oneof=</span><span class="s4">None, </span><span class="s1">json_name=</span><span class="s4">None,</span>
+               <span class="s1">file=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+    <span class="s2">&quot;&quot;&quot;The arguments are as described in the description of FieldDescriptor 
+    attributes above. 
+ 
+    Note that containing_type may be None, and may be set later if necessary 
+    (to deal with circular references between message types, for example). 
+    Likewise for extension_scope. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'FieldDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(FieldDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s3">'FieldOptions'</span><span class="s1">)</span>
+    <span class="s1">self.name = name</span>
+    <span class="s1">self.full_name = full_name</span>
+    <span class="s1">self.file = file</span>
+    <span class="s1">self._camelcase_name = </span><span class="s4">None</span>
+    <span class="s4">if </span><span class="s1">json_name </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s1">self.json_name = _ToJsonName(name)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self.json_name = json_name</span>
+    <span class="s1">self.index = index</span>
+    <span class="s1">self.number = number</span>
+    <span class="s1">self.type = type</span>
+    <span class="s1">self.cpp_type = cpp_type</span>
+    <span class="s1">self.label = label</span>
+    <span class="s1">self.has_default_value = has_default_value</span>
+    <span class="s1">self.default_value = default_value</span>
+    <span class="s1">self.containing_type = containing_type</span>
+    <span class="s1">self.message_type = message_type</span>
+    <span class="s1">self.enum_type = enum_type</span>
+    <span class="s1">self.is_extension = is_extension</span>
+    <span class="s1">self.extension_scope = extension_scope</span>
+    <span class="s1">self.containing_oneof = containing_oneof</span>
+    <span class="s4">if </span><span class="s1">api_implementation.Type() == </span><span class="s3">'cpp'</span><span class="s1">:</span>
+      <span class="s4">if </span><span class="s1">is_extension:</span>
+        <span class="s1">self._cdescriptor = _message.default_pool.FindExtensionByName(full_name)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">self._cdescriptor = _message.default_pool.FindFieldByName(full_name)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self._cdescriptor = </span><span class="s4">None</span>
+
+  <span class="s1">@property</span>
+  <span class="s4">def </span><span class="s1">camelcase_name(self):</span>
+    <span class="s2">&quot;&quot;&quot;Camelcase name of this field. 
+ 
+    Returns: 
+      str: the name in CamelCase. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self._camelcase_name </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s1">self._camelcase_name = _ToCamelCase(self.name)</span>
+    <span class="s4">return </span><span class="s1">self._camelcase_name</span>
+
+  <span class="s1">@property</span>
+  <span class="s4">def </span><span class="s1">has_presence(self):</span>
+    <span class="s2">&quot;&quot;&quot;Whether the field distinguishes between unpopulated and default values. 
+ 
+    Raises: 
+      RuntimeError: singular field that is not linked with message nor file. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self.label == FieldDescriptor.LABEL_REPEATED:</span>
+      <span class="s4">return False</span>
+    <span class="s4">if </span><span class="s1">(self.cpp_type == FieldDescriptor.CPPTYPE_MESSAGE </span><span class="s4">or</span>
+        <span class="s1">self.containing_oneof):</span>
+      <span class="s4">return True</span>
+    <span class="s4">if </span><span class="s1">hasattr(self.file</span><span class="s4">, </span><span class="s3">'syntax'</span><span class="s1">):</span>
+      <span class="s4">return </span><span class="s1">self.file.syntax == </span><span class="s3">'proto2'</span>
+    <span class="s4">if </span><span class="s1">hasattr(self.message_type</span><span class="s4">, </span><span class="s3">'syntax'</span><span class="s1">):</span>
+      <span class="s4">return </span><span class="s1">self.message_type.syntax == </span><span class="s3">'proto2'</span>
+    <span class="s4">raise </span><span class="s1">RuntimeError(</span>
+        <span class="s3">'has_presence is not ready to use because field %s is not'</span>
+        <span class="s3">' linked with message type nor file' </span><span class="s1">% self.full_name)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s4">def </span><span class="s1">ProtoTypeToCppProtoType(proto_type):</span>
+    <span class="s2">&quot;&quot;&quot;Converts from a Python proto type to a C++ Proto Type. 
+ 
+    The Python ProtocolBuffer classes specify both the 'Python' datatype and the 
+    'C++' datatype - and they're not the same. This helper method should 
+    translate from one to another. 
+ 
+    Args: 
+      proto_type: the Python proto type (descriptor.FieldDescriptor.TYPE_*) 
+    Returns: 
+      int: descriptor.FieldDescriptor.CPPTYPE_*, the C++ type. 
+    Raises: 
+      TypeTransformationError: when the Python proto type isn't known. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s4">return </span><span class="s1">FieldDescriptor._PYTHON_TO_CPP_PROTO_TYPE_MAP[proto_type]</span>
+    <span class="s4">except </span><span class="s1">KeyError:</span>
+      <span class="s4">raise </span><span class="s1">TypeTransformationError(</span><span class="s3">'Unknown proto_type: %s' </span><span class="s1">% proto_type)</span>
+
+
+<span class="s4">class </span><span class="s1">EnumDescriptor(_NestedDescriptorBase):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptor for an enum defined in a .proto file. 
+ 
+  Attributes: 
+    name (str): Name of the enum type. 
+    full_name (str): Full name of the type, including package name 
+      and any enclosing type(s). 
+ 
+    values (list[EnumValueDescriptor]): List of the values 
+      in this enum. 
+    values_by_name (dict(str, EnumValueDescriptor)): Same as :attr:`values`, 
+      but indexed by the &quot;name&quot; field of each EnumValueDescriptor. 
+    values_by_number (dict(int, EnumValueDescriptor)): Same as :attr:`values`, 
+      but indexed by the &quot;number&quot; field of each EnumValueDescriptor. 
+    containing_type (Descriptor): Descriptor of the immediate containing 
+      type of this enum, or None if this is an enum defined at the 
+      top level in a .proto file.  Set by Descriptor's constructor 
+      if we're passed into one. 
+    file (FileDescriptor): Reference to file descriptor. 
+    options (descriptor_pb2.EnumOptions): Enum options message or 
+      None to use default enum options. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.EnumDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(cls</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">values</span><span class="s4">,</span>
+                <span class="s1">containing_type=</span><span class="s4">None, </span><span class="s1">options=</span><span class="s4">None,</span>
+                <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">file=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+                <span class="s1">serialized_start=</span><span class="s4">None, </span><span class="s1">serialized_end=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()</span>
+      <span class="s4">return </span><span class="s1">_message.default_pool.FindEnumTypeByName(full_name)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">values</span><span class="s4">,</span>
+               <span class="s1">containing_type=</span><span class="s4">None, </span><span class="s1">options=</span><span class="s4">None,</span>
+               <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">file=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+               <span class="s1">serialized_start=</span><span class="s4">None, </span><span class="s1">serialized_end=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Arguments are as described in the attribute description above. 
+ 
+    Note that filename is an obsolete argument, that is not used anymore. 
+    Please use file.name to access this as an attribute. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'EnumDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(EnumDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s3">'EnumOptions'</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">file</span><span class="s4">,</span>
+        <span class="s1">containing_type</span><span class="s4">, </span><span class="s1">serialized_start=serialized_start</span><span class="s4">,</span>
+        <span class="s1">serialized_end=serialized_end</span><span class="s4">, </span><span class="s1">serialized_options=serialized_options)</span>
+
+    <span class="s1">self.values = values</span>
+    <span class="s4">for </span><span class="s1">value </span><span class="s4">in </span><span class="s1">self.values:</span>
+      <span class="s1">value.type = self</span>
+    <span class="s1">self.values_by_name = dict((v.name</span><span class="s4">, </span><span class="s1">v) </span><span class="s4">for </span><span class="s1">v </span><span class="s4">in </span><span class="s1">values)</span>
+    <span class="s0"># Values are reversed to ensure that the first alias is retained.</span>
+    <span class="s1">self.values_by_number = dict((v.number</span><span class="s4">, </span><span class="s1">v) </span><span class="s4">for </span><span class="s1">v </span><span class="s4">in </span><span class="s1">reversed(values))</span>
+
+  <span class="s4">def </span><span class="s1">CopyToProto(self</span><span class="s4">, </span><span class="s1">proto):</span>
+    <span class="s2">&quot;&quot;&quot;Copies this to a descriptor_pb2.EnumDescriptorProto. 
+ 
+    Args: 
+      proto (descriptor_pb2.EnumDescriptorProto): An empty descriptor proto. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># This function is overridden to give a better doc comment.</span>
+    <span class="s1">super(EnumDescriptor</span><span class="s4">, </span><span class="s1">self).CopyToProto(proto)</span>
+
+
+<span class="s4">class </span><span class="s1">EnumValueDescriptor(DescriptorBase):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptor for a single value within an enum. 
+ 
+  Attributes: 
+    name (str): Name of this value. 
+    index (int): Dense, 0-indexed index giving the order that this 
+      value appears textually within its enum in the .proto file. 
+    number (int): Actual number assigned to this enum value. 
+    type (EnumDescriptor): :class:`EnumDescriptor` to which this value 
+      belongs.  Set by :class:`EnumDescriptor`'s constructor if we're 
+      passed into one. 
+    options (descriptor_pb2.EnumValueOptions): Enum value options message or 
+      None to use default enum value options options. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.EnumValueDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(cls</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">number</span><span class="s4">,</span>
+                <span class="s1">type=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+                <span class="s1">options=</span><span class="s4">None, </span><span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()</span>
+      <span class="s0"># There is no way we can build a complete EnumValueDescriptor with the</span>
+      <span class="s0"># given parameters (the name of the Enum is not known, for example).</span>
+      <span class="s0"># Fortunately generated files just pass it to the EnumDescriptor()</span>
+      <span class="s0"># constructor, which will ignore it, so returning None is good enough.</span>
+      <span class="s4">return None</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">number</span><span class="s4">,</span>
+               <span class="s1">type=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+               <span class="s1">options=</span><span class="s4">None, </span><span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Arguments are as described in the attribute description above.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'EnumValueDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(EnumValueDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s3">'EnumValueOptions'</span><span class="s1">)</span>
+    <span class="s1">self.name = name</span>
+    <span class="s1">self.index = index</span>
+    <span class="s1">self.number = number</span>
+    <span class="s1">self.type = type</span>
+
+
+<span class="s4">class </span><span class="s1">OneofDescriptor(DescriptorBase):</span>
+  <span class="s2">&quot;&quot;&quot;Descriptor for a oneof field. 
+ 
+  Attributes: 
+    name (str): Name of the oneof field. 
+    full_name (str): Full name of the oneof field, including package name. 
+    index (int): 0-based index giving the order of the oneof field inside 
+      its containing type. 
+    containing_type (Descriptor): :class:`Descriptor` of the protocol message 
+      type that contains this field.  Set by the :class:`Descriptor` constructor 
+      if we're passed into one. 
+    fields (list[FieldDescriptor]): The list of field descriptors this 
+      oneof can contain. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.OneofDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(</span>
+        <span class="s1">cls</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">containing_type</span><span class="s4">, </span><span class="s1">fields</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+        <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()</span>
+      <span class="s4">return </span><span class="s1">_message.default_pool.FindOneofByName(full_name)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(</span>
+      <span class="s1">self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">containing_type</span><span class="s4">, </span><span class="s1">fields</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+      <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Arguments are as described in the attribute description above.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'OneofDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(OneofDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s3">'OneofOptions'</span><span class="s1">)</span>
+    <span class="s1">self.name = name</span>
+    <span class="s1">self.full_name = full_name</span>
+    <span class="s1">self.index = index</span>
+    <span class="s1">self.containing_type = containing_type</span>
+    <span class="s1">self.fields = fields</span>
+
+
+<span class="s4">class </span><span class="s1">ServiceDescriptor(_NestedDescriptorBase):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptor for a service. 
+ 
+  Attributes: 
+    name (str): Name of the service. 
+    full_name (str): Full name of the service, including package name. 
+    index (int): 0-indexed index giving the order that this services 
+      definition appears within the .proto file. 
+    methods (list[MethodDescriptor]): List of methods provided by this 
+      service. 
+    methods_by_name (dict(str, MethodDescriptor)): Same 
+      :class:`MethodDescriptor` objects as in :attr:`methods_by_name`, but 
+      indexed by &quot;name&quot; attribute in each :class:`MethodDescriptor`. 
+    options (descriptor_pb2.ServiceOptions): Service options message or 
+      None to use default service options. 
+    file (FileDescriptor): Reference to file info. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.ServiceDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(</span>
+        <span class="s1">cls</span><span class="s4">,</span>
+        <span class="s1">name=</span><span class="s4">None,</span>
+        <span class="s1">full_name=</span><span class="s4">None,</span>
+        <span class="s1">index=</span><span class="s4">None,</span>
+        <span class="s1">methods=</span><span class="s4">None,</span>
+        <span class="s1">options=</span><span class="s4">None,</span>
+        <span class="s1">serialized_options=</span><span class="s4">None,</span>
+        <span class="s1">file=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+        <span class="s1">serialized_start=</span><span class="s4">None,</span>
+        <span class="s1">serialized_end=</span><span class="s4">None,</span>
+        <span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()  </span><span class="s0"># pylint: disable=protected-access</span>
+      <span class="s4">return </span><span class="s1">_message.default_pool.FindServiceByName(full_name)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">methods</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+               <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">file=</span><span class="s4">None,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+               <span class="s1">serialized_start=</span><span class="s4">None, </span><span class="s1">serialized_end=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'ServiceDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(ServiceDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s3">'ServiceOptions'</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">file</span><span class="s4">,</span>
+        <span class="s4">None, </span><span class="s1">serialized_start=serialized_start</span><span class="s4">,</span>
+        <span class="s1">serialized_end=serialized_end</span><span class="s4">, </span><span class="s1">serialized_options=serialized_options)</span>
+    <span class="s1">self.index = index</span>
+    <span class="s1">self.methods = methods</span>
+    <span class="s1">self.methods_by_name = dict((m.name</span><span class="s4">, </span><span class="s1">m) </span><span class="s4">for </span><span class="s1">m </span><span class="s4">in </span><span class="s1">methods)</span>
+    <span class="s0"># Set the containing service for each method in this service.</span>
+    <span class="s4">for </span><span class="s1">method </span><span class="s4">in </span><span class="s1">self.methods:</span>
+      <span class="s1">method.containing_service = self</span>
+
+  <span class="s4">def </span><span class="s1">FindMethodByName(self</span><span class="s4">, </span><span class="s1">name):</span>
+    <span class="s2">&quot;&quot;&quot;Searches for the specified method, and returns its descriptor. 
+ 
+    Args: 
+      name (str): Name of the method. 
+    Returns: 
+      MethodDescriptor or None: the descriptor for the requested method, if 
+      found. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">return </span><span class="s1">self.methods_by_name.get(name</span><span class="s4">, None</span><span class="s1">)</span>
+
+  <span class="s4">def </span><span class="s1">CopyToProto(self</span><span class="s4">, </span><span class="s1">proto):</span>
+    <span class="s2">&quot;&quot;&quot;Copies this to a descriptor_pb2.ServiceDescriptorProto. 
+ 
+    Args: 
+      proto (descriptor_pb2.ServiceDescriptorProto): An empty descriptor proto. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># This function is overridden to give a better doc comment.</span>
+    <span class="s1">super(ServiceDescriptor</span><span class="s4">, </span><span class="s1">self).CopyToProto(proto)</span>
+
+
+<span class="s4">class </span><span class="s1">MethodDescriptor(DescriptorBase):</span>
+
+  <span class="s2">&quot;&quot;&quot;Descriptor for a method in a service. 
+ 
+  Attributes: 
+    name (str): Name of the method within the service. 
+    full_name (str): Full name of method. 
+    index (int): 0-indexed index of the method inside the service. 
+    containing_service (ServiceDescriptor): The service that contains this 
+      method. 
+    input_type (Descriptor): The descriptor of the message that this method 
+      accepts. 
+    output_type (Descriptor): The descriptor of the message that this method 
+      returns. 
+    client_streaming (bool): Whether this method uses client streaming. 
+    server_streaming (bool): Whether this method uses server streaming. 
+    options (descriptor_pb2.MethodOptions or None): Method options message, or 
+      None to use default method options. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.MethodDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(cls</span><span class="s4">,</span>
+                <span class="s1">name</span><span class="s4">,</span>
+                <span class="s1">full_name</span><span class="s4">,</span>
+                <span class="s1">index</span><span class="s4">,</span>
+                <span class="s1">containing_service</span><span class="s4">,</span>
+                <span class="s1">input_type</span><span class="s4">,</span>
+                <span class="s1">output_type</span><span class="s4">,</span>
+                <span class="s1">client_streaming=</span><span class="s4">False,</span>
+                <span class="s1">server_streaming=</span><span class="s4">False,</span>
+                <span class="s1">options=</span><span class="s4">None,</span>
+                <span class="s1">serialized_options=</span><span class="s4">None,</span>
+                <span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s1">_message.Message._CheckCalledFromGeneratedFile()  </span><span class="s0"># pylint: disable=protected-access</span>
+      <span class="s4">return </span><span class="s1">_message.default_pool.FindMethodByName(full_name)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">,</span>
+               <span class="s1">name</span><span class="s4">,</span>
+               <span class="s1">full_name</span><span class="s4">,</span>
+               <span class="s1">index</span><span class="s4">,</span>
+               <span class="s1">containing_service</span><span class="s4">,</span>
+               <span class="s1">input_type</span><span class="s4">,</span>
+               <span class="s1">output_type</span><span class="s4">,</span>
+               <span class="s1">client_streaming=</span><span class="s4">False,</span>
+               <span class="s1">server_streaming=</span><span class="s4">False,</span>
+               <span class="s1">options=</span><span class="s4">None,</span>
+               <span class="s1">serialized_options=</span><span class="s4">None,</span>
+               <span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;The arguments are as described in the description of MethodDescriptor 
+    attributes above. 
+ 
+    Note that containing_service may be None, and may be set later if necessary. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'MethodDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(MethodDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s3">'MethodOptions'</span><span class="s1">)</span>
+    <span class="s1">self.name = name</span>
+    <span class="s1">self.full_name = full_name</span>
+    <span class="s1">self.index = index</span>
+    <span class="s1">self.containing_service = containing_service</span>
+    <span class="s1">self.input_type = input_type</span>
+    <span class="s1">self.output_type = output_type</span>
+    <span class="s1">self.client_streaming = client_streaming</span>
+    <span class="s1">self.server_streaming = server_streaming</span>
+
+  <span class="s4">def </span><span class="s1">CopyToProto(self</span><span class="s4">, </span><span class="s1">proto):</span>
+    <span class="s2">&quot;&quot;&quot;Copies this to a descriptor_pb2.MethodDescriptorProto. 
+ 
+    Args: 
+      proto (descriptor_pb2.MethodDescriptorProto): An empty descriptor proto. 
+ 
+    Raises: 
+      Error: If self couldn't be serialized, due to too few constructor 
+        arguments. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">self.containing_service </span><span class="s4">is not None</span><span class="s1">:</span>
+      <span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor_pb2</span>
+      <span class="s1">service_proto = descriptor_pb2.ServiceDescriptorProto()</span>
+      <span class="s1">self.containing_service.CopyToProto(service_proto)</span>
+      <span class="s1">proto.CopyFrom(service_proto.method[self.index])</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">Error(</span><span class="s3">'Descriptor does not contain a service.'</span><span class="s1">)</span>
+
+
+<span class="s4">class </span><span class="s1">FileDescriptor(DescriptorBase):</span>
+  <span class="s2">&quot;&quot;&quot;Descriptor for a file. Mimics the descriptor_pb2.FileDescriptorProto. 
+ 
+  Note that :attr:`enum_types_by_name`, :attr:`extensions_by_name`, and 
+  :attr:`dependencies` fields are only set by the 
+  :py:mod:`google.protobuf.message_factory` module, and not by the generated 
+  proto code. 
+ 
+  Attributes: 
+    name (str): Name of file, relative to root of source tree. 
+    package (str): Name of the package 
+    syntax (str): string indicating syntax of the file (can be &quot;proto2&quot; or 
+      &quot;proto3&quot;) 
+    serialized_pb (bytes): Byte string of serialized 
+      :class:`descriptor_pb2.FileDescriptorProto`. 
+    dependencies (list[FileDescriptor]): List of other :class:`FileDescriptor` 
+      objects this :class:`FileDescriptor` depends on. 
+    public_dependencies (list[FileDescriptor]): A subset of 
+      :attr:`dependencies`, which were declared as &quot;public&quot;. 
+    message_types_by_name (dict(str, Descriptor)): Mapping from message names 
+      to their :class:`Descriptor`. 
+    enum_types_by_name (dict(str, EnumDescriptor)): Mapping from enum names to 
+      their :class:`EnumDescriptor`. 
+    extensions_by_name (dict(str, FieldDescriptor)): Mapping from extension 
+      names declared at file scope to their :class:`FieldDescriptor`. 
+    services_by_name (dict(str, ServiceDescriptor)): Mapping from services' 
+      names to their :class:`ServiceDescriptor`. 
+    pool (DescriptorPool): The pool this descriptor belongs to.  When not 
+      passed to the constructor, the global default pool is used. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+    <span class="s1">_C_DESCRIPTOR_CLASS = _message.FileDescriptor</span>
+
+    <span class="s4">def </span><span class="s1">__new__(cls</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">package</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+                <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">serialized_pb=</span><span class="s4">None,</span>
+                <span class="s1">dependencies=</span><span class="s4">None, </span><span class="s1">public_dependencies=</span><span class="s4">None,</span>
+                <span class="s1">syntax=</span><span class="s4">None, </span><span class="s1">pool=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+      <span class="s0"># FileDescriptor() is called from various places, not only from generated</span>
+      <span class="s0"># files, to register dynamic proto files and messages.</span>
+      <span class="s0"># pylint: disable=g-explicit-bool-comparison</span>
+      <span class="s4">if </span><span class="s1">serialized_pb == </span><span class="s6">b''</span><span class="s1">:</span>
+        <span class="s0"># Cpp generated code must be linked in if serialized_pb is ''</span>
+        <span class="s4">try</span><span class="s1">:</span>
+          <span class="s4">return </span><span class="s1">_message.default_pool.FindFileByName(name)</span>
+        <span class="s4">except </span><span class="s1">KeyError:</span>
+          <span class="s4">raise </span><span class="s1">RuntimeError(</span><span class="s3">'Please link in cpp generated lib for %s' </span><span class="s1">% (name))</span>
+      <span class="s4">elif </span><span class="s1">serialized_pb:</span>
+        <span class="s4">return </span><span class="s1">_message.default_pool.AddSerializedFile(serialized_pb)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">super(FileDescriptor</span><span class="s4">, </span><span class="s1">cls).__new__(cls)</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">package</span><span class="s4">, </span><span class="s1">options=</span><span class="s4">None,</span>
+               <span class="s1">serialized_options=</span><span class="s4">None, </span><span class="s1">serialized_pb=</span><span class="s4">None,</span>
+               <span class="s1">dependencies=</span><span class="s4">None, </span><span class="s1">public_dependencies=</span><span class="s4">None,</span>
+               <span class="s1">syntax=</span><span class="s4">None, </span><span class="s1">pool=</span><span class="s4">None, </span><span class="s1">create_key=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Constructor.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">create_key </span><span class="s4">is not </span><span class="s1">_internal_create_key:</span>
+      <span class="s1">_Deprecated(</span><span class="s3">'FileDescriptor'</span><span class="s1">)</span>
+
+    <span class="s1">super(FileDescriptor</span><span class="s4">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">options</span><span class="s4">, </span><span class="s1">serialized_options</span><span class="s4">, </span><span class="s3">'FileOptions'</span><span class="s1">)</span>
+
+    <span class="s4">if </span><span class="s1">pool </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor_pool</span>
+      <span class="s1">pool = descriptor_pool.Default()</span>
+    <span class="s1">self.pool = pool</span>
+    <span class="s1">self.message_types_by_name = {}</span>
+    <span class="s1">self.name = name</span>
+    <span class="s1">self.package = package</span>
+    <span class="s1">self.syntax = syntax </span><span class="s4">or </span><span class="s3">&quot;proto2&quot;</span>
+    <span class="s1">self.serialized_pb = serialized_pb</span>
+
+    <span class="s1">self.enum_types_by_name = {}</span>
+    <span class="s1">self.extensions_by_name = {}</span>
+    <span class="s1">self.services_by_name = {}</span>
+    <span class="s1">self.dependencies = (dependencies </span><span class="s4">or </span><span class="s1">[])</span>
+    <span class="s1">self.public_dependencies = (public_dependencies </span><span class="s4">or </span><span class="s1">[])</span>
+
+  <span class="s4">def </span><span class="s1">CopyToProto(self</span><span class="s4">, </span><span class="s1">proto):</span>
+    <span class="s2">&quot;&quot;&quot;Copies this to a descriptor_pb2.FileDescriptorProto. 
+ 
+    Args: 
+      proto: An empty descriptor_pb2.FileDescriptorProto. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">proto.ParseFromString(self.serialized_pb)</span>
+
+
+<span class="s4">def </span><span class="s1">_ParseOptions(message</span><span class="s4">, </span><span class="s1">string):</span>
+  <span class="s2">&quot;&quot;&quot;Parses serialized options. 
+ 
+  This helper function is used to parse serialized options in generated 
+  proto2 files. It must not be used outside proto2. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">message.ParseFromString(string)</span>
+  <span class="s4">return </span><span class="s1">message</span>
+
+
+<span class="s4">def </span><span class="s1">_ToCamelCase(name):</span>
+  <span class="s2">&quot;&quot;&quot;Converts name to camel-case and returns it.&quot;&quot;&quot;</span>
+  <span class="s1">capitalize_next = </span><span class="s4">False</span>
+  <span class="s1">result = []</span>
+
+  <span class="s4">for </span><span class="s1">c </span><span class="s4">in </span><span class="s1">name:</span>
+    <span class="s4">if </span><span class="s1">c == </span><span class="s3">'_'</span><span class="s1">:</span>
+      <span class="s4">if </span><span class="s1">result:</span>
+        <span class="s1">capitalize_next = </span><span class="s4">True</span>
+    <span class="s4">elif </span><span class="s1">capitalize_next:</span>
+      <span class="s1">result.append(c.upper())</span>
+      <span class="s1">capitalize_next = </span><span class="s4">False</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">result += c</span>
+
+  <span class="s0"># Lower-case the first letter.</span>
+  <span class="s4">if </span><span class="s1">result </span><span class="s4">and </span><span class="s1">result[</span><span class="s5">0</span><span class="s1">].isupper():</span>
+    <span class="s1">result[</span><span class="s5">0</span><span class="s1">] = result[</span><span class="s5">0</span><span class="s1">].lower()</span>
+  <span class="s4">return </span><span class="s3">''</span><span class="s1">.join(result)</span>
+
+
+<span class="s4">def </span><span class="s1">_OptionsOrNone(descriptor_proto):</span>
+  <span class="s2">&quot;&quot;&quot;Returns the value of the field `options`, or None if it is not set.&quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">descriptor_proto.HasField(</span><span class="s3">'options'</span><span class="s1">):</span>
+    <span class="s4">return </span><span class="s1">descriptor_proto.options</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">return None</span>
+
+
+<span class="s4">def </span><span class="s1">_ToJsonName(name):</span>
+  <span class="s2">&quot;&quot;&quot;Converts name to Json name and returns it.&quot;&quot;&quot;</span>
+  <span class="s1">capitalize_next = </span><span class="s4">False</span>
+  <span class="s1">result = []</span>
+
+  <span class="s4">for </span><span class="s1">c </span><span class="s4">in </span><span class="s1">name:</span>
+    <span class="s4">if </span><span class="s1">c == </span><span class="s3">'_'</span><span class="s1">:</span>
+      <span class="s1">capitalize_next = </span><span class="s4">True</span>
+    <span class="s4">elif </span><span class="s1">capitalize_next:</span>
+      <span class="s1">result.append(c.upper())</span>
+      <span class="s1">capitalize_next = </span><span class="s4">False</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">result += c</span>
+
+  <span class="s4">return </span><span class="s3">''</span><span class="s1">.join(result)</span>
+
+
+<span class="s4">def </span><span class="s1">MakeDescriptor(desc_proto</span><span class="s4">, </span><span class="s1">package=</span><span class="s3">''</span><span class="s4">, </span><span class="s1">build_file_if_cpp=</span><span class="s4">True,</span>
+                   <span class="s1">syntax=</span><span class="s4">None</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Make a protobuf Descriptor given a DescriptorProto protobuf. 
+ 
+  Handles nested descriptors. Note that this is limited to the scope of defining 
+  a message inside of another message. Composite fields can currently only be 
+  resolved if the message is defined in the same scope as the field. 
+ 
+  Args: 
+    desc_proto: The descriptor_pb2.DescriptorProto protobuf message. 
+    package: Optional package name for the new message Descriptor (string). 
+    build_file_if_cpp: Update the C++ descriptor pool if api matches. 
+                       Set to False on recursion, so no duplicates are created. 
+    syntax: The syntax/semantics that should be used.  Set to &quot;proto3&quot; to get 
+            proto3 field presence semantics. 
+  Returns: 
+    A Descriptor for protobuf messages. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">api_implementation.Type() == </span><span class="s3">'cpp' </span><span class="s4">and </span><span class="s1">build_file_if_cpp:</span>
+    <span class="s0"># The C++ implementation requires all descriptors to be backed by the same</span>
+    <span class="s0"># definition in the C++ descriptor pool. To do this, we build a</span>
+    <span class="s0"># FileDescriptorProto with the same definition as this descriptor and build</span>
+    <span class="s0"># it into the pool.</span>
+    <span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor_pb2</span>
+    <span class="s1">file_descriptor_proto = descriptor_pb2.FileDescriptorProto()</span>
+    <span class="s1">file_descriptor_proto.message_type.add().MergeFrom(desc_proto)</span>
+
+    <span class="s0"># Generate a random name for this proto file to prevent conflicts with any</span>
+    <span class="s0"># imported ones. We need to specify a file name so the descriptor pool</span>
+    <span class="s0"># accepts our FileDescriptorProto, but it is not important what that file</span>
+    <span class="s0"># name is actually set to.</span>
+    <span class="s1">proto_name = binascii.hexlify(os.urandom(</span><span class="s5">16</span><span class="s1">)).decode(</span><span class="s3">'ascii'</span><span class="s1">)</span>
+
+    <span class="s4">if </span><span class="s1">package:</span>
+      <span class="s1">file_descriptor_proto.name = os.path.join(package.replace(</span><span class="s3">'.'</span><span class="s4">, </span><span class="s3">'/'</span><span class="s1">)</span><span class="s4">,</span>
+                                                <span class="s1">proto_name + </span><span class="s3">'.proto'</span><span class="s1">)</span>
+      <span class="s1">file_descriptor_proto.package = package</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">file_descriptor_proto.name = proto_name + </span><span class="s3">'.proto'</span>
+
+    <span class="s1">_message.default_pool.Add(file_descriptor_proto)</span>
+    <span class="s1">result = _message.default_pool.FindFileByName(file_descriptor_proto.name)</span>
+
+    <span class="s4">if </span><span class="s1">_USE_C_DESCRIPTORS:</span>
+      <span class="s4">return </span><span class="s1">result.message_types_by_name[desc_proto.name]</span>
+
+  <span class="s1">full_message_name = [desc_proto.name]</span>
+  <span class="s4">if </span><span class="s1">package: full_message_name.insert(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">package)</span>
+
+  <span class="s0"># Create Descriptors for enum types</span>
+  <span class="s1">enum_types = {}</span>
+  <span class="s4">for </span><span class="s1">enum_proto </span><span class="s4">in </span><span class="s1">desc_proto.enum_type:</span>
+    <span class="s1">full_name = </span><span class="s3">'.'</span><span class="s1">.join(full_message_name + [enum_proto.name])</span>
+    <span class="s1">enum_desc = EnumDescriptor(</span>
+        <span class="s1">enum_proto.name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, None, </span><span class="s1">[</span>
+            <span class="s1">EnumValueDescriptor(enum_val.name</span><span class="s4">, </span><span class="s1">ii</span><span class="s4">, </span><span class="s1">enum_val.number</span><span class="s4">,</span>
+                                <span class="s1">create_key=_internal_create_key)</span>
+            <span class="s4">for </span><span class="s1">ii</span><span class="s4">, </span><span class="s1">enum_val </span><span class="s4">in </span><span class="s1">enumerate(enum_proto.value)]</span><span class="s4">,</span>
+        <span class="s1">create_key=_internal_create_key)</span>
+    <span class="s1">enum_types[full_name] = enum_desc</span>
+
+  <span class="s0"># Create Descriptors for nested types</span>
+  <span class="s1">nested_types = {}</span>
+  <span class="s4">for </span><span class="s1">nested_proto </span><span class="s4">in </span><span class="s1">desc_proto.nested_type:</span>
+    <span class="s1">full_name = </span><span class="s3">'.'</span><span class="s1">.join(full_message_name + [nested_proto.name])</span>
+    <span class="s0"># Nested types are just those defined inside of the message, not all types</span>
+    <span class="s0"># used by fields in the message, so no loops are possible here.</span>
+    <span class="s1">nested_desc = MakeDescriptor(nested_proto</span><span class="s4">,</span>
+                                 <span class="s1">package=</span><span class="s3">'.'</span><span class="s1">.join(full_message_name)</span><span class="s4">,</span>
+                                 <span class="s1">build_file_if_cpp=</span><span class="s4">False,</span>
+                                 <span class="s1">syntax=syntax)</span>
+    <span class="s1">nested_types[full_name] = nested_desc</span>
+
+  <span class="s1">fields = []</span>
+  <span class="s4">for </span><span class="s1">field_proto </span><span class="s4">in </span><span class="s1">desc_proto.field:</span>
+    <span class="s1">full_name = </span><span class="s3">'.'</span><span class="s1">.join(full_message_name + [field_proto.name])</span>
+    <span class="s1">enum_desc = </span><span class="s4">None</span>
+    <span class="s1">nested_desc = </span><span class="s4">None</span>
+    <span class="s4">if </span><span class="s1">field_proto.json_name:</span>
+      <span class="s1">json_name = field_proto.json_name</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">json_name = </span><span class="s4">None</span>
+    <span class="s4">if </span><span class="s1">field_proto.HasField(</span><span class="s3">'type_name'</span><span class="s1">):</span>
+      <span class="s1">type_name = field_proto.type_name</span>
+      <span class="s1">full_type_name = </span><span class="s3">'.'</span><span class="s1">.join(full_message_name +</span>
+                                <span class="s1">[type_name[type_name.rfind(</span><span class="s3">'.'</span><span class="s1">)+</span><span class="s5">1</span><span class="s1">:]])</span>
+      <span class="s4">if </span><span class="s1">full_type_name </span><span class="s4">in </span><span class="s1">nested_types:</span>
+        <span class="s1">nested_desc = nested_types[full_type_name]</span>
+      <span class="s4">elif </span><span class="s1">full_type_name </span><span class="s4">in </span><span class="s1">enum_types:</span>
+        <span class="s1">enum_desc = enum_types[full_type_name]</span>
+      <span class="s0"># Else type_name references a non-local type, which isn't implemented</span>
+    <span class="s1">field = FieldDescriptor(</span>
+        <span class="s1">field_proto.name</span><span class="s4">, </span><span class="s1">full_name</span><span class="s4">, </span><span class="s1">field_proto.number - </span><span class="s5">1</span><span class="s4">,</span>
+        <span class="s1">field_proto.number</span><span class="s4">, </span><span class="s1">field_proto.type</span><span class="s4">,</span>
+        <span class="s1">FieldDescriptor.ProtoTypeToCppProtoType(field_proto.type)</span><span class="s4">,</span>
+        <span class="s1">field_proto.label</span><span class="s4">, None, </span><span class="s1">nested_desc</span><span class="s4">, </span><span class="s1">enum_desc</span><span class="s4">, None, False, None,</span>
+        <span class="s1">options=_OptionsOrNone(field_proto)</span><span class="s4">, </span><span class="s1">has_default_value=</span><span class="s4">False,</span>
+        <span class="s1">json_name=json_name</span><span class="s4">, </span><span class="s1">create_key=_internal_create_key)</span>
+    <span class="s1">fields.append(field)</span>
+
+  <span class="s1">desc_name = </span><span class="s3">'.'</span><span class="s1">.join(full_message_name)</span>
+  <span class="s4">return </span><span class="s1">Descriptor(desc_proto.name</span><span class="s4">, </span><span class="s1">desc_name</span><span class="s4">, None, None, </span><span class="s1">fields</span><span class="s4">,</span>
+                    <span class="s1">list(nested_types.values())</span><span class="s4">, </span><span class="s1">list(enum_types.values())</span><span class="s4">, </span><span class="s1">[]</span><span class="s4">,</span>
+                    <span class="s1">options=_OptionsOrNone(desc_proto)</span><span class="s4">,</span>
+                    <span class="s1">create_key=_internal_create_key)</span>
+</pre>
+</body>
+</html>

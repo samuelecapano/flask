@@ -1,0 +1,1035 @@
+<html>
+<head>
+<title>backend_tools.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_tools.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Abstract base classes define the primitives for Tools. 
+These tools are used by `matplotlib.backend_managers.ToolManager` 
+ 
+:class:`ToolBase` 
+    Simple stateless tool 
+ 
+:class:`ToolToggleBase` 
+    Tool that has two states, only one Toggle tool can be 
+    active at any given time for the same 
+    `matplotlib.backend_managers.ToolManager` 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">enum</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">time</span>
+<span class="s2">from </span><span class="s1">types </span><span class="s2">import </span><span class="s1">SimpleNamespace</span>
+<span class="s2">import </span><span class="s1">uuid</span>
+<span class="s2">from </span><span class="s1">weakref </span><span class="s2">import </span><span class="s1">WeakKeyDictionary</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib._pylab_helpers </span><span class="s2">import </span><span class="s1">Gcf</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span>
+
+
+<span class="s2">class </span><span class="s1">Cursors(enum.IntEnum):  </span><span class="s3"># Must subclass int for the macOS backend.</span>
+    <span class="s0">&quot;&quot;&quot;Backend-independent cursor types.&quot;&quot;&quot;</span>
+    <span class="s1">POINTER = enum.auto()</span>
+    <span class="s1">HAND = enum.auto()</span>
+    <span class="s1">SELECT_REGION = enum.auto()</span>
+    <span class="s1">MOVE = enum.auto()</span>
+    <span class="s1">WAIT = enum.auto()</span>
+    <span class="s1">RESIZE_HORIZONTAL = enum.auto()</span>
+    <span class="s1">RESIZE_VERTICAL = enum.auto()</span>
+<span class="s1">cursors = Cursors  </span><span class="s3"># Backcompat.</span>
+
+
+<span class="s3"># _tool_registry, _register_tool_class, and _find_tool_class implement a</span>
+<span class="s3"># mechanism through which ToolManager.add_tool can determine whether a subclass</span>
+<span class="s3"># of the requested tool class has been registered (either for the current</span>
+<span class="s3"># canvas class or for a parent class), in which case that tool subclass will be</span>
+<span class="s3"># instantiated instead.  This is the mechanism used e.g. to allow different</span>
+<span class="s3"># GUI backends to implement different specializations for ConfigureSubplots.</span>
+
+
+<span class="s1">_tool_registry = set()</span>
+
+
+<span class="s2">def </span><span class="s1">_register_tool_class(canvas_cls</span><span class="s2">, </span><span class="s1">tool_cls=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Decorator registering *tool_cls* as a tool class for *canvas_cls*.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">tool_cls </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">functools.partial(_register_tool_class</span><span class="s2">, </span><span class="s1">canvas_cls)</span>
+    <span class="s1">_tool_registry.add((canvas_cls</span><span class="s2">, </span><span class="s1">tool_cls))</span>
+    <span class="s2">return </span><span class="s1">tool_cls</span>
+
+
+<span class="s2">def </span><span class="s1">_find_tool_class(canvas_cls</span><span class="s2">, </span><span class="s1">tool_cls):</span>
+    <span class="s0">&quot;&quot;&quot;Find a subclass of *tool_cls* registered for *canvas_cls*.&quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">canvas_parent </span><span class="s2">in </span><span class="s1">canvas_cls.__mro__:</span>
+        <span class="s2">for </span><span class="s1">tool_child </span><span class="s2">in </span><span class="s1">_api.recursive_subclasses(tool_cls):</span>
+            <span class="s2">if </span><span class="s1">(canvas_parent</span><span class="s2">, </span><span class="s1">tool_child) </span><span class="s2">in </span><span class="s1">_tool_registry:</span>
+                <span class="s2">return </span><span class="s1">tool_child</span>
+    <span class="s2">return </span><span class="s1">tool_cls</span>
+
+
+<span class="s3"># Views positions tool</span>
+<span class="s1">_views_positions = </span><span class="s4">'viewpos'</span>
+
+
+<span class="s2">class </span><span class="s1">ToolBase:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Base tool class. 
+ 
+    A base tool, only implements `trigger` method or no method at all. 
+    The tool is instantiated by `matplotlib.backend_managers.ToolManager`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">default_keymap = </span><span class="s2">None</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Keymap to associate with this tool. 
+ 
+    ``list[str]``: List of keys that will trigger this tool when a keypress 
+    event is emitted on ``self.figure.canvas``.  Note that this attribute is 
+    looked up on the instance, and can therefore be a property (this is used 
+    e.g. by the built-in tools to load the rcParams at instantiation time). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s2">None</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Description of the Tool. 
+ 
+    `str`: Tooltip used if the Tool is included in a Toolbar. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">image = </span><span class="s2">None</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Filename of the image. 
+ 
+    `str`: Filename of the image to use in a Toolbar.  If None, the *name* is 
+    used as a label in the toolbar button. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">toolmanager</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s1">self._name = name</span>
+        <span class="s1">self._toolmanager = toolmanager</span>
+        <span class="s1">self._figure = </span><span class="s2">None</span>
+
+    <span class="s1">name = property(</span>
+        <span class="s2">lambda </span><span class="s1">self: self._name</span><span class="s2">,</span>
+        <span class="s1">doc=</span><span class="s4">&quot;The tool id (str, must be unique among tools of a tool manager).&quot;</span><span class="s1">)</span>
+    <span class="s1">toolmanager = property(</span>
+        <span class="s2">lambda </span><span class="s1">self: self._toolmanager</span><span class="s2">,</span>
+        <span class="s1">doc=</span><span class="s4">&quot;The `.ToolManager` that controls this tool.&quot;</span><span class="s1">)</span>
+    <span class="s1">canvas = property(</span>
+        <span class="s2">lambda </span><span class="s1">self: self._figure.canvas </span><span class="s2">if </span><span class="s1">self._figure </span><span class="s2">is not None else None,</span>
+        <span class="s1">doc=</span><span class="s4">&quot;The canvas of the figure affected by this tool, or None.&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">figure(self):</span>
+        <span class="s0">&quot;&quot;&quot;The Figure affected by this tool, or None.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._figure</span>
+
+    <span class="s1">@figure.setter</span>
+    <span class="s2">def </span><span class="s1">figure(self</span><span class="s2">, </span><span class="s1">figure):</span>
+        <span class="s1">self._figure = figure</span>
+
+    <span class="s1">set_figure = figure.fset</span>
+
+    <span class="s2">def </span><span class="s1">_make_classic_style_pseudo_toolbar(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a placeholder object with a single `canvas` attribute. 
+ 
+        This is useful to reuse the implementations of tools already provided 
+        by the classic Toolbars. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">SimpleNamespace(canvas=self.canvas)</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Called when this tool gets used. 
+ 
+        This method is called by `.ToolManager.trigger_tool`. 
+ 
+        Parameters 
+        ---------- 
+        event : `.Event` 
+            The canvas event that caused this tool to be called. 
+        sender : object 
+            Object that requested the tool to be triggered. 
+        data : object 
+            Extra data. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s4">&quot;tool_removed_event&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">destroy(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Destroy the tool. 
+ 
+        This method is called by `.ToolManager.remove_tool`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">ToolToggleBase(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Toggleable tool. 
+ 
+    Every time it is triggered, it switches between enable and disable. 
+ 
+    Parameters 
+    ---------- 
+    ``*args`` 
+        Variable length argument to be used by the Tool. 
+    ``**kwargs`` 
+        `toggled` if present and True, sets the initial state of the Tool 
+        Arbitrary keyword arguments to be consumed by the Tool 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">radio_group = </span><span class="s2">None</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Attribute to group 'radio' like tools (mutually exclusive). 
+ 
+    `str` that identifies the group or **None** if not belonging to a group. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">cursor = </span><span class="s2">None</span>
+    <span class="s4">&quot;&quot;&quot;Cursor to use when the tool is active.&quot;&quot;&quot;</span>
+
+    <span class="s1">default_toggled = </span><span class="s2">False</span>
+    <span class="s4">&quot;&quot;&quot;Default of toggled state.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._toggled = kwargs.pop(</span><span class="s4">'toggled'</span><span class="s2">, </span><span class="s1">self.default_toggled)</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Calls `enable` or `disable` based on `toggled` value.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._toggled:</span>
+            <span class="s1">self.disable(event)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.enable(event)</span>
+        <span class="s1">self._toggled = </span><span class="s2">not </span><span class="s1">self._toggled</span>
+
+    <span class="s2">def </span><span class="s1">enable(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Enable the toggle tool. 
+ 
+        `trigger` calls this method when `toggled` is False. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">disable(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Disable the toggle tool. 
+ 
+        `trigger` call this method when `toggled` is True. 
+ 
+        This can happen in different circumstances. 
+ 
+        * Click on the toolbar tool button. 
+        * Call to `matplotlib.backend_managers.ToolManager.trigger_tool`. 
+        * Another `ToolToggleBase` derived tool is triggered 
+          (from the same `.ToolManager`). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">toggled(self):</span>
+        <span class="s0">&quot;&quot;&quot;State of the toggled tool.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._toggled</span>
+
+    <span class="s2">def </span><span class="s1">set_figure(self</span><span class="s2">, </span><span class="s1">figure):</span>
+        <span class="s1">toggled = self.toggled</span>
+        <span class="s2">if </span><span class="s1">toggled:</span>
+            <span class="s2">if </span><span class="s1">self.figure:</span>
+                <span class="s1">self.trigger(self</span><span class="s2">, None</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s3"># if no figure the internal state is not changed</span>
+                <span class="s3"># we change it here so next call to trigger will change it back</span>
+                <span class="s1">self._toggled = </span><span class="s2">False</span>
+        <span class="s1">super().set_figure(figure)</span>
+        <span class="s2">if </span><span class="s1">toggled:</span>
+            <span class="s2">if </span><span class="s1">figure:</span>
+                <span class="s1">self.trigger(self</span><span class="s2">, None</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s3"># if there is no figure, trigger won't change the internal</span>
+                <span class="s3"># state we change it back</span>
+                <span class="s1">self._toggled = </span><span class="s2">True</span>
+
+
+<span class="s2">class </span><span class="s1">ToolSetCursor(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Change to the current cursor while inaxes. 
+ 
+    This tool, keeps track of all `ToolToggleBase` derived tools, and updates 
+    the cursor when a tool gets triggered. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self._id_drag = </span><span class="s2">None</span>
+        <span class="s1">self._current_tool = </span><span class="s2">None</span>
+        <span class="s1">self._default_cursor = cursors.POINTER</span>
+        <span class="s1">self._last_cursor = self._default_cursor</span>
+        <span class="s1">self.toolmanager.toolmanager_connect(</span><span class="s4">'tool_added_event'</span><span class="s2">,</span>
+                                             <span class="s1">self._add_tool_cbk)</span>
+        <span class="s3"># process current tools</span>
+        <span class="s2">for </span><span class="s1">tool </span><span class="s2">in </span><span class="s1">self.toolmanager.tools.values():</span>
+            <span class="s1">self._add_tool(tool)</span>
+
+    <span class="s2">def </span><span class="s1">set_figure(self</span><span class="s2">, </span><span class="s1">figure):</span>
+        <span class="s2">if </span><span class="s1">self._id_drag:</span>
+            <span class="s1">self.canvas.mpl_disconnect(self._id_drag)</span>
+        <span class="s1">super().set_figure(figure)</span>
+        <span class="s2">if </span><span class="s1">figure:</span>
+            <span class="s1">self._id_drag = self.canvas.mpl_connect(</span>
+                <span class="s4">'motion_notify_event'</span><span class="s2">, </span><span class="s1">self._set_cursor_cbk)</span>
+
+    <span class="s2">def </span><span class="s1">_tool_trigger_cbk(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s2">if </span><span class="s1">event.tool.toggled:</span>
+            <span class="s1">self._current_tool = event.tool</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._current_tool = </span><span class="s2">None</span>
+        <span class="s1">self._set_cursor_cbk(event.canvasevent)</span>
+
+    <span class="s2">def </span><span class="s1">_add_tool(self</span><span class="s2">, </span><span class="s1">tool):</span>
+        <span class="s0">&quot;&quot;&quot;Set the cursor when the tool is triggered.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">getattr(tool</span><span class="s2">, </span><span class="s4">'cursor'</span><span class="s2">, None</span><span class="s1">) </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.toolmanager.toolmanager_connect(</span><span class="s4">'tool_trigger_%s' </span><span class="s1">% tool.name</span><span class="s2">,</span>
+                                                 <span class="s1">self._tool_trigger_cbk)</span>
+
+    <span class="s2">def </span><span class="s1">_add_tool_cbk(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Process every newly added tool.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">event.tool </span><span class="s2">is </span><span class="s1">self:</span>
+            <span class="s2">return</span>
+        <span class="s1">self._add_tool(event.tool)</span>
+
+    <span class="s2">def </span><span class="s1">_set_cursor_cbk(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s2">if not </span><span class="s1">event </span><span class="s2">or not </span><span class="s1">self.canvas:</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">(self._current_tool </span><span class="s2">and </span><span class="s1">getattr(event</span><span class="s2">, </span><span class="s4">&quot;inaxes&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+                <span class="s2">and </span><span class="s1">event.inaxes.get_navigate()):</span>
+            <span class="s2">if </span><span class="s1">self._last_cursor != self._current_tool.cursor:</span>
+                <span class="s1">self.canvas.set_cursor(self._current_tool.cursor)</span>
+                <span class="s1">self._last_cursor = self._current_tool.cursor</span>
+        <span class="s2">elif </span><span class="s1">self._last_cursor != self._default_cursor:</span>
+            <span class="s1">self.canvas.set_cursor(self._default_cursor)</span>
+            <span class="s1">self._last_cursor = self._default_cursor</span>
+
+
+<span class="s2">class </span><span class="s1">ToolCursorPosition(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Send message with the current pointer position. 
+ 
+    This tool runs in the background reporting the position of the cursor. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._id_drag = </span><span class="s2">None</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">set_figure(self</span><span class="s2">, </span><span class="s1">figure):</span>
+        <span class="s2">if </span><span class="s1">self._id_drag:</span>
+            <span class="s1">self.canvas.mpl_disconnect(self._id_drag)</span>
+        <span class="s1">super().set_figure(figure)</span>
+        <span class="s2">if </span><span class="s1">figure:</span>
+            <span class="s1">self._id_drag = self.canvas.mpl_connect(</span>
+                <span class="s4">'motion_notify_event'</span><span class="s2">, </span><span class="s1">self.send_message)</span>
+
+    <span class="s2">def </span><span class="s1">send_message(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Call `matplotlib.backend_managers.ToolManager.message_event`.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.toolmanager.messagelock.locked():</span>
+            <span class="s2">return</span>
+
+        <span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">NavigationToolbar2</span>
+        <span class="s1">message = NavigationToolbar2._mouse_event_to_message(event)</span>
+        <span class="s1">self.toolmanager.message_event(message</span><span class="s2">, </span><span class="s1">self)</span>
+
+
+<span class="s2">class </span><span class="s1">RubberbandBase(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Draw and remove a rubberband.&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Call `draw_rubberband` or `remove_rubberband` based on data.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">self.figure.canvas.widgetlock.available(sender):</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">data </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.draw_rubberband(*data)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.remove_rubberband()</span>
+
+    <span class="s2">def </span><span class="s1">draw_rubberband(self</span><span class="s2">, </span><span class="s1">*data):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Draw rubberband. 
+ 
+        This method must get implemented per backend. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s2">def </span><span class="s1">remove_rubberband(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Remove rubberband. 
+ 
+        This method should get implemented per backend. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">ToolQuit(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to call the figure manager destroy method.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Quit the figure'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.quit'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">Gcf.destroy_fig(self.figure)</span>
+
+
+<span class="s2">class </span><span class="s1">ToolQuitAll(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to call the figure manager destroy method.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Quit all figures'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.quit_all'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">Gcf.destroy_all()</span>
+
+
+<span class="s2">class </span><span class="s1">ToolGrid(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to toggle the major grids of the figure.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Toggle major grids'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.grid'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">sentinel = str(uuid.uuid4())</span>
+        <span class="s3"># Trigger grid switching by temporarily setting :rc:`keymap.grid`</span>
+        <span class="s3"># to a unique key and sending an appropriate event.</span>
+        <span class="s2">with </span><span class="s1">cbook._setattr_cm(event</span><span class="s2">, </span><span class="s1">key=sentinel)</span><span class="s2">, </span><span class="s1">\</span>
+             <span class="s1">mpl.rc_context({</span><span class="s4">'keymap.grid'</span><span class="s1">: sentinel}):</span>
+            <span class="s1">mpl.backend_bases.key_press_handler(event</span><span class="s2">, </span><span class="s1">self.figure.canvas)</span>
+
+
+<span class="s2">class </span><span class="s1">ToolMinorGrid(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to toggle the major and minor grids of the figure.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Toggle major and minor grids'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.grid_minor'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">sentinel = str(uuid.uuid4())</span>
+        <span class="s3"># Trigger grid switching by temporarily setting :rc:`keymap.grid_minor`</span>
+        <span class="s3"># to a unique key and sending an appropriate event.</span>
+        <span class="s2">with </span><span class="s1">cbook._setattr_cm(event</span><span class="s2">, </span><span class="s1">key=sentinel)</span><span class="s2">, </span><span class="s1">\</span>
+             <span class="s1">mpl.rc_context({</span><span class="s4">'keymap.grid_minor'</span><span class="s1">: sentinel}):</span>
+            <span class="s1">mpl.backend_bases.key_press_handler(event</span><span class="s2">, </span><span class="s1">self.figure.canvas)</span>
+
+
+<span class="s2">class </span><span class="s1">ToolFullScreen(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to toggle full screen.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Toggle fullscreen mode'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.fullscreen'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.figure.canvas.manager.full_screen_toggle()</span>
+
+
+<span class="s2">class </span><span class="s1">AxisScaleBase(ToolToggleBase):</span>
+    <span class="s0">&quot;&quot;&quot;Base Tool to toggle between linear and logarithmic.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">event.inaxes </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+        <span class="s1">super().trigger(sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data)</span>
+
+    <span class="s2">def </span><span class="s1">enable(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.set_scale(event.inaxes</span><span class="s2">, </span><span class="s4">'log'</span><span class="s1">)</span>
+        <span class="s1">self.figure.canvas.draw_idle()</span>
+
+    <span class="s2">def </span><span class="s1">disable(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.set_scale(event.inaxes</span><span class="s2">, </span><span class="s4">'linear'</span><span class="s1">)</span>
+        <span class="s1">self.figure.canvas.draw_idle()</span>
+
+
+<span class="s2">class </span><span class="s1">ToolYScale(AxisScaleBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to toggle between linear and logarithmic scales on the Y axis.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Toggle scale Y axis'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.yscale'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">set_scale(self</span><span class="s2">, </span><span class="s1">ax</span><span class="s2">, </span><span class="s1">scale):</span>
+        <span class="s1">ax.set_yscale(scale)</span>
+
+
+<span class="s2">class </span><span class="s1">ToolXScale(AxisScaleBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to toggle between linear and logarithmic scales on the X axis.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Toggle scale X axis'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.xscale'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">set_scale(self</span><span class="s2">, </span><span class="s1">ax</span><span class="s2">, </span><span class="s1">scale):</span>
+        <span class="s1">ax.set_xscale(scale)</span>
+
+
+<span class="s2">class </span><span class="s1">ToolViewsPositions(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Auxiliary Tool to handle changes in views and positions. 
+ 
+    Runs in the background and should get used by all the tools that 
+    need to access the figure's history of views and positions, e.g. 
+ 
+    * `ToolZoom` 
+    * `ToolPan` 
+    * `ToolHome` 
+    * `ToolBack` 
+    * `ToolForward` 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.views = WeakKeyDictionary()</span>
+        <span class="s1">self.positions = WeakKeyDictionary()</span>
+        <span class="s1">self.home_views = WeakKeyDictionary()</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">add_figure(self</span><span class="s2">, </span><span class="s1">figure):</span>
+        <span class="s0">&quot;&quot;&quot;Add the current figure to the stack of views and positions.&quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">figure </span><span class="s2">not in </span><span class="s1">self.views:</span>
+            <span class="s1">self.views[figure] = cbook.Stack()</span>
+            <span class="s1">self.positions[figure] = cbook.Stack()</span>
+            <span class="s1">self.home_views[figure] = WeakKeyDictionary()</span>
+            <span class="s3"># Define Home</span>
+            <span class="s1">self.push_current(figure)</span>
+            <span class="s3"># Make sure we add a home view for new axes as they're added</span>
+            <span class="s1">figure.add_axobserver(</span><span class="s2">lambda </span><span class="s1">fig: self.update_home_views(fig))</span>
+
+    <span class="s2">def </span><span class="s1">clear(self</span><span class="s2">, </span><span class="s1">figure):</span>
+        <span class="s0">&quot;&quot;&quot;Reset the axes stack.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">figure </span><span class="s2">in </span><span class="s1">self.views:</span>
+            <span class="s1">self.views[figure].clear()</span>
+            <span class="s1">self.positions[figure].clear()</span>
+            <span class="s1">self.home_views[figure].clear()</span>
+            <span class="s1">self.update_home_views()</span>
+
+    <span class="s2">def </span><span class="s1">update_view(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Update the view limits and position for each axes from the current 
+        stack position. If any axes are present in the figure that aren't in 
+        the current stack position, use the home view limits for those axes and 
+        don't update *any* positions. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">views = self.views[self.figure]()</span>
+        <span class="s2">if </span><span class="s1">views </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+        <span class="s1">pos = self.positions[self.figure]()</span>
+        <span class="s2">if </span><span class="s1">pos </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+        <span class="s1">home_views = self.home_views[self.figure]</span>
+        <span class="s1">all_axes = self.figure.get_axes()</span>
+        <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">all_axes:</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">in </span><span class="s1">views:</span>
+                <span class="s1">cur_view = views[a]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">cur_view = home_views[a]</span>
+            <span class="s1">a._set_view(cur_view)</span>
+
+        <span class="s2">if </span><span class="s1">set(all_axes).issubset(pos):</span>
+            <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">all_axes:</span>
+                <span class="s3"># Restore both the original and modified positions</span>
+                <span class="s1">a._set_position(pos[a][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s4">'original'</span><span class="s1">)</span>
+                <span class="s1">a._set_position(pos[a][</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s4">'active'</span><span class="s1">)</span>
+
+        <span class="s1">self.figure.canvas.draw_idle()</span>
+
+    <span class="s2">def </span><span class="s1">push_current(self</span><span class="s2">, </span><span class="s1">figure=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Push the current view limits and position onto their respective stacks. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">figure:</span>
+            <span class="s1">figure = self.figure</span>
+        <span class="s1">views = WeakKeyDictionary()</span>
+        <span class="s1">pos = WeakKeyDictionary()</span>
+        <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">figure.get_axes():</span>
+            <span class="s1">views[a] = a._get_view()</span>
+            <span class="s1">pos[a] = self._axes_pos(a)</span>
+        <span class="s1">self.views[figure].push(views)</span>
+        <span class="s1">self.positions[figure].push(pos)</span>
+
+    <span class="s2">def </span><span class="s1">_axes_pos(self</span><span class="s2">, </span><span class="s1">ax):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the original and modified positions for the specified axes. 
+ 
+        Parameters 
+        ---------- 
+        ax : matplotlib.axes.Axes 
+            The `.Axes` to get the positions for. 
+ 
+        Returns 
+        ------- 
+        original_position, modified_position 
+            A tuple of the original and modified positions. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">(ax.get_position(</span><span class="s2">True</span><span class="s1">).frozen()</span><span class="s2">,</span>
+                <span class="s1">ax.get_position().frozen())</span>
+
+    <span class="s2">def </span><span class="s1">update_home_views(self</span><span class="s2">, </span><span class="s1">figure=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Make sure that ``self.home_views`` has an entry for all axes present 
+        in the figure. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if not </span><span class="s1">figure:</span>
+            <span class="s1">figure = self.figure</span>
+        <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">figure.get_axes():</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">not in </span><span class="s1">self.home_views[figure]:</span>
+                <span class="s1">self.home_views[figure][a] = a._get_view()</span>
+
+    <span class="s2">def </span><span class="s1">home(self):</span>
+        <span class="s0">&quot;&quot;&quot;Recall the first view and position from the stack.&quot;&quot;&quot;</span>
+        <span class="s1">self.views[self.figure].home()</span>
+        <span class="s1">self.positions[self.figure].home()</span>
+
+    <span class="s2">def </span><span class="s1">back(self):</span>
+        <span class="s0">&quot;&quot;&quot;Back one step in the stack of views and positions.&quot;&quot;&quot;</span>
+        <span class="s1">self.views[self.figure].back()</span>
+        <span class="s1">self.positions[self.figure].back()</span>
+
+    <span class="s2">def </span><span class="s1">forward(self):</span>
+        <span class="s0">&quot;&quot;&quot;Forward one step in the stack of views and positions.&quot;&quot;&quot;</span>
+        <span class="s1">self.views[self.figure].forward()</span>
+        <span class="s1">self.positions[self.figure].forward()</span>
+
+
+<span class="s2">class </span><span class="s1">ViewsPositionsBase(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for `ToolHome`, `ToolBack` and `ToolForward`.&quot;&quot;&quot;</span>
+
+    <span class="s1">_on_trigger = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.toolmanager.get_tool(_views_positions).add_figure(self.figure)</span>
+        <span class="s1">getattr(self.toolmanager.get_tool(_views_positions)</span><span class="s2">,</span>
+                <span class="s1">self._on_trigger)()</span>
+        <span class="s1">self.toolmanager.get_tool(_views_positions).update_view()</span>
+
+
+<span class="s2">class </span><span class="s1">ToolHome(ViewsPositionsBase):</span>
+    <span class="s0">&quot;&quot;&quot;Restore the original view limits.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Reset original view'</span>
+    <span class="s1">image = </span><span class="s4">'home'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.home'</span><span class="s1">])</span>
+    <span class="s1">_on_trigger = </span><span class="s4">'home'</span>
+
+
+<span class="s2">class </span><span class="s1">ToolBack(ViewsPositionsBase):</span>
+    <span class="s0">&quot;&quot;&quot;Move back up the view limits stack.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Back to previous view'</span>
+    <span class="s1">image = </span><span class="s4">'back'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.back'</span><span class="s1">])</span>
+    <span class="s1">_on_trigger = </span><span class="s4">'back'</span>
+
+
+<span class="s2">class </span><span class="s1">ToolForward(ViewsPositionsBase):</span>
+    <span class="s0">&quot;&quot;&quot;Move forward in the view lim stack.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Forward to next view'</span>
+    <span class="s1">image = </span><span class="s4">'forward'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.forward'</span><span class="s1">])</span>
+    <span class="s1">_on_trigger = </span><span class="s4">'forward'</span>
+
+
+<span class="s2">class </span><span class="s1">ConfigureSubplotsBase(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Base tool for the configuration of subplots.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Configure subplots'</span>
+    <span class="s1">image = </span><span class="s4">'subplots'</span>
+
+
+<span class="s2">class </span><span class="s1">SaveFigureBase(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Base tool for figure saving.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Save the figure'</span>
+    <span class="s1">image = </span><span class="s4">'filesave'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.save'</span><span class="s1">])</span>
+
+
+<span class="s2">class </span><span class="s1">ZoomPanBase(ToolToggleBase):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for `ToolZoom` and `ToolPan`.&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().__init__(*args)</span>
+        <span class="s1">self._button_pressed = </span><span class="s2">None</span>
+        <span class="s1">self._xypress = </span><span class="s2">None</span>
+        <span class="s1">self._idPress = </span><span class="s2">None</span>
+        <span class="s1">self._idRelease = </span><span class="s2">None</span>
+        <span class="s1">self._idScroll = </span><span class="s2">None</span>
+        <span class="s1">self.base_scale = </span><span class="s5">2.</span>
+        <span class="s1">self.scrollthresh = </span><span class="s5">.5  </span><span class="s3"># .5 second scroll threshold</span>
+        <span class="s1">self.lastscroll = time.time()-self.scrollthresh</span>
+
+    <span class="s2">def </span><span class="s1">enable(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Connect press/release events and lock the canvas.&quot;&quot;&quot;</span>
+        <span class="s1">self.figure.canvas.widgetlock(self)</span>
+        <span class="s1">self._idPress = self.figure.canvas.mpl_connect(</span>
+            <span class="s4">'button_press_event'</span><span class="s2">, </span><span class="s1">self._press)</span>
+        <span class="s1">self._idRelease = self.figure.canvas.mpl_connect(</span>
+            <span class="s4">'button_release_event'</span><span class="s2">, </span><span class="s1">self._release)</span>
+        <span class="s1">self._idScroll = self.figure.canvas.mpl_connect(</span>
+            <span class="s4">'scroll_event'</span><span class="s2">, </span><span class="s1">self.scroll_zoom)</span>
+
+    <span class="s2">def </span><span class="s1">disable(self</span><span class="s2">, </span><span class="s1">event=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Release the canvas and disconnect press/release events.&quot;&quot;&quot;</span>
+        <span class="s1">self._cancel_action()</span>
+        <span class="s1">self.figure.canvas.widgetlock.release(self)</span>
+        <span class="s1">self.figure.canvas.mpl_disconnect(self._idPress)</span>
+        <span class="s1">self.figure.canvas.mpl_disconnect(self._idRelease)</span>
+        <span class="s1">self.figure.canvas.mpl_disconnect(self._idScroll)</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.toolmanager.get_tool(_views_positions).add_figure(self.figure)</span>
+        <span class="s1">super().trigger(sender</span><span class="s2">, </span><span class="s1">event</span><span class="s2">, </span><span class="s1">data)</span>
+        <span class="s1">new_navigate_mode = self.name.upper() </span><span class="s2">if </span><span class="s1">self.toggled </span><span class="s2">else None</span>
+        <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">self.figure.axes:</span>
+            <span class="s1">ax.set_navigate_mode(new_navigate_mode)</span>
+
+    <span class="s2">def </span><span class="s1">scroll_zoom(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s3"># https://gist.github.com/tacaswell/3144287</span>
+        <span class="s2">if </span><span class="s1">event.inaxes </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">if </span><span class="s1">event.button == </span><span class="s4">'up'</span><span class="s1">:</span>
+            <span class="s3"># deal with zoom in</span>
+            <span class="s1">scl = self.base_scale</span>
+        <span class="s2">elif </span><span class="s1">event.button == </span><span class="s4">'down'</span><span class="s1">:</span>
+            <span class="s3"># deal with zoom out</span>
+            <span class="s1">scl = </span><span class="s5">1</span><span class="s1">/self.base_scale</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s3"># deal with something that should never happen</span>
+            <span class="s1">scl = </span><span class="s5">1</span>
+
+        <span class="s1">ax = event.inaxes</span>
+        <span class="s1">ax._set_view_from_bbox([event.x</span><span class="s2">, </span><span class="s1">event.y</span><span class="s2">, </span><span class="s1">scl])</span>
+
+        <span class="s3"># If last scroll was done within the timing threshold, delete the</span>
+        <span class="s3"># previous view</span>
+        <span class="s2">if </span><span class="s1">(time.time()-self.lastscroll) &lt; self.scrollthresh:</span>
+            <span class="s1">self.toolmanager.get_tool(_views_positions).back()</span>
+
+        <span class="s1">self.figure.canvas.draw_idle()  </span><span class="s3"># force re-draw</span>
+
+        <span class="s1">self.lastscroll = time.time()</span>
+        <span class="s1">self.toolmanager.get_tool(_views_positions).push_current()</span>
+
+
+<span class="s2">class </span><span class="s1">ToolZoom(ZoomPanBase):</span>
+    <span class="s0">&quot;&quot;&quot;A Tool for zooming using a rectangle selector.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Zoom to rectangle'</span>
+    <span class="s1">image = </span><span class="s4">'zoom_to_rect'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.zoom'</span><span class="s1">])</span>
+    <span class="s1">cursor = cursors.SELECT_REGION</span>
+    <span class="s1">radio_group = </span><span class="s4">'default'</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().__init__(*args)</span>
+        <span class="s1">self._ids_zoom = []</span>
+
+    <span class="s2">def </span><span class="s1">_cancel_action(self):</span>
+        <span class="s2">for </span><span class="s1">zoom_id </span><span class="s2">in </span><span class="s1">self._ids_zoom:</span>
+            <span class="s1">self.figure.canvas.mpl_disconnect(zoom_id)</span>
+        <span class="s1">self.toolmanager.trigger_tool(</span><span class="s4">'rubberband'</span><span class="s2">, </span><span class="s1">self)</span>
+        <span class="s1">self.figure.canvas.draw_idle()</span>
+        <span class="s1">self._xypress = </span><span class="s2">None</span>
+        <span class="s1">self._button_pressed = </span><span class="s2">None</span>
+        <span class="s1">self._ids_zoom = []</span>
+        <span class="s2">return</span>
+
+    <span class="s2">def </span><span class="s1">_press(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Callback for mouse button presses in zoom-to-rectangle mode.&quot;&quot;&quot;</span>
+
+        <span class="s3"># If we're already in the middle of a zoom, pressing another</span>
+        <span class="s3"># button works to &quot;cancel&quot;</span>
+        <span class="s2">if </span><span class="s1">self._ids_zoom:</span>
+            <span class="s1">self._cancel_action()</span>
+
+        <span class="s2">if </span><span class="s1">event.button == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self._button_pressed = </span><span class="s5">1</span>
+        <span class="s2">elif </span><span class="s1">event.button == </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s1">self._button_pressed = </span><span class="s5">3</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._cancel_action()</span>
+            <span class="s2">return</span>
+
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y = event.x</span><span class="s2">, </span><span class="s1">event.y</span>
+
+        <span class="s1">self._xypress = []</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">a </span><span class="s2">in </span><span class="s1">enumerate(self.figure.get_axes()):</span>
+            <span class="s2">if </span><span class="s1">(x </span><span class="s2">is not None and </span><span class="s1">y </span><span class="s2">is not None and </span><span class="s1">a.in_axes(event) </span><span class="s2">and</span>
+                    <span class="s1">a.get_navigate() </span><span class="s2">and </span><span class="s1">a.can_zoom()):</span>
+                <span class="s1">self._xypress.append((x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">a._get_view()))</span>
+
+        <span class="s1">id1 = self.figure.canvas.mpl_connect(</span>
+            <span class="s4">'motion_notify_event'</span><span class="s2">, </span><span class="s1">self._mouse_move)</span>
+        <span class="s1">id2 = self.figure.canvas.mpl_connect(</span>
+            <span class="s4">'key_press_event'</span><span class="s2">, </span><span class="s1">self._switch_on_zoom_mode)</span>
+        <span class="s1">id3 = self.figure.canvas.mpl_connect(</span>
+            <span class="s4">'key_release_event'</span><span class="s2">, </span><span class="s1">self._switch_off_zoom_mode)</span>
+
+        <span class="s1">self._ids_zoom = id1</span><span class="s2">, </span><span class="s1">id2</span><span class="s2">, </span><span class="s1">id3</span>
+        <span class="s1">self._zoom_mode = event.key</span>
+
+    <span class="s2">def </span><span class="s1">_switch_on_zoom_mode(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s1">self._zoom_mode = event.key</span>
+        <span class="s1">self._mouse_move(event)</span>
+
+    <span class="s2">def </span><span class="s1">_switch_off_zoom_mode(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s1">self._zoom_mode = </span><span class="s2">None</span>
+        <span class="s1">self._mouse_move(event)</span>
+
+    <span class="s2">def </span><span class="s1">_mouse_move(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Callback for mouse moves in zoom-to-rectangle mode.&quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">self._xypress:</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = event.x</span><span class="s2">, </span><span class="s1">event.y</span>
+            <span class="s1">lastx</span><span class="s2">, </span><span class="s1">lasty</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">view = self._xypress[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">(x1</span><span class="s2">, </span><span class="s1">y1)</span><span class="s2">, </span><span class="s1">(x2</span><span class="s2">, </span><span class="s1">y2) = np.clip(</span>
+                <span class="s1">[[lastx</span><span class="s2">, </span><span class="s1">lasty]</span><span class="s2">, </span><span class="s1">[x</span><span class="s2">, </span><span class="s1">y]]</span><span class="s2">, </span><span class="s1">a.bbox.min</span><span class="s2">, </span><span class="s1">a.bbox.max)</span>
+            <span class="s2">if </span><span class="s1">self._zoom_mode == </span><span class="s4">&quot;x&quot;</span><span class="s1">:</span>
+                <span class="s1">y1</span><span class="s2">, </span><span class="s1">y2 = a.bbox.intervaly</span>
+            <span class="s2">elif </span><span class="s1">self._zoom_mode == </span><span class="s4">&quot;y&quot;</span><span class="s1">:</span>
+                <span class="s1">x1</span><span class="s2">, </span><span class="s1">x2 = a.bbox.intervalx</span>
+            <span class="s1">self.toolmanager.trigger_tool(</span>
+                <span class="s4">'rubberband'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">data=(x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2))</span>
+
+    <span class="s2">def </span><span class="s1">_release(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0">&quot;&quot;&quot;Callback for mouse button releases in zoom-to-rectangle mode.&quot;&quot;&quot;</span>
+
+        <span class="s2">for </span><span class="s1">zoom_id </span><span class="s2">in </span><span class="s1">self._ids_zoom:</span>
+            <span class="s1">self.figure.canvas.mpl_disconnect(zoom_id)</span>
+        <span class="s1">self._ids_zoom = []</span>
+
+        <span class="s2">if not </span><span class="s1">self._xypress:</span>
+            <span class="s1">self._cancel_action()</span>
+            <span class="s2">return</span>
+
+        <span class="s1">done_ax = []</span>
+
+        <span class="s2">for </span><span class="s1">cur_xypress </span><span class="s2">in </span><span class="s1">self._xypress:</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = event.x</span><span class="s2">, </span><span class="s1">event.y</span>
+            <span class="s1">lastx</span><span class="s2">, </span><span class="s1">lasty</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">_ind</span><span class="s2">, </span><span class="s1">view = cur_xypress</span>
+            <span class="s3"># ignore singular clicks - 5 pixels is a threshold</span>
+            <span class="s2">if </span><span class="s1">abs(x - lastx) &lt; </span><span class="s5">5 </span><span class="s2">or </span><span class="s1">abs(y - lasty) &lt; </span><span class="s5">5</span><span class="s1">:</span>
+                <span class="s1">self._cancel_action()</span>
+                <span class="s2">return</span>
+
+            <span class="s3"># detect twinx, twiny axes and avoid double zooming</span>
+            <span class="s1">twinx = any(a.get_shared_x_axes().joined(a</span><span class="s2">, </span><span class="s1">a1) </span><span class="s2">for </span><span class="s1">a1 </span><span class="s2">in </span><span class="s1">done_ax)</span>
+            <span class="s1">twiny = any(a.get_shared_y_axes().joined(a</span><span class="s2">, </span><span class="s1">a1) </span><span class="s2">for </span><span class="s1">a1 </span><span class="s2">in </span><span class="s1">done_ax)</span>
+            <span class="s1">done_ax.append(a)</span>
+
+            <span class="s2">if </span><span class="s1">self._button_pressed == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">direction = </span><span class="s4">'in'</span>
+            <span class="s2">elif </span><span class="s1">self._button_pressed == </span><span class="s5">3</span><span class="s1">:</span>
+                <span class="s1">direction = </span><span class="s4">'out'</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">continue</span>
+
+            <span class="s1">a._set_view_from_bbox((lastx</span><span class="s2">, </span><span class="s1">lasty</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">, </span><span class="s1">direction</span><span class="s2">,</span>
+                                  <span class="s1">self._zoom_mode</span><span class="s2">, </span><span class="s1">twinx</span><span class="s2">, </span><span class="s1">twiny)</span>
+
+        <span class="s1">self._zoom_mode = </span><span class="s2">None</span>
+        <span class="s1">self.toolmanager.get_tool(_views_positions).push_current()</span>
+        <span class="s1">self._cancel_action()</span>
+
+
+<span class="s2">class </span><span class="s1">ToolPan(ZoomPanBase):</span>
+    <span class="s0">&quot;&quot;&quot;Pan axes with left mouse, zoom with right.&quot;&quot;&quot;</span>
+
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.pan'</span><span class="s1">])</span>
+    <span class="s1">description = </span><span class="s4">'Pan axes with left mouse, zoom with right'</span>
+    <span class="s1">image = </span><span class="s4">'move'</span>
+    <span class="s1">cursor = cursors.MOVE</span>
+    <span class="s1">radio_group = </span><span class="s4">'default'</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s1">super().__init__(*args)</span>
+        <span class="s1">self._id_drag = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_cancel_action(self):</span>
+        <span class="s1">self._button_pressed = </span><span class="s2">None</span>
+        <span class="s1">self._xypress = []</span>
+        <span class="s1">self.figure.canvas.mpl_disconnect(self._id_drag)</span>
+        <span class="s1">self.toolmanager.messagelock.release(self)</span>
+        <span class="s1">self.figure.canvas.draw_idle()</span>
+
+    <span class="s2">def </span><span class="s1">_press(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s2">if </span><span class="s1">event.button == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self._button_pressed = </span><span class="s5">1</span>
+        <span class="s2">elif </span><span class="s1">event.button == </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s1">self._button_pressed = </span><span class="s5">3</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._cancel_action()</span>
+            <span class="s2">return</span>
+
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y = event.x</span><span class="s2">, </span><span class="s1">event.y</span>
+
+        <span class="s1">self._xypress = []</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">a </span><span class="s2">in </span><span class="s1">enumerate(self.figure.get_axes()):</span>
+            <span class="s2">if </span><span class="s1">(x </span><span class="s2">is not None and </span><span class="s1">y </span><span class="s2">is not None and </span><span class="s1">a.in_axes(event) </span><span class="s2">and</span>
+                    <span class="s1">a.get_navigate() </span><span class="s2">and </span><span class="s1">a.can_pan()):</span>
+                <span class="s1">a.start_pan(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">event.button)</span>
+                <span class="s1">self._xypress.append((a</span><span class="s2">, </span><span class="s1">i))</span>
+                <span class="s1">self.toolmanager.messagelock(self)</span>
+                <span class="s1">self._id_drag = self.figure.canvas.mpl_connect(</span>
+                    <span class="s4">'motion_notify_event'</span><span class="s2">, </span><span class="s1">self._mouse_move)</span>
+
+    <span class="s2">def </span><span class="s1">_release(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s2">if </span><span class="s1">self._button_pressed </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._cancel_action()</span>
+            <span class="s2">return</span>
+
+        <span class="s1">self.figure.canvas.mpl_disconnect(self._id_drag)</span>
+        <span class="s1">self.toolmanager.messagelock.release(self)</span>
+
+        <span class="s2">for </span><span class="s1">a</span><span class="s2">, </span><span class="s1">_ind </span><span class="s2">in </span><span class="s1">self._xypress:</span>
+            <span class="s1">a.end_pan()</span>
+        <span class="s2">if not </span><span class="s1">self._xypress:</span>
+            <span class="s1">self._cancel_action()</span>
+            <span class="s2">return</span>
+
+        <span class="s1">self.toolmanager.get_tool(_views_positions).push_current()</span>
+        <span class="s1">self._cancel_action()</span>
+
+    <span class="s2">def </span><span class="s1">_mouse_move(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s2">for </span><span class="s1">a</span><span class="s2">, </span><span class="s1">_ind </span><span class="s2">in </span><span class="s1">self._xypress:</span>
+            <span class="s3"># safer to use the recorded button at the _press than current</span>
+            <span class="s3"># button: # multiple button can get pressed during motion...</span>
+            <span class="s1">a.drag_pan(self._button_pressed</span><span class="s2">, </span><span class="s1">event.key</span><span class="s2">, </span><span class="s1">event.x</span><span class="s2">, </span><span class="s1">event.y)</span>
+        <span class="s1">self.toolmanager.canvas.draw_idle()</span>
+
+
+<span class="s2">class </span><span class="s1">ToolHelpBase(ToolBase):</span>
+    <span class="s1">description = </span><span class="s4">'Print tool list, shortcuts and description'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.help'</span><span class="s1">])</span>
+    <span class="s1">image = </span><span class="s4">'help'</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">format_shortcut(key_sequence):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Convert a shortcut string from the notation used in rc config to the 
+        standard notation for displaying shortcuts, e.g. 'ctrl+a' -&gt; 'Ctrl+A'. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">(key_sequence </span><span class="s2">if </span><span class="s1">len(key_sequence) == </span><span class="s5">1 </span><span class="s2">else</span>
+                <span class="s1">re.sub(</span><span class="s4">r&quot;\+[A-Z]&quot;</span><span class="s2">, </span><span class="s4">r&quot;+Shift\g&lt;0&gt;&quot;</span><span class="s2">, </span><span class="s1">key_sequence).title())</span>
+
+    <span class="s2">def </span><span class="s1">_format_tool_keymap(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s1">keymaps = self.toolmanager.get_tool_keymap(name)</span>
+        <span class="s2">return </span><span class="s4">&quot;, &quot;</span><span class="s1">.join(self.format_shortcut(keymap) </span><span class="s2">for </span><span class="s1">keymap </span><span class="s2">in </span><span class="s1">keymaps)</span>
+
+    <span class="s2">def </span><span class="s1">_get_help_entries(self):</span>
+        <span class="s2">return </span><span class="s1">[(name</span><span class="s2">, </span><span class="s1">self._format_tool_keymap(name)</span><span class="s2">, </span><span class="s1">tool.description)</span>
+                <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">tool </span><span class="s2">in </span><span class="s1">sorted(self.toolmanager.tools.items())</span>
+                <span class="s2">if </span><span class="s1">tool.description]</span>
+
+    <span class="s2">def </span><span class="s1">_get_help_text(self):</span>
+        <span class="s1">entries = self._get_help_entries()</span>
+        <span class="s1">entries = [</span><span class="s4">&quot;{}: {}</span><span class="s2">\n\t</span><span class="s4">{}&quot;</span><span class="s1">.format(*entry) </span><span class="s2">for </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">entries]</span>
+        <span class="s2">return </span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">.join(entries)</span>
+
+    <span class="s2">def </span><span class="s1">_get_help_html(self):</span>
+        <span class="s1">fmt = </span><span class="s4">&quot;&lt;tr&gt;&lt;td&gt;{}&lt;/td&gt;&lt;td&gt;{}&lt;/td&gt;&lt;td&gt;{}&lt;/td&gt;&lt;/tr&gt;&quot;</span>
+        <span class="s1">rows = [fmt.format(</span>
+            <span class="s4">&quot;&lt;b&gt;Action&lt;/b&gt;&quot;</span><span class="s2">, </span><span class="s4">&quot;&lt;b&gt;Shortcuts&lt;/b&gt;&quot;</span><span class="s2">, </span><span class="s4">&quot;&lt;b&gt;Description&lt;/b&gt;&quot;</span><span class="s1">)]</span>
+        <span class="s1">rows += [fmt.format(*row) </span><span class="s2">for </span><span class="s1">row </span><span class="s2">in </span><span class="s1">self._get_help_entries()]</span>
+        <span class="s2">return </span><span class="s1">(</span><span class="s4">&quot;&lt;style&gt;td {padding: 0px 4px}&lt;/style&gt;&quot;</span>
+                <span class="s4">&quot;&lt;table&gt;&lt;thead&gt;&quot; </span><span class="s1">+ rows[</span><span class="s5">0</span><span class="s1">] + </span><span class="s4">&quot;&lt;/thead&gt;&quot;</span>
+                <span class="s4">&quot;&lt;tbody&gt;&quot;</span><span class="s1">.join(rows[</span><span class="s5">1</span><span class="s1">:]) + </span><span class="s4">&quot;&lt;/tbody&gt;&lt;/table&gt;&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">ToolCopyToClipboardBase(ToolBase):</span>
+    <span class="s0">&quot;&quot;&quot;Tool to copy the figure to the clipboard.&quot;&quot;&quot;</span>
+
+    <span class="s1">description = </span><span class="s4">'Copy the canvas figure to clipboard'</span>
+    <span class="s1">default_keymap = property(</span><span class="s2">lambda </span><span class="s1">self: mpl.rcParams[</span><span class="s4">'keymap.copy'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">trigger(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">message = </span><span class="s4">&quot;Copy tool is not available&quot;</span>
+        <span class="s1">self.toolmanager.message_event(message</span><span class="s2">, </span><span class="s1">self)</span>
+
+
+<span class="s1">default_tools = {</span><span class="s4">'home'</span><span class="s1">: ToolHome</span><span class="s2">, </span><span class="s4">'back'</span><span class="s1">: ToolBack</span><span class="s2">, </span><span class="s4">'forward'</span><span class="s1">: ToolForward</span><span class="s2">,</span>
+                 <span class="s4">'zoom'</span><span class="s1">: ToolZoom</span><span class="s2">, </span><span class="s4">'pan'</span><span class="s1">: ToolPan</span><span class="s2">,</span>
+                 <span class="s4">'subplots'</span><span class="s1">: ConfigureSubplotsBase</span><span class="s2">,</span>
+                 <span class="s4">'save'</span><span class="s1">: SaveFigureBase</span><span class="s2">,</span>
+                 <span class="s4">'grid'</span><span class="s1">: ToolGrid</span><span class="s2">,</span>
+                 <span class="s4">'grid_minor'</span><span class="s1">: ToolMinorGrid</span><span class="s2">,</span>
+                 <span class="s4">'fullscreen'</span><span class="s1">: ToolFullScreen</span><span class="s2">,</span>
+                 <span class="s4">'quit'</span><span class="s1">: ToolQuit</span><span class="s2">,</span>
+                 <span class="s4">'quit_all'</span><span class="s1">: ToolQuitAll</span><span class="s2">,</span>
+                 <span class="s4">'xscale'</span><span class="s1">: ToolXScale</span><span class="s2">,</span>
+                 <span class="s4">'yscale'</span><span class="s1">: ToolYScale</span><span class="s2">,</span>
+                 <span class="s4">'position'</span><span class="s1">: ToolCursorPosition</span><span class="s2">,</span>
+                 <span class="s1">_views_positions: ToolViewsPositions</span><span class="s2">,</span>
+                 <span class="s4">'cursor'</span><span class="s1">: ToolSetCursor</span><span class="s2">,</span>
+                 <span class="s4">'rubberband'</span><span class="s1">: RubberbandBase</span><span class="s2">,</span>
+                 <span class="s4">'help'</span><span class="s1">: ToolHelpBase</span><span class="s2">,</span>
+                 <span class="s4">'copy'</span><span class="s1">: ToolCopyToClipboardBase</span><span class="s2">,</span>
+                 <span class="s1">}</span>
+
+<span class="s1">default_toolbar_tools = [[</span><span class="s4">'navigation'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'home'</span><span class="s2">, </span><span class="s4">'back'</span><span class="s2">, </span><span class="s4">'forward'</span><span class="s1">]]</span><span class="s2">,</span>
+                         <span class="s1">[</span><span class="s4">'zoompan'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'pan'</span><span class="s2">, </span><span class="s4">'zoom'</span><span class="s2">, </span><span class="s4">'subplots'</span><span class="s1">]]</span><span class="s2">,</span>
+                         <span class="s1">[</span><span class="s4">'io'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'save'</span><span class="s2">, </span><span class="s4">'help'</span><span class="s1">]]]</span>
+
+
+<span class="s2">def </span><span class="s1">add_tools_to_manager(toolmanager</span><span class="s2">, </span><span class="s1">tools=default_tools):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Add multiple tools to a `.ToolManager`. 
+ 
+    Parameters 
+    ---------- 
+    toolmanager : `.backend_managers.ToolManager` 
+        Manager to which the tools are added. 
+    tools : {str: class_like}, optional 
+        The tools to add in a {name: tool} dict, see 
+        `.backend_managers.ToolManager.add_tool` for more info. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">tool </span><span class="s2">in </span><span class="s1">tools.items():</span>
+        <span class="s1">toolmanager.add_tool(name</span><span class="s2">, </span><span class="s1">tool)</span>
+
+
+<span class="s2">def </span><span class="s1">add_tools_to_container(container</span><span class="s2">, </span><span class="s1">tools=default_toolbar_tools):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Add multiple tools to the container. 
+ 
+    Parameters 
+    ---------- 
+    container : Container 
+        `.backend_bases.ToolContainerBase` object that will get the tools 
+        added. 
+    tools : list, optional 
+        List in the form ``[[group1, [tool1, tool2 ...]], [group2, [...]]]`` 
+        where the tools ``[tool1, tool2, ...]`` will display in group1. 
+        See `.backend_bases.ToolContainerBase.add_tool` for details. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">for </span><span class="s1">group</span><span class="s2">, </span><span class="s1">grouptools </span><span class="s2">in </span><span class="s1">tools:</span>
+        <span class="s2">for </span><span class="s1">position</span><span class="s2">, </span><span class="s1">tool </span><span class="s2">in </span><span class="s1">enumerate(grouptools):</span>
+            <span class="s1">container.add_tool(tool</span><span class="s2">, </span><span class="s1">group</span><span class="s2">, </span><span class="s1">position)</span>
+</pre>
+</body>
+</html>

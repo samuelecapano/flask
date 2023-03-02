@@ -1,0 +1,345 @@
+<html>
+<head>
+<title>auth.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+auth.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Network Authentication Helpers 
+ 
+Contains interface (MultiDomainBasicAuth) and associated glue code for 
+providing credentials in the context of network requests. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">urllib.parse</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">Any</span><span class="s2">, </span><span class="s1">Dict</span><span class="s2">, </span><span class="s1">List</span><span class="s2">, </span><span class="s1">Optional</span><span class="s2">, </span><span class="s1">Tuple</span>
+
+<span class="s2">from </span><span class="s1">pip._vendor.requests.auth </span><span class="s2">import </span><span class="s1">AuthBase</span><span class="s2">, </span><span class="s1">HTTPBasicAuth</span>
+<span class="s2">from </span><span class="s1">pip._vendor.requests.models </span><span class="s2">import </span><span class="s1">Request</span><span class="s2">, </span><span class="s1">Response</span>
+<span class="s2">from </span><span class="s1">pip._vendor.requests.utils </span><span class="s2">import </span><span class="s1">get_netrc_auth</span>
+
+<span class="s2">from </span><span class="s1">pip._internal.utils.logging </span><span class="s2">import </span><span class="s1">getLogger</span>
+<span class="s2">from </span><span class="s1">pip._internal.utils.misc </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">ask</span><span class="s2">,</span>
+    <span class="s1">ask_input</span><span class="s2">,</span>
+    <span class="s1">ask_password</span><span class="s2">,</span>
+    <span class="s1">remove_auth_from_url</span><span class="s2">,</span>
+    <span class="s1">split_auth_netloc_from_url</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">pip._internal.vcs.versioncontrol </span><span class="s2">import </span><span class="s1">AuthInfo</span>
+
+<span class="s1">logger = getLogger(__name__)</span>
+
+<span class="s1">Credentials = Tuple[str</span><span class="s2">, </span><span class="s1">str</span><span class="s2">, </span><span class="s1">str]</span>
+
+<span class="s2">try</span><span class="s1">:</span>
+    <span class="s2">import </span><span class="s1">keyring</span>
+<span class="s2">except </span><span class="s1">ImportError:</span>
+    <span class="s1">keyring = </span><span class="s2">None  </span><span class="s3"># type: ignore[assignment]</span>
+<span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">exc:</span>
+    <span class="s1">logger.warning(</span>
+        <span class="s4">&quot;Keyring is skipped due to an exception: %s&quot;</span><span class="s2">,</span>
+        <span class="s1">str(exc)</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s1">keyring = </span><span class="s2">None  </span><span class="s3"># type: ignore[assignment]</span>
+
+
+<span class="s2">def </span><span class="s1">get_keyring_auth(url: Optional[str]</span><span class="s2">, </span><span class="s1">username: Optional[str]) -&gt; Optional[AuthInfo]:</span>
+    <span class="s0">&quot;&quot;&quot;Return the tuple auth for a given url from keyring.&quot;&quot;&quot;</span>
+    <span class="s2">global </span><span class="s1">keyring</span>
+    <span class="s2">if not </span><span class="s1">url </span><span class="s2">or not </span><span class="s1">keyring:</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">get_credential = keyring.get_credential</span>
+        <span class="s2">except </span><span class="s1">AttributeError:</span>
+            <span class="s2">pass</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">logger.debug(</span><span class="s4">&quot;Getting credentials from keyring for %s&quot;</span><span class="s2">, </span><span class="s1">url)</span>
+            <span class="s1">cred = get_credential(url</span><span class="s2">, </span><span class="s1">username)</span>
+            <span class="s2">if </span><span class="s1">cred </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">cred.username</span><span class="s2">, </span><span class="s1">cred.password</span>
+            <span class="s2">return None</span>
+
+        <span class="s2">if </span><span class="s1">username:</span>
+            <span class="s1">logger.debug(</span><span class="s4">&quot;Getting password from keyring for %s&quot;</span><span class="s2">, </span><span class="s1">url)</span>
+            <span class="s1">password = keyring.get_password(url</span><span class="s2">, </span><span class="s1">username)</span>
+            <span class="s2">if </span><span class="s1">password:</span>
+                <span class="s2">return </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password</span>
+
+    <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">exc:</span>
+        <span class="s1">logger.warning(</span>
+            <span class="s4">&quot;Keyring is skipped due to an exception: %s&quot;</span><span class="s2">,</span>
+            <span class="s1">str(exc)</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">keyring = </span><span class="s2">None  </span><span class="s3"># type: ignore[assignment]</span>
+    <span class="s2">return None</span>
+
+
+<span class="s2">class </span><span class="s1">MultiDomainBasicAuth(AuthBase):</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">prompting: bool = </span><span class="s2">True, </span><span class="s1">index_urls: Optional[List[str]] = </span><span class="s2">None</span>
+    <span class="s1">) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+        <span class="s1">self.prompting = prompting</span>
+        <span class="s1">self.index_urls = index_urls</span>
+        <span class="s1">self.passwords: Dict[str</span><span class="s2">, </span><span class="s1">AuthInfo] = {}</span>
+        <span class="s3"># When the user is prompted to enter credentials and keyring is</span>
+        <span class="s3"># available, we will offer to save them. If the user accepts,</span>
+        <span class="s3"># this value is set to the credentials they entered. After the</span>
+        <span class="s3"># request authenticates, the caller should call</span>
+        <span class="s3"># ``save_credentials`` to save these.</span>
+        <span class="s1">self._credentials_to_save: Optional[Credentials] = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_get_index_url(self</span><span class="s2">, </span><span class="s1">url: str) -&gt; Optional[str]:</span>
+        <span class="s0">&quot;&quot;&quot;Return the original index URL matching the requested URL. 
+ 
+        Cached or dynamically generated credentials may work against 
+        the original index URL rather than just the netloc. 
+ 
+        The provided url should have had its username and password 
+        removed already. If the original index url had credentials then 
+        they will be included in the return value. 
+ 
+        Returns None if no matching index was found, or if --no-index 
+        was specified by the user. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">url </span><span class="s2">or not </span><span class="s1">self.index_urls:</span>
+            <span class="s2">return None</span>
+
+        <span class="s2">for </span><span class="s1">u </span><span class="s2">in </span><span class="s1">self.index_urls:</span>
+            <span class="s1">prefix = remove_auth_from_url(u).rstrip(</span><span class="s4">&quot;/&quot;</span><span class="s1">) + </span><span class="s4">&quot;/&quot;</span>
+            <span class="s2">if </span><span class="s1">url.startswith(prefix):</span>
+                <span class="s2">return </span><span class="s1">u</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_get_new_credentials(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">original_url: str</span><span class="s2">,</span>
+        <span class="s1">allow_netrc: bool = </span><span class="s2">True,</span>
+        <span class="s1">allow_keyring: bool = </span><span class="s2">False,</span>
+    <span class="s1">) -&gt; AuthInfo:</span>
+        <span class="s0">&quot;&quot;&quot;Find and return credentials for the specified URL.&quot;&quot;&quot;</span>
+        <span class="s3"># Split the credentials and netloc from the url.</span>
+        <span class="s1">url</span><span class="s2">, </span><span class="s1">netloc</span><span class="s2">, </span><span class="s1">url_user_password = split_auth_netloc_from_url(</span>
+            <span class="s1">original_url</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s3"># Start with the credentials embedded in the url</span>
+        <span class="s1">username</span><span class="s2">, </span><span class="s1">password = url_user_password</span>
+        <span class="s2">if </span><span class="s1">username </span><span class="s2">is not None and </span><span class="s1">password </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">logger.debug(</span><span class="s4">&quot;Found credentials in url for %s&quot;</span><span class="s2">, </span><span class="s1">netloc)</span>
+            <span class="s2">return </span><span class="s1">url_user_password</span>
+
+        <span class="s3"># Find a matching index url for this request</span>
+        <span class="s1">index_url = self._get_index_url(url)</span>
+        <span class="s2">if </span><span class="s1">index_url:</span>
+            <span class="s3"># Split the credentials from the url.</span>
+            <span class="s1">index_info = split_auth_netloc_from_url(index_url)</span>
+            <span class="s2">if </span><span class="s1">index_info:</span>
+                <span class="s1">index_url</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">index_url_user_password = index_info</span>
+                <span class="s1">logger.debug(</span><span class="s4">&quot;Found index url %s&quot;</span><span class="s2">, </span><span class="s1">index_url)</span>
+
+        <span class="s3"># If an index URL was found, try its embedded credentials</span>
+        <span class="s2">if </span><span class="s1">index_url </span><span class="s2">and </span><span class="s1">index_url_user_password[</span><span class="s5">0</span><span class="s1">] </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">username</span><span class="s2">, </span><span class="s1">password = index_url_user_password</span>
+            <span class="s2">if </span><span class="s1">username </span><span class="s2">is not None and </span><span class="s1">password </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">logger.debug(</span><span class="s4">&quot;Found credentials in index url for %s&quot;</span><span class="s2">, </span><span class="s1">netloc)</span>
+                <span class="s2">return </span><span class="s1">index_url_user_password</span>
+
+        <span class="s3"># Get creds from netrc if we still don't have them</span>
+        <span class="s2">if </span><span class="s1">allow_netrc:</span>
+            <span class="s1">netrc_auth = get_netrc_auth(original_url)</span>
+            <span class="s2">if </span><span class="s1">netrc_auth:</span>
+                <span class="s1">logger.debug(</span><span class="s4">&quot;Found credentials in netrc for %s&quot;</span><span class="s2">, </span><span class="s1">netloc)</span>
+                <span class="s2">return </span><span class="s1">netrc_auth</span>
+
+        <span class="s3"># If we don't have a password and keyring is available, use it.</span>
+        <span class="s2">if </span><span class="s1">allow_keyring:</span>
+            <span class="s3"># The index url is more specific than the netloc, so try it first</span>
+            <span class="s3"># fmt: off</span>
+            <span class="s1">kr_auth = (</span>
+                <span class="s1">get_keyring_auth(index_url</span><span class="s2">, </span><span class="s1">username) </span><span class="s2">or</span>
+                <span class="s1">get_keyring_auth(netloc</span><span class="s2">, </span><span class="s1">username)</span>
+            <span class="s1">)</span>
+            <span class="s3"># fmt: on</span>
+            <span class="s2">if </span><span class="s1">kr_auth:</span>
+                <span class="s1">logger.debug(</span><span class="s4">&quot;Found credentials in keyring for %s&quot;</span><span class="s2">, </span><span class="s1">netloc)</span>
+                <span class="s2">return </span><span class="s1">kr_auth</span>
+
+        <span class="s2">return </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password</span>
+
+    <span class="s2">def </span><span class="s1">_get_url_and_credentials(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">original_url: str</span>
+    <span class="s1">) -&gt; Tuple[str</span><span class="s2">, </span><span class="s1">Optional[str]</span><span class="s2">, </span><span class="s1">Optional[str]]:</span>
+        <span class="s0">&quot;&quot;&quot;Return the credentials to use for the provided URL. 
+ 
+        If allowed, netrc and keyring may be used to obtain the 
+        correct credentials. 
+ 
+        Returns (url_without_credentials, username, password). Note 
+        that even if the original URL contains credentials, this 
+        function may return a different username and password. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">url</span><span class="s2">, </span><span class="s1">netloc</span><span class="s2">, </span><span class="s1">_ = split_auth_netloc_from_url(original_url)</span>
+
+        <span class="s3"># Try to get credentials from original url</span>
+        <span class="s1">username</span><span class="s2">, </span><span class="s1">password = self._get_new_credentials(original_url)</span>
+
+        <span class="s3"># If credentials not found, use any stored credentials for this netloc.</span>
+        <span class="s3"># Do this if either the username or the password is missing.</span>
+        <span class="s3"># This accounts for the situation in which the user has specified</span>
+        <span class="s3"># the username in the index url, but the password comes from keyring.</span>
+        <span class="s2">if </span><span class="s1">(username </span><span class="s2">is None or </span><span class="s1">password </span><span class="s2">is None</span><span class="s1">) </span><span class="s2">and </span><span class="s1">netloc </span><span class="s2">in </span><span class="s1">self.passwords:</span>
+            <span class="s1">un</span><span class="s2">, </span><span class="s1">pw = self.passwords[netloc]</span>
+            <span class="s3"># It is possible that the cached credentials are for a different username,</span>
+            <span class="s3"># in which case the cache should be ignored.</span>
+            <span class="s2">if </span><span class="s1">username </span><span class="s2">is None or </span><span class="s1">username == un:</span>
+                <span class="s1">username</span><span class="s2">, </span><span class="s1">password = un</span><span class="s2">, </span><span class="s1">pw</span>
+
+        <span class="s2">if </span><span class="s1">username </span><span class="s2">is not None or </span><span class="s1">password </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s3"># Convert the username and password if they're None, so that</span>
+            <span class="s3"># this netloc will show up as &quot;cached&quot; in the conditional above.</span>
+            <span class="s3"># Further, HTTPBasicAuth doesn't accept None, so it makes sense to</span>
+            <span class="s3"># cache the value that is going to be used.</span>
+            <span class="s1">username = username </span><span class="s2">or </span><span class="s4">&quot;&quot;</span>
+            <span class="s1">password = password </span><span class="s2">or </span><span class="s4">&quot;&quot;</span>
+
+            <span class="s3"># Store any acquired credentials.</span>
+            <span class="s1">self.passwords[netloc] = (username</span><span class="s2">, </span><span class="s1">password)</span>
+
+        <span class="s2">assert </span><span class="s1">(</span>
+            <span class="s3"># Credentials were found</span>
+            <span class="s1">(username </span><span class="s2">is not None and </span><span class="s1">password </span><span class="s2">is not None</span><span class="s1">)</span>
+            <span class="s3"># Credentials were not found</span>
+            <span class="s2">or </span><span class="s1">(username </span><span class="s2">is None and </span><span class="s1">password </span><span class="s2">is None</span><span class="s1">)</span>
+        <span class="s1">)</span><span class="s2">, </span><span class="s4">f&quot;Could not load credentials from url: </span><span class="s2">{</span><span class="s1">original_url</span><span class="s2">}</span><span class="s4">&quot;</span>
+
+        <span class="s2">return </span><span class="s1">url</span><span class="s2">, </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">req: Request) -&gt; Request:</span>
+        <span class="s3"># Get credentials for this request</span>
+        <span class="s1">url</span><span class="s2">, </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password = self._get_url_and_credentials(req.url)</span>
+
+        <span class="s3"># Set the url of the request to the url without any credentials</span>
+        <span class="s1">req.url = url</span>
+
+        <span class="s2">if </span><span class="s1">username </span><span class="s2">is not None and </span><span class="s1">password </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s3"># Send the basic auth with this request</span>
+            <span class="s1">req = HTTPBasicAuth(username</span><span class="s2">, </span><span class="s1">password)(req)</span>
+
+        <span class="s3"># Attach a hook to handle 401 responses</span>
+        <span class="s1">req.register_hook(</span><span class="s4">&quot;response&quot;</span><span class="s2">, </span><span class="s1">self.handle_401)</span>
+
+        <span class="s2">return </span><span class="s1">req</span>
+
+    <span class="s3"># Factored out to allow for easy patching in tests</span>
+    <span class="s2">def </span><span class="s1">_prompt_for_password(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">netloc: str</span>
+    <span class="s1">) -&gt; Tuple[Optional[str]</span><span class="s2">, </span><span class="s1">Optional[str]</span><span class="s2">, </span><span class="s1">bool]:</span>
+        <span class="s1">username = ask_input(</span><span class="s4">f&quot;User for </span><span class="s2">{</span><span class="s1">netloc</span><span class="s2">}</span><span class="s4">: &quot;</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">username:</span>
+            <span class="s2">return None, None, False</span>
+        <span class="s1">auth = get_keyring_auth(netloc</span><span class="s2">, </span><span class="s1">username)</span>
+        <span class="s2">if </span><span class="s1">auth </span><span class="s2">and </span><span class="s1">auth[</span><span class="s5">0</span><span class="s1">] </span><span class="s2">is not None and </span><span class="s1">auth[</span><span class="s5">1</span><span class="s1">] </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">auth[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">auth[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, False</span>
+        <span class="s1">password = ask_password(</span><span class="s4">&quot;Password: &quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password</span><span class="s2">, True</span>
+
+    <span class="s3"># Factored out to allow for easy patching in tests</span>
+    <span class="s2">def </span><span class="s1">_should_save_password_to_keyring(self) -&gt; bool:</span>
+        <span class="s2">if not </span><span class="s1">keyring:</span>
+            <span class="s2">return False</span>
+        <span class="s2">return </span><span class="s1">ask(</span><span class="s4">&quot;Save credentials to keyring [y/N]: &quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s4">&quot;n&quot;</span><span class="s1">]) == </span><span class="s4">&quot;y&quot;</span>
+
+    <span class="s2">def </span><span class="s1">handle_401(self</span><span class="s2">, </span><span class="s1">resp: Response</span><span class="s2">, </span><span class="s1">**kwargs: Any) -&gt; Response:</span>
+        <span class="s3"># We only care about 401 responses, anything else we want to just</span>
+        <span class="s3">#   pass through the actual response</span>
+        <span class="s2">if </span><span class="s1">resp.status_code != </span><span class="s5">401</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">resp</span>
+
+        <span class="s3"># We are not able to prompt the user so simply return the response</span>
+        <span class="s2">if not </span><span class="s1">self.prompting:</span>
+            <span class="s2">return </span><span class="s1">resp</span>
+
+        <span class="s1">parsed = urllib.parse.urlparse(resp.url)</span>
+
+        <span class="s3"># Query the keyring for credentials:</span>
+        <span class="s1">username</span><span class="s2">, </span><span class="s1">password = self._get_new_credentials(</span>
+            <span class="s1">resp.url</span><span class="s2">,</span>
+            <span class="s1">allow_netrc=</span><span class="s2">False,</span>
+            <span class="s1">allow_keyring=</span><span class="s2">True,</span>
+        <span class="s1">)</span>
+
+        <span class="s3"># Prompt the user for a new username and password</span>
+        <span class="s1">save = </span><span class="s2">False</span>
+        <span class="s2">if not </span><span class="s1">username </span><span class="s2">and not </span><span class="s1">password:</span>
+            <span class="s1">username</span><span class="s2">, </span><span class="s1">password</span><span class="s2">, </span><span class="s1">save = self._prompt_for_password(parsed.netloc)</span>
+
+        <span class="s3"># Store the new username and password to use for future requests</span>
+        <span class="s1">self._credentials_to_save = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">username </span><span class="s2">is not None and </span><span class="s1">password </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.passwords[parsed.netloc] = (username</span><span class="s2">, </span><span class="s1">password)</span>
+
+            <span class="s3"># Prompt to save the password to keyring</span>
+            <span class="s2">if </span><span class="s1">save </span><span class="s2">and </span><span class="s1">self._should_save_password_to_keyring():</span>
+                <span class="s1">self._credentials_to_save = (parsed.netloc</span><span class="s2">, </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password)</span>
+
+        <span class="s3"># Consume content and release the original connection to allow our new</span>
+        <span class="s3">#   request to reuse the same one.</span>
+        <span class="s1">resp.content</span>
+        <span class="s1">resp.raw.release_conn()</span>
+
+        <span class="s3"># Add our new username and password to the request</span>
+        <span class="s1">req = HTTPBasicAuth(username </span><span class="s2">or </span><span class="s4">&quot;&quot;</span><span class="s2">, </span><span class="s1">password </span><span class="s2">or </span><span class="s4">&quot;&quot;</span><span class="s1">)(resp.request)</span>
+        <span class="s1">req.register_hook(</span><span class="s4">&quot;response&quot;</span><span class="s2">, </span><span class="s1">self.warn_on_401)</span>
+
+        <span class="s3"># On successful request, save the credentials that were used to</span>
+        <span class="s3"># keyring. (Note that if the user responded &quot;no&quot; above, this member</span>
+        <span class="s3"># is not set and nothing will be saved.)</span>
+        <span class="s2">if </span><span class="s1">self._credentials_to_save:</span>
+            <span class="s1">req.register_hook(</span><span class="s4">&quot;response&quot;</span><span class="s2">, </span><span class="s1">self.save_credentials)</span>
+
+        <span class="s3"># Send our new request</span>
+        <span class="s1">new_resp = resp.connection.send(req</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">new_resp.history.append(resp)</span>
+
+        <span class="s2">return </span><span class="s1">new_resp</span>
+
+    <span class="s2">def </span><span class="s1">warn_on_401(self</span><span class="s2">, </span><span class="s1">resp: Response</span><span class="s2">, </span><span class="s1">**kwargs: Any) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+        <span class="s0">&quot;&quot;&quot;Response callback to warn about incorrect credentials.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">resp.status_code == </span><span class="s5">401</span><span class="s1">:</span>
+            <span class="s1">logger.warning(</span>
+                <span class="s4">&quot;401 Error, Credentials not correct for %s&quot;</span><span class="s2">,</span>
+                <span class="s1">resp.request.url</span><span class="s2">,</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">save_credentials(self</span><span class="s2">, </span><span class="s1">resp: Response</span><span class="s2">, </span><span class="s1">**kwargs: Any) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+        <span class="s0">&quot;&quot;&quot;Response callback to save credentials on success.&quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">keyring </span><span class="s2">is not None, </span><span class="s4">&quot;should never reach here without keyring&quot;</span>
+        <span class="s2">if not </span><span class="s1">keyring:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">creds = self._credentials_to_save</span>
+        <span class="s1">self._credentials_to_save = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">creds </span><span class="s2">and </span><span class="s1">resp.status_code &lt; </span><span class="s5">400</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">logger.info(</span><span class="s4">&quot;Saving credentials to keyring&quot;</span><span class="s1">)</span>
+                <span class="s1">keyring.set_password(*creds)</span>
+            <span class="s2">except </span><span class="s1">Exception:</span>
+                <span class="s1">logger.exception(</span><span class="s4">&quot;Failed to save credentials&quot;</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

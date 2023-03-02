@@ -1,0 +1,282 @@
+<html>
+<head>
+<title>cu2quPen.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cu2quPen.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2016 Google Inc. All Rights Reserved.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#     http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+<span class="s2">from </span><span class="s1">fontTools.cu2qu </span><span class="s2">import </span><span class="s1">curve_to_quadratic</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.basePen </span><span class="s2">import </span><span class="s1">AbstractPen</span><span class="s2">, </span><span class="s1">decomposeSuperBezierSegment</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.reverseContourPen </span><span class="s2">import </span><span class="s1">ReverseContourPen</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.pointPen </span><span class="s2">import </span><span class="s1">BasePointToSegmentPen</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.pointPen </span><span class="s2">import </span><span class="s1">ReverseContourPointPen</span>
+
+
+<span class="s2">class </span><span class="s1">Cu2QuPen(AbstractPen):</span>
+    <span class="s3">&quot;&quot;&quot; A filter pen to convert cubic bezier curves to quadratic b-splines 
+    using the FontTools SegmentPen protocol. 
+ 
+    Args: 
+ 
+        other_pen: another SegmentPen used to draw the transformed outline. 
+        max_err: maximum approximation error in font units. For optimal results, 
+            if you know the UPEM of the font, we recommend setting this to a 
+            value equal, or close to UPEM / 1000. 
+        reverse_direction: flip the contours' direction but keep starting point. 
+        stats: a dictionary counting the point numbers of quadratic segments. 
+        ignore_single_points: don't emit contours containing only a single point 
+ 
+    NOTE: The &quot;ignore_single_points&quot; argument is deprecated since v1.3.0, 
+    which dropped Robofab subpport. It's no longer needed to special-case 
+    UFO2-style anchors (aka &quot;named points&quot;) when using ufoLib &gt;= 2.0, 
+    as these are no longer drawn onto pens as single-point contours, 
+    but are handled separately as anchors. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">other_pen</span><span class="s2">, </span><span class="s1">max_err</span><span class="s2">, </span><span class="s1">reverse_direction=</span><span class="s2">False,</span>
+                 <span class="s1">stats=</span><span class="s2">None, </span><span class="s1">ignore_single_points=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">reverse_direction:</span>
+            <span class="s1">self.pen = ReverseContourPen(other_pen)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.pen = other_pen</span>
+        <span class="s1">self.max_err = max_err</span>
+        <span class="s1">self.stats = stats</span>
+        <span class="s2">if </span><span class="s1">ignore_single_points:</span>
+            <span class="s2">import </span><span class="s1">warnings</span>
+            <span class="s1">warnings.warn(</span><span class="s4">&quot;ignore_single_points is deprecated and &quot;</span>
+                          <span class="s4">&quot;will be removed in future versions&quot;</span><span class="s2">,</span>
+                          <span class="s1">UserWarning</span><span class="s2">, </span><span class="s1">stacklevel=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">self.ignore_single_points = ignore_single_points</span>
+        <span class="s1">self.start_pt = </span><span class="s2">None</span>
+        <span class="s1">self.current_pt = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_check_contour_is_open(self):</span>
+        <span class="s2">if </span><span class="s1">self.current_pt </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s4">&quot;moveTo is required&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_check_contour_is_closed(self):</span>
+        <span class="s2">if </span><span class="s1">self.current_pt </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s4">&quot;closePath or endPath is required&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_add_moveTo(self):</span>
+        <span class="s2">if </span><span class="s1">self.start_pt </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.pen.moveTo(self.start_pt)</span>
+            <span class="s1">self.start_pt = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">moveTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+        <span class="s1">self._check_contour_is_closed()</span>
+        <span class="s1">self.start_pt = self.current_pt = pt</span>
+        <span class="s2">if not </span><span class="s1">self.ignore_single_points:</span>
+            <span class="s1">self._add_moveTo()</span>
+
+    <span class="s2">def </span><span class="s1">lineTo(self</span><span class="s2">, </span><span class="s1">pt):</span>
+        <span class="s1">self._check_contour_is_open()</span>
+        <span class="s1">self._add_moveTo()</span>
+        <span class="s1">self.pen.lineTo(pt)</span>
+        <span class="s1">self.current_pt = pt</span>
+
+    <span class="s2">def </span><span class="s1">qCurveTo(self</span><span class="s2">, </span><span class="s1">*points):</span>
+        <span class="s1">self._check_contour_is_open()</span>
+        <span class="s1">n = len(points)</span>
+        <span class="s2">if </span><span class="s1">n == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self.lineTo(points[</span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s2">elif </span><span class="s1">n &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self._add_moveTo()</span>
+            <span class="s1">self.pen.qCurveTo(*points)</span>
+            <span class="s1">self.current_pt = points[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s4">&quot;illegal qcurve segment point count: %d&quot; </span><span class="s1">% n)</span>
+
+    <span class="s2">def </span><span class="s1">_curve_to_quadratic(self</span><span class="s2">, </span><span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3):</span>
+        <span class="s1">curve = (self.current_pt</span><span class="s2">, </span><span class="s1">pt1</span><span class="s2">, </span><span class="s1">pt2</span><span class="s2">, </span><span class="s1">pt3)</span>
+        <span class="s1">quadratic = curve_to_quadratic(curve</span><span class="s2">, </span><span class="s1">self.max_err)</span>
+        <span class="s2">if </span><span class="s1">self.stats </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">n = str(len(quadratic) - </span><span class="s5">2</span><span class="s1">)</span>
+            <span class="s1">self.stats[n] = self.stats.get(n</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) + </span><span class="s5">1</span>
+        <span class="s1">self.qCurveTo(*quadratic[</span><span class="s5">1</span><span class="s1">:])</span>
+
+    <span class="s2">def </span><span class="s1">curveTo(self</span><span class="s2">, </span><span class="s1">*points):</span>
+        <span class="s1">self._check_contour_is_open()</span>
+        <span class="s1">n = len(points)</span>
+        <span class="s2">if </span><span class="s1">n == </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s0"># this is the most common case, so we special-case it</span>
+            <span class="s1">self._curve_to_quadratic(*points)</span>
+        <span class="s2">elif </span><span class="s1">n &gt; </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">segment </span><span class="s2">in </span><span class="s1">decomposeSuperBezierSegment(points):</span>
+                <span class="s1">self._curve_to_quadratic(*segment)</span>
+        <span class="s2">elif </span><span class="s1">n == </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s1">self.qCurveTo(*points)</span>
+        <span class="s2">elif </span><span class="s1">n == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self.lineTo(points[</span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">AssertionError(</span><span class="s4">&quot;illegal curve segment point count: %d&quot; </span><span class="s1">% n)</span>
+
+    <span class="s2">def </span><span class="s1">closePath(self):</span>
+        <span class="s1">self._check_contour_is_open()</span>
+        <span class="s2">if </span><span class="s1">self.start_pt </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s0"># if 'start_pt' is _not_ None, we are ignoring single-point paths</span>
+            <span class="s1">self.pen.closePath()</span>
+        <span class="s1">self.current_pt = self.start_pt = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">endPath(self):</span>
+        <span class="s1">self._check_contour_is_open()</span>
+        <span class="s2">if </span><span class="s1">self.start_pt </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.pen.endPath()</span>
+        <span class="s1">self.current_pt = self.start_pt = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">addComponent(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transformation):</span>
+        <span class="s1">self._check_contour_is_closed()</span>
+        <span class="s1">self.pen.addComponent(glyphName</span><span class="s2">, </span><span class="s1">transformation)</span>
+
+
+<span class="s2">class </span><span class="s1">Cu2QuPointPen(BasePointToSegmentPen):</span>
+    <span class="s3">&quot;&quot;&quot; A filter pen to convert cubic bezier curves to quadratic b-splines 
+    using the RoboFab PointPen protocol. 
+ 
+    Args: 
+        other_point_pen: another PointPen used to draw the transformed outline. 
+        max_err: maximum approximation error in font units. For optimal results, 
+            if you know the UPEM of the font, we recommend setting this to a 
+            value equal, or close to UPEM / 1000. 
+        reverse_direction: reverse the winding direction of all contours. 
+        stats: a dictionary counting the point numbers of quadratic segments. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">other_point_pen</span><span class="s2">, </span><span class="s1">max_err</span><span class="s2">, </span><span class="s1">reverse_direction=</span><span class="s2">False,</span>
+                 <span class="s1">stats=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">BasePointToSegmentPen.__init__(self)</span>
+        <span class="s2">if </span><span class="s1">reverse_direction:</span>
+            <span class="s1">self.pen = ReverseContourPointPen(other_point_pen)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.pen = other_point_pen</span>
+        <span class="s1">self.max_err = max_err</span>
+        <span class="s1">self.stats = stats</span>
+
+    <span class="s2">def </span><span class="s1">_flushContour(self</span><span class="s2">, </span><span class="s1">segments):</span>
+        <span class="s2">assert </span><span class="s1">len(segments) &gt;= </span><span class="s5">1</span>
+        <span class="s1">closed = segments[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] != </span><span class="s4">&quot;move&quot;</span>
+        <span class="s1">new_segments = []</span>
+        <span class="s1">prev_points = segments[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">prev_on_curve = prev_points[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s2">for </span><span class="s1">segment_type</span><span class="s2">, </span><span class="s1">points </span><span class="s2">in </span><span class="s1">segments:</span>
+            <span class="s2">if </span><span class="s1">segment_type == </span><span class="s4">'curve'</span><span class="s1">:</span>
+                <span class="s2">for </span><span class="s1">sub_points </span><span class="s2">in </span><span class="s1">self._split_super_bezier_segments(points):</span>
+                    <span class="s1">on_curve</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs = sub_points[-</span><span class="s5">1</span><span class="s1">]</span>
+                    <span class="s1">bcp1</span><span class="s2">, </span><span class="s1">bcp2 = sub_points[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">sub_points[</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+                    <span class="s1">cubic = [prev_on_curve</span><span class="s2">, </span><span class="s1">bcp1</span><span class="s2">, </span><span class="s1">bcp2</span><span class="s2">, </span><span class="s1">on_curve]</span>
+                    <span class="s1">quad = curve_to_quadratic(cubic</span><span class="s2">, </span><span class="s1">self.max_err)</span>
+                    <span class="s2">if </span><span class="s1">self.stats </span><span class="s2">is not None</span><span class="s1">:</span>
+                        <span class="s1">n = str(len(quad) - </span><span class="s5">2</span><span class="s1">)</span>
+                        <span class="s1">self.stats[n] = self.stats.get(n</span><span class="s2">, </span><span class="s5">0</span><span class="s1">) + </span><span class="s5">1</span>
+                    <span class="s1">new_points = [(pt</span><span class="s2">, False, None, </span><span class="s1">{}) </span><span class="s2">for </span><span class="s1">pt </span><span class="s2">in </span><span class="s1">quad[</span><span class="s5">1</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">]]</span>
+                    <span class="s1">new_points.append((on_curve</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs))</span>
+                    <span class="s1">new_segments.append([</span><span class="s4">&quot;qcurve&quot;</span><span class="s2">, </span><span class="s1">new_points])</span>
+                    <span class="s1">prev_on_curve = sub_points[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">new_segments.append([segment_type</span><span class="s2">, </span><span class="s1">points])</span>
+                <span class="s1">prev_on_curve = points[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">closed:</span>
+            <span class="s0"># the BasePointToSegmentPen.endPath method that calls _flushContour</span>
+            <span class="s0"># rotates the point list of closed contours so that they end with</span>
+            <span class="s0"># the first on-curve point. We restore the original starting point.</span>
+            <span class="s1">new_segments = new_segments[-</span><span class="s5">1</span><span class="s1">:] + new_segments[:-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">self._drawPoints(new_segments)</span>
+
+    <span class="s2">def </span><span class="s1">_split_super_bezier_segments(self</span><span class="s2">, </span><span class="s1">points):</span>
+        <span class="s1">sub_segments = []</span>
+        <span class="s0"># n is the number of control points</span>
+        <span class="s1">n = len(points) - </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">n == </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s0"># a simple bezier curve segment</span>
+            <span class="s1">sub_segments.append(points)</span>
+        <span class="s2">elif </span><span class="s1">n &gt; </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s0"># a &quot;super&quot; bezier; decompose it</span>
+            <span class="s1">on_curve</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs = points[-</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">num_sub_segments = n - </span><span class="s5">1</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">sub_points </span><span class="s2">in </span><span class="s1">enumerate(decomposeSuperBezierSegment([</span>
+                    <span class="s1">pt </span><span class="s2">for </span><span class="s1">pt</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">points])):</span>
+                <span class="s1">new_segment = []</span>
+                <span class="s2">for </span><span class="s1">point </span><span class="s2">in </span><span class="s1">sub_points[:-</span><span class="s5">1</span><span class="s1">]:</span>
+                    <span class="s1">new_segment.append((point</span><span class="s2">, False, None, </span><span class="s1">{}))</span>
+                <span class="s2">if </span><span class="s1">i == (num_sub_segments - </span><span class="s5">1</span><span class="s1">):</span>
+                    <span class="s0"># the last on-curve keeps its original attributes</span>
+                    <span class="s1">new_segment.append((on_curve</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs))</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s0"># on-curves of sub-segments are always &quot;smooth&quot;</span>
+                    <span class="s1">new_segment.append((sub_points[-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, True, None, </span><span class="s1">{}))</span>
+                <span class="s1">sub_segments.append(new_segment)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">AssertionError(</span>
+                <span class="s4">&quot;expected 2 control points, found: %d&quot; </span><span class="s1">% n)</span>
+        <span class="s2">return </span><span class="s1">sub_segments</span>
+
+    <span class="s2">def </span><span class="s1">_drawPoints(self</span><span class="s2">, </span><span class="s1">segments):</span>
+        <span class="s1">pen = self.pen</span>
+        <span class="s1">pen.beginPath()</span>
+        <span class="s1">last_offcurves = []</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(segment_type</span><span class="s2">, </span><span class="s1">points) </span><span class="s2">in </span><span class="s1">enumerate(segments):</span>
+            <span class="s2">if </span><span class="s1">segment_type </span><span class="s2">in </span><span class="s1">(</span><span class="s4">&quot;move&quot;</span><span class="s2">, </span><span class="s4">&quot;line&quot;</span><span class="s1">):</span>
+                <span class="s2">assert </span><span class="s1">len(points) == </span><span class="s5">1</span><span class="s2">, </span><span class="s1">(</span>
+                    <span class="s4">&quot;illegal line segment point count: %d&quot; </span><span class="s1">% len(points))</span>
+                <span class="s1">pt</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs = points[</span><span class="s5">0</span><span class="s1">]</span>
+                <span class="s1">pen.addPoint(pt</span><span class="s2">, </span><span class="s1">segment_type</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+            <span class="s2">elif </span><span class="s1">segment_type == </span><span class="s4">&quot;qcurve&quot;</span><span class="s1">:</span>
+                <span class="s2">assert </span><span class="s1">len(points) &gt;= </span><span class="s5">2</span><span class="s2">, </span><span class="s1">(</span>
+                    <span class="s4">&quot;illegal qcurve segment point count: %d&quot; </span><span class="s1">% len(points))</span>
+                <span class="s1">offcurves = points[:-</span><span class="s5">1</span><span class="s1">]</span>
+                <span class="s2">if </span><span class="s1">offcurves:</span>
+                    <span class="s2">if </span><span class="s1">i == </span><span class="s5">0</span><span class="s1">:</span>
+                        <span class="s0"># any off-curve points preceding the first on-curve</span>
+                        <span class="s0"># will be appended at the end of the contour</span>
+                        <span class="s1">last_offcurves = offcurves</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s2">for </span><span class="s1">(pt</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs) </span><span class="s2">in </span><span class="s1">offcurves:</span>
+                            <span class="s1">pen.addPoint(pt</span><span class="s2">, None, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+                <span class="s1">pt</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs = points[-</span><span class="s5">1</span><span class="s1">]</span>
+                <span class="s2">if </span><span class="s1">pt </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s0"># special quadratic contour with no on-curve points:</span>
+                    <span class="s0"># we need to skip the &quot;None&quot; point. See also the Pen</span>
+                    <span class="s0"># protocol's qCurveTo() method and fontTools.pens.basePen</span>
+                    <span class="s2">pass</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">pen.addPoint(pt</span><span class="s2">, </span><span class="s1">segment_type</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s0"># 'curve' segments must have been converted to 'qcurve' by now</span>
+                <span class="s2">raise </span><span class="s1">AssertionError(</span>
+                    <span class="s4">&quot;unexpected segment type: %r&quot; </span><span class="s1">% segment_type)</span>
+        <span class="s2">for </span><span class="s1">(pt</span><span class="s2">, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs) </span><span class="s2">in </span><span class="s1">last_offcurves:</span>
+            <span class="s1">pen.addPoint(pt</span><span class="s2">, None, </span><span class="s1">smooth</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">pen.endPath()</span>
+
+    <span class="s2">def </span><span class="s1">addComponent(self</span><span class="s2">, </span><span class="s1">baseGlyphName</span><span class="s2">, </span><span class="s1">transformation):</span>
+        <span class="s2">assert </span><span class="s1">self.currentPath </span><span class="s2">is None</span>
+        <span class="s1">self.pen.addComponent(baseGlyphName</span><span class="s2">, </span><span class="s1">transformation)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,582 @@
+<html>
+<head>
+<title>_layoutgrid.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_layoutgrid.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A layoutgrid is a nrows by ncols set of boxes, meant to be used by 
+`._constrained_layout`, each box is analogous to a subplotspec element of 
+a gridspec. 
+ 
+Each box is defined by left[ncols], right[ncols], bottom[nrows] and top[nrows], 
+and by two editable margins for each side.  The main margin gets its value 
+set by the size of ticklabels, titles, etc on each axes that is in the figure. 
+The outer margin is the padding around the axes, and space for any 
+colorbars. 
+ 
+The &quot;inner&quot; widths and heights of these boxes are then constrained to be the 
+same (relative the values of `width_ratios[ncols]` and `height_ratios[nrows]`). 
+ 
+The layoutgrid is then constrained to be contained within a parent layoutgrid, 
+its column(s) and row(s) specified when it is created. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">kiwisolver </span><span class="s2">as </span><span class="s1">kiwi</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">import </span><span class="s1">matplotlib.patches </span><span class="s2">as </span><span class="s1">mpatches</span>
+<span class="s2">from </span><span class="s1">matplotlib.transforms </span><span class="s2">import </span><span class="s1">Bbox</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+
+<span class="s2">class </span><span class="s1">LayoutGrid:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Analogous to a gridspec, and contained in another LayoutGrid. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">parent=</span><span class="s2">None, </span><span class="s1">parent_pos=(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)</span><span class="s2">,</span>
+                 <span class="s1">parent_inner=</span><span class="s2">False, </span><span class="s1">name=</span><span class="s4">''</span><span class="s2">, </span><span class="s1">ncols=</span><span class="s3">1</span><span class="s2">, </span><span class="s1">nrows=</span><span class="s3">1</span><span class="s2">,</span>
+                 <span class="s1">h_pad=</span><span class="s2">None, </span><span class="s1">w_pad=</span><span class="s2">None, </span><span class="s1">width_ratios=</span><span class="s2">None,</span>
+                 <span class="s1">height_ratios=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">Variable = kiwi.Variable</span>
+        <span class="s1">self.parent = parent</span>
+        <span class="s1">self.parent_pos = parent_pos</span>
+        <span class="s1">self.parent_inner = parent_inner</span>
+        <span class="s1">self.name = name + seq_id()</span>
+        <span class="s2">if </span><span class="s1">isinstance(parent</span><span class="s2">, </span><span class="s1">LayoutGrid):</span>
+            <span class="s1">self.name = </span><span class="s4">f'</span><span class="s2">{</span><span class="s1">parent.name</span><span class="s2">}</span><span class="s4">.</span><span class="s2">{</span><span class="s1">self.name</span><span class="s2">}</span><span class="s4">'</span>
+        <span class="s1">self.nrows = nrows</span>
+        <span class="s1">self.ncols = ncols</span>
+        <span class="s1">self.height_ratios = np.atleast_1d(height_ratios)</span>
+        <span class="s2">if </span><span class="s1">height_ratios </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.height_ratios = np.ones(nrows)</span>
+        <span class="s1">self.width_ratios = np.atleast_1d(width_ratios)</span>
+        <span class="s2">if </span><span class="s1">width_ratios </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.width_ratios = np.ones(ncols)</span>
+
+        <span class="s1">sn = self.name + </span><span class="s4">'_'</span>
+        <span class="s2">if not </span><span class="s1">isinstance(parent</span><span class="s2">, </span><span class="s1">LayoutGrid):</span>
+            <span class="s5"># parent can be a rect if not a LayoutGrid</span>
+            <span class="s5"># allows specifying a rectangle to contain the layout.</span>
+            <span class="s1">self.parent = parent</span>
+            <span class="s1">self.solver = kiwi.Solver()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.parent = parent</span>
+            <span class="s1">parent.add_child(self</span><span class="s2">, </span><span class="s1">*parent_pos)</span>
+            <span class="s1">self.solver = self.parent.solver</span>
+        <span class="s5"># keep track of artist associated w/ this layout.  Can be none</span>
+        <span class="s1">self.artists = np.empty((nrows</span><span class="s2">, </span><span class="s1">ncols)</span><span class="s2">, </span><span class="s1">dtype=object)</span>
+        <span class="s1">self.children = np.empty((nrows</span><span class="s2">, </span><span class="s1">ncols)</span><span class="s2">, </span><span class="s1">dtype=object)</span>
+
+        <span class="s1">self.margins = {}</span>
+        <span class="s1">self.margin_vals = {}</span>
+        <span class="s5"># all the boxes in each column share the same left/right margins:</span>
+        <span class="s2">for </span><span class="s1">todo </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'left'</span><span class="s2">, </span><span class="s4">'right'</span><span class="s2">, </span><span class="s4">'leftcb'</span><span class="s2">, </span><span class="s4">'rightcb'</span><span class="s1">]:</span>
+            <span class="s5"># track the value so we can change only if a margin is larger</span>
+            <span class="s5"># than the current value</span>
+            <span class="s1">self.margin_vals[todo] = np.zeros(ncols)</span>
+
+        <span class="s1">sol = self.solver</span>
+
+        <span class="s5"># These are redundant, but make life easier if</span>
+        <span class="s5"># we define them all.  All that is really</span>
+        <span class="s5"># needed is left/right, margin['left'], and margin['right']</span>
+        <span class="s1">self.widths = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">widths[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(ncols)]</span>
+        <span class="s1">self.lefts = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">lefts[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(ncols)]</span>
+        <span class="s1">self.rights = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">rights[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(ncols)]</span>
+        <span class="s1">self.inner_widths = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">inner_widths[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">)</span>
+                             <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(ncols)]</span>
+        <span class="s2">for </span><span class="s1">todo </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'left'</span><span class="s2">, </span><span class="s4">'right'</span><span class="s2">, </span><span class="s4">'leftcb'</span><span class="s2">, </span><span class="s4">'rightcb'</span><span class="s1">]:</span>
+            <span class="s1">self.margins[todo] = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">margins[</span><span class="s2">{</span><span class="s1">todo</span><span class="s2">}</span><span class="s4">][</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">)</span>
+                                  <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(ncols)]</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(ncols):</span>
+                <span class="s1">sol.addEditVariable(self.margins[todo][i]</span><span class="s2">, </span><span class="s4">'strong'</span><span class="s1">)</span>
+
+        <span class="s2">for </span><span class="s1">todo </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'bottom'</span><span class="s2">, </span><span class="s4">'top'</span><span class="s2">, </span><span class="s4">'bottomcb'</span><span class="s2">, </span><span class="s4">'topcb'</span><span class="s1">]:</span>
+            <span class="s1">self.margins[todo] = np.empty((nrows)</span><span class="s2">, </span><span class="s1">dtype=object)</span>
+            <span class="s1">self.margin_vals[todo] = np.zeros(nrows)</span>
+
+        <span class="s1">self.heights = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">heights[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nrows)]</span>
+        <span class="s1">self.inner_heights = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">inner_heights[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">)</span>
+                              <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nrows)]</span>
+        <span class="s1">self.bottoms = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">bottoms[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nrows)]</span>
+        <span class="s1">self.tops = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">tops[</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nrows)]</span>
+        <span class="s2">for </span><span class="s1">todo </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'bottom'</span><span class="s2">, </span><span class="s4">'top'</span><span class="s2">, </span><span class="s4">'bottomcb'</span><span class="s2">, </span><span class="s4">'topcb'</span><span class="s1">]:</span>
+            <span class="s1">self.margins[todo] = [Variable(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">sn</span><span class="s2">}</span><span class="s4">margins[</span><span class="s2">{</span><span class="s1">todo</span><span class="s2">}</span><span class="s4">][</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">]'</span><span class="s1">)</span>
+                                  <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nrows)]</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nrows):</span>
+                <span class="s1">sol.addEditVariable(self.margins[todo][i]</span><span class="s2">, </span><span class="s4">'strong'</span><span class="s1">)</span>
+
+        <span class="s5"># set these margins to zero by default. They will be edited as</span>
+        <span class="s5"># children are filled.</span>
+        <span class="s1">self.reset_margins()</span>
+        <span class="s1">self.add_constraints()</span>
+
+        <span class="s1">self.h_pad = h_pad</span>
+        <span class="s1">self.w_pad = w_pad</span>
+
+    <span class="s2">def </span><span class="s1">__repr__(self):</span>
+        <span class="s1">str = </span><span class="s4">f'LayoutBox: </span><span class="s2">{</span><span class="s1">self.name</span><span class="s2">:</span><span class="s4">25s</span><span class="s2">} {</span><span class="s1">self.nrows</span><span class="s2">}</span><span class="s4">x</span><span class="s2">{</span><span class="s1">self.ncols</span><span class="s2">}</span><span class="s4">,</span><span class="s2">\n</span><span class="s4">'</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.nrows):</span>
+            <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(self.ncols):</span>
+                <span class="s1">str += </span><span class="s4">f'</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">, </span><span class="s2">{</span><span class="s1">j</span><span class="s2">}</span><span class="s4">: '</span><span class="s1">\</span>
+                       <span class="s4">f'L(</span><span class="s2">{</span><span class="s1">self.lefts[j].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'B</span><span class="s2">{</span><span class="s1">self.bottoms[i].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'W</span><span class="s2">{</span><span class="s1">self.widths[j].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'H</span><span class="s2">{</span><span class="s1">self.heights[i].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'innerW</span><span class="s2">{</span><span class="s1">self.inner_widths[j].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'innerH</span><span class="s2">{</span><span class="s1">self.inner_heights[i].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'ML</span><span class="s2">{</span><span class="s1">self.margins[</span><span class="s4">&quot;left&quot;</span><span class="s1">][j].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, ' </span><span class="s1">\</span>
+                       <span class="s4">f'MR</span><span class="s2">{</span><span class="s1">self.margins[</span><span class="s4">&quot;right&quot;</span><span class="s1">][j].value()</span><span class="s2">:</span><span class="s4">1.3f</span><span class="s2">}</span><span class="s4">, </span><span class="s2">\n</span><span class="s4">'</span>
+        <span class="s2">return </span><span class="s1">str</span>
+
+    <span class="s2">def </span><span class="s1">reset_margins(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Reset all the margins to zero.  Must do this after changing 
+        figure size, for instance, because the relative size of the 
+        axes labels etc changes. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">todo </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'left'</span><span class="s2">, </span><span class="s4">'right'</span><span class="s2">, </span><span class="s4">'bottom'</span><span class="s2">, </span><span class="s4">'top'</span><span class="s2">,</span>
+                     <span class="s4">'leftcb'</span><span class="s2">, </span><span class="s4">'rightcb'</span><span class="s2">, </span><span class="s4">'bottomcb'</span><span class="s2">, </span><span class="s4">'topcb'</span><span class="s1">]:</span>
+            <span class="s1">self.edit_margins(todo</span><span class="s2">, </span><span class="s3">0.0</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">add_constraints(self):</span>
+        <span class="s5"># define self-consistent constraints</span>
+        <span class="s1">self.hard_constraints()</span>
+        <span class="s5"># define relationship with parent layoutgrid:</span>
+        <span class="s1">self.parent_constraints()</span>
+        <span class="s5"># define relative widths of the grid cells to each other</span>
+        <span class="s5"># and stack horizontally and vertically.</span>
+        <span class="s1">self.grid_constraints()</span>
+
+    <span class="s2">def </span><span class="s1">hard_constraints(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        These are the redundant constraints, plus ones that make the 
+        rest of the code easier. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.ncols):</span>
+            <span class="s1">hc = [self.rights[i] &gt;= self.lefts[i]</span><span class="s2">,</span>
+                  <span class="s1">(self.rights[i] - self.margins[</span><span class="s4">'right'</span><span class="s1">][i] -</span>
+                    <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][i] &gt;=</span>
+                    <span class="s1">self.lefts[i] - self.margins[</span><span class="s4">'left'</span><span class="s1">][i] -</span>
+                    <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][i])</span>
+                  <span class="s1">]</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">hc:</span>
+                <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'required'</span><span class="s1">)</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.nrows):</span>
+            <span class="s1">hc = [self.tops[i] &gt;= self.bottoms[i]</span><span class="s2">,</span>
+                  <span class="s1">(self.tops[i] - self.margins[</span><span class="s4">'top'</span><span class="s1">][i] -</span>
+                    <span class="s1">self.margins[</span><span class="s4">'topcb'</span><span class="s1">][i] &gt;=</span>
+                    <span class="s1">self.bottoms[i] - self.margins[</span><span class="s4">'bottom'</span><span class="s1">][i] -</span>
+                    <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][i])</span>
+                  <span class="s1">]</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">hc:</span>
+                <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'required'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">add_child(self</span><span class="s2">, </span><span class="s1">child</span><span class="s2">, </span><span class="s1">i=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">j=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s5"># np.ix_ returns the cross product of i and j indices</span>
+        <span class="s1">self.children[np.ix_(np.atleast_1d(i)</span><span class="s2">, </span><span class="s1">np.atleast_1d(j))] = child</span>
+
+    <span class="s2">def </span><span class="s1">parent_constraints(self):</span>
+        <span class="s5"># constraints that are due to the parent...</span>
+        <span class="s5"># i.e. the first column's left is equal to the</span>
+        <span class="s5"># parent's left, the last column right equal to the</span>
+        <span class="s5"># parent's right...</span>
+        <span class="s1">parent = self.parent</span>
+        <span class="s2">if not </span><span class="s1">isinstance(parent</span><span class="s2">, </span><span class="s1">LayoutGrid):</span>
+            <span class="s5"># specify a rectangle in figure coordinates</span>
+            <span class="s1">hc = [self.lefts[</span><span class="s3">0</span><span class="s1">] == parent[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                  <span class="s1">self.rights[-</span><span class="s3">1</span><span class="s1">] == parent[</span><span class="s3">0</span><span class="s1">] + parent[</span><span class="s3">2</span><span class="s1">]</span><span class="s2">,</span>
+                  <span class="s5"># top and bottom reversed order...</span>
+                  <span class="s1">self.tops[</span><span class="s3">0</span><span class="s1">] == parent[</span><span class="s3">1</span><span class="s1">] + parent[</span><span class="s3">3</span><span class="s1">]</span><span class="s2">,</span>
+                  <span class="s1">self.bottoms[-</span><span class="s3">1</span><span class="s1">] == parent[</span><span class="s3">1</span><span class="s1">]]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">rows</span><span class="s2">, </span><span class="s1">cols = self.parent_pos</span>
+            <span class="s1">rows = np.atleast_1d(rows)</span>
+            <span class="s1">cols = np.atleast_1d(cols)</span>
+
+            <span class="s1">left = parent.lefts[cols[</span><span class="s3">0</span><span class="s1">]]</span>
+            <span class="s1">right = parent.rights[cols[-</span><span class="s3">1</span><span class="s1">]]</span>
+            <span class="s1">top = parent.tops[rows[</span><span class="s3">0</span><span class="s1">]]</span>
+            <span class="s1">bottom = parent.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]]</span>
+            <span class="s2">if </span><span class="s1">self.parent_inner:</span>
+                <span class="s5"># the layout grid is contained inside the inner</span>
+                <span class="s5"># grid of the parent.</span>
+                <span class="s1">left += parent.margins[</span><span class="s4">'left'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]]</span>
+                <span class="s1">left += parent.margins[</span><span class="s4">'leftcb'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]]</span>
+                <span class="s1">right -= parent.margins[</span><span class="s4">'right'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]]</span>
+                <span class="s1">right -= parent.margins[</span><span class="s4">'rightcb'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]]</span>
+                <span class="s1">top -= parent.margins[</span><span class="s4">'top'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]]</span>
+                <span class="s1">top -= parent.margins[</span><span class="s4">'topcb'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]]</span>
+                <span class="s1">bottom += parent.margins[</span><span class="s4">'bottom'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]]</span>
+                <span class="s1">bottom += parent.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]]</span>
+            <span class="s1">hc = [self.lefts[</span><span class="s3">0</span><span class="s1">] == left</span><span class="s2">,</span>
+                  <span class="s1">self.rights[-</span><span class="s3">1</span><span class="s1">] == right</span><span class="s2">,</span>
+                  <span class="s5"># from top to bottom</span>
+                  <span class="s1">self.tops[</span><span class="s3">0</span><span class="s1">] == top</span><span class="s2">,</span>
+                  <span class="s1">self.bottoms[-</span><span class="s3">1</span><span class="s1">] == bottom]</span>
+        <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">hc:</span>
+            <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'required'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">grid_constraints(self):</span>
+        <span class="s5"># constrain the ratio of the inner part of the grids</span>
+        <span class="s5"># to be the same (relative to width_ratios)</span>
+
+        <span class="s5"># constrain widths:</span>
+        <span class="s1">w = (self.rights[</span><span class="s3">0</span><span class="s1">] - self.margins[</span><span class="s4">'right'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">] -</span>
+             <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">])</span>
+        <span class="s1">w = (w - self.lefts[</span><span class="s3">0</span><span class="s1">] - self.margins[</span><span class="s4">'left'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">] -</span>
+             <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">])</span>
+        <span class="s1">w0 = w / self.width_ratios[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s5"># from left to right</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">self.ncols):</span>
+            <span class="s1">w = (self.rights[i] - self.margins[</span><span class="s4">'right'</span><span class="s1">][i] -</span>
+                 <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][i])</span>
+            <span class="s1">w = (w - self.lefts[i] - self.margins[</span><span class="s4">'left'</span><span class="s1">][i] -</span>
+                 <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][i])</span>
+            <span class="s1">c = (w == w0 * self.width_ratios[i])</span>
+            <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'strong'</span><span class="s1">)</span>
+            <span class="s5"># constrain the grid cells to be directly next to each other.</span>
+            <span class="s1">c = (self.rights[i - </span><span class="s3">1</span><span class="s1">] == self.lefts[i])</span>
+            <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'strong'</span><span class="s1">)</span>
+
+        <span class="s5"># constrain heights:</span>
+        <span class="s1">h = self.tops[</span><span class="s3">0</span><span class="s1">] - self.margins[</span><span class="s4">'top'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">] - self.margins[</span><span class="s4">'topcb'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">h = (h - self.bottoms[</span><span class="s3">0</span><span class="s1">] - self.margins[</span><span class="s4">'bottom'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">] -</span>
+             <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][</span><span class="s3">0</span><span class="s1">])</span>
+        <span class="s1">h0 = h / self.height_ratios[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s5"># from top to bottom:</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">self.nrows):</span>
+            <span class="s1">h = (self.tops[i] - self.margins[</span><span class="s4">'top'</span><span class="s1">][i] -</span>
+                 <span class="s1">self.margins[</span><span class="s4">'topcb'</span><span class="s1">][i])</span>
+            <span class="s1">h = (h - self.bottoms[i] - self.margins[</span><span class="s4">'bottom'</span><span class="s1">][i] -</span>
+                 <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][i])</span>
+            <span class="s1">c = (h == h0 * self.height_ratios[i])</span>
+            <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'strong'</span><span class="s1">)</span>
+            <span class="s5"># constrain the grid cells to be directly above each other.</span>
+            <span class="s1">c = (self.bottoms[i - </span><span class="s3">1</span><span class="s1">] == self.tops[i])</span>
+            <span class="s1">self.solver.addConstraint(c | </span><span class="s4">'strong'</span><span class="s1">)</span>
+
+    <span class="s5"># Margin editing:  The margins are variable and meant to</span>
+    <span class="s5"># contain things of a fixed size like axes labels, tick labels, titles</span>
+    <span class="s5"># etc</span>
+    <span class="s2">def </span><span class="s1">edit_margin(self</span><span class="s2">, </span><span class="s1">todo</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">cell):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Change the size of the margin for one cell. 
+ 
+        Parameters 
+        ---------- 
+        todo : string (one of 'left', 'right', 'bottom', 'top') 
+            margin to alter. 
+ 
+        size : float 
+            Size of the margin.  If it is larger than the existing minimum it 
+            updates the margin size. Fraction of figure size. 
+ 
+        cell : int 
+            Cell column or row to edit. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.solver.suggestValue(self.margins[todo][cell]</span><span class="s2">, </span><span class="s1">size)</span>
+        <span class="s1">self.margin_vals[todo][cell] = size</span>
+
+    <span class="s2">def </span><span class="s1">edit_margin_min(self</span><span class="s2">, </span><span class="s1">todo</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">cell=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Change the minimum size of the margin for one cell. 
+ 
+        Parameters 
+        ---------- 
+        todo : string (one of 'left', 'right', 'bottom', 'top') 
+            margin to alter. 
+ 
+        size : float 
+            Minimum size of the margin .  If it is larger than the 
+            existing minimum it updates the margin size. Fraction of 
+            figure size. 
+ 
+        cell : int 
+            Cell column or row to edit. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">size &gt; self.margin_vals[todo][cell]:</span>
+            <span class="s1">self.edit_margin(todo</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">cell)</span>
+
+    <span class="s2">def </span><span class="s1">edit_margins(self</span><span class="s2">, </span><span class="s1">todo</span><span class="s2">, </span><span class="s1">size):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Change the size of all the margin of all the cells in the layout grid. 
+ 
+        Parameters 
+        ---------- 
+        todo : string (one of 'left', 'right', 'bottom', 'top') 
+            margin to alter. 
+ 
+        size : float 
+            Size to set the margins.  Fraction of figure size. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(self.margin_vals[todo])):</span>
+            <span class="s1">self.edit_margin(todo</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">i)</span>
+
+    <span class="s2">def </span><span class="s1">edit_all_margins_min(self</span><span class="s2">, </span><span class="s1">todo</span><span class="s2">, </span><span class="s1">size):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Change the minimum size of all the margin of all 
+        the cells in the layout grid. 
+ 
+        Parameters 
+        ---------- 
+        todo : {'left', 'right', 'bottom', 'top'} 
+            The margin to alter. 
+ 
+        size : float 
+            Minimum size of the margin.  If it is larger than the 
+            existing minimum it updates the margin size. Fraction of 
+            figure size. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(self.margin_vals[todo])):</span>
+            <span class="s1">self.edit_margin_min(todo</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">i)</span>
+
+    <span class="s2">def </span><span class="s1">edit_outer_margin_mins(self</span><span class="s2">, </span><span class="s1">margin</span><span class="s2">, </span><span class="s1">ss):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Edit all four margin minimums in one statement. 
+ 
+        Parameters 
+        ---------- 
+        margin : dict 
+            size of margins in a dict with keys 'left', 'right', 'bottom', 
+            'top' 
+ 
+        ss : SubplotSpec 
+            defines the subplotspec these margins should be applied to 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'left'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'left'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.colspan.start)</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'leftcb'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'leftcb'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.colspan.start)</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'right'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'right'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.colspan.stop - </span><span class="s3">1</span><span class="s1">)</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'rightcb'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'rightcb'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.colspan.stop - </span><span class="s3">1</span><span class="s1">)</span>
+        <span class="s5"># rows are from the top down:</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'top'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'top'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.rowspan.start)</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'topcb'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'topcb'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.rowspan.start)</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'bottom'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'bottom'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ss.rowspan.stop - </span><span class="s3">1</span><span class="s1">)</span>
+        <span class="s1">self.edit_margin_min(</span><span class="s4">'bottomcb'</span><span class="s2">, </span><span class="s1">margin[</span><span class="s4">'bottomcb'</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">ss.rowspan.stop - </span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_margins(self</span><span class="s2">, </span><span class="s1">todo</span><span class="s2">, </span><span class="s1">col):</span>
+        <span class="s0">&quot;&quot;&quot;Return the margin at this position&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.margin_vals[todo][col]</span>
+
+    <span class="s2">def </span><span class="s1">get_outer_bbox(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the outer bounding box of the subplot specs 
+        given by rows and cols.  rows and cols can be spans. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value()</span><span class="s2">,</span>
+            <span class="s1">self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value()</span><span class="s2">,</span>
+            <span class="s1">self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value()</span><span class="s2">,</span>
+            <span class="s1">self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value())</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">get_inner_bbox(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the inner bounding box of the subplot specs 
+        given by rows and cols.  rows and cols can be spans. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">(self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'left'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'bottom'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'right'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'top'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'topcb'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]].value())</span>
+        <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">get_bbox_for_cb(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the bounding box that includes the 
+        decorations but, *not* the colorbar... 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">(self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'topcb'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]].value())</span>
+        <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">get_left_margin_bbox(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the left margin bounding box of the subplot specs 
+        given by rows and cols.  rows and cols can be spans. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">(self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'leftcb'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'left'</span><span class="s1">][cols[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value()))</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">get_bottom_margin_bbox(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the left margin bounding box of the subplot specs 
+        given by rows and cols.  rows and cols can be spans. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">(self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value() +</span>
+             <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value() +</span>
+                <span class="s1">self.margins[</span><span class="s4">'bottom'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]].value() +</span>
+             <span class="s1">self.margins[</span><span class="s4">'bottomcb'</span><span class="s1">][rows[-</span><span class="s3">1</span><span class="s1">]].value()</span>
+             <span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">get_right_margin_bbox(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the left margin bounding box of the subplot specs 
+        given by rows and cols.  rows and cols can be spans. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">(self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'right'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.bottoms[rows[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'rightcb'</span><span class="s1">][cols[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value()))</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">get_top_margin_bbox(self</span><span class="s2">, </span><span class="s1">rows=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">cols=</span><span class="s3">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the left margin bounding box of the subplot specs 
+        given by rows and cols.  rows and cols can be spans. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rows = np.atleast_1d(rows)</span>
+        <span class="s1">cols = np.atleast_1d(cols)</span>
+
+        <span class="s1">bbox = Bbox.from_extents(</span>
+            <span class="s1">(self.lefts[cols[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'topcb'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.rights[cols[-</span><span class="s3">1</span><span class="s1">]].value())</span><span class="s2">,</span>
+            <span class="s1">(self.tops[rows[</span><span class="s3">0</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'topcb'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]].value() -</span>
+                <span class="s1">self.margins[</span><span class="s4">'top'</span><span class="s1">][rows[</span><span class="s3">0</span><span class="s1">]].value()))</span>
+        <span class="s2">return </span><span class="s1">bbox</span>
+
+    <span class="s2">def </span><span class="s1">update_variables(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Update the variables for the solver attached to this layoutgrid. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.solver.updateVariables()</span>
+
+<span class="s1">_layoutboxobjnum = itertools.count()</span>
+
+
+<span class="s2">def </span><span class="s1">seq_id():</span>
+    <span class="s0">&quot;&quot;&quot;Generate a short sequential id for layoutbox objects.&quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s4">'%06d' </span><span class="s1">% next(_layoutboxobjnum)</span>
+
+
+<span class="s2">def </span><span class="s1">plot_children(fig</span><span class="s2">, </span><span class="s1">lg=</span><span class="s2">None, </span><span class="s1">level=</span><span class="s3">0</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Simple plotting to show where boxes are.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">lg </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">_layoutgrids = fig.get_layout_engine().execute(fig)</span>
+        <span class="s1">lg = _layoutgrids[fig]</span>
+    <span class="s1">colors = mpl.rcParams[</span><span class="s4">&quot;axes.prop_cycle&quot;</span><span class="s1">].by_key()[</span><span class="s4">&quot;color&quot;</span><span class="s1">]</span>
+    <span class="s1">col = colors[level]</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(lg.nrows):</span>
+        <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(lg.ncols):</span>
+            <span class="s1">bb = lg.get_outer_bbox(rows=i</span><span class="s2">, </span><span class="s1">cols=j)</span>
+            <span class="s1">fig.add_artist(</span>
+                <span class="s1">mpatches.Rectangle(bb.p0</span><span class="s2">, </span><span class="s1">bb.width</span><span class="s2">, </span><span class="s1">bb.height</span><span class="s2">, </span><span class="s1">linewidth=</span><span class="s3">1</span><span class="s2">,</span>
+                                   <span class="s1">edgecolor=</span><span class="s4">'0.7'</span><span class="s2">, </span><span class="s1">facecolor=</span><span class="s4">'0.7'</span><span class="s2">,</span>
+                                   <span class="s1">alpha=</span><span class="s3">0.2</span><span class="s2">, </span><span class="s1">transform=fig.transFigure</span><span class="s2">,</span>
+                                   <span class="s1">zorder=-</span><span class="s3">3</span><span class="s1">))</span>
+            <span class="s1">bbi = lg.get_inner_bbox(rows=i</span><span class="s2">, </span><span class="s1">cols=j)</span>
+            <span class="s1">fig.add_artist(</span>
+                <span class="s1">mpatches.Rectangle(bbi.p0</span><span class="s2">, </span><span class="s1">bbi.width</span><span class="s2">, </span><span class="s1">bbi.height</span><span class="s2">, </span><span class="s1">linewidth=</span><span class="s3">2</span><span class="s2">,</span>
+                                   <span class="s1">edgecolor=col</span><span class="s2">, </span><span class="s1">facecolor=</span><span class="s4">'none'</span><span class="s2">,</span>
+                                   <span class="s1">transform=fig.transFigure</span><span class="s2">, </span><span class="s1">zorder=-</span><span class="s3">2</span><span class="s1">))</span>
+
+            <span class="s1">bbi = lg.get_left_margin_bbox(rows=i</span><span class="s2">, </span><span class="s1">cols=j)</span>
+            <span class="s1">fig.add_artist(</span>
+                <span class="s1">mpatches.Rectangle(bbi.p0</span><span class="s2">, </span><span class="s1">bbi.width</span><span class="s2">, </span><span class="s1">bbi.height</span><span class="s2">, </span><span class="s1">linewidth=</span><span class="s3">0</span><span class="s2">,</span>
+                                   <span class="s1">edgecolor=</span><span class="s4">'none'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.2</span><span class="s2">,</span>
+                                   <span class="s1">facecolor=[</span><span class="s3">0.5</span><span class="s2">, </span><span class="s3">0.7</span><span class="s2">, </span><span class="s3">0.5</span><span class="s1">]</span><span class="s2">,</span>
+                                   <span class="s1">transform=fig.transFigure</span><span class="s2">, </span><span class="s1">zorder=-</span><span class="s3">2</span><span class="s1">))</span>
+            <span class="s1">bbi = lg.get_right_margin_bbox(rows=i</span><span class="s2">, </span><span class="s1">cols=j)</span>
+            <span class="s1">fig.add_artist(</span>
+                <span class="s1">mpatches.Rectangle(bbi.p0</span><span class="s2">, </span><span class="s1">bbi.width</span><span class="s2">, </span><span class="s1">bbi.height</span><span class="s2">, </span><span class="s1">linewidth=</span><span class="s3">0</span><span class="s2">,</span>
+                                   <span class="s1">edgecolor=</span><span class="s4">'none'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.2</span><span class="s2">,</span>
+                                   <span class="s1">facecolor=[</span><span class="s3">0.7</span><span class="s2">, </span><span class="s3">0.5</span><span class="s2">, </span><span class="s3">0.5</span><span class="s1">]</span><span class="s2">,</span>
+                                   <span class="s1">transform=fig.transFigure</span><span class="s2">, </span><span class="s1">zorder=-</span><span class="s3">2</span><span class="s1">))</span>
+            <span class="s1">bbi = lg.get_bottom_margin_bbox(rows=i</span><span class="s2">, </span><span class="s1">cols=j)</span>
+            <span class="s1">fig.add_artist(</span>
+                <span class="s1">mpatches.Rectangle(bbi.p0</span><span class="s2">, </span><span class="s1">bbi.width</span><span class="s2">, </span><span class="s1">bbi.height</span><span class="s2">, </span><span class="s1">linewidth=</span><span class="s3">0</span><span class="s2">,</span>
+                                   <span class="s1">edgecolor=</span><span class="s4">'none'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.2</span><span class="s2">,</span>
+                                   <span class="s1">facecolor=[</span><span class="s3">0.5</span><span class="s2">, </span><span class="s3">0.5</span><span class="s2">, </span><span class="s3">0.7</span><span class="s1">]</span><span class="s2">,</span>
+                                   <span class="s1">transform=fig.transFigure</span><span class="s2">, </span><span class="s1">zorder=-</span><span class="s3">2</span><span class="s1">))</span>
+            <span class="s1">bbi = lg.get_top_margin_bbox(rows=i</span><span class="s2">, </span><span class="s1">cols=j)</span>
+            <span class="s1">fig.add_artist(</span>
+                <span class="s1">mpatches.Rectangle(bbi.p0</span><span class="s2">, </span><span class="s1">bbi.width</span><span class="s2">, </span><span class="s1">bbi.height</span><span class="s2">, </span><span class="s1">linewidth=</span><span class="s3">0</span><span class="s2">,</span>
+                                   <span class="s1">edgecolor=</span><span class="s4">'none'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.2</span><span class="s2">,</span>
+                                   <span class="s1">facecolor=[</span><span class="s3">0.7</span><span class="s2">, </span><span class="s3">0.2</span><span class="s2">, </span><span class="s3">0.7</span><span class="s1">]</span><span class="s2">,</span>
+                                   <span class="s1">transform=fig.transFigure</span><span class="s2">, </span><span class="s1">zorder=-</span><span class="s3">2</span><span class="s1">))</span>
+    <span class="s2">for </span><span class="s1">ch </span><span class="s2">in </span><span class="s1">lg.children.flat:</span>
+        <span class="s2">if </span><span class="s1">ch </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">plot_children(fig</span><span class="s2">, </span><span class="s1">ch</span><span class="s2">, </span><span class="s1">level=level+</span><span class="s3">1</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

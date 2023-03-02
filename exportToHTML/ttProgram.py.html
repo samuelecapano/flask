@@ -1,0 +1,567 @@
+<html>
+<head>
+<title>ttProgram.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ttProgram.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;ttLib.tables.ttProgram.py -- Assembler/disassembler for TrueType bytecode programs.&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">fontTools.misc.textTools </span><span class="s2">import </span><span class="s1">num2binary</span><span class="s2">, </span><span class="s1">binary2num</span><span class="s2">, </span><span class="s1">readHex</span><span class="s2">, </span><span class="s1">strjoin</span>
+<span class="s2">import </span><span class="s1">array</span>
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">StringIO</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s3"># first, the list of instructions that eat bytes or words from the instruction stream</span>
+
+<span class="s1">streamInstructions = [</span>
+<span class="s3">#</span>
+<span class="s3">#   opcode  mnemonic     argBits    descriptive name      pops pushes         eats from instruction stream          pushes</span>
+<span class="s3">#</span>
+	<span class="s1">(</span><span class="s4">0x40</span><span class="s2">,	</span><span class="s5">'NPUSHB'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'PushNBytes'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                      n, b1, b2,...bn      b1,b2...bn</span>
+	<span class="s1">(</span><span class="s4">0x41</span><span class="s2">,	</span><span class="s5">'NPUSHW'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'PushNWords'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                       n, w1, w2,...w      w1,w2...wn</span>
+	<span class="s1">(</span><span class="s4">0xb0</span><span class="s2">,	</span><span class="s5">'PUSHB'</span><span class="s2">,	</span><span class="s4">3</span><span class="s2">,	</span><span class="s5">'PushBytes'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                          b0, b1,..bn  b0, b1, ...,bn</span>
+	<span class="s1">(</span><span class="s4">0xb8</span><span class="s2">,	</span><span class="s5">'PUSHW'</span><span class="s2">,	</span><span class="s4">3</span><span class="s2">,	</span><span class="s5">'PushWords'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                           w0,w1,..wn   w0 ,w1, ...wn</span>
+<span class="s1">]</span>
+
+
+<span class="s3"># next, the list of &quot;normal&quot; instructions</span>
+
+<span class="s1">instructions = [</span>
+<span class="s3">#</span>
+<span class="s3">#,  opcode  mnemonic     argBits    descriptive name      pops pushes         eats from instruction stream          pushes</span>
+<span class="s3">#</span>
+	<span class="s1">(</span><span class="s4">0x7f</span><span class="s2">,	</span><span class="s5">'AA'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'AdjustAngle'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0x64</span><span class="s2">,	</span><span class="s5">'ABS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Absolute'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n             |n|</span>
+	<span class="s1">(</span><span class="s4">0x60</span><span class="s2">,	</span><span class="s5">'ADD'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Add'</span><span class="s2">,			</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               n2, n1       (n1 + n2)</span>
+	<span class="s1">(</span><span class="s4">0x27</span><span class="s2">,	</span><span class="s5">'ALIGNPTS'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'AlignPts'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               p2, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x3c</span><span class="s2">,	</span><span class="s5">'ALIGNRP'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'AlignRelativePt'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#             p1, p2, ... , ploopvalue               -</span>
+	<span class="s1">(</span><span class="s4">0x5a</span><span class="s2">,	</span><span class="s5">'AND'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'LogicalAnd'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x2b</span><span class="s2">,	</span><span class="s5">'CALL'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'CallFunction'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    f               -</span>
+	<span class="s1">(</span><span class="s4">0x67</span><span class="s2">,	</span><span class="s5">'CEILING'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Ceiling'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n         ceil(n)</span>
+	<span class="s1">(</span><span class="s4">0x25</span><span class="s2">,	</span><span class="s5">'CINDEX'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'CopyXToTopStack'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    k              ek</span>
+	<span class="s1">(</span><span class="s4">0x22</span><span class="s2">,	</span><span class="s5">'CLEAR'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'ClearStack'</span><span class="s2">,		</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#               all items on the stack               -</span>
+	<span class="s1">(</span><span class="s4">0x4f</span><span class="s2">,	</span><span class="s5">'DEBUG'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DebugCall'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x73</span><span class="s2">,	</span><span class="s5">'DELTAC1'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DeltaExceptionC1'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#    argn, cn, argn-1,cn-1, , arg1, c1               -</span>
+	<span class="s1">(</span><span class="s4">0x74</span><span class="s2">,	</span><span class="s5">'DELTAC2'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DeltaExceptionC2'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#    argn, cn, argn-1,cn-1, , arg1, c1               -</span>
+	<span class="s1">(</span><span class="s4">0x75</span><span class="s2">,	</span><span class="s5">'DELTAC3'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DeltaExceptionC3'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#    argn, cn, argn-1,cn-1, , arg1, c1               -</span>
+	<span class="s1">(</span><span class="s4">0x5d</span><span class="s2">,	</span><span class="s5">'DELTAP1'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DeltaExceptionP1'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#   argn, pn, argn-1, pn-1, , arg1, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x71</span><span class="s2">,	</span><span class="s5">'DELTAP2'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DeltaExceptionP2'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#   argn, pn, argn-1, pn-1, , arg1, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x72</span><span class="s2">,	</span><span class="s5">'DELTAP3'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DeltaExceptionP3'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#   argn, pn, argn-1, pn-1, , arg1, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x24</span><span class="s2">,	</span><span class="s5">'DEPTH'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'GetDepthStack'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               n</span>
+	<span class="s1">(</span><span class="s4">0x62</span><span class="s2">,	</span><span class="s5">'DIV'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Divide'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               n2, n1   (n1 * 64)/ n2</span>
+	<span class="s1">(</span><span class="s4">0x20</span><span class="s2">,	</span><span class="s5">'DUP'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'DuplicateTopStack'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e            e, e</span>
+	<span class="s1">(</span><span class="s4">0x59</span><span class="s2">,	</span><span class="s5">'EIF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'EndIf'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x1b</span><span class="s2">,	</span><span class="s5">'ELSE'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Else'</span><span class="s2">,			</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x2d</span><span class="s2">,	</span><span class="s5">'ENDF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'EndFunctionDefinition'</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x54</span><span class="s2">,	</span><span class="s5">'EQ'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Equal'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x57</span><span class="s2">,	</span><span class="s5">'EVEN'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Even'</span><span class="s2">,			</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e               b</span>
+	<span class="s1">(</span><span class="s4">0x2c</span><span class="s2">,	</span><span class="s5">'FDEF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'FunctionDefinition'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    f               -</span>
+	<span class="s1">(</span><span class="s4">0x4e</span><span class="s2">,	</span><span class="s5">'FLIPOFF'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetAutoFlipOff'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x4d</span><span class="s2">,	</span><span class="s5">'FLIPON'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetAutoFlipOn'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x80</span><span class="s2">,	</span><span class="s5">'FLIPPT'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'FlipPoint'</span><span class="s2">,		</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#              p1, p2, ..., ploopvalue               -</span>
+	<span class="s1">(</span><span class="s4">0x82</span><span class="s2">,	</span><span class="s5">'FLIPRGOFF'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'FlipRangeOff'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 h, l               -</span>
+	<span class="s1">(</span><span class="s4">0x81</span><span class="s2">,	</span><span class="s5">'FLIPRGON'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'FlipRangeOn'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 h, l               -</span>
+	<span class="s1">(</span><span class="s4">0x66</span><span class="s2">,	</span><span class="s5">'FLOOR'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Floor'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n        floor(n)</span>
+	<span class="s1">(</span><span class="s4">0x46</span><span class="s2">,	</span><span class="s5">'GC'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'GetCoordOnPVector'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               c</span>
+	<span class="s1">(</span><span class="s4">0x88</span><span class="s2">,	</span><span class="s5">'GETINFO'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'GetInfo'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                             selector          result</span>
+        <span class="s1">(</span><span class="s4">0x91</span><span class="s2">,  </span><span class="s5">'GETVARIATION'</span><span class="s2">, </span><span class="s4">0</span><span class="s2">,      </span><span class="s5">'GetVariation'</span><span class="s2">,         </span><span class="s4">0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s3">#                                    -        a1,..,an</span>
+	<span class="s1">(</span><span class="s4">0x0d</span><span class="s2">,	</span><span class="s5">'GFV'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'GetFVector'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -          px, py</span>
+	<span class="s1">(</span><span class="s4">0x0c</span><span class="s2">,	</span><span class="s5">'GPV'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'GetPVector'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -          px, py</span>
+	<span class="s1">(</span><span class="s4">0x52</span><span class="s2">,	</span><span class="s5">'GT'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'GreaterThan'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x53</span><span class="s2">,	</span><span class="s5">'GTEQ'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'GreaterThanOrEqual'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x89</span><span class="s2">,	</span><span class="s5">'IDEF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'InstructionDefinition'</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    f               -</span>
+	<span class="s1">(</span><span class="s4">0x58</span><span class="s2">,	</span><span class="s5">'IF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'If'</span><span class="s2">,			</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e               -</span>
+	<span class="s1">(</span><span class="s4">0x8e</span><span class="s2">,	</span><span class="s5">'INSTCTRL'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetInstrExecControl'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 s, v               -</span>
+	<span class="s1">(</span><span class="s4">0x39</span><span class="s2">,	</span><span class="s5">'IP'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'InterpolatePts'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#             p1, p2, ... , ploopvalue               -</span>
+	<span class="s1">(</span><span class="s4">0x0f</span><span class="s2">,	</span><span class="s5">'ISECT'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'MovePtToIntersect'</span><span class="s2">,	</span><span class="s4">5</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                    a1, a0, b1, b0, p               -</span>
+	<span class="s1">(</span><span class="s4">0x30</span><span class="s2">,	</span><span class="s5">'IUP'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'InterpolateUntPts'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x1c</span><span class="s2">,	</span><span class="s5">'JMPR'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Jump'</span><span class="s2">,			</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               offset               -</span>
+	<span class="s1">(</span><span class="s4">0x79</span><span class="s2">,	</span><span class="s5">'JROF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'JumpRelativeOnFalse'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                            e, offset               -</span>
+	<span class="s1">(</span><span class="s4">0x78</span><span class="s2">,	</span><span class="s5">'JROT'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'JumpRelativeOnTrue'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                            e, offset               -</span>
+	<span class="s1">(</span><span class="s4">0x2a</span><span class="s2">,	</span><span class="s5">'LOOPCALL'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'LoopAndCallFunction'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                             f, count               -</span>
+	<span class="s1">(</span><span class="s4">0x50</span><span class="s2">,	</span><span class="s5">'LT'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'LessThan'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x51</span><span class="s2">,	</span><span class="s5">'LTEQ'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'LessThenOrEqual'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x8b</span><span class="s2">,	</span><span class="s5">'MAX'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Maximum'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1     max(e1, e2)</span>
+	<span class="s1">(</span><span class="s4">0x49</span><span class="s2">,	</span><span class="s5">'MD'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'MeasureDistance'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                p2,p1               d</span>
+	<span class="s1">(</span><span class="s4">0x2e</span><span class="s2">,	</span><span class="s5">'MDAP'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'MoveDirectAbsPt'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0xc0</span><span class="s2">,	</span><span class="s5">'MDRP'</span><span class="s2">,		</span><span class="s4">5</span><span class="s2">,	</span><span class="s5">'MoveDirectRelPt'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0x3e</span><span class="s2">,	</span><span class="s5">'MIAP'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'MoveIndirectAbsPt'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 n, p               -</span>
+	<span class="s1">(</span><span class="s4">0x8c</span><span class="s2">,	</span><span class="s5">'MIN'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Minimum'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1     min(e1, e2)</span>
+	<span class="s1">(</span><span class="s4">0x26</span><span class="s2">,	</span><span class="s5">'MINDEX'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'MoveXToTopStack'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    k              ek</span>
+	<span class="s1">(</span><span class="s4">0xe0</span><span class="s2">,	</span><span class="s5">'MIRP'</span><span class="s2">,		</span><span class="s4">5</span><span class="s2">,	</span><span class="s5">'MoveIndirectRelPt'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 n, p               -</span>
+	<span class="s1">(</span><span class="s4">0x4b</span><span class="s2">,	</span><span class="s5">'MPPEM'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'MeasurePixelPerEm'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -            ppem</span>
+	<span class="s1">(</span><span class="s4">0x4c</span><span class="s2">,	</span><span class="s5">'MPS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'MeasurePointSize'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -       pointSize</span>
+	<span class="s1">(</span><span class="s4">0x3a</span><span class="s2">,	</span><span class="s5">'MSIRP'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'MoveStackIndirRelPt'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 d, p               -</span>
+	<span class="s1">(</span><span class="s4">0x63</span><span class="s2">,	</span><span class="s5">'MUL'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Multiply'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               n2, n1    (n1 * n2)/64</span>
+	<span class="s1">(</span><span class="s4">0x65</span><span class="s2">,	</span><span class="s5">'NEG'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Negate'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n              -n</span>
+	<span class="s1">(</span><span class="s4">0x55</span><span class="s2">,	</span><span class="s5">'NEQ'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'NotEqual'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x5c</span><span class="s2">,	</span><span class="s5">'NOT'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'LogicalNot'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e       ( not e )</span>
+	<span class="s1">(</span><span class="s4">0x6c</span><span class="s2">,	</span><span class="s5">'NROUND'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">,	</span><span class="s5">'NoRound'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                   n1              n2</span>
+	<span class="s1">(</span><span class="s4">0x56</span><span class="s2">,	</span><span class="s5">'ODD'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Odd'</span><span class="s2">,			</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e               b</span>
+	<span class="s1">(</span><span class="s4">0x5b</span><span class="s2">,	</span><span class="s5">'OR'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'LogicalOr'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1               b</span>
+	<span class="s1">(</span><span class="s4">0x21</span><span class="s2">,	</span><span class="s5">'POP'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'PopTopStack'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e               -</span>
+	<span class="s1">(</span><span class="s4">0x45</span><span class="s2">,	</span><span class="s5">'RCVT'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'ReadCVT'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                             location           value</span>
+	<span class="s1">(</span><span class="s4">0x7d</span><span class="s2">,	</span><span class="s5">'RDTG'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RoundDownToGrid'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x7a</span><span class="s2">,	</span><span class="s5">'ROFF'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RoundOff'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x8a</span><span class="s2">,	</span><span class="s5">'ROLL'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RollTopThreeStack'</span><span class="s2">,	</span><span class="s4">3</span><span class="s2">, </span><span class="s4">3</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                a,b,c           b,a,c</span>
+	<span class="s1">(</span><span class="s4">0x68</span><span class="s2">,	</span><span class="s5">'ROUND'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">,	</span><span class="s5">'Round'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                   n1              n2</span>
+	<span class="s1">(</span><span class="s4">0x43</span><span class="s2">,	</span><span class="s5">'RS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'ReadStore'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               v</span>
+	<span class="s1">(</span><span class="s4">0x3d</span><span class="s2">,	</span><span class="s5">'RTDG'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RoundToDoubleGrid'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x18</span><span class="s2">,	</span><span class="s5">'RTG'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RoundToGrid'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x19</span><span class="s2">,	</span><span class="s5">'RTHG'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RoundToHalfGrid'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x7c</span><span class="s2">,	</span><span class="s5">'RUTG'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'RoundUpToGrid'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x77</span><span class="s2">,	</span><span class="s5">'S45ROUND'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SuperRound45Degrees'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x7e</span><span class="s2">,	</span><span class="s5">'SANGW'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetAngleWeight'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               weight               -</span>
+	<span class="s1">(</span><span class="s4">0x85</span><span class="s2">,	</span><span class="s5">'SCANCTRL'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'ScanConversionControl'</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x8d</span><span class="s2">,	</span><span class="s5">'SCANTYPE'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'ScanType'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x48</span><span class="s2">,	</span><span class="s5">'SCFS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetCoordFromStackFP'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 c, p               -</span>
+	<span class="s1">(</span><span class="s4">0x1d</span><span class="s2">,	</span><span class="s5">'SCVTCI'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetCVTCutIn'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x5e</span><span class="s2">,	</span><span class="s5">'SDB'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetDeltaBaseInGState'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x86</span><span class="s2">,	</span><span class="s5">'SDPVTL'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'SetDualPVectorToLine'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               p2, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x5f</span><span class="s2">,	</span><span class="s5">'SDS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetDeltaShiftInGState'</span><span class="s2">,</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x0b</span><span class="s2">,	</span><span class="s5">'SFVFS'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetFVectorFromStack'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 y, x               -</span>
+	<span class="s1">(</span><span class="s4">0x04</span><span class="s2">,	</span><span class="s5">'SFVTCA'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'SetFVectorToAxis'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x08</span><span class="s2">,	</span><span class="s5">'SFVTL'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'SetFVectorToLine'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               p2, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x0e</span><span class="s2">,	</span><span class="s5">'SFVTPV'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetFVectorToPVector'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x34</span><span class="s2">,	</span><span class="s5">'SHC'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'ShiftContourByLastPt'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    c               -</span>
+	<span class="s1">(</span><span class="s4">0x32</span><span class="s2">,	</span><span class="s5">'SHP'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'ShiftPointByLastPoint'</span><span class="s2">,</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#              p1, p2, ..., ploopvalue               -</span>
+	<span class="s1">(</span><span class="s4">0x38</span><span class="s2">,	</span><span class="s5">'SHPIX'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'ShiftZoneByPixel'</span><span class="s2">,	</span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#           d, p1, p2, ..., ploopvalue               -</span>
+	<span class="s1">(</span><span class="s4">0x36</span><span class="s2">,	</span><span class="s5">'SHZ'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'ShiftZoneByLastPoint'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    e               -</span>
+	<span class="s1">(</span><span class="s4">0x17</span><span class="s2">,	</span><span class="s5">'SLOOP'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetLoopVariable'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x1a</span><span class="s2">,	</span><span class="s5">'SMD'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetMinimumDistance'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                             distance               -</span>
+	<span class="s1">(</span><span class="s4">0x0a</span><span class="s2">,	</span><span class="s5">'SPVFS'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetPVectorFromStack'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 y, x               -</span>
+	<span class="s1">(</span><span class="s4">0x02</span><span class="s2">,	</span><span class="s5">'SPVTCA'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'SetPVectorToAxis'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x06</span><span class="s2">,	</span><span class="s5">'SPVTL'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'SetPVectorToLine'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               p2, p1               -</span>
+	<span class="s1">(</span><span class="s4">0x76</span><span class="s2">,	</span><span class="s5">'SROUND'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SuperRound'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x10</span><span class="s2">,	</span><span class="s5">'SRP0'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetRefPoint0'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0x11</span><span class="s2">,	</span><span class="s5">'SRP1'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetRefPoint1'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0x12</span><span class="s2">,	</span><span class="s5">'SRP2'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetRefPoint2'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0x1f</span><span class="s2">,	</span><span class="s5">'SSW'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetSingleWidth'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x1e</span><span class="s2">,	</span><span class="s5">'SSWCI'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetSingleWidthCutIn'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x61</span><span class="s2">,	</span><span class="s5">'SUB'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'Subtract'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               n2, n1       (n1 - n2)</span>
+	<span class="s1">(</span><span class="s4">0x00</span><span class="s2">,	</span><span class="s5">'SVTCA'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">,	</span><span class="s5">'SetFPVectorToAxis'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    -               -</span>
+	<span class="s1">(</span><span class="s4">0x23</span><span class="s2">,	</span><span class="s5">'SWAP'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SwapTopStack'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                               e2, e1          e1, e2</span>
+	<span class="s1">(</span><span class="s4">0x13</span><span class="s2">,	</span><span class="s5">'SZP0'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetZonePointer0'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x14</span><span class="s2">,	</span><span class="s5">'SZP1'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetZonePointer1'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x15</span><span class="s2">,	</span><span class="s5">'SZP2'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetZonePointer2'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x16</span><span class="s2">,	</span><span class="s5">'SZPS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'SetZonePointerS'</span><span class="s2">,	</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    n               -</span>
+	<span class="s1">(</span><span class="s4">0x29</span><span class="s2">,	</span><span class="s5">'UTP'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'UnTouchPt'</span><span class="s2">,		</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                    p               -</span>
+	<span class="s1">(</span><span class="s4">0x70</span><span class="s2">,	</span><span class="s5">'WCVTF'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'WriteCVTInFUnits'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 n, l               -</span>
+	<span class="s1">(</span><span class="s4">0x44</span><span class="s2">,	</span><span class="s5">'WCVTP'</span><span class="s2">,	</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'WriteCVTInPixels'</span><span class="s2">,	</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 v, l               -</span>
+	<span class="s1">(</span><span class="s4">0x42</span><span class="s2">,	</span><span class="s5">'WS'</span><span class="s2">,		</span><span class="s4">0</span><span class="s2">,	</span><span class="s5">'WriteStore'</span><span class="s2">,		</span><span class="s4">2</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">,	</span><span class="s3">#                                 v, l               -</span>
+<span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">bitRepr(value</span><span class="s2">, </span><span class="s1">bits):</span>
+	<span class="s1">s = </span><span class="s5">&quot;&quot;</span>
+	<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(bits):</span>
+		<span class="s1">s = </span><span class="s5">&quot;01&quot;</span><span class="s1">[value &amp; </span><span class="s4">0x1</span><span class="s1">] + s</span>
+		<span class="s1">value = value &gt;&gt; </span><span class="s4">1</span>
+	<span class="s2">return </span><span class="s1">s</span>
+
+
+<span class="s1">_mnemonicPat = re.compile(</span><span class="s5">r&quot;[A-Z][A-Z0-9]*$&quot;</span><span class="s1">)</span>
+
+<span class="s2">def </span><span class="s1">_makeDict(instructionList):</span>
+	<span class="s1">opcodeDict = {}</span>
+	<span class="s1">mnemonicDict = {}</span>
+	<span class="s2">for </span><span class="s1">op</span><span class="s2">, </span><span class="s1">mnemonic</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">pops</span><span class="s2">, </span><span class="s1">pushes </span><span class="s2">in </span><span class="s1">instructionList:</span>
+		<span class="s2">assert </span><span class="s1">_mnemonicPat.match(mnemonic)</span>
+		<span class="s1">mnemonicDict[mnemonic] = op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name</span>
+		<span class="s2">if </span><span class="s1">argBits:</span>
+			<span class="s1">argoffset = op</span>
+			<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">1 </span><span class="s1">&lt;&lt; argBits):</span>
+				<span class="s1">opcodeDict[op+i] = mnemonic</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">argoffset</span><span class="s2">, </span><span class="s1">name</span>
+		<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">opcodeDict[op] = mnemonic</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">name</span>
+	<span class="s2">return </span><span class="s1">opcodeDict</span><span class="s2">, </span><span class="s1">mnemonicDict</span>
+
+<span class="s1">streamOpcodeDict</span><span class="s2">, </span><span class="s1">streamMnemonicDict = _makeDict(streamInstructions)</span>
+<span class="s1">opcodeDict</span><span class="s2">, </span><span class="s1">mnemonicDict = _makeDict(instructions)</span>
+
+<span class="s2">class </span><span class="s1">tt_instructions_error(Exception):</span>
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">error):</span>
+		<span class="s1">self.error = error</span>
+	<span class="s2">def </span><span class="s1">__str__(self):</span>
+		<span class="s2">return </span><span class="s5">&quot;TT instructions error: %s&quot; </span><span class="s1">% repr(self.error)</span>
+
+
+<span class="s1">_comment = </span><span class="s5">r&quot;/\*.*?\*/&quot;</span>
+<span class="s1">_instruction = </span><span class="s5">r&quot;([A-Z][A-Z0-9]*)\s*\[(.*?)\]&quot;</span>
+<span class="s1">_number = </span><span class="s5">r&quot;-?[0-9]+&quot;</span>
+<span class="s1">_token = </span><span class="s5">&quot;(%s)|(%s)|(%s)&quot; </span><span class="s1">% (_instruction</span><span class="s2">, </span><span class="s1">_number</span><span class="s2">, </span><span class="s1">_comment)</span>
+
+<span class="s1">_tokenRE = re.compile(_token)</span>
+<span class="s1">_whiteRE = re.compile(</span><span class="s5">r&quot;\s*&quot;</span><span class="s1">)</span>
+
+<span class="s1">_pushCountPat = re.compile(</span><span class="s5">r&quot;[A-Z][A-Z0-9]*\s*\[.*?\]\s*/\* ([0-9]+).*?\*/&quot;</span><span class="s1">)</span>
+
+<span class="s1">_indentRE = re.compile(</span><span class="s5">r&quot;^FDEF|IF|ELSE\[ \]\t.+&quot;</span><span class="s1">)</span>
+<span class="s1">_unindentRE = re.compile(</span><span class="s5">r&quot;^ELSE|ENDF|EIF\[ \]\t.+&quot;</span><span class="s1">)</span>
+
+<span class="s2">def </span><span class="s1">_skipWhite(data</span><span class="s2">, </span><span class="s1">pos):</span>
+	<span class="s1">m = _whiteRE.match(data</span><span class="s2">, </span><span class="s1">pos)</span>
+	<span class="s1">newPos = m.regs[</span><span class="s4">0</span><span class="s1">][</span><span class="s4">1</span><span class="s1">]</span>
+	<span class="s2">assert </span><span class="s1">newPos &gt;= pos</span>
+	<span class="s2">return </span><span class="s1">newPos</span>
+
+
+<span class="s2">class </span><span class="s1">Program(object):</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s2">pass</span>
+
+	<span class="s2">def </span><span class="s1">fromBytecode(self</span><span class="s2">, </span><span class="s1">bytecode):</span>
+		<span class="s1">self.bytecode = array.array(</span><span class="s5">&quot;B&quot;</span><span class="s2">, </span><span class="s1">bytecode)</span>
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">&quot;assembly&quot;</span><span class="s1">):</span>
+			<span class="s2">del </span><span class="s1">self.assembly</span>
+
+	<span class="s2">def </span><span class="s1">fromAssembly(self</span><span class="s2">, </span><span class="s1">assembly):</span>
+		<span class="s1">self.assembly = assembly</span>
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">&quot;bytecode&quot;</span><span class="s1">):</span>
+			<span class="s2">del </span><span class="s1">self.bytecode</span>
+
+	<span class="s2">def </span><span class="s1">getBytecode(self):</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">&quot;bytecode&quot;</span><span class="s1">):</span>
+			<span class="s1">self._assemble()</span>
+		<span class="s2">return </span><span class="s1">self.bytecode.tobytes()</span>
+
+	<span class="s2">def </span><span class="s1">getAssembly(self</span><span class="s2">, </span><span class="s1">preserve=</span><span class="s2">True</span><span class="s1">):</span>
+		<span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">&quot;assembly&quot;</span><span class="s1">):</span>
+			<span class="s1">self._disassemble(preserve=preserve)</span>
+		<span class="s2">return </span><span class="s1">self.assembly</span>
+
+	<span class="s2">def </span><span class="s1">toXML(self</span><span class="s2">, </span><span class="s1">writer</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s2">if not </span><span class="s1">hasattr (ttFont</span><span class="s2">, </span><span class="s5">&quot;disassembleInstructions&quot;</span><span class="s1">) </span><span class="s2">or </span><span class="s1">ttFont.disassembleInstructions:</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">assembly = self.getAssembly()</span>
+			<span class="s2">except</span><span class="s1">:</span>
+				<span class="s2">import </span><span class="s1">traceback</span>
+				<span class="s1">tmp = StringIO()</span>
+				<span class="s1">traceback.print_exc(file=tmp)</span>
+				<span class="s1">msg = </span><span class="s5">&quot;An exception occurred during the decompilation of glyph program:</span><span class="s2">\n\n</span><span class="s5">&quot;</span>
+				<span class="s1">msg += tmp.getvalue()</span>
+				<span class="s1">log.error(msg)</span>
+				<span class="s1">writer.begintag(</span><span class="s5">&quot;bytecode&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">writer.comment(msg.strip())</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">writer.dumphex(self.getBytecode())</span>
+				<span class="s1">writer.endtag(</span><span class="s5">&quot;bytecode&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">if not </span><span class="s1">assembly:</span>
+					<span class="s2">return</span>
+				<span class="s1">writer.begintag(</span><span class="s5">&quot;assembly&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+				<span class="s1">i = </span><span class="s4">0</span>
+				<span class="s1">indent = </span><span class="s4">0</span>
+				<span class="s1">nInstr = len(assembly)</span>
+				<span class="s2">while </span><span class="s1">i &lt; nInstr:</span>
+					<span class="s1">instr = assembly[i]</span>
+					<span class="s2">if </span><span class="s1">_unindentRE.match(instr):</span>
+						<span class="s1">indent -= </span><span class="s4">1</span>
+					<span class="s1">writer.write(writer.indentwhite * indent)</span>
+					<span class="s1">writer.write(instr)</span>
+					<span class="s1">writer.newline()</span>
+					<span class="s1">m = _pushCountPat.match(instr)</span>
+					<span class="s1">i = i + </span><span class="s4">1</span>
+					<span class="s2">if </span><span class="s1">m:</span>
+						<span class="s1">nValues = int(m.group(</span><span class="s4">1</span><span class="s1">))</span>
+						<span class="s1">line = []</span>
+						<span class="s1">j = </span><span class="s4">0</span>
+						<span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(nValues):</span>
+							<span class="s2">if </span><span class="s1">j </span><span class="s2">and not </span><span class="s1">(j % </span><span class="s4">25</span><span class="s1">):</span>
+								<span class="s1">writer.write(writer.indentwhite * indent)</span>
+								<span class="s1">writer.write(</span><span class="s5">' '</span><span class="s1">.join(line))</span>
+								<span class="s1">writer.newline()</span>
+								<span class="s1">line = []</span>
+							<span class="s1">line.append(assembly[i+j])</span>
+						<span class="s1">writer.write(writer.indentwhite * indent)</span>
+						<span class="s1">writer.write(</span><span class="s5">' '</span><span class="s1">.join(line))</span>
+						<span class="s1">writer.newline()</span>
+						<span class="s1">i = i + j + </span><span class="s4">1</span>
+					<span class="s2">if </span><span class="s1">_indentRE.match(instr):</span>
+						<span class="s1">indent += </span><span class="s4">1</span>
+				<span class="s1">writer.endtag(</span><span class="s5">&quot;assembly&quot;</span><span class="s1">)</span>
+				<span class="s1">writer.newline()</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">bytecode = self.getBytecode()</span>
+			<span class="s2">if not </span><span class="s1">bytecode:</span>
+				<span class="s2">return</span>
+			<span class="s1">writer.begintag(</span><span class="s5">&quot;bytecode&quot;</span><span class="s1">)</span>
+			<span class="s1">writer.newline()</span>
+			<span class="s1">writer.dumphex(bytecode)</span>
+			<span class="s1">writer.endtag(</span><span class="s5">&quot;bytecode&quot;</span><span class="s1">)</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s2">def </span><span class="s1">fromXML(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">content</span><span class="s2">, </span><span class="s1">ttFont):</span>
+		<span class="s2">if </span><span class="s1">name == </span><span class="s5">&quot;assembly&quot;</span><span class="s1">:</span>
+			<span class="s1">self.fromAssembly(strjoin(content))</span>
+			<span class="s1">self._assemble()</span>
+			<span class="s2">del </span><span class="s1">self.assembly</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">assert </span><span class="s1">name == </span><span class="s5">&quot;bytecode&quot;</span>
+			<span class="s1">self.fromBytecode(readHex(content))</span>
+
+	<span class="s2">def </span><span class="s1">_assemble(self):</span>
+		<span class="s1">assembly = getattr(self</span><span class="s2">, </span><span class="s5">'assembly'</span><span class="s2">, </span><span class="s1">[])</span>
+		<span class="s2">if </span><span class="s1">isinstance(assembly</span><span class="s2">, </span><span class="s1">type([])):</span>
+			<span class="s1">assembly = </span><span class="s5">' '</span><span class="s1">.join(assembly)</span>
+		<span class="s1">bytecode = []</span>
+		<span class="s1">push = bytecode.append</span>
+		<span class="s1">lenAssembly = len(assembly)</span>
+		<span class="s1">pos = _skipWhite(assembly</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+		<span class="s2">while </span><span class="s1">pos &lt; lenAssembly:</span>
+			<span class="s1">m = _tokenRE.match(assembly</span><span class="s2">, </span><span class="s1">pos)</span>
+			<span class="s2">if </span><span class="s1">m </span><span class="s2">is None</span><span class="s1">:</span>
+				<span class="s2">raise </span><span class="s1">tt_instructions_error(</span><span class="s5">&quot;Syntax error in TT program (%s)&quot; </span><span class="s1">% assembly[pos-</span><span class="s4">5</span><span class="s1">:pos+</span><span class="s4">15</span><span class="s1">])</span>
+			<span class="s1">dummy</span><span class="s2">, </span><span class="s1">mnemonic</span><span class="s2">, </span><span class="s1">arg</span><span class="s2">, </span><span class="s1">number</span><span class="s2">, </span><span class="s1">comment = m.groups()</span>
+			<span class="s1">pos = m.regs[</span><span class="s4">0</span><span class="s1">][</span><span class="s4">1</span><span class="s1">]</span>
+			<span class="s2">if </span><span class="s1">comment:</span>
+				<span class="s1">pos = _skipWhite(assembly</span><span class="s2">, </span><span class="s1">pos)</span>
+				<span class="s2">continue</span>
+
+			<span class="s1">arg = arg.strip()</span>
+			<span class="s2">if </span><span class="s1">mnemonic.startswith(</span><span class="s5">&quot;INSTR&quot;</span><span class="s1">):</span>
+				<span class="s3"># Unknown instruction</span>
+				<span class="s1">op = int(mnemonic[</span><span class="s4">5</span><span class="s1">:])</span>
+				<span class="s1">push(op)</span>
+			<span class="s2">elif </span><span class="s1">mnemonic </span><span class="s2">not in </span><span class="s1">(</span><span class="s5">&quot;PUSH&quot;</span><span class="s2">, </span><span class="s5">&quot;NPUSHB&quot;</span><span class="s2">, </span><span class="s5">&quot;NPUSHW&quot;</span><span class="s2">, </span><span class="s5">&quot;PUSHB&quot;</span><span class="s2">, </span><span class="s5">&quot;PUSHW&quot;</span><span class="s1">):</span>
+				<span class="s1">op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name = mnemonicDict[mnemonic]</span>
+				<span class="s2">if </span><span class="s1">len(arg) != argBits:</span>
+					<span class="s2">raise </span><span class="s1">tt_instructions_error(</span><span class="s5">&quot;Incorrect number of argument bits (%s[%s])&quot; </span><span class="s1">% (mnemonic</span><span class="s2">, </span><span class="s1">arg))</span>
+				<span class="s2">if </span><span class="s1">arg:</span>
+					<span class="s1">arg = binary2num(arg)</span>
+					<span class="s1">push(op + arg)</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">push(op)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">args = []</span>
+				<span class="s1">pos = _skipWhite(assembly</span><span class="s2">, </span><span class="s1">pos)</span>
+				<span class="s2">while </span><span class="s1">pos &lt; lenAssembly:</span>
+					<span class="s1">m = _tokenRE.match(assembly</span><span class="s2">, </span><span class="s1">pos)</span>
+					<span class="s2">if </span><span class="s1">m </span><span class="s2">is None</span><span class="s1">:</span>
+						<span class="s2">raise </span><span class="s1">tt_instructions_error(</span><span class="s5">&quot;Syntax error in TT program (%s)&quot; </span><span class="s1">% assembly[pos:pos+</span><span class="s4">15</span><span class="s1">])</span>
+					<span class="s1">dummy</span><span class="s2">, </span><span class="s1">_mnemonic</span><span class="s2">, </span><span class="s1">arg</span><span class="s2">, </span><span class="s1">number</span><span class="s2">, </span><span class="s1">comment = m.groups()</span>
+					<span class="s2">if </span><span class="s1">number </span><span class="s2">is None and </span><span class="s1">comment </span><span class="s2">is None</span><span class="s1">:</span>
+						<span class="s2">break</span>
+					<span class="s1">pos = m.regs[</span><span class="s4">0</span><span class="s1">][</span><span class="s4">1</span><span class="s1">]</span>
+					<span class="s1">pos = _skipWhite(assembly</span><span class="s2">, </span><span class="s1">pos)</span>
+					<span class="s2">if </span><span class="s1">comment </span><span class="s2">is not None</span><span class="s1">:</span>
+						<span class="s2">continue</span>
+					<span class="s1">args.append(int(number))</span>
+				<span class="s1">nArgs = len(args)</span>
+				<span class="s2">if </span><span class="s1">mnemonic == </span><span class="s5">&quot;PUSH&quot;</span><span class="s1">:</span>
+					<span class="s3"># Automatically choose the most compact representation</span>
+					<span class="s1">nWords = </span><span class="s4">0</span>
+					<span class="s2">while </span><span class="s1">nArgs:</span>
+						<span class="s2">while </span><span class="s1">nWords &lt; nArgs </span><span class="s2">and </span><span class="s1">nWords &lt; </span><span class="s4">255 </span><span class="s2">and not </span><span class="s1">(</span><span class="s4">0 </span><span class="s1">&lt;= args[nWords] &lt;= </span><span class="s4">255</span><span class="s1">):</span>
+							<span class="s1">nWords += </span><span class="s4">1</span>
+						<span class="s1">nBytes = </span><span class="s4">0</span>
+						<span class="s2">while </span><span class="s1">nWords+nBytes &lt; nArgs </span><span class="s2">and </span><span class="s1">nBytes &lt; </span><span class="s4">255 </span><span class="s2">and </span><span class="s4">0 </span><span class="s1">&lt;= args[nWords+nBytes] &lt;= </span><span class="s4">255</span><span class="s1">:</span>
+							<span class="s1">nBytes += </span><span class="s4">1</span>
+						<span class="s2">if </span><span class="s1">nBytes &lt; </span><span class="s4">2 </span><span class="s2">and </span><span class="s1">nWords + nBytes &lt; </span><span class="s4">255 </span><span class="s2">and </span><span class="s1">nWords + nBytes != nArgs:</span>
+							<span class="s3"># Will write bytes as words</span>
+							<span class="s1">nWords += nBytes</span>
+							<span class="s2">continue</span>
+
+						<span class="s3"># Write words</span>
+						<span class="s2">if </span><span class="s1">nWords:</span>
+							<span class="s2">if </span><span class="s1">nWords &lt;= </span><span class="s4">8</span><span class="s1">:</span>
+								<span class="s1">op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name = streamMnemonicDict[</span><span class="s5">&quot;PUSHW&quot;</span><span class="s1">]</span>
+								<span class="s1">op = op + nWords - </span><span class="s4">1</span>
+								<span class="s1">push(op)</span>
+							<span class="s2">else</span><span class="s1">:</span>
+								<span class="s1">op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name = streamMnemonicDict[</span><span class="s5">&quot;NPUSHW&quot;</span><span class="s1">]</span>
+								<span class="s1">push(op)</span>
+								<span class="s1">push(nWords)</span>
+							<span class="s2">for </span><span class="s1">value </span><span class="s2">in </span><span class="s1">args[:nWords]:</span>
+								<span class="s2">assert </span><span class="s1">-</span><span class="s4">32768 </span><span class="s1">&lt;= value &lt; </span><span class="s4">32768</span><span class="s2">, </span><span class="s5">&quot;PUSH value out of range %d&quot; </span><span class="s1">% value</span>
+								<span class="s1">push((value &gt;&gt; </span><span class="s4">8</span><span class="s1">) &amp; </span><span class="s4">0xff</span><span class="s1">)</span>
+								<span class="s1">push(value &amp; </span><span class="s4">0xff</span><span class="s1">)</span>
+
+						<span class="s3"># Write bytes</span>
+						<span class="s2">if </span><span class="s1">nBytes:</span>
+							<span class="s2">pass</span>
+							<span class="s2">if </span><span class="s1">nBytes &lt;= </span><span class="s4">8</span><span class="s1">:</span>
+								<span class="s1">op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name = streamMnemonicDict[</span><span class="s5">&quot;PUSHB&quot;</span><span class="s1">]</span>
+								<span class="s1">op = op + nBytes - </span><span class="s4">1</span>
+								<span class="s1">push(op)</span>
+							<span class="s2">else</span><span class="s1">:</span>
+								<span class="s1">op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name = streamMnemonicDict[</span><span class="s5">&quot;NPUSHB&quot;</span><span class="s1">]</span>
+								<span class="s1">push(op)</span>
+								<span class="s1">push(nBytes)</span>
+							<span class="s2">for </span><span class="s1">value </span><span class="s2">in </span><span class="s1">args[nWords:nWords+nBytes]:</span>
+								<span class="s1">push(value)</span>
+
+						<span class="s1">nTotal = nWords + nBytes</span>
+						<span class="s1">args = args[nTotal:]</span>
+						<span class="s1">nArgs -= nTotal</span>
+						<span class="s1">nWords = </span><span class="s4">0</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s3"># Write exactly what we've been asked to</span>
+					<span class="s1">words = mnemonic[-</span><span class="s4">1</span><span class="s1">] == </span><span class="s5">&quot;W&quot;</span>
+					<span class="s1">op</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">name = streamMnemonicDict[mnemonic]</span>
+					<span class="s2">if </span><span class="s1">mnemonic[</span><span class="s4">0</span><span class="s1">] != </span><span class="s5">&quot;N&quot;</span><span class="s1">:</span>
+						<span class="s2">assert </span><span class="s1">nArgs &lt;= </span><span class="s4">8</span><span class="s2">, </span><span class="s1">nArgs</span>
+						<span class="s1">op = op + nArgs - </span><span class="s4">1</span>
+						<span class="s1">push(op)</span>
+					<span class="s2">else</span><span class="s1">:</span>
+						<span class="s2">assert </span><span class="s1">nArgs &lt; </span><span class="s4">256</span>
+						<span class="s1">push(op)</span>
+						<span class="s1">push(nArgs)</span>
+					<span class="s2">if </span><span class="s1">words:</span>
+						<span class="s2">for </span><span class="s1">value </span><span class="s2">in </span><span class="s1">args:</span>
+							<span class="s2">assert </span><span class="s1">-</span><span class="s4">32768 </span><span class="s1">&lt;= value &lt; </span><span class="s4">32768</span><span class="s2">, </span><span class="s5">&quot;PUSHW value out of range %d&quot; </span><span class="s1">% value</span>
+							<span class="s1">push((value &gt;&gt; </span><span class="s4">8</span><span class="s1">) &amp; </span><span class="s4">0xff</span><span class="s1">)</span>
+							<span class="s1">push(value &amp; </span><span class="s4">0xff</span><span class="s1">)</span>
+					<span class="s2">else</span><span class="s1">:</span>
+						<span class="s2">for </span><span class="s1">value </span><span class="s2">in </span><span class="s1">args:</span>
+							<span class="s2">assert </span><span class="s4">0 </span><span class="s1">&lt;= value &lt; </span><span class="s4">256</span><span class="s2">, </span><span class="s5">&quot;PUSHB value out of range %d&quot; </span><span class="s1">% value</span>
+							<span class="s1">push(value)</span>
+
+			<span class="s1">pos = _skipWhite(assembly</span><span class="s2">, </span><span class="s1">pos)</span>
+
+		<span class="s2">if </span><span class="s1">bytecode:</span>
+			<span class="s2">assert </span><span class="s1">max(bytecode) &lt; </span><span class="s4">256 </span><span class="s2">and </span><span class="s1">min(bytecode) &gt;= </span><span class="s4">0</span>
+		<span class="s1">self.bytecode = array.array(</span><span class="s5">&quot;B&quot;</span><span class="s2">, </span><span class="s1">bytecode)</span>
+
+	<span class="s2">def </span><span class="s1">_disassemble(self</span><span class="s2">, </span><span class="s1">preserve=</span><span class="s2">False</span><span class="s1">):</span>
+		<span class="s1">assembly = []</span>
+		<span class="s1">i = </span><span class="s4">0</span>
+		<span class="s1">bytecode = getattr(self</span><span class="s2">, </span><span class="s5">'bytecode'</span><span class="s2">, </span><span class="s1">[])</span>
+		<span class="s1">numBytecode = len(bytecode)</span>
+		<span class="s2">while </span><span class="s1">i &lt; numBytecode:</span>
+			<span class="s1">op = bytecode[i]</span>
+			<span class="s2">try</span><span class="s1">:</span>
+				<span class="s1">mnemonic</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">argoffset</span><span class="s2">, </span><span class="s1">name = opcodeDict[op]</span>
+			<span class="s2">except </span><span class="s1">KeyError:</span>
+				<span class="s2">if </span><span class="s1">op </span><span class="s2">in </span><span class="s1">streamOpcodeDict:</span>
+					<span class="s1">values = []</span>
+
+					<span class="s3"># Merge consecutive PUSH operations</span>
+					<span class="s2">while </span><span class="s1">bytecode[i] </span><span class="s2">in </span><span class="s1">streamOpcodeDict:</span>
+						<span class="s1">op = bytecode[i]</span>
+						<span class="s1">mnemonic</span><span class="s2">, </span><span class="s1">argBits</span><span class="s2">, </span><span class="s1">argoffset</span><span class="s2">, </span><span class="s1">name = streamOpcodeDict[op]</span>
+						<span class="s1">words = mnemonic[-</span><span class="s4">1</span><span class="s1">] == </span><span class="s5">&quot;W&quot;</span>
+						<span class="s2">if </span><span class="s1">argBits:</span>
+							<span class="s1">nValues = op - argoffset + </span><span class="s4">1</span>
+						<span class="s2">else</span><span class="s1">:</span>
+							<span class="s1">i = i + </span><span class="s4">1</span>
+							<span class="s1">nValues = bytecode[i]</span>
+						<span class="s1">i = i + </span><span class="s4">1</span>
+						<span class="s2">assert </span><span class="s1">nValues &gt; </span><span class="s4">0</span>
+						<span class="s2">if not </span><span class="s1">words:</span>
+							<span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(nValues):</span>
+								<span class="s1">value = bytecode[i]</span>
+								<span class="s1">values.append(repr(value))</span>
+								<span class="s1">i = i + </span><span class="s4">1</span>
+						<span class="s2">else</span><span class="s1">:</span>
+							<span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(nValues):</span>
+								<span class="s3"># cast to signed int16</span>
+								<span class="s1">value = (bytecode[i] &lt;&lt; </span><span class="s4">8</span><span class="s1">) | bytecode[i+</span><span class="s4">1</span><span class="s1">]</span>
+								<span class="s2">if </span><span class="s1">value &gt;= </span><span class="s4">0x8000</span><span class="s1">:</span>
+									<span class="s1">value = value - </span><span class="s4">0x10000</span>
+								<span class="s1">values.append(repr(value))</span>
+								<span class="s1">i = i + </span><span class="s4">2</span>
+						<span class="s2">if </span><span class="s1">preserve:</span>
+							<span class="s2">break</span>
+
+					<span class="s2">if not </span><span class="s1">preserve:</span>
+						<span class="s1">mnemonic = </span><span class="s5">&quot;PUSH&quot;</span>
+					<span class="s1">nValues = len(values)</span>
+					<span class="s2">if </span><span class="s1">nValues == </span><span class="s4">1</span><span class="s1">:</span>
+						<span class="s1">assembly.append(</span><span class="s5">&quot;%s[ ]  /* 1 value pushed */&quot; </span><span class="s1">% mnemonic)</span>
+					<span class="s2">else</span><span class="s1">:</span>
+						<span class="s1">assembly.append(</span><span class="s5">&quot;%s[ ]  /* %s values pushed */&quot; </span><span class="s1">% (mnemonic</span><span class="s2">, </span><span class="s1">nValues))</span>
+					<span class="s1">assembly.extend(values)</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">assembly.append(</span><span class="s5">&quot;INSTR%d[ ]&quot; </span><span class="s1">% op)</span>
+					<span class="s1">i = i + </span><span class="s4">1</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">argBits:</span>
+					<span class="s1">assembly.append(mnemonic + </span><span class="s5">&quot;[%s]  /* %s */&quot; </span><span class="s1">% (num2binary(op - argoffset</span><span class="s2">, </span><span class="s1">argBits)</span><span class="s2">, </span><span class="s1">name))</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">assembly.append(mnemonic + </span><span class="s5">&quot;[ ]   /* %s */&quot; </span><span class="s1">% name)</span>
+				<span class="s1">i = i + </span><span class="s4">1</span>
+		<span class="s1">self.assembly = assembly</span>
+
+	<span class="s2">def </span><span class="s1">__bool__(self):</span>
+		<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; p = Program() 
+        &gt;&gt;&gt; bool(p) 
+        False 
+        &gt;&gt;&gt; bc = array.array(&quot;B&quot;, [0]) 
+        &gt;&gt;&gt; p.fromBytecode(bc) 
+        &gt;&gt;&gt; bool(p) 
+        True 
+        &gt;&gt;&gt; p.bytecode.pop() 
+        0 
+        &gt;&gt;&gt; bool(p) 
+        False 
+ 
+        &gt;&gt;&gt; p = Program() 
+        &gt;&gt;&gt; asm = ['SVTCA[0]'] 
+        &gt;&gt;&gt; p.fromAssembly(asm) 
+        &gt;&gt;&gt; bool(p) 
+        True 
+        &gt;&gt;&gt; p.assembly.pop() 
+        'SVTCA[0]' 
+        &gt;&gt;&gt; bool(p) 
+        False 
+        &quot;&quot;&quot;</span>
+		<span class="s2">return </span><span class="s1">((hasattr(self</span><span class="s2">, </span><span class="s5">'assembly'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">len(self.assembly) &gt; </span><span class="s4">0</span><span class="s1">) </span><span class="s2">or</span>
+				<span class="s1">(hasattr(self</span><span class="s2">, </span><span class="s5">'bytecode'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">len(self.bytecode) &gt; </span><span class="s4">0</span><span class="s1">))</span>
+
+	<span class="s1">__nonzero__ = __bool__</span>
+
+	<span class="s2">def </span><span class="s1">__eq__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s2">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s2">return </span><span class="s1">NotImplemented</span>
+		<span class="s2">return </span><span class="s1">self.__dict__ == other.__dict__</span>
+
+	<span class="s2">def </span><span class="s1">__ne__(self</span><span class="s2">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s2">return </span><span class="s1">result </span><span class="s2">if </span><span class="s1">result </span><span class="s2">is </span><span class="s1">NotImplemented </span><span class="s2">else not </span><span class="s1">result</span>
+
+
+<span class="s2">def </span><span class="s1">_test():</span>
+	<span class="s0">&quot;&quot;&quot; 
+        &gt;&gt;&gt; _test() 
+        True 
+    &quot;&quot;&quot;</span>
+
+	<span class="s1">bc = </span><span class="s6">b&quot;&quot;&quot;@;:9876543210/.-,+*)(</span><span class="s2">\'</span><span class="s6">&amp;%$#&quot;! </span><span class="s2">\037\036\035\034\033\032\031\030\027\026\025\024\023\022\021\020\017\016\015\014\013\012\011\010\007\006\005\004\003\002\001\000</span><span class="s6">,</span><span class="s2">\001\260\030</span><span class="s6">CXEj</span><span class="s2">\260\031</span><span class="s6">C`</span><span class="s2">\260</span><span class="s6">F#D#</span><span class="s2">\020 \260</span><span class="s6">FN</span><span class="s2">\360</span><span class="s6">M/</span><span class="s2">\260\000\022\033</span><span class="s6">!#</span><span class="s2">\021</span><span class="s6">3Y-,</span><span class="s2">\001\260\030</span><span class="s6">CX</span><span class="s2">\260\005</span><span class="s6">+</span><span class="s2">\260\000\023</span><span class="s6">K</span><span class="s2">\260\024</span><span class="s6">PX</span><span class="s2">\261\000</span><span class="s6">@8Y</span><span class="s2">\260\006</span><span class="s6">+</span><span class="s2">\033</span><span class="s6">!#</span><span class="s2">\021</span><span class="s6">3Y-,</span><span class="s2">\001\260\030</span><span class="s6">CXN</span><span class="s2">\260\003</span><span class="s6">%</span><span class="s2">\020\362</span><span class="s6">!</span><span class="s2">\260\000\022</span><span class="s6">M</span><span class="s2">\033 </span><span class="s6">E</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\004</span><span class="s6">%#Jad</span><span class="s2">\260</span><span class="s6">(RX!#</span><span class="s2">\020\326\033\260\003</span><span class="s6">%</span><span class="s2">\020\362</span><span class="s6">!</span><span class="s2">\260\000\022</span><span class="s6">YY-,</span><span class="s2">\260\032</span><span class="s6">CX!!</span><span class="s2">\033\260\002</span><span class="s6">%</span><span class="s2">\260\002</span><span class="s6">%I</span><span class="s2">\260\003</span><span class="s6">%</span><span class="s2">\260\003</span><span class="s6">%Ja d</span><span class="s2">\260\020</span><span class="s6">PX!!!</span><span class="s2">\033\260\003</span><span class="s6">%</span><span class="s2">\260\003</span><span class="s6">%I</span><span class="s2">\260\000</span><span class="s6">PX</span><span class="s2">\260\000</span><span class="s6">PX</span><span class="s2">\270\377\342</span><span class="s6">8!</span><span class="s2">\033\260\020</span><span class="s6">8!Y</span><span class="s2">\033\260\000</span><span class="s6">RX</span><span class="s2">\260\036</span><span class="s6">8!</span><span class="s2">\033\270\377\360</span><span class="s6">8!YYYY-,</span><span class="s2">\001\260\030</span><span class="s6">CX</span><span class="s2">\260\005</span><span class="s6">+</span><span class="s2">\260\000\023</span><span class="s6">K</span><span class="s2">\260\024</span><span class="s6">PX</span><span class="s2">\271\000\000\377\300</span><span class="s6">8Y</span><span class="s2">\260\006</span><span class="s6">+</span><span class="s2">\033</span><span class="s6">!#</span><span class="s2">\021</span><span class="s6">3Y-,N</span><span class="s2">\001\212\020\261</span><span class="s6">F</span><span class="s2">\031</span><span class="s6">CD</span><span class="s2">\260\000\024\261\000</span><span class="s6">F</span><span class="s2">\342\260\000\025\271\000\000\377\360</span><span class="s6">8</span><span class="s2">\000\260\000</span><span class="s6">&lt;</span><span class="s2">\260</span><span class="s6">(+</span><span class="s2">\260\002</span><span class="s6">%</span><span class="s2">\020\260\000</span><span class="s6">&lt;-,</span><span class="s2">\001\030\260\000</span><span class="s6">/</span><span class="s2">\260\001\024\362\260\001\023\260\001\025</span><span class="s6">M</span><span class="s2">\260\000\022</span><span class="s6">-,</span><span class="s2">\001\260\030</span><span class="s6">CX</span><span class="s2">\260\005</span><span class="s6">+</span><span class="s2">\260\000\023\271\000\000\377\340</span><span class="s6">8</span><span class="s2">\260\006</span><span class="s6">+</span><span class="s2">\033</span><span class="s6">!#</span><span class="s2">\021</span><span class="s6">3Y-,</span><span class="s2">\001\260\030</span><span class="s6">CXEdj#Edi</span><span class="s2">\260\031</span><span class="s6">Cd``</span><span class="s2">\260</span><span class="s6">F#D#</span><span class="s2">\020 \260</span><span class="s6">F</span><span class="s2">\360</span><span class="s6">/</span><span class="s2">\260\000\022\033</span><span class="s6">!! </span><span class="s2">\212 \212</span><span class="s6">RX</span><span class="s2">\021</span><span class="s6">3</span><span class="s2">\033</span><span class="s6">!!YY-,</span><span class="s2">\001\261\013\012</span><span class="s6">C#Ce</span><span class="s2">\012</span><span class="s6">-,</span><span class="s2">\000\261\012\013</span><span class="s6">C#C</span><span class="s2">\013</span><span class="s6">-,</span><span class="s2">\000\260</span><span class="s6">F#p</span><span class="s2">\261\001</span><span class="s6">F&gt;</span><span class="s2">\001\260</span><span class="s6">F#p</span><span class="s2">\261\002</span><span class="s6">FE:</span><span class="s2">\261\002\000\010\015</span><span class="s6">-,</span><span class="s2">\260\022</span><span class="s6">+</span><span class="s2">\260\002</span><span class="s6">%E</span><span class="s2">\260\002</span><span class="s6">%Ej</span><span class="s2">\260</span><span class="s6">@</span><span class="s2">\213</span><span class="s6">`</span><span class="s2">\260\002</span><span class="s6">%#D!!!-,</span><span class="s2">\260\023</span><span class="s6">+</span><span class="s2">\260\002</span><span class="s6">%E</span><span class="s2">\260\002</span><span class="s6">%Ej</span><span class="s2">\270\377\300\214</span><span class="s6">`</span><span class="s2">\260\002</span><span class="s6">%#D!!!-,</span><span class="s2">\260\000\260\022</span><span class="s6">+!!!-,</span><span class="s2">\260\000\260\023</span><span class="s6">+!!!-,</span><span class="s2">\001\260\006</span><span class="s6">C</span><span class="s2">\260\007</span><span class="s6">Ce</span><span class="s2">\012</span><span class="s6">-, i</span><span class="s2">\260</span><span class="s6">@a</span><span class="s2">\260\000\213 \261</span><span class="s6">,</span><span class="s2">\300\212\214\270\020\000</span><span class="s6">b`+</span><span class="s2">\014</span><span class="s6">d#da</span><span class="s2">\\</span><span class="s6">X</span><span class="s2">\260\003</span><span class="s6">aY-,</span><span class="s2">\261\000\003</span><span class="s6">%EhT</span><span class="s2">\260\034</span><span class="s6">KPZX</span><span class="s2">\260\003</span><span class="s6">%E</span><span class="s2">\260\003</span><span class="s6">%E`h </span><span class="s2">\260\004</span><span class="s6">%#D</span><span class="s2">\260\004</span><span class="s6">%#D</span><span class="s2">\033\260\003</span><span class="s6">% Eh </span><span class="s2">\212</span><span class="s6">#D</span><span class="s2">\260\003</span><span class="s6">%Eh`</span><span class="s2">\260\003</span><span class="s6">%#DY-,</span><span class="s2">\260\003</span><span class="s6">% Eh </span><span class="s2">\212</span><span class="s6">#D</span><span class="s2">\260\003</span><span class="s6">%Edhe`</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\001</span><span class="s6">`#D-,</span><span class="s2">\260\011</span><span class="s6">CX</span><span class="s2">\207</span><span class="s6">!</span><span class="s2">\300\033\260\022</span><span class="s6">CX</span><span class="s2">\207</span><span class="s6">E</span><span class="s2">\260\021</span><span class="s6">+</span><span class="s2">\260</span><span class="s6">G#D</span><span class="s2">\260</span><span class="s6">Gz</span><span class="s2">\344\033\003\212</span><span class="s6">E</span><span class="s2">\030</span><span class="s6">i </span><span class="s2">\260</span><span class="s6">G#D</span><span class="s2">\212\212\207 \260\240</span><span class="s6">QX</span><span class="s2">\260\021</span><span class="s6">+</span><span class="s2">\260</span><span class="s6">G#D</span><span class="s2">\260</span><span class="s6">Gz</span><span class="s2">\344\033</span><span class="s6">!</span><span class="s2">\260</span><span class="s6">Gz</span><span class="s2">\344</span><span class="s6">YYY</span><span class="s2">\030</span><span class="s6">-, </span><span class="s2">\212</span><span class="s6">E#Eh`D-,EjB-,</span><span class="s2">\001\030</span><span class="s6">/-,</span><span class="s2">\001\260\030</span><span class="s6">CX</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\004</span><span class="s6">%Id#Edi</span><span class="s2">\260</span><span class="s6">@</span><span class="s2">\213</span><span class="s6">a </span><span class="s2">\260\200</span><span class="s6">bj</span><span class="s2">\260\002</span><span class="s6">%</span><span class="s2">\260\002</span><span class="s6">%a</span><span class="s2">\214\260\031</span><span class="s6">C`</span><span class="s2">\260</span><span class="s6">F#D!</span><span class="s2">\212\020\260</span><span class="s6">F</span><span class="s2">\366</span><span class="s6">!</span><span class="s2">\033</span><span class="s6">!!!!Y-,</span><span class="s2">\001\260\030</span><span class="s6">CX</span><span class="s2">\260\002</span><span class="s6">%E</span><span class="s2">\260\002</span><span class="s6">%Ed`j</span><span class="s2">\260\003</span><span class="s6">%Eja </span><span class="s2">\260\004</span><span class="s6">%Ej </span><span class="s2">\212\213</span><span class="s6">e</span><span class="s2">\260\004</span><span class="s6">%#D</span><span class="s2">\214\260\003</span><span class="s6">%#D!!</span><span class="s2">\033 </span><span class="s6">EjD EjDY-,</span><span class="s2">\001 </span><span class="s6">E</span><span class="s2">\260\000</span><span class="s6">U</span><span class="s2">\260\030</span><span class="s6">CZXEh#Ei</span><span class="s2">\260</span><span class="s6">@</span><span class="s2">\213</span><span class="s6">a </span><span class="s2">\260\200</span><span class="s6">bj </span><span class="s2">\212</span><span class="s6">#a </span><span class="s2">\260\003</span><span class="s6">%</span><span class="s2">\213</span><span class="s6">e</span><span class="s2">\260\004</span><span class="s6">%#D</span><span class="s2">\214\260\003</span><span class="s6">%#D!!</span><span class="s2">\033</span><span class="s6">!!</span><span class="s2">\260\031</span><span class="s6">+Y-,</span><span class="s2">\001\212\212</span><span class="s6">Ed#EdadB-,</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\031</span><span class="s6">+</span><span class="s2">\260\030</span><span class="s6">CX</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\003</span><span class="s6">%</span><span class="s2">\260\033</span><span class="s6">+</span><span class="s2">\001\260\002</span><span class="s6">%C</span><span class="s2">\260</span><span class="s6">@T</span><span class="s2">\260\002</span><span class="s6">%C</span><span class="s2">\260\000</span><span class="s6">TZX</span><span class="s2">\260\003</span><span class="s6">% E</span><span class="s2">\260</span><span class="s6">@aDY</span><span class="s2">\260\002</span><span class="s6">%C</span><span class="s2">\260\000</span><span class="s6">T</span><span class="s2">\260\002</span><span class="s6">%C</span><span class="s2">\260</span><span class="s6">@TZX</span><span class="s2">\260\004</span><span class="s6">% E</span><span class="s2">\260</span><span class="s6">@`DYY!!!!-,</span><span class="s2">\001</span><span class="s6">KRXC</span><span class="s2">\260\002</span><span class="s6">%E#aD</span><span class="s2">\033</span><span class="s6">!!Y-,</span><span class="s2">\001</span><span class="s6">KRXC</span><span class="s2">\260\002</span><span class="s6">%E#`D</span><span class="s2">\033</span><span class="s6">!!Y-,KRXED</span><span class="s2">\033</span><span class="s6">!!Y-,</span><span class="s2">\001 \260\003</span><span class="s6">%#I</span><span class="s2">\260</span><span class="s6">@`</span><span class="s2">\260 </span><span class="s6">c </span><span class="s2">\260\000</span><span class="s6">RX#</span><span class="s2">\260\002</span><span class="s6">%8#</span><span class="s2">\260\002</span><span class="s6">%e8</span><span class="s2">\000\212</span><span class="s6">c8</span><span class="s2">\033</span><span class="s6">!!!!!Y</span><span class="s2">\001</span><span class="s6">-,KPXED</span><span class="s2">\033</span><span class="s6">!!Y-,</span><span class="s2">\001\260\005</span><span class="s6">%</span><span class="s2">\020</span><span class="s6"># </span><span class="s2">\212\365\000\260\001</span><span class="s6">`#</span><span class="s2">\355\354</span><span class="s6">-,</span><span class="s2">\001\260\005</span><span class="s6">%</span><span class="s2">\020</span><span class="s6"># </span><span class="s2">\212\365\000\260\001</span><span class="s6">a#</span><span class="s2">\355\354</span><span class="s6">-,</span><span class="s2">\001\260\006</span><span class="s6">%</span><span class="s2">\020\365\000\355\354</span><span class="s6">-,F#F`</span><span class="s2">\212\212</span><span class="s6">F# F</span><span class="s2">\212</span><span class="s6">`</span><span class="s2">\212</span><span class="s6">a</span><span class="s2">\270\377\200</span><span class="s6">b# </span><span class="s2">\020</span><span class="s6">#</span><span class="s2">\212\261</span><span class="s6">KK</span><span class="s2">\212</span><span class="s6">pE` </span><span class="s2">\260\000</span><span class="s6">PX</span><span class="s2">\260\001</span><span class="s6">a</span><span class="s2">\270\377\272\213\033\260</span><span class="s6">F</span><span class="s2">\214</span><span class="s6">Y</span><span class="s2">\260\020</span><span class="s6">`h</span><span class="s2">\001</span><span class="s6">:-, E</span><span class="s2">\260\003</span><span class="s6">%FRX</span><span class="s2">\260\002</span><span class="s6">%F ha</span><span class="s2">\260\003</span><span class="s6">%</span><span class="s2">\260\003</span><span class="s6">%?#!8</span><span class="s2">\033</span><span class="s6">!</span><span class="s2">\021</span><span class="s6">Y-, E</span><span class="s2">\260\003</span><span class="s6">%FPX</span><span class="s2">\260\002</span><span class="s6">%F ha</span><span class="s2">\260\003</span><span class="s6">%</span><span class="s2">\260\003</span><span class="s6">%?#!8</span><span class="s2">\033</span><span class="s6">!</span><span class="s2">\021</span><span class="s6">Y-,</span><span class="s2">\000\260\007</span><span class="s6">C</span><span class="s2">\260\006</span><span class="s6">C</span><span class="s2">\013</span><span class="s6">-,</span><span class="s2">\212\020\354</span><span class="s6">-,</span><span class="s2">\260\014</span><span class="s6">CX!</span><span class="s2">\033 </span><span class="s6">F</span><span class="s2">\260\000</span><span class="s6">RX</span><span class="s2">\270\377\360</span><span class="s6">8</span><span class="s2">\033\260\020</span><span class="s6">8YY-, </span><span class="s2">\260\000</span><span class="s6">UX</span><span class="s2">\270\020\000</span><span class="s6">c</span><span class="s2">\260\003</span><span class="s6">%Ed</span><span class="s2">\260\003</span><span class="s6">%Eda</span><span class="s2">\260\000</span><span class="s6">SX</span><span class="s2">\260\002\033\260</span><span class="s6">@a</span><span class="s2">\260\003</span><span class="s6">Y%EiSXED</span><span class="s2">\033</span><span class="s6">!!Y</span><span class="s2">\033</span><span class="s6">!</span><span class="s2">\260\002</span><span class="s6">%E</span><span class="s2">\260\002</span><span class="s6">%Ead</span><span class="s2">\260</span><span class="s6">(QXED</span><span class="s2">\033</span><span class="s6">!!YY-,!!</span><span class="s2">\014</span><span class="s6">d#d</span><span class="s2">\213\270</span><span class="s6">@</span><span class="s2">\000</span><span class="s6">b-,!</span><span class="s2">\260\200</span><span class="s6">QX</span><span class="s2">\014</span><span class="s6">d#d</span><span class="s2">\213\270 \000</span><span class="s6">b</span><span class="s2">\033\262\000</span><span class="s6">@/+Y</span><span class="s2">\260\002</span><span class="s6">`-,!</span><span class="s2">\260\300</span><span class="s6">QX</span><span class="s2">\014</span><span class="s6">d#d</span><span class="s2">\213\270\025</span><span class="s6">Ub</span><span class="s2">\033\262\000\200</span><span class="s6">/+Y</span><span class="s2">\260\002</span><span class="s6">`-,</span><span class="s2">\014</span><span class="s6">d#d</span><span class="s2">\213\270</span><span class="s6">@</span><span class="s2">\000</span><span class="s6">b`#!-,KSX</span><span class="s2">\260\004</span><span class="s6">%</span><span class="s2">\260\004</span><span class="s6">%Id#Edi</span><span class="s2">\260</span><span class="s6">@</span><span class="s2">\213</span><span class="s6">a </span><span class="s2">\260\200</span><span class="s6">bj</span><span class="s2">\260\002</span><span class="s6">%</span><span class="s2">\260\002</span><span class="s6">%a</span><span class="s2">\214\260</span><span class="s6">F#D!</span><span class="s2">\212\020\260</span><span class="s6">F</span><span class="s2">\366</span><span class="s6">!</span><span class="s2">\033</span><span class="s6">!</span><span class="s2">\212\021</span><span class="s6">#</span><span class="s2">\022 </span><span class="s6">9/Y-,</span><span class="s2">\260\002</span><span class="s6">%</span><span class="s2">\260\002</span><span class="s6">%Id</span><span class="s2">\260\300</span><span class="s6">TX</span><span class="s2">\270\377\370</span><span class="s6">8</span><span class="s2">\260\010</span><span class="s6">8</span><span class="s2">\033</span><span class="s6">!!Y-,</span><span class="s2">\260\023</span><span class="s6">CX</span><span class="s2">\003\033\002</span><span class="s6">Y-,</span><span class="s2">\260\023</span><span class="s6">CX</span><span class="s2">\002\033\003</span><span class="s6">Y-,</span><span class="s2">\260\012</span><span class="s6">+#</span><span class="s2">\020 </span><span class="s6">&lt;</span><span class="s2">\260\027</span><span class="s6">+-,</span><span class="s2">\260\002</span><span class="s6">%</span><span class="s2">\270\377\360</span><span class="s6">8</span><span class="s2">\260</span><span class="s6">(+</span><span class="s2">\212\020</span><span class="s6"># </span><span class="s2">\320</span><span class="s6">#</span><span class="s2">\260\020</span><span class="s6">+</span><span class="s2">\260\005</span><span class="s6">CX</span><span class="s2">\300\033</span><span class="s6">&lt;Y </span><span class="s2">\020\021\260\000\022\001</span><span class="s6">-,KS#KQZX8</span><span class="s2">\033</span><span class="s6">!!Y-,</span><span class="s2">\001\260\002</span><span class="s6">%</span><span class="s2">\020\320</span><span class="s6">#</span><span class="s2">\311\001\260\001\023\260\000\024\020\260\001</span><span class="s6">&lt;</span><span class="s2">\260\001\026</span><span class="s6">-,</span><span class="s2">\001\260\000\023\260\001\260\003</span><span class="s6">%I</span><span class="s2">\260\003\027</span><span class="s6">8</span><span class="s2">\260\001\023</span><span class="s6">-,KS#KQZX E</span><span class="s2">\212</span><span class="s6">`D</span><span class="s2">\033</span><span class="s6">!!Y-, 9/-&quot;&quot;&quot;</span>
+
+	<span class="s1">p = Program()</span>
+	<span class="s1">p.fromBytecode(bc)</span>
+	<span class="s1">asm = p.getAssembly(preserve=</span><span class="s2">True</span><span class="s1">)</span>
+	<span class="s1">p.fromAssembly(asm)</span>
+	<span class="s1">print(bc == p.getBytecode())</span>
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s5">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s2">import </span><span class="s1">sys</span>
+	<span class="s2">import </span><span class="s1">doctest</span>
+	<span class="s1">sys.exit(doctest.testmod().failed)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,670 @@
+<html>
+<head>
+<title>parser.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+parser.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">fontTools.voltLib.ast </span><span class="s0">as </span><span class="s1">ast</span>
+<span class="s0">from </span><span class="s1">fontTools.voltLib.lexer </span><span class="s0">import </span><span class="s1">Lexer</span>
+<span class="s0">from </span><span class="s1">fontTools.voltLib.error </span><span class="s0">import </span><span class="s1">VoltLibError</span>
+<span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">open</span>
+
+<span class="s1">PARSE_FUNCS = {</span>
+    <span class="s2">&quot;DEF_GLYPH&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_def_glyph_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;DEF_GROUP&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_def_group_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;DEF_SCRIPT&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_def_script_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;DEF_LOOKUP&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_def_lookup_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;DEF_ANCHOR&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_def_anchor_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;GRID_PPEM&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_ppem_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;PRESENTATION_PPEM&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_ppem_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;PPOSITIONING_PPEM&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_ppem_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;COMPILER_USEEXTENSIONLOOKUPS&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_noarg_option_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;COMPILER_USEPAIRPOSFORMAT2&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_noarg_option_&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;CMAP_FORMAT&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_cmap_format&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;DO_NOT_TOUCH_CMAP&quot;</span><span class="s1">: </span><span class="s2">&quot;parse_noarg_option_&quot;</span><span class="s0">,</span>
+<span class="s1">}</span>
+
+
+<span class="s0">class </span><span class="s1">Parser(object):</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">self.doc_ = ast.VoltFile()</span>
+        <span class="s1">self.glyphs_ = OrderedSymbolTable()</span>
+        <span class="s1">self.groups_ = SymbolTable()</span>
+        <span class="s1">self.anchors_ = {}  </span><span class="s3"># dictionary of SymbolTable() keyed by glyph</span>
+        <span class="s1">self.scripts_ = SymbolTable()</span>
+        <span class="s1">self.langs_ = SymbolTable()</span>
+        <span class="s1">self.lookups_ = SymbolTable()</span>
+        <span class="s1">self.next_token_type_</span><span class="s0">, </span><span class="s1">self.next_token_ = (</span><span class="s0">None, None</span><span class="s1">)</span>
+        <span class="s1">self.next_token_location_ = </span><span class="s0">None</span>
+        <span class="s1">self.make_lexer_(path)</span>
+        <span class="s1">self.advance_lexer_()</span>
+
+    <span class="s0">def </span><span class="s1">make_lexer_(self</span><span class="s0">, </span><span class="s1">file_or_path):</span>
+        <span class="s0">if </span><span class="s1">hasattr(file_or_path</span><span class="s0">, </span><span class="s2">&quot;read&quot;</span><span class="s1">):</span>
+            <span class="s1">filename = getattr(file_or_path</span><span class="s0">, </span><span class="s2">&quot;name&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+            <span class="s1">data = file_or_path.read()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">filename = file_or_path</span>
+            <span class="s0">with </span><span class="s1">open(file_or_path</span><span class="s0">, </span><span class="s2">&quot;r&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+                <span class="s1">data = f.read()</span>
+        <span class="s1">self.lexer_ = Lexer(data</span><span class="s0">, </span><span class="s1">filename)</span>
+
+    <span class="s0">def </span><span class="s1">parse(self):</span>
+        <span class="s1">statements = self.doc_.statements</span>
+        <span class="s0">while </span><span class="s1">self.next_token_type_ </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s0">if </span><span class="s1">self.cur_token_ </span><span class="s0">in </span><span class="s1">PARSE_FUNCS.keys():</span>
+                <span class="s1">func = getattr(self</span><span class="s0">, </span><span class="s1">PARSE_FUNCS[self.cur_token_])</span>
+                <span class="s1">statements.append(func())</span>
+            <span class="s0">elif </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;END&quot;</span><span class="s1">):</span>
+                <span class="s0">break</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                    <span class="s2">&quot;Expected &quot; </span><span class="s1">+ </span><span class="s2">&quot;, &quot;</span><span class="s1">.join(sorted(PARSE_FUNCS.keys()))</span><span class="s0">,</span>
+                    <span class="s1">self.cur_token_location_)</span>
+        <span class="s0">return </span><span class="s1">self.doc_</span>
+
+    <span class="s0">def </span><span class="s1">parse_def_glyph_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_GLYPH&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = self.expect_string_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;ID&quot;</span><span class="s1">)</span>
+        <span class="s1">gid = self.expect_number_()</span>
+        <span class="s0">if </span><span class="s1">gid &lt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Invalid glyph ID&quot;</span><span class="s0">, </span><span class="s1">self.cur_token_location_)</span>
+        <span class="s1">gunicode = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;UNICODE&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;UNICODE&quot;</span><span class="s1">)</span>
+            <span class="s1">gunicode = [self.expect_number_()]</span>
+            <span class="s0">if </span><span class="s1">gunicode[</span><span class="s4">0</span><span class="s1">] &lt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Invalid glyph UNICODE&quot;</span><span class="s0">,</span>
+                                   <span class="s1">self.cur_token_location_)</span>
+        <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;UNICODEVALUES&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;UNICODEVALUES&quot;</span><span class="s1">)</span>
+            <span class="s1">gunicode = self.parse_unicode_values_()</span>
+        <span class="s1">gtype = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;TYPE&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;TYPE&quot;</span><span class="s1">)</span>
+            <span class="s1">gtype = self.expect_name_()</span>
+            <span class="s0">assert </span><span class="s1">gtype </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;BASE&quot;</span><span class="s0">, </span><span class="s2">&quot;LIGATURE&quot;</span><span class="s0">, </span><span class="s2">&quot;MARK&quot;</span><span class="s0">, </span><span class="s2">&quot;COMPONENT&quot;</span><span class="s1">)</span>
+        <span class="s1">components = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;COMPONENTS&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;COMPONENTS&quot;</span><span class="s1">)</span>
+            <span class="s1">components = self.expect_number_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_GLYPH&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.glyphs_.resolve(name) </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">'Glyph &quot;%s&quot; (gid %i) already defined' </span><span class="s1">% (name</span><span class="s0">, </span><span class="s1">gid)</span><span class="s0">,</span>
+                <span class="s1">location</span>
+            <span class="s1">)</span>
+        <span class="s1">def_glyph = ast.GlyphDefinition(name</span><span class="s0">, </span><span class="s1">gid</span><span class="s0">,</span>
+                                        <span class="s1">gunicode</span><span class="s0">, </span><span class="s1">gtype</span><span class="s0">, </span><span class="s1">components</span><span class="s0">,</span>
+                                        <span class="s1">location=location)</span>
+        <span class="s1">self.glyphs_.define(name</span><span class="s0">, </span><span class="s1">def_glyph)</span>
+        <span class="s0">return </span><span class="s1">def_glyph</span>
+
+    <span class="s0">def </span><span class="s1">parse_def_group_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_GROUP&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = self.expect_string_()</span>
+        <span class="s1">enum = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ENUM&quot;</span><span class="s1">:</span>
+            <span class="s1">enum = self.parse_enum_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_GROUP&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.groups_.resolve(name) </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">'Glyph group &quot;%s&quot; already defined, '</span>
+                <span class="s2">'group names are case insensitive' </span><span class="s1">% name</span><span class="s0">,</span>
+                <span class="s1">location</span>
+            <span class="s1">)</span>
+        <span class="s1">def_group = ast.GroupDefinition(name</span><span class="s0">, </span><span class="s1">enum</span><span class="s0">,</span>
+                                        <span class="s1">location=location)</span>
+        <span class="s1">self.groups_.define(name</span><span class="s0">, </span><span class="s1">def_group)</span>
+        <span class="s0">return </span><span class="s1">def_group</span>
+
+    <span class="s0">def </span><span class="s1">parse_def_script_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_SCRIPT&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;NAME&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;NAME&quot;</span><span class="s1">)</span>
+            <span class="s1">name = self.expect_string_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;TAG&quot;</span><span class="s1">)</span>
+        <span class="s1">tag = self.expect_string_()</span>
+        <span class="s0">if </span><span class="s1">self.scripts_.resolve(tag) </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">'Script &quot;%s&quot; already defined, '</span>
+                <span class="s2">'script tags are case insensitive' </span><span class="s1">% tag</span><span class="s0">,</span>
+                <span class="s1">location</span>
+            <span class="s1">)</span>
+        <span class="s1">self.langs_.enter_scope()</span>
+        <span class="s1">langs = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_SCRIPT&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">lang = self.parse_langsys_()</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_LANGSYS&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">self.langs_.resolve(lang.tag) </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                    <span class="s2">'Language &quot;%s&quot; already defined in script &quot;%s&quot;, '</span>
+                    <span class="s2">'language tags are case insensitive' </span><span class="s1">% (lang.tag</span><span class="s0">, </span><span class="s1">tag)</span><span class="s0">,</span>
+                    <span class="s1">location</span>
+                <span class="s1">)</span>
+            <span class="s1">self.langs_.define(lang.tag</span><span class="s0">, </span><span class="s1">lang)</span>
+            <span class="s1">langs.append(lang)</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_SCRIPT&quot;</span><span class="s1">)</span>
+        <span class="s1">self.langs_.exit_scope()</span>
+        <span class="s1">def_script = ast.ScriptDefinition(name</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">langs</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s1">self.scripts_.define(tag</span><span class="s0">, </span><span class="s1">def_script)</span>
+        <span class="s0">return </span><span class="s1">def_script</span>
+
+    <span class="s0">def </span><span class="s1">parse_langsys_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_LANGSYS&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;NAME&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;NAME&quot;</span><span class="s1">)</span>
+            <span class="s1">name = self.expect_string_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;TAG&quot;</span><span class="s1">)</span>
+        <span class="s1">tag = self.expect_string_()</span>
+        <span class="s1">features = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_LANGSYS&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">feature = self.parse_feature_()</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_FEATURE&quot;</span><span class="s1">)</span>
+            <span class="s1">features.append(feature)</span>
+        <span class="s1">def_langsys = ast.LangSysDefinition(name</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">features</span><span class="s0">,</span>
+                                            <span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">def_langsys</span>
+
+    <span class="s0">def </span><span class="s1">parse_feature_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_FEATURE&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;NAME&quot;</span><span class="s1">)</span>
+        <span class="s1">name = self.expect_string_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;TAG&quot;</span><span class="s1">)</span>
+        <span class="s1">tag = self.expect_string_()</span>
+        <span class="s1">lookups = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_FEATURE&quot;</span><span class="s1">:</span>
+            <span class="s3"># self.advance_lexer_()</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;LOOKUP&quot;</span><span class="s1">)</span>
+            <span class="s1">lookup = self.expect_string_()</span>
+            <span class="s1">lookups.append(lookup)</span>
+        <span class="s1">feature = ast.FeatureDefinition(name</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">lookups</span><span class="s0">,</span>
+                                        <span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">feature</span>
+
+    <span class="s0">def </span><span class="s1">parse_def_lookup_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_LOOKUP&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = self.expect_string_()</span>
+        <span class="s0">if not </span><span class="s1">name[</span><span class="s4">0</span><span class="s1">].isalpha():</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">'Lookup name &quot;%s&quot; must start with a letter' </span><span class="s1">% name</span><span class="s0">,</span>
+                <span class="s1">location</span>
+            <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.lookups_.resolve(name) </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">'Lookup &quot;%s&quot; already defined, '</span>
+                <span class="s2">'lookup names are case insensitive' </span><span class="s1">% name</span><span class="s0">,</span>
+                <span class="s1">location</span>
+            <span class="s1">)</span>
+        <span class="s1">process_base = </span><span class="s0">True</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;PROCESS_BASE&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;SKIP_BASE&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">process_base = </span><span class="s0">False</span>
+        <span class="s1">process_marks = </span><span class="s0">True</span>
+        <span class="s1">mark_glyph_set = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;PROCESS_MARKS&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;MARK_GLYPH_SET&quot;</span><span class="s1">:</span>
+                <span class="s1">self.advance_lexer_()</span>
+                <span class="s1">mark_glyph_set = self.expect_string_()</span>
+            <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ALL&quot;</span><span class="s1">:</span>
+                <span class="s1">self.advance_lexer_()</span>
+            <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;NONE&quot;</span><span class="s1">:</span>
+                <span class="s1">self.advance_lexer_()</span>
+                <span class="s1">process_marks = </span><span class="s0">False</span>
+            <span class="s0">elif </span><span class="s1">self.next_token_type_ == Lexer.STRING:</span>
+                <span class="s1">process_marks = self.expect_string_()</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                    <span class="s2">&quot;Expected ALL, NONE, MARK_GLYPH_SET or an ID. &quot;</span>
+                    <span class="s2">&quot;Got %s&quot; </span><span class="s1">% (self.next_token_type_)</span><span class="s0">,</span>
+                    <span class="s1">location)</span>
+        <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;SKIP_MARKS&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">process_marks = </span><span class="s0">False</span>
+        <span class="s1">direction = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;DIRECTION&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;DIRECTION&quot;</span><span class="s1">)</span>
+            <span class="s1">direction = self.expect_name_()</span>
+            <span class="s0">assert </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;LTR&quot;</span><span class="s0">, </span><span class="s2">&quot;RTL&quot;</span><span class="s1">)</span>
+        <span class="s1">reversal = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;REVERSAL&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;REVERSAL&quot;</span><span class="s1">)</span>
+            <span class="s1">reversal = </span><span class="s0">True</span>
+        <span class="s1">comments = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;COMMENTS&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;COMMENTS&quot;</span><span class="s1">)</span>
+            <span class="s1">comments = self.expect_string_().replace(</span><span class="s2">r'\n'</span><span class="s0">, </span><span class="s2">'</span><span class="s0">\n</span><span class="s2">'</span><span class="s1">)</span>
+        <span class="s1">context = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;EXCEPT_CONTEXT&quot;</span><span class="s0">, </span><span class="s2">&quot;IN_CONTEXT&quot;</span><span class="s1">):</span>
+            <span class="s1">context = self.parse_context_()</span>
+        <span class="s1">as_pos_or_sub = self.expect_name_()</span>
+        <span class="s1">sub = </span><span class="s0">None</span>
+        <span class="s1">pos = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">as_pos_or_sub == </span><span class="s2">&quot;AS_SUBSTITUTION&quot;</span><span class="s1">:</span>
+            <span class="s1">sub = self.parse_substitution_(reversal)</span>
+        <span class="s0">elif </span><span class="s1">as_pos_or_sub == </span><span class="s2">&quot;AS_POSITION&quot;</span><span class="s1">:</span>
+            <span class="s1">pos = self.parse_position_()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">&quot;Expected AS_SUBSTITUTION or AS_POSITION. &quot;</span>
+                <span class="s2">&quot;Got %s&quot; </span><span class="s1">% (as_pos_or_sub)</span><span class="s0">,</span>
+                <span class="s1">location)</span>
+        <span class="s1">def_lookup = ast.LookupDefinition(</span>
+            <span class="s1">name</span><span class="s0">, </span><span class="s1">process_base</span><span class="s0">, </span><span class="s1">process_marks</span><span class="s0">, </span><span class="s1">mark_glyph_set</span><span class="s0">, </span><span class="s1">direction</span><span class="s0">,</span>
+            <span class="s1">reversal</span><span class="s0">, </span><span class="s1">comments</span><span class="s0">, </span><span class="s1">context</span><span class="s0">, </span><span class="s1">sub</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s1">self.lookups_.define(name</span><span class="s0">, </span><span class="s1">def_lookup)</span>
+        <span class="s0">return </span><span class="s1">def_lookup</span>
+
+    <span class="s0">def </span><span class="s1">parse_context_(self):</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">contexts = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;EXCEPT_CONTEXT&quot;</span><span class="s0">, </span><span class="s2">&quot;IN_CONTEXT&quot;</span><span class="s1">):</span>
+            <span class="s1">side = </span><span class="s0">None</span>
+            <span class="s1">coverage = </span><span class="s0">None</span>
+            <span class="s1">ex_or_in = self.expect_name_()</span>
+            <span class="s3"># side_contexts = [] # XXX</span>
+            <span class="s0">if </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_CONTEXT&quot;</span><span class="s1">:</span>
+                <span class="s1">left = []</span>
+                <span class="s1">right = []</span>
+                <span class="s0">while </span><span class="s1">self.next_token_ </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;LEFT&quot;</span><span class="s0">, </span><span class="s2">&quot;RIGHT&quot;</span><span class="s1">):</span>
+                    <span class="s1">side = self.expect_name_()</span>
+                    <span class="s1">coverage = self.parse_coverage_()</span>
+                    <span class="s0">if </span><span class="s1">side == </span><span class="s2">&quot;LEFT&quot;</span><span class="s1">:</span>
+                        <span class="s1">left.append(coverage)</span>
+                    <span class="s0">else</span><span class="s1">:</span>
+                        <span class="s1">right.append(coverage)</span>
+                <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_CONTEXT&quot;</span><span class="s1">)</span>
+                <span class="s1">context = ast.ContextDefinition(ex_or_in</span><span class="s0">, </span><span class="s1">left</span><span class="s0">,</span>
+                                                <span class="s1">right</span><span class="s0">, </span><span class="s1">location=location)</span>
+                <span class="s1">contexts.append(context)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_CONTEXT&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">contexts</span>
+
+    <span class="s0">def </span><span class="s1">parse_substitution_(self</span><span class="s0">, </span><span class="s1">reversal):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;AS_SUBSTITUTION&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">src = []</span>
+        <span class="s1">dest = []</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;SUB&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Expected SUB&quot;</span><span class="s0">, </span><span class="s1">location)</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;SUB&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;SUB&quot;</span><span class="s1">)</span>
+            <span class="s1">src.append(self.parse_coverage_())</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;WITH&quot;</span><span class="s1">)</span>
+            <span class="s1">dest.append(self.parse_coverage_())</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_SUB&quot;</span><span class="s1">)</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_SUBSTITUTION&quot;</span><span class="s1">)</span>
+        <span class="s1">max_src = max([len(cov) </span><span class="s0">for </span><span class="s1">cov </span><span class="s0">in </span><span class="s1">src])</span>
+        <span class="s1">max_dest = max([len(cov) </span><span class="s0">for </span><span class="s1">cov </span><span class="s0">in </span><span class="s1">dest])</span>
+        <span class="s3"># many to many or mixed is invalid</span>
+        <span class="s0">if </span><span class="s1">((max_src &gt; </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">max_dest &gt; </span><span class="s4">1</span><span class="s1">) </span><span class="s0">or</span>
+                <span class="s1">(reversal </span><span class="s0">and </span><span class="s1">(max_src &gt; </span><span class="s4">1 </span><span class="s0">or </span><span class="s1">max_dest &gt; </span><span class="s4">1</span><span class="s1">))):</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">&quot;Invalid substitution type&quot;</span><span class="s0">,</span>
+                <span class="s1">location)</span>
+        <span class="s1">mapping = dict(zip(tuple(src)</span><span class="s0">, </span><span class="s1">tuple(dest)))</span>
+        <span class="s0">if </span><span class="s1">max_src == </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">max_dest == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">reversal:</span>
+                <span class="s1">sub = ast.SubstitutionReverseChainingSingleDefinition(</span>
+                    <span class="s1">mapping</span><span class="s0">, </span><span class="s1">location=location)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">sub = ast.SubstitutionSingleDefinition(mapping</span><span class="s0">,</span>
+                                                       <span class="s1">location=location)</span>
+        <span class="s0">elif </span><span class="s1">max_src == </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">max_dest &gt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">sub = ast.SubstitutionMultipleDefinition(mapping</span><span class="s0">,</span>
+                                                     <span class="s1">location=location)</span>
+        <span class="s0">elif </span><span class="s1">max_src &gt; </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">max_dest == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">sub = ast.SubstitutionLigatureDefinition(mapping</span><span class="s0">,</span>
+                                                     <span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">sub</span>
+
+    <span class="s0">def </span><span class="s1">parse_position_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;AS_POSITION&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">pos_type = self.expect_name_()</span>
+        <span class="s0">if </span><span class="s1">pos_type </span><span class="s0">not in </span><span class="s1">(</span>
+                <span class="s2">&quot;ATTACH&quot;</span><span class="s0">, </span><span class="s2">&quot;ATTACH_CURSIVE&quot;</span><span class="s0">, </span><span class="s2">&quot;ADJUST_PAIR&quot;</span><span class="s0">, </span><span class="s2">&quot;ADJUST_SINGLE&quot;</span><span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                <span class="s2">&quot;Expected ATTACH, ATTACH_CURSIVE, ADJUST_PAIR, ADJUST_SINGLE&quot;</span><span class="s0">,</span>
+                <span class="s1">location)</span>
+        <span class="s0">if </span><span class="s1">pos_type == </span><span class="s2">&quot;ATTACH&quot;</span><span class="s1">:</span>
+            <span class="s1">position = self.parse_attach_()</span>
+        <span class="s0">elif </span><span class="s1">pos_type == </span><span class="s2">&quot;ATTACH_CURSIVE&quot;</span><span class="s1">:</span>
+            <span class="s1">position = self.parse_attach_cursive_()</span>
+        <span class="s0">elif </span><span class="s1">pos_type == </span><span class="s2">&quot;ADJUST_PAIR&quot;</span><span class="s1">:</span>
+            <span class="s1">position = self.parse_adjust_pair_()</span>
+        <span class="s0">elif </span><span class="s1">pos_type == </span><span class="s2">&quot;ADJUST_SINGLE&quot;</span><span class="s1">:</span>
+            <span class="s1">position = self.parse_adjust_single_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_POSITION&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">position</span>
+
+    <span class="s0">def </span><span class="s1">parse_attach_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;ATTACH&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">coverage = self.parse_coverage_()</span>
+        <span class="s1">coverage_to = []</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;TO&quot;</span><span class="s1">)</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_ATTACH&quot;</span><span class="s1">:</span>
+            <span class="s1">cov = self.parse_coverage_()</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;AT&quot;</span><span class="s1">)</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;ANCHOR&quot;</span><span class="s1">)</span>
+            <span class="s1">anchor_name = self.expect_string_()</span>
+            <span class="s1">coverage_to.append((cov</span><span class="s0">, </span><span class="s1">anchor_name))</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_ATTACH&quot;</span><span class="s1">)</span>
+        <span class="s1">position = ast.PositionAttachDefinition(</span>
+            <span class="s1">coverage</span><span class="s0">, </span><span class="s1">coverage_to</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">position</span>
+
+    <span class="s0">def </span><span class="s1">parse_attach_cursive_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;ATTACH_CURSIVE&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">coverages_exit = []</span>
+        <span class="s1">coverages_enter = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;ENTER&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;EXIT&quot;</span><span class="s1">)</span>
+            <span class="s1">coverages_exit.append(self.parse_coverage_())</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_ATTACH&quot;</span><span class="s1">:</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;ENTER&quot;</span><span class="s1">)</span>
+            <span class="s1">coverages_enter.append(self.parse_coverage_())</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_ATTACH&quot;</span><span class="s1">)</span>
+        <span class="s1">position = ast.PositionAttachCursiveDefinition(</span>
+            <span class="s1">coverages_exit</span><span class="s0">, </span><span class="s1">coverages_enter</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">position</span>
+
+    <span class="s0">def </span><span class="s1">parse_adjust_pair_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;ADJUST_PAIR&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">coverages_1 = []</span>
+        <span class="s1">coverages_2 = []</span>
+        <span class="s1">adjust_pair = {}</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;FIRST&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">coverage_1 = self.parse_coverage_()</span>
+            <span class="s1">coverages_1.append(coverage_1)</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;SECOND&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">coverage_2 = self.parse_coverage_()</span>
+            <span class="s1">coverages_2.append(coverage_2)</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_ADJUST&quot;</span><span class="s1">:</span>
+            <span class="s1">id_1 = self.expect_number_()</span>
+            <span class="s1">id_2 = self.expect_number_()</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;BY&quot;</span><span class="s1">)</span>
+            <span class="s1">pos_1 = self.parse_pos_()</span>
+            <span class="s1">pos_2 = self.parse_pos_()</span>
+            <span class="s1">adjust_pair[(id_1</span><span class="s0">, </span><span class="s1">id_2)] = (pos_1</span><span class="s0">, </span><span class="s1">pos_2)</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_ADJUST&quot;</span><span class="s1">)</span>
+        <span class="s1">position = ast.PositionAdjustPairDefinition(</span>
+            <span class="s1">coverages_1</span><span class="s0">, </span><span class="s1">coverages_2</span><span class="s0">, </span><span class="s1">adjust_pair</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">position</span>
+
+    <span class="s0">def </span><span class="s1">parse_adjust_single_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;ADJUST_SINGLE&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">adjust_single = []</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ != </span><span class="s2">&quot;END_ADJUST&quot;</span><span class="s1">:</span>
+            <span class="s1">coverages = self.parse_coverage_()</span>
+            <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;BY&quot;</span><span class="s1">)</span>
+            <span class="s1">pos = self.parse_pos_()</span>
+            <span class="s1">adjust_single.append((coverages</span><span class="s0">, </span><span class="s1">pos))</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_ADJUST&quot;</span><span class="s1">)</span>
+        <span class="s1">position = ast.PositionAdjustSingleDefinition(</span>
+            <span class="s1">adjust_single</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">position</span>
+
+    <span class="s0">def </span><span class="s1">parse_def_anchor_(self):</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;DEF_ANCHOR&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = self.expect_string_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;ON&quot;</span><span class="s1">)</span>
+        <span class="s1">gid = self.expect_number_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;GLYPH&quot;</span><span class="s1">)</span>
+        <span class="s1">glyph_name = self.expect_name_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;COMPONENT&quot;</span><span class="s1">)</span>
+        <span class="s1">component = self.expect_number_()</span>
+        <span class="s3"># check for duplicate anchor names on this glyph</span>
+        <span class="s0">if </span><span class="s1">glyph_name </span><span class="s0">in </span><span class="s1">self.anchors_:</span>
+            <span class="s1">anchor = self.anchors_[glyph_name].resolve(name)</span>
+            <span class="s0">if </span><span class="s1">anchor </span><span class="s0">is not None and </span><span class="s1">anchor.component == component:</span>
+                <span class="s0">raise </span><span class="s1">VoltLibError(</span>
+                    <span class="s2">'Anchor &quot;%s&quot; already defined, '</span>
+                    <span class="s2">'anchor names are case insensitive' </span><span class="s1">% name</span><span class="s0">,</span>
+                    <span class="s1">location</span>
+                <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;LOCKED&quot;</span><span class="s1">:</span>
+            <span class="s1">locked = </span><span class="s0">True</span>
+            <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">locked = </span><span class="s0">False</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;AT&quot;</span><span class="s1">)</span>
+        <span class="s1">pos = self.parse_pos_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_ANCHOR&quot;</span><span class="s1">)</span>
+        <span class="s1">anchor = ast.AnchorDefinition(name</span><span class="s0">, </span><span class="s1">gid</span><span class="s0">, </span><span class="s1">glyph_name</span><span class="s0">,</span>
+                                      <span class="s1">component</span><span class="s0">, </span><span class="s1">locked</span><span class="s0">, </span><span class="s1">pos</span><span class="s0">,</span>
+                                      <span class="s1">location=location)</span>
+        <span class="s0">if </span><span class="s1">glyph_name </span><span class="s0">not in </span><span class="s1">self.anchors_:</span>
+            <span class="s1">self.anchors_[glyph_name] = SymbolTable()</span>
+        <span class="s1">self.anchors_[glyph_name].define(name</span><span class="s0">, </span><span class="s1">anchor)</span>
+        <span class="s0">return </span><span class="s1">anchor</span>
+
+    <span class="s0">def </span><span class="s1">parse_adjust_by_(self):</span>
+        <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;ADJUST_BY&quot;</span><span class="s1">)</span>
+        <span class="s1">adjustment = self.expect_number_()</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;AT&quot;</span><span class="s1">)</span>
+        <span class="s1">size = self.expect_number_()</span>
+        <span class="s0">return </span><span class="s1">adjustment</span><span class="s0">, </span><span class="s1">size</span>
+
+    <span class="s0">def </span><span class="s1">parse_pos_(self):</span>
+        <span class="s3"># VOLT syntax doesn't seem to take device Y advance</span>
+        <span class="s1">self.advance_lexer_()</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s0">assert </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;POS&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">location</span>
+        <span class="s1">adv = </span><span class="s0">None</span>
+        <span class="s1">dx = </span><span class="s0">None</span>
+        <span class="s1">dy = </span><span class="s0">None</span>
+        <span class="s1">adv_adjust_by = {}</span>
+        <span class="s1">dx_adjust_by = {}</span>
+        <span class="s1">dy_adjust_by = {}</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ADV&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">adv = self.expect_number_()</span>
+            <span class="s0">while </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ADJUST_BY&quot;</span><span class="s1">:</span>
+                <span class="s1">adjustment</span><span class="s0">, </span><span class="s1">size = self.parse_adjust_by_()</span>
+                <span class="s1">adv_adjust_by[size] = adjustment</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;DX&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">dx = self.expect_number_()</span>
+            <span class="s0">while </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ADJUST_BY&quot;</span><span class="s1">:</span>
+                <span class="s1">adjustment</span><span class="s0">, </span><span class="s1">size = self.parse_adjust_by_()</span>
+                <span class="s1">dx_adjust_by[size] = adjustment</span>
+        <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;DY&quot;</span><span class="s1">:</span>
+            <span class="s1">self.advance_lexer_()</span>
+            <span class="s1">dy = self.expect_number_()</span>
+            <span class="s0">while </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ADJUST_BY&quot;</span><span class="s1">:</span>
+                <span class="s1">adjustment</span><span class="s0">, </span><span class="s1">size = self.parse_adjust_by_()</span>
+                <span class="s1">dy_adjust_by[size] = adjustment</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_POS&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">ast.Pos(adv</span><span class="s0">, </span><span class="s1">dx</span><span class="s0">, </span><span class="s1">dy</span><span class="s0">, </span><span class="s1">adv_adjust_by</span><span class="s0">, </span><span class="s1">dx_adjust_by</span><span class="s0">, </span><span class="s1">dy_adjust_by)</span>
+
+    <span class="s0">def </span><span class="s1">parse_unicode_values_(self):</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">unicode_values = self.expect_string_().split(</span><span class="s2">&quot;,&quot;</span><span class="s1">)</span>
+            <span class="s1">unicode_values = [</span>
+                <span class="s1">int(uni[</span><span class="s4">2</span><span class="s1">:]</span><span class="s0">, </span><span class="s4">16</span><span class="s1">)</span>
+                <span class="s0">for </span><span class="s1">uni </span><span class="s0">in </span><span class="s1">unicode_values </span><span class="s0">if </span><span class="s1">uni != </span><span class="s2">&quot;&quot;</span><span class="s1">]</span>
+        <span class="s0">except </span><span class="s1">ValueError </span><span class="s0">as </span><span class="s1">err:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(str(err)</span><span class="s0">, </span><span class="s1">location)</span>
+        <span class="s0">return </span><span class="s1">unicode_values </span><span class="s0">if </span><span class="s1">unicode_values != [] </span><span class="s0">else None</span>
+
+    <span class="s0">def </span><span class="s1">parse_enum_(self):</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;ENUM&quot;</span><span class="s1">)</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">enum = ast.Enum(self.parse_coverage_()</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;END_ENUM&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">enum</span>
+
+    <span class="s0">def </span><span class="s1">parse_coverage_(self):</span>
+        <span class="s1">coverage = []</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s0">while </span><span class="s1">self.next_token_ </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;GLYPH&quot;</span><span class="s0">, </span><span class="s2">&quot;GROUP&quot;</span><span class="s0">, </span><span class="s2">&quot;RANGE&quot;</span><span class="s0">, </span><span class="s2">&quot;ENUM&quot;</span><span class="s1">):</span>
+            <span class="s0">if </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;ENUM&quot;</span><span class="s1">:</span>
+                <span class="s1">enum = self.parse_enum_()</span>
+                <span class="s1">coverage.append(enum)</span>
+            <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;GLYPH&quot;</span><span class="s1">:</span>
+                <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;GLYPH&quot;</span><span class="s1">)</span>
+                <span class="s1">name = self.expect_string_()</span>
+                <span class="s1">coverage.append(ast.GlyphName(name</span><span class="s0">, </span><span class="s1">location=location))</span>
+            <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;GROUP&quot;</span><span class="s1">:</span>
+                <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;GROUP&quot;</span><span class="s1">)</span>
+                <span class="s1">name = self.expect_string_()</span>
+                <span class="s1">coverage.append(ast.GroupName(name</span><span class="s0">, </span><span class="s1">self</span><span class="s0">, </span><span class="s1">location=location))</span>
+            <span class="s0">elif </span><span class="s1">self.next_token_ == </span><span class="s2">&quot;RANGE&quot;</span><span class="s1">:</span>
+                <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;RANGE&quot;</span><span class="s1">)</span>
+                <span class="s1">start = self.expect_string_()</span>
+                <span class="s1">self.expect_keyword_(</span><span class="s2">&quot;TO&quot;</span><span class="s1">)</span>
+                <span class="s1">end = self.expect_string_()</span>
+                <span class="s1">coverage.append(ast.Range(start</span><span class="s0">, </span><span class="s1">end</span><span class="s0">, </span><span class="s1">self</span><span class="s0">, </span><span class="s1">location=location))</span>
+        <span class="s0">return </span><span class="s1">tuple(coverage)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_group(self</span><span class="s0">, </span><span class="s1">group_name):</span>
+        <span class="s0">return </span><span class="s1">self.groups_.resolve(group_name)</span>
+
+    <span class="s0">def </span><span class="s1">glyph_range(self</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end):</span>
+        <span class="s0">return </span><span class="s1">self.glyphs_.range(start</span><span class="s0">, </span><span class="s1">end)</span>
+
+    <span class="s0">def </span><span class="s1">parse_ppem_(self):</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">ppem_name = self.cur_token_</span>
+        <span class="s1">value = self.expect_number_()</span>
+        <span class="s1">setting = ast.SettingDefinition(ppem_name</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">setting</span>
+
+    <span class="s0">def </span><span class="s1">parse_noarg_option_(self):</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = self.cur_token_</span>
+        <span class="s1">value = </span><span class="s0">True</span>
+        <span class="s1">setting = ast.SettingDefinition(name</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">setting</span>
+
+    <span class="s0">def </span><span class="s1">parse_cmap_format(self):</span>
+        <span class="s1">location = self.cur_token_location_</span>
+        <span class="s1">name = self.cur_token_</span>
+        <span class="s1">value = (self.expect_number_()</span><span class="s0">, </span><span class="s1">self.expect_number_()</span><span class="s0">,</span>
+                 <span class="s1">self.expect_number_())</span>
+        <span class="s1">setting = ast.SettingDefinition(name</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">location=location)</span>
+        <span class="s0">return </span><span class="s1">setting</span>
+
+    <span class="s0">def </span><span class="s1">is_cur_keyword_(self</span><span class="s0">, </span><span class="s1">k):</span>
+        <span class="s0">return </span><span class="s1">(self.cur_token_type_ </span><span class="s0">is </span><span class="s1">Lexer.NAME) </span><span class="s0">and </span><span class="s1">(self.cur_token_ == k)</span>
+
+    <span class="s0">def </span><span class="s1">expect_string_(self):</span>
+        <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">if </span><span class="s1">self.cur_token_type_ </span><span class="s0">is not </span><span class="s1">Lexer.STRING:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Expected a string&quot;</span><span class="s0">, </span><span class="s1">self.cur_token_location_)</span>
+        <span class="s0">return </span><span class="s1">self.cur_token_</span>
+
+    <span class="s0">def </span><span class="s1">expect_keyword_(self</span><span class="s0">, </span><span class="s1">keyword):</span>
+        <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">if </span><span class="s1">self.cur_token_type_ </span><span class="s0">is </span><span class="s1">Lexer.NAME </span><span class="s0">and </span><span class="s1">self.cur_token_ == keyword:</span>
+            <span class="s0">return </span><span class="s1">self.cur_token_</span>
+        <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Expected </span><span class="s0">\&quot;</span><span class="s2">%s</span><span class="s0">\&quot;</span><span class="s2">&quot; </span><span class="s1">% keyword</span><span class="s0">,</span>
+                           <span class="s1">self.cur_token_location_)</span>
+
+    <span class="s0">def </span><span class="s1">expect_name_(self):</span>
+        <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">if </span><span class="s1">self.cur_token_type_ </span><span class="s0">is </span><span class="s1">Lexer.NAME:</span>
+            <span class="s0">return </span><span class="s1">self.cur_token_</span>
+        <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Expected a name&quot;</span><span class="s0">, </span><span class="s1">self.cur_token_location_)</span>
+
+    <span class="s0">def </span><span class="s1">expect_number_(self):</span>
+        <span class="s1">self.advance_lexer_()</span>
+        <span class="s0">if </span><span class="s1">self.cur_token_type_ </span><span class="s0">is not </span><span class="s1">Lexer.NUMBER:</span>
+            <span class="s0">raise </span><span class="s1">VoltLibError(</span><span class="s2">&quot;Expected a number&quot;</span><span class="s0">, </span><span class="s1">self.cur_token_location_)</span>
+        <span class="s0">return </span><span class="s1">self.cur_token_</span>
+
+    <span class="s0">def </span><span class="s1">advance_lexer_(self):</span>
+        <span class="s1">self.cur_token_type_</span><span class="s0">, </span><span class="s1">self.cur_token_</span><span class="s0">, </span><span class="s1">self.cur_token_location_ = (</span>
+            <span class="s1">self.next_token_type_</span><span class="s0">, </span><span class="s1">self.next_token_</span><span class="s0">, </span><span class="s1">self.next_token_location_)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">self.is_cur_keyword_(</span><span class="s2">&quot;END&quot;</span><span class="s1">):</span>
+                <span class="s0">raise </span><span class="s1">StopIteration</span>
+            <span class="s1">(self.next_token_type_</span><span class="s0">, </span><span class="s1">self.next_token_</span><span class="s0">,</span>
+             <span class="s1">self.next_token_location_) = self.lexer_.next()</span>
+        <span class="s0">except </span><span class="s1">StopIteration:</span>
+            <span class="s1">self.next_token_type_</span><span class="s0">, </span><span class="s1">self.next_token_ = (</span><span class="s0">None, None</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">SymbolTable(object):</span>
+    <span class="s0">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self.scopes_ = [{}]</span>
+
+    <span class="s0">def </span><span class="s1">enter_scope(self):</span>
+        <span class="s1">self.scopes_.append({})</span>
+
+    <span class="s0">def </span><span class="s1">exit_scope(self):</span>
+        <span class="s1">self.scopes_.pop()</span>
+
+    <span class="s0">def </span><span class="s1">define(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">item):</span>
+        <span class="s1">self.scopes_[-</span><span class="s4">1</span><span class="s1">][name] = item</span>
+
+    <span class="s0">def </span><span class="s1">resolve(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">case_insensitive=</span><span class="s0">True</span><span class="s1">):</span>
+        <span class="s0">for </span><span class="s1">scope </span><span class="s0">in </span><span class="s1">reversed(self.scopes_):</span>
+            <span class="s1">item = scope.get(name)</span>
+            <span class="s0">if </span><span class="s1">item:</span>
+                <span class="s0">return </span><span class="s1">item</span>
+        <span class="s0">if </span><span class="s1">case_insensitive:</span>
+            <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">scope:</span>
+                <span class="s0">if </span><span class="s1">key.lower() == name.lower():</span>
+                    <span class="s0">return </span><span class="s1">scope[key]</span>
+        <span class="s0">return None</span>
+
+
+<span class="s0">class </span><span class="s1">OrderedSymbolTable(SymbolTable):</span>
+    <span class="s0">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self.scopes_ = [{}]</span>
+
+    <span class="s0">def </span><span class="s1">enter_scope(self):</span>
+        <span class="s1">self.scopes_.append({})</span>
+
+    <span class="s0">def </span><span class="s1">resolve(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">case_insensitive=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s1">SymbolTable.resolve(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">case_insensitive=case_insensitive)</span>
+
+    <span class="s0">def </span><span class="s1">range(self</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end):</span>
+        <span class="s0">for </span><span class="s1">scope </span><span class="s0">in </span><span class="s1">reversed(self.scopes_):</span>
+            <span class="s0">if </span><span class="s1">start </span><span class="s0">in </span><span class="s1">scope </span><span class="s0">and </span><span class="s1">end </span><span class="s0">in </span><span class="s1">scope:</span>
+                <span class="s1">start_idx = list(scope.keys()).index(start)</span>
+                <span class="s1">end_idx = list(scope.keys()).index(end)</span>
+                <span class="s0">return </span><span class="s1">list(scope.keys())[start_idx:end_idx + </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s0">return None</span>
+</pre>
+</body>
+</html>

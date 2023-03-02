@@ -1,0 +1,1804 @@
+<html>
+<head>
+<title>animation.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+animation.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># TODO:</span>
+<span class="s0"># * Documentation -- this will need a new section of the User's Guide.</span>
+<span class="s0">#      Both for Animations and just timers.</span>
+<span class="s0">#   - Also need to update</span>
+<span class="s0">#     https://scipy-cookbook.readthedocs.io/items/Matplotlib_Animations.html</span>
+<span class="s0"># * Blit</span>
+<span class="s0">#   * Currently broken with Qt4 for widgets that don't start on screen</span>
+<span class="s0">#   * Still a few edge cases that aren't working correctly</span>
+<span class="s0">#   * Can this integrate better with existing matplotlib animation artist flag?</span>
+<span class="s0">#     - If animated removes from default draw(), perhaps we could use this to</span>
+<span class="s0">#       simplify initial draw.</span>
+<span class="s0"># * Example</span>
+<span class="s0">#   * Frameless animation - pure procedural with no loop</span>
+<span class="s0">#   * Need example that uses something like inotify or subprocess</span>
+<span class="s0">#   * Complex syncing examples</span>
+<span class="s0"># * Movies</span>
+<span class="s0">#   * Can blit be enabled for movies?</span>
+<span class="s0"># * Need to consider event sources to allow clicking through multiple figures</span>
+
+
+<span class="s2">import </span><span class="s1">abc</span>
+<span class="s2">import </span><span class="s1">base64</span>
+<span class="s2">import </span><span class="s1">contextlib</span>
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">BytesIO</span><span class="s2">, </span><span class="s1">TextIOWrapper</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">import </span><span class="s1">shutil</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">from </span><span class="s1">tempfile </span><span class="s2">import </span><span class="s1">TemporaryDirectory</span>
+<span class="s2">import </span><span class="s1">uuid</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">PIL </span><span class="s2">import </span><span class="s1">Image</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib._animation_data </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">DISPLAY_TEMPLATE</span><span class="s2">, </span><span class="s1">INCLUDED_FRAMES</span><span class="s2">, </span><span class="s1">JS_INCLUDE</span><span class="s2">, </span><span class="s1">STYLE_INCLUDE)</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span>
+<span class="s2">import </span><span class="s1">matplotlib.colors </span><span class="s2">as </span><span class="s1">mcolors</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+<span class="s0"># Process creation flag for subprocess to prevent it raising a terminal</span>
+<span class="s0"># window. See for example https://stackoverflow.com/q/24130623/</span>
+<span class="s1">subprocess_creation_flags = (</span>
+    <span class="s1">subprocess.CREATE_NO_WINDOW </span><span class="s2">if </span><span class="s1">sys.platform == </span><span class="s3">'win32' </span><span class="s2">else </span><span class="s4">0</span><span class="s1">)</span>
+
+<span class="s0"># Other potential writing methods:</span>
+<span class="s0"># * http://pymedia.org/</span>
+<span class="s0"># * libming (produces swf) python wrappers: https://github.com/libming/libming</span>
+<span class="s0"># * Wrap x264 API:</span>
+
+<span class="s0"># (https://stackoverflow.com/q/2940671/)</span>
+
+
+<span class="s2">def </span><span class="s1">adjusted_figsize(w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">n):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Compute figure size so that pixels are a multiple of n. 
+ 
+    Parameters 
+    ---------- 
+    w, h : float 
+        Size in inches. 
+ 
+    dpi : float 
+        The dpi. 
+ 
+    n : int 
+        The target multiple. 
+ 
+    Returns 
+    ------- 
+    wnew, hnew : float 
+        The new figure size in inches. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># this maybe simplified if / when we adopt consistent rounding for</span>
+    <span class="s0"># pixel size across the whole library</span>
+    <span class="s2">def </span><span class="s1">correct_roundoff(x</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">n):</span>
+        <span class="s2">if </span><span class="s1">int(x*dpi) % n != </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">int(np.nextafter(x</span><span class="s2">, </span><span class="s1">np.inf)*dpi) % n == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">x = np.nextafter(x</span><span class="s2">, </span><span class="s1">np.inf)</span>
+            <span class="s2">elif </span><span class="s1">int(np.nextafter(x</span><span class="s2">, </span><span class="s1">-np.inf)*dpi) % n == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">x = np.nextafter(x</span><span class="s2">, </span><span class="s1">-np.inf)</span>
+        <span class="s2">return </span><span class="s1">x</span>
+
+    <span class="s1">wnew = int(w * dpi / n) * n / dpi</span>
+    <span class="s1">hnew = int(h * dpi / n) * n / dpi</span>
+    <span class="s2">return </span><span class="s1">correct_roundoff(wnew</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">n)</span><span class="s2">, </span><span class="s1">correct_roundoff(hnew</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">n)</span>
+
+
+<span class="s2">class </span><span class="s1">MovieWriterRegistry:</span>
+    <span class="s5">&quot;&quot;&quot;Registry of available writer classes by human readable name.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._registered = dict()</span>
+
+    <span class="s2">def </span><span class="s1">register(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Decorator for registering a class under a name. 
+ 
+        Example use:: 
+ 
+            @registry.register(name) 
+            class Foo: 
+                pass 
+        &quot;&quot;&quot;</span>
+        <span class="s2">def </span><span class="s1">wrapper(writer_cls):</span>
+            <span class="s1">self._registered[name] = writer_cls</span>
+            <span class="s2">return </span><span class="s1">writer_cls</span>
+        <span class="s2">return </span><span class="s1">wrapper</span>
+
+    <span class="s2">def </span><span class="s1">is_available(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Check if given writer is available by name. 
+ 
+        Parameters 
+        ---------- 
+        name : str 
+ 
+        Returns 
+        ------- 
+        bool 
+        &quot;&quot;&quot;</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">cls = self._registered[name]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s2">return False</span>
+        <span class="s2">return </span><span class="s1">cls.isAvailable()</span>
+
+    <span class="s2">def </span><span class="s1">__iter__(self):</span>
+        <span class="s5">&quot;&quot;&quot;Iterate over names of available writer class.&quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self._registered:</span>
+            <span class="s2">if </span><span class="s1">self.is_available(name):</span>
+                <span class="s2">yield </span><span class="s1">name</span>
+
+    <span class="s2">def </span><span class="s1">list(self):</span>
+        <span class="s5">&quot;&quot;&quot;Get a list of available MovieWriters.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">[*self]</span>
+
+    <span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s5">&quot;&quot;&quot;Get an available writer class from its name.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.is_available(name):</span>
+            <span class="s2">return </span><span class="s1">self._registered[name]</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">f&quot;Requested MovieWriter (</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s3">) not available&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">writers = MovieWriterRegistry()</span>
+
+
+<span class="s2">class </span><span class="s1">AbstractMovieWriter(abc.ABC):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Abstract base class for writing movies, providing a way to grab frames by 
+    calling `~AbstractMovieWriter.grab_frame`. 
+ 
+    `setup` is called to start the process and `finish` is called afterwards. 
+    `saving` is provided as a context manager to facilitate this process as :: 
+ 
+        with moviewriter.saving(fig, outfile='myfile.mp4', dpi=100): 
+            # Iterate over frames 
+            moviewriter.grab_frame(**savefig_kwargs) 
+ 
+    The use of the context manager ensures that `setup` and `finish` are 
+    performed as necessary. 
+ 
+    An instance of a concrete subclass of this class can be given as the 
+    ``writer`` argument of `Animation.save()`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fps=</span><span class="s4">5</span><span class="s2">, </span><span class="s1">metadata=</span><span class="s2">None, </span><span class="s1">codec=</span><span class="s2">None, </span><span class="s1">bitrate=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.fps = fps</span>
+        <span class="s1">self.metadata = metadata </span><span class="s2">if </span><span class="s1">metadata </span><span class="s2">is not None else </span><span class="s1">{}</span>
+        <span class="s1">self.codec = (</span>
+            <span class="s1">mpl.rcParams[</span><span class="s3">'animation.codec'</span><span class="s1">] </span><span class="s2">if </span><span class="s1">codec </span><span class="s2">is None else </span><span class="s1">codec)</span>
+        <span class="s1">self.bitrate = (</span>
+            <span class="s1">mpl.rcParams[</span><span class="s3">'animation.bitrate'</span><span class="s1">] </span><span class="s2">if </span><span class="s1">bitrate </span><span class="s2">is None else </span><span class="s1">bitrate)</span>
+
+    <span class="s1">@abc.abstractmethod</span>
+    <span class="s2">def </span><span class="s1">setup(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Setup for writing the movie file. 
+ 
+        Parameters 
+        ---------- 
+        fig : `~matplotlib.figure.Figure` 
+            The figure object that contains the information for frames. 
+        outfile : str 
+            The filename of the resulting movie file. 
+        dpi : float, default: ``fig.dpi`` 
+            The DPI (or resolution) for the file.  This controls the size 
+            in pixels of the resulting movie file. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.outfile = outfile</span>
+        <span class="s1">self.fig = fig</span>
+        <span class="s2">if </span><span class="s1">dpi </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dpi = self.fig.dpi</span>
+        <span class="s1">self.dpi = dpi</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">frame_size(self):</span>
+        <span class="s5">&quot;&quot;&quot;A tuple ``(width, height)`` in pixels of a movie frame.&quot;&quot;&quot;</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h = self.fig.get_size_inches()</span>
+        <span class="s2">return </span><span class="s1">int(w * self.dpi)</span><span class="s2">, </span><span class="s1">int(h * self.dpi)</span>
+
+    <span class="s1">@abc.abstractmethod</span>
+    <span class="s2">def </span><span class="s1">grab_frame(self</span><span class="s2">, </span><span class="s1">**savefig_kwargs):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Grab the image information from the figure and save as a movie frame. 
+ 
+        All keyword arguments in *savefig_kwargs* are passed on to the 
+        `~.Figure.savefig` call that saves the figure. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s1">@abc.abstractmethod</span>
+    <span class="s2">def </span><span class="s1">finish(self):</span>
+        <span class="s5">&quot;&quot;&quot;Finish any processing for writing the movie.&quot;&quot;&quot;</span>
+
+    <span class="s1">@contextlib.contextmanager</span>
+    <span class="s2">def </span><span class="s1">saving(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Context manager to facilitate writing the movie file. 
+ 
+        ``*args, **kw`` are any parameters that should be passed to `setup`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># This particular sequence is what contextlib.contextmanager wants</span>
+        <span class="s1">self.setup(fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">yield </span><span class="s1">self</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s1">self.finish()</span>
+
+
+<span class="s2">class </span><span class="s1">MovieWriter(AbstractMovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Base class for writing movies. 
+ 
+    This is a base class for MovieWriter subclasses that write a movie frame 
+    data to a pipe. You cannot instantiate this class directly. 
+    See examples for how to use its subclasses. 
+ 
+    Attributes 
+    ---------- 
+    frame_format : str 
+        The format used in writing frame data, defaults to 'rgba'. 
+    fig : `~matplotlib.figure.Figure` 
+        The figure to capture data from. 
+        This must be provided by the subclasses. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># Builtin writer subclasses additionally define the _exec_key and _args_key</span>
+    <span class="s0"># attributes, which indicate the rcParams entries where the path to the</span>
+    <span class="s0"># executable and additional command-line arguments to the executable are</span>
+    <span class="s0"># stored.  Third-party writers cannot meaningfully set these as they cannot</span>
+    <span class="s0"># extend rcParams with new keys.</span>
+
+    <span class="s0"># Pipe-based writers only support RGBA, but file-based ones support more</span>
+    <span class="s0"># formats.</span>
+    <span class="s1">supported_formats = [</span><span class="s3">&quot;rgba&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fps=</span><span class="s4">5</span><span class="s2">, </span><span class="s1">codec=</span><span class="s2">None, </span><span class="s1">bitrate=</span><span class="s2">None, </span><span class="s1">extra_args=</span><span class="s2">None,</span>
+                 <span class="s1">metadata=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        fps : int, default: 5 
+            Movie frame rate (per second). 
+        codec : str or None, default: :rc:`animation.codec` 
+            The codec to use. 
+        bitrate : int, default: :rc:`animation.bitrate` 
+            The bitrate of the movie, in kilobits per second.  Higher values 
+            means higher quality movies, but increase the file size.  A value 
+            of -1 lets the underlying movie encoder select the bitrate. 
+        extra_args : list of str or None, optional 
+            Extra command-line arguments passed to the underlying movie 
+            encoder.  The default, None, means to use 
+            :rc:`animation.[name-of-encoder]_args` for the builtin writers. 
+        metadata : dict[str, str], default: {} 
+            A dictionary of keys and values for metadata to include in the 
+            output file. Some keys that may be of use include: 
+            title, artist, genre, subject, copyright, srcform, comment. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">type(self) </span><span class="s2">is </span><span class="s1">MovieWriter:</span>
+            <span class="s0"># TODO MovieWriter is still an abstract class and needs to be</span>
+            <span class="s0">#      extended with a mixin. This should be clearer in naming</span>
+            <span class="s0">#      and description. For now, just give a reasonable error</span>
+            <span class="s0">#      message to users.</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span>
+                <span class="s3">'MovieWriter cannot be instantiated directly. Please use one '</span>
+                <span class="s3">'of its subclasses.'</span><span class="s1">)</span>
+
+        <span class="s1">super().__init__(fps=fps</span><span class="s2">, </span><span class="s1">metadata=metadata</span><span class="s2">, </span><span class="s1">codec=codec</span><span class="s2">,</span>
+                         <span class="s1">bitrate=bitrate)</span>
+        <span class="s1">self.frame_format = self.supported_formats[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">self.extra_args = extra_args</span>
+
+    <span class="s2">def </span><span class="s1">_adjust_frame_size(self):</span>
+        <span class="s2">if </span><span class="s1">self.codec == </span><span class="s3">'h264'</span><span class="s1">:</span>
+            <span class="s1">wo</span><span class="s2">, </span><span class="s1">ho = self.fig.get_size_inches()</span>
+            <span class="s1">w</span><span class="s2">, </span><span class="s1">h = adjusted_figsize(wo</span><span class="s2">, </span><span class="s1">ho</span><span class="s2">, </span><span class="s1">self.dpi</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">(wo</span><span class="s2">, </span><span class="s1">ho) != (w</span><span class="s2">, </span><span class="s1">h):</span>
+                <span class="s1">self.fig.set_size_inches(w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">forward=</span><span class="s2">True</span><span class="s1">)</span>
+                <span class="s1">_log.info(</span><span class="s3">'figure size in inches has been adjusted '</span>
+                          <span class="s3">'from %s x %s to %s x %s'</span><span class="s2">, </span><span class="s1">wo</span><span class="s2">, </span><span class="s1">ho</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">w</span><span class="s2">, </span><span class="s1">h = self.fig.get_size_inches()</span>
+        <span class="s1">_log.debug(</span><span class="s3">'frame size in pixels is %s x %s'</span><span class="s2">, </span><span class="s1">*self.frame_size)</span>
+        <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span>
+
+    <span class="s2">def </span><span class="s1">setup(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0"># docstring inherited</span>
+        <span class="s1">super().setup(fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=dpi)</span>
+        <span class="s1">self._w</span><span class="s2">, </span><span class="s1">self._h = self._adjust_frame_size()</span>
+        <span class="s0"># Run here so that grab_frame() can write the data to a pipe. This</span>
+        <span class="s0"># eliminates the need for temp files.</span>
+        <span class="s1">self._run()</span>
+
+    <span class="s2">def </span><span class="s1">_run(self):</span>
+        <span class="s0"># Uses subprocess to call the program for assembling frames into a</span>
+        <span class="s0"># movie file.  *args* returns the sequence of command line arguments</span>
+        <span class="s0"># from a few configuration options.</span>
+        <span class="s1">command = self._args()</span>
+        <span class="s1">_log.info(</span><span class="s3">'MovieWriter._run: running command: %s'</span><span class="s2">,</span>
+                  <span class="s1">cbook._pformat_subprocess(command))</span>
+        <span class="s1">PIPE = subprocess.PIPE</span>
+        <span class="s1">self._proc = subprocess.Popen(</span>
+            <span class="s1">command</span><span class="s2">, </span><span class="s1">stdin=PIPE</span><span class="s2">, </span><span class="s1">stdout=PIPE</span><span class="s2">, </span><span class="s1">stderr=PIPE</span><span class="s2">,</span>
+            <span class="s1">creationflags=subprocess_creation_flags)</span>
+
+    <span class="s2">def </span><span class="s1">finish(self):</span>
+        <span class="s5">&quot;&quot;&quot;Finish any processing for writing the movie.&quot;&quot;&quot;</span>
+        <span class="s1">out</span><span class="s2">, </span><span class="s1">err = self._proc.communicate()</span>
+        <span class="s0"># Use the encoding/errors that universal_newlines would use.</span>
+        <span class="s1">out = TextIOWrapper(BytesIO(out)).read()</span>
+        <span class="s1">err = TextIOWrapper(BytesIO(err)).read()</span>
+        <span class="s2">if </span><span class="s1">out:</span>
+            <span class="s1">_log.log(</span>
+                <span class="s1">logging.WARNING </span><span class="s2">if </span><span class="s1">self._proc.returncode </span><span class="s2">else </span><span class="s1">logging.DEBUG</span><span class="s2">,</span>
+                <span class="s3">&quot;MovieWriter stdout:</span><span class="s2">\n</span><span class="s3">%s&quot;</span><span class="s2">, </span><span class="s1">out)</span>
+        <span class="s2">if </span><span class="s1">err:</span>
+            <span class="s1">_log.log(</span>
+                <span class="s1">logging.WARNING </span><span class="s2">if </span><span class="s1">self._proc.returncode </span><span class="s2">else </span><span class="s1">logging.DEBUG</span><span class="s2">,</span>
+                <span class="s3">&quot;MovieWriter stderr:</span><span class="s2">\n</span><span class="s3">%s&quot;</span><span class="s2">, </span><span class="s1">err)</span>
+        <span class="s2">if </span><span class="s1">self._proc.returncode:</span>
+            <span class="s2">raise </span><span class="s1">subprocess.CalledProcessError(</span>
+                <span class="s1">self._proc.returncode</span><span class="s2">, </span><span class="s1">self._proc.args</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">err)</span>
+
+    <span class="s2">def </span><span class="s1">grab_frame(self</span><span class="s2">, </span><span class="s1">**savefig_kwargs):</span>
+        <span class="s0"># docstring inherited</span>
+        <span class="s1">_log.debug(</span><span class="s3">'MovieWriter.grab_frame: Grabbing frame.'</span><span class="s1">)</span>
+        <span class="s0"># Readjust the figure size in case it has been changed by the user.</span>
+        <span class="s0"># All frames must have the same size to save the movie correctly.</span>
+        <span class="s1">self.fig.set_size_inches(self._w</span><span class="s2">, </span><span class="s1">self._h)</span>
+        <span class="s0"># Save the figure data to the sink, using the frame format and dpi.</span>
+        <span class="s1">self.fig.savefig(self._proc.stdin</span><span class="s2">, </span><span class="s1">format=self.frame_format</span><span class="s2">,</span>
+                         <span class="s1">dpi=self.dpi</span><span class="s2">, </span><span class="s1">**savefig_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_args(self):</span>
+        <span class="s5">&quot;&quot;&quot;Assemble list of encoder-specific command-line arguments.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">NotImplementedError(</span><span class="s3">&quot;args needs to be implemented by subclass.&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">bin_path(cls):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the binary path to the commandline tool used by a specific 
+        subclass. This is a class method so that the tool can be looked for 
+        before making a particular MovieWriter subclass available. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">str(mpl.rcParams[cls._exec_key])</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">isAvailable(cls):</span>
+        <span class="s5">&quot;&quot;&quot;Return whether a MovieWriter subclass is actually available.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">shutil.which(cls.bin_path()) </span><span class="s2">is not None</span>
+
+
+<span class="s2">class </span><span class="s1">FileMovieWriter(MovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    `MovieWriter` for writing to individual files and stitching at the end. 
+ 
+    This must be sub-classed to be useful. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self.frame_format = mpl.rcParams[</span><span class="s3">'animation.frame_format'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">setup(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=</span><span class="s2">None, </span><span class="s1">frame_prefix=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Setup for writing the movie file. 
+ 
+        Parameters 
+        ---------- 
+        fig : `~matplotlib.figure.Figure` 
+            The figure to grab the rendered frames from. 
+        outfile : str 
+            The filename of the resulting movie file. 
+        dpi : float, default: ``fig.dpi`` 
+            The dpi of the output file. This, with the figure size, 
+            controls the size in pixels of the resulting movie file. 
+        frame_prefix : str, optional 
+            The filename prefix to use for temporary files.  If *None* (the 
+            default), files are written to a temporary directory which is 
+            deleted by `finish`; if not *None*, no temporary files are 
+            deleted. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.fig = fig</span>
+        <span class="s1">self.outfile = outfile</span>
+        <span class="s2">if </span><span class="s1">dpi </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dpi = self.fig.dpi</span>
+        <span class="s1">self.dpi = dpi</span>
+        <span class="s1">self._adjust_frame_size()</span>
+
+        <span class="s2">if </span><span class="s1">frame_prefix </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._tmpdir = TemporaryDirectory()</span>
+            <span class="s1">self.temp_prefix = str(Path(self._tmpdir.name</span><span class="s2">, </span><span class="s3">'tmp'</span><span class="s1">))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._tmpdir = </span><span class="s2">None</span>
+            <span class="s1">self.temp_prefix = frame_prefix</span>
+        <span class="s1">self._frame_counter = </span><span class="s4">0  </span><span class="s0"># used for generating sequential file names</span>
+        <span class="s1">self._temp_paths = list()</span>
+        <span class="s1">self.fname_format_str = </span><span class="s3">'%s%%07d.%s'</span>
+
+    <span class="s2">def </span><span class="s1">__del__(self):</span>
+        <span class="s2">if </span><span class="s1">self._tmpdir:</span>
+            <span class="s1">self._tmpdir.cleanup()</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">frame_format(self):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Format (png, jpeg, etc.) to use for saving the frames, which can be 
+        decided by the individual subclasses. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._frame_format</span>
+
+    <span class="s1">@frame_format.setter</span>
+    <span class="s2">def </span><span class="s1">frame_format(self</span><span class="s2">, </span><span class="s1">frame_format):</span>
+        <span class="s2">if </span><span class="s1">frame_format </span><span class="s2">in </span><span class="s1">self.supported_formats:</span>
+            <span class="s1">self._frame_format = frame_format</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">_api.warn_external(</span>
+                <span class="s3">f&quot;Ignoring file format </span><span class="s2">{</span><span class="s1">frame_format</span><span class="s2">!r} </span><span class="s3">which is not &quot;</span>
+                <span class="s3">f&quot;supported by </span><span class="s2">{</span><span class="s1">type(self).__name__</span><span class="s2">}</span><span class="s3">; using &quot;</span>
+                <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">self.supported_formats[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">} </span><span class="s3">instead.&quot;</span><span class="s1">)</span>
+            <span class="s1">self._frame_format = self.supported_formats[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">_base_temp_name(self):</span>
+        <span class="s0"># Generates a template name (without number) given the frame format</span>
+        <span class="s0"># for extension and the prefix.</span>
+        <span class="s2">return </span><span class="s1">self.fname_format_str % (self.temp_prefix</span><span class="s2">, </span><span class="s1">self.frame_format)</span>
+
+    <span class="s2">def </span><span class="s1">grab_frame(self</span><span class="s2">, </span><span class="s1">**savefig_kwargs):</span>
+        <span class="s0"># docstring inherited</span>
+        <span class="s0"># Creates a filename for saving using basename and counter.</span>
+        <span class="s1">path = Path(self._base_temp_name() % self._frame_counter)</span>
+        <span class="s1">self._temp_paths.append(path)  </span><span class="s0"># Record the filename for later use.</span>
+        <span class="s1">self._frame_counter += </span><span class="s4">1  </span><span class="s0"># Ensures each created name is unique.</span>
+        <span class="s1">_log.debug(</span><span class="s3">'FileMovieWriter.grab_frame: Grabbing frame %d to path=%s'</span><span class="s2">,</span>
+                   <span class="s1">self._frame_counter</span><span class="s2">, </span><span class="s1">path)</span>
+        <span class="s2">with </span><span class="s1">open(path</span><span class="s2">, </span><span class="s3">'wb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">sink:  </span><span class="s0"># Save figure to the sink.</span>
+            <span class="s1">self.fig.savefig(sink</span><span class="s2">, </span><span class="s1">format=self.frame_format</span><span class="s2">, </span><span class="s1">dpi=self.dpi</span><span class="s2">,</span>
+                             <span class="s1">**savefig_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">finish(self):</span>
+        <span class="s0"># Call run here now that all frame grabbing is done. All temp files</span>
+        <span class="s0"># are available to be assembled.</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">self._run()</span>
+            <span class="s1">super().finish()</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">self._tmpdir:</span>
+                <span class="s1">_log.debug(</span>
+                    <span class="s3">'MovieWriter: clearing temporary path=%s'</span><span class="s2">, </span><span class="s1">self._tmpdir</span>
+                <span class="s1">)</span>
+                <span class="s1">self._tmpdir.cleanup()</span>
+
+
+<span class="s1">@writers.register(</span><span class="s3">'pillow'</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">PillowWriter(AbstractMovieWriter):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">isAvailable(cls):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">setup(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">super().setup(fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=dpi)</span>
+        <span class="s1">self._frames = []</span>
+
+    <span class="s2">def </span><span class="s1">grab_frame(self</span><span class="s2">, </span><span class="s1">**savefig_kwargs):</span>
+        <span class="s1">buf = BytesIO()</span>
+        <span class="s1">self.fig.savefig(</span>
+            <span class="s1">buf</span><span class="s2">, </span><span class="s1">**{**savefig_kwargs</span><span class="s2">, </span><span class="s3">&quot;format&quot;</span><span class="s1">: </span><span class="s3">&quot;rgba&quot;</span><span class="s2">, </span><span class="s3">&quot;dpi&quot;</span><span class="s1">: self.dpi})</span>
+        <span class="s1">self._frames.append(Image.frombuffer(</span>
+            <span class="s3">&quot;RGBA&quot;</span><span class="s2">, </span><span class="s1">self.frame_size</span><span class="s2">, </span><span class="s1">buf.getbuffer()</span><span class="s2">, </span><span class="s3">&quot;raw&quot;</span><span class="s2">, </span><span class="s3">&quot;RGBA&quot;</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span>
+
+    <span class="s2">def </span><span class="s1">finish(self):</span>
+        <span class="s1">self._frames[</span><span class="s4">0</span><span class="s1">].save(</span>
+            <span class="s1">self.outfile</span><span class="s2">, </span><span class="s1">save_all=</span><span class="s2">True, </span><span class="s1">append_images=self._frames[</span><span class="s4">1</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s1">duration=int(</span><span class="s4">1000 </span><span class="s1">/ self.fps)</span><span class="s2">, </span><span class="s1">loop=</span><span class="s4">0</span><span class="s1">)</span>
+
+
+<span class="s0"># Base class of ffmpeg information. Has the config keys and the common set</span>
+<span class="s0"># of arguments that controls the *output* side of things.</span>
+<span class="s2">class </span><span class="s1">FFMpegBase:</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Mixin class for FFMpeg output. 
+ 
+    This is a base class for the concrete `FFMpegWriter` and `FFMpegFileWriter` 
+    classes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_exec_key = </span><span class="s3">'animation.ffmpeg_path'</span>
+    <span class="s1">_args_key = </span><span class="s3">'animation.ffmpeg_args'</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">output_args(self):</span>
+        <span class="s1">args = []</span>
+        <span class="s2">if </span><span class="s1">Path(self.outfile).suffix == </span><span class="s3">'.gif'</span><span class="s1">:</span>
+            <span class="s1">self.codec = </span><span class="s3">'gif'</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">args.extend([</span><span class="s3">'-vcodec'</span><span class="s2">, </span><span class="s1">self.codec])</span>
+        <span class="s1">extra_args = (self.extra_args </span><span class="s2">if </span><span class="s1">self.extra_args </span><span class="s2">is not None</span>
+                      <span class="s2">else </span><span class="s1">mpl.rcParams[self._args_key])</span>
+        <span class="s0"># For h264, the default format is yuv444p, which is not compatible</span>
+        <span class="s0"># with quicktime (and others). Specifying yuv420p fixes playback on</span>
+        <span class="s0"># iOS, as well as HTML5 video in firefox and safari (on both Win and</span>
+        <span class="s0"># OSX). Also fixes internet explorer. This is as of 2015/10/29.</span>
+        <span class="s2">if </span><span class="s1">self.codec == </span><span class="s3">'h264' </span><span class="s2">and </span><span class="s3">'-pix_fmt' </span><span class="s2">not in </span><span class="s1">extra_args:</span>
+            <span class="s1">args.extend([</span><span class="s3">'-pix_fmt'</span><span class="s2">, </span><span class="s3">'yuv420p'</span><span class="s1">])</span>
+        <span class="s0"># For GIF, we're telling FFMPEG to split the video stream, to generate</span>
+        <span class="s0"># a palette, and then use it for encoding.</span>
+        <span class="s2">elif </span><span class="s1">self.codec == </span><span class="s3">'gif' </span><span class="s2">and </span><span class="s3">'-filter_complex' </span><span class="s2">not in </span><span class="s1">extra_args:</span>
+            <span class="s1">args.extend([</span><span class="s3">'-filter_complex'</span><span class="s2">,</span>
+                         <span class="s3">'split [a][b];[a] palettegen [p];[b][p] paletteuse'</span><span class="s1">])</span>
+        <span class="s2">if </span><span class="s1">self.bitrate &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">args.extend([</span><span class="s3">'-b'</span><span class="s2">, </span><span class="s3">'%dk' </span><span class="s1">% self.bitrate])  </span><span class="s0"># %dk: bitrate in kbps.</span>
+        <span class="s1">args.extend(extra_args)</span>
+        <span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">self.metadata.items():</span>
+            <span class="s1">args.extend([</span><span class="s3">'-metadata'</span><span class="s2">, </span><span class="s3">'%s=%s' </span><span class="s1">% (k</span><span class="s2">, </span><span class="s1">v)])</span>
+
+        <span class="s2">return </span><span class="s1">args + [</span><span class="s3">'-y'</span><span class="s2">, </span><span class="s1">self.outfile]</span>
+
+
+<span class="s0"># Combine FFMpeg options with pipe-based writing</span>
+<span class="s1">@writers.register(</span><span class="s3">'ffmpeg'</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">FFMpegWriter(FFMpegBase</span><span class="s2">, </span><span class="s1">MovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Pipe-based ffmpeg writer. 
+ 
+    Frames are streamed directly to ffmpeg via a pipe and written in a single 
+    pass. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">_args(self):</span>
+        <span class="s0"># Returns the command line parameters for subprocess to use</span>
+        <span class="s0"># ffmpeg to create a movie using a pipe.</span>
+        <span class="s1">args = [self.bin_path()</span><span class="s2">, </span><span class="s3">'-f'</span><span class="s2">, </span><span class="s3">'rawvideo'</span><span class="s2">, </span><span class="s3">'-vcodec'</span><span class="s2">, </span><span class="s3">'rawvideo'</span><span class="s2">,</span>
+                <span class="s3">'-s'</span><span class="s2">, </span><span class="s3">'%dx%d' </span><span class="s1">% self.frame_size</span><span class="s2">, </span><span class="s3">'-pix_fmt'</span><span class="s2">, </span><span class="s1">self.frame_format</span><span class="s2">,</span>
+                <span class="s3">'-r'</span><span class="s2">, </span><span class="s1">str(self.fps)]</span>
+        <span class="s0"># Logging is quieted because subprocess.PIPE has limited buffer size.</span>
+        <span class="s0"># If you have a lot of frames in your animation and set logging to</span>
+        <span class="s0"># DEBUG, you will have a buffer overrun.</span>
+        <span class="s2">if </span><span class="s1">_log.getEffectiveLevel() &gt; logging.DEBUG:</span>
+            <span class="s1">args += [</span><span class="s3">'-loglevel'</span><span class="s2">, </span><span class="s3">'error'</span><span class="s1">]</span>
+        <span class="s1">args += [</span><span class="s3">'-i'</span><span class="s2">, </span><span class="s3">'pipe:'</span><span class="s1">] + self.output_args</span>
+        <span class="s2">return </span><span class="s1">args</span>
+
+
+<span class="s0"># Combine FFMpeg options with temp file-based writing</span>
+<span class="s1">@writers.register(</span><span class="s3">'ffmpeg_file'</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">FFMpegFileWriter(FFMpegBase</span><span class="s2">, </span><span class="s1">FileMovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    File-based ffmpeg writer. 
+ 
+    Frames are written to temporary files on disk and then stitched 
+    together at the end. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">supported_formats = [</span><span class="s3">'png'</span><span class="s2">, </span><span class="s3">'jpeg'</span><span class="s2">, </span><span class="s3">'tiff'</span><span class="s2">, </span><span class="s3">'raw'</span><span class="s2">, </span><span class="s3">'rgba'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">_args(self):</span>
+        <span class="s0"># Returns the command line parameters for subprocess to use</span>
+        <span class="s0"># ffmpeg to create a movie using a collection of temp images</span>
+        <span class="s1">args = []</span>
+        <span class="s0"># For raw frames, we need to explicitly tell ffmpeg the metadata.</span>
+        <span class="s2">if </span><span class="s1">self.frame_format </span><span class="s2">in </span><span class="s1">{</span><span class="s3">'raw'</span><span class="s2">, </span><span class="s3">'rgba'</span><span class="s1">}:</span>
+            <span class="s1">args += [</span>
+                <span class="s3">'-f'</span><span class="s2">, </span><span class="s3">'image2'</span><span class="s2">, </span><span class="s3">'-vcodec'</span><span class="s2">, </span><span class="s3">'rawvideo'</span><span class="s2">,</span>
+                <span class="s3">'-video_size'</span><span class="s2">, </span><span class="s3">'%dx%d' </span><span class="s1">% self.frame_size</span><span class="s2">,</span>
+                <span class="s3">'-pixel_format'</span><span class="s2">, </span><span class="s3">'rgba'</span><span class="s2">,</span>
+                <span class="s3">'-framerate'</span><span class="s2">, </span><span class="s1">str(self.fps)</span><span class="s2">,</span>
+            <span class="s1">]</span>
+        <span class="s1">args += [</span><span class="s3">'-r'</span><span class="s2">, </span><span class="s1">str(self.fps)</span><span class="s2">, </span><span class="s3">'-i'</span><span class="s2">, </span><span class="s1">self._base_temp_name()</span><span class="s2">,</span>
+                 <span class="s3">'-vframes'</span><span class="s2">, </span><span class="s1">str(self._frame_counter)]</span>
+        <span class="s0"># Logging is quieted because subprocess.PIPE has limited buffer size.</span>
+        <span class="s0"># If you have a lot of frames in your animation and set logging to</span>
+        <span class="s0"># DEBUG, you will have a buffer overrun.</span>
+        <span class="s2">if </span><span class="s1">_log.getEffectiveLevel() &gt; logging.DEBUG:</span>
+            <span class="s1">args += [</span><span class="s3">'-loglevel'</span><span class="s2">, </span><span class="s3">'error'</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">[self.bin_path()</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">*self.output_args]</span>
+
+
+<span class="s0"># Base class for animated GIFs with ImageMagick</span>
+<span class="s2">class </span><span class="s1">ImageMagickBase:</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Mixin class for ImageMagick output. 
+ 
+    This is a base class for the concrete `ImageMagickWriter` and 
+    `ImageMagickFileWriter` classes, which define an ``input_names`` attribute 
+    (or property) specifying the input names passed to ImageMagick. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_exec_key = </span><span class="s3">'animation.convert_path'</span>
+    <span class="s1">_args_key = </span><span class="s3">'animation.convert_args'</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">delay(self):</span>
+        <span class="s2">return </span><span class="s4">100. </span><span class="s1">/ self.fps</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s3">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">output_args(self):</span>
+        <span class="s1">extra_args = (self.extra_args </span><span class="s2">if </span><span class="s1">self.extra_args </span><span class="s2">is not None</span>
+                      <span class="s2">else </span><span class="s1">mpl.rcParams[self._args_key])</span>
+        <span class="s2">return </span><span class="s1">[*extra_args</span><span class="s2">, </span><span class="s1">self.outfile]</span>
+
+    <span class="s2">def </span><span class="s1">_args(self):</span>
+        <span class="s0"># ImageMagick does not recognize &quot;raw&quot;.</span>
+        <span class="s1">fmt = </span><span class="s3">&quot;rgba&quot; </span><span class="s2">if </span><span class="s1">self.frame_format == </span><span class="s3">&quot;raw&quot; </span><span class="s2">else </span><span class="s1">self.frame_format</span>
+        <span class="s1">extra_args = (self.extra_args </span><span class="s2">if </span><span class="s1">self.extra_args </span><span class="s2">is not None</span>
+                      <span class="s2">else </span><span class="s1">mpl.rcParams[self._args_key])</span>
+        <span class="s2">return </span><span class="s1">[</span>
+            <span class="s1">self.bin_path()</span><span class="s2">,</span>
+            <span class="s3">&quot;-size&quot;</span><span class="s2">, </span><span class="s3">&quot;%ix%i&quot; </span><span class="s1">% self.frame_size</span><span class="s2">,</span>
+            <span class="s3">&quot;-depth&quot;</span><span class="s2">, </span><span class="s3">&quot;8&quot;</span><span class="s2">,</span>
+            <span class="s3">&quot;-delay&quot;</span><span class="s2">, </span><span class="s1">str(</span><span class="s4">100 </span><span class="s1">/ self.fps)</span><span class="s2">,</span>
+            <span class="s3">&quot;-loop&quot;</span><span class="s2">, </span><span class="s3">&quot;0&quot;</span><span class="s2">,</span>
+            <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">fmt</span><span class="s2">}</span><span class="s3">:</span><span class="s2">{</span><span class="s1">self.input_names</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s2">,</span>
+            <span class="s1">*extra_args</span><span class="s2">,</span>
+            <span class="s1">self.outfile</span><span class="s2">,</span>
+        <span class="s1">]</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">bin_path(cls):</span>
+        <span class="s1">binpath = super().bin_path()</span>
+        <span class="s2">if </span><span class="s1">binpath == </span><span class="s3">'convert'</span><span class="s1">:</span>
+            <span class="s1">binpath = mpl._get_executable_info(</span><span class="s3">'magick'</span><span class="s1">).executable</span>
+        <span class="s2">return </span><span class="s1">binpath</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">isAvailable(cls):</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">super().isAvailable()</span>
+        <span class="s2">except </span><span class="s1">mpl.ExecutableNotFoundError </span><span class="s2">as </span><span class="s1">_enf:</span>
+            <span class="s0"># May be raised by get_executable_info.</span>
+            <span class="s1">_log.debug(</span><span class="s3">'ImageMagick unavailable due to: %s'</span><span class="s2">, </span><span class="s1">_enf)</span>
+            <span class="s2">return False</span>
+
+
+<span class="s0"># Combine ImageMagick options with pipe-based writing</span>
+<span class="s1">@writers.register(</span><span class="s3">'imagemagick'</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">ImageMagickWriter(ImageMagickBase</span><span class="s2">, </span><span class="s1">MovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Pipe-based animated gif writer. 
+ 
+    Frames are streamed directly to ImageMagick via a pipe and written 
+    in a single pass. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">input_names = </span><span class="s3">&quot;-&quot;  </span><span class="s0"># stdin</span>
+
+
+<span class="s0"># Combine ImageMagick options with temp file-based writing</span>
+<span class="s1">@writers.register(</span><span class="s3">'imagemagick_file'</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">ImageMagickFileWriter(ImageMagickBase</span><span class="s2">, </span><span class="s1">FileMovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    File-based animated gif writer. 
+ 
+    Frames are written to temporary files on disk and then stitched 
+    together at the end. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">supported_formats = [</span><span class="s3">'png'</span><span class="s2">, </span><span class="s3">'jpeg'</span><span class="s2">, </span><span class="s3">'tiff'</span><span class="s2">, </span><span class="s3">'raw'</span><span class="s2">, </span><span class="s3">'rgba'</span><span class="s1">]</span>
+    <span class="s1">input_names = property(</span>
+        <span class="s2">lambda </span><span class="s1">self: </span><span class="s3">f'</span><span class="s2">{</span><span class="s1">self.temp_prefix</span><span class="s2">}</span><span class="s3">*.</span><span class="s2">{</span><span class="s1">self.frame_format</span><span class="s2">}</span><span class="s3">'</span><span class="s1">)</span>
+
+
+<span class="s0"># Taken directly from jakevdp's JSAnimation package at</span>
+<span class="s0"># http://github.com/jakevdp/JSAnimation</span>
+<span class="s2">def </span><span class="s1">_included_frames(frame_count</span><span class="s2">, </span><span class="s1">frame_format</span><span class="s2">, </span><span class="s1">frame_dir):</span>
+    <span class="s2">return </span><span class="s1">INCLUDED_FRAMES.format(Nframes=frame_count</span><span class="s2">,</span>
+                                  <span class="s1">frame_dir=frame_dir</span><span class="s2">,</span>
+                                  <span class="s1">frame_format=frame_format)</span>
+
+
+<span class="s2">def </span><span class="s1">_embedded_frames(frame_list</span><span class="s2">, </span><span class="s1">frame_format):</span>
+    <span class="s5">&quot;&quot;&quot;frame_list should be a list of base64-encoded png files&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">frame_format == </span><span class="s3">'svg'</span><span class="s1">:</span>
+        <span class="s0"># Fix MIME type for svg</span>
+        <span class="s1">frame_format = </span><span class="s3">'svg+xml'</span>
+    <span class="s1">template = </span><span class="s3">'  frames[{0}] = &quot;data:image/{1};base64,{2}&quot;</span><span class="s2">\n</span><span class="s3">'</span>
+    <span class="s2">return </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">+ </span><span class="s3">&quot;&quot;</span><span class="s1">.join(</span>
+        <span class="s1">template.format(i</span><span class="s2">, </span><span class="s1">frame_format</span><span class="s2">, </span><span class="s1">frame_data.replace(</span><span class="s3">'</span><span class="s2">\n</span><span class="s3">'</span><span class="s2">, </span><span class="s3">'</span><span class="s2">\\\n</span><span class="s3">'</span><span class="s1">))</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">frame_data </span><span class="s2">in </span><span class="s1">enumerate(frame_list))</span>
+
+
+<span class="s1">@writers.register(</span><span class="s3">'html'</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">HTMLWriter(FileMovieWriter):</span>
+    <span class="s5">&quot;&quot;&quot;Writer for JavaScript-based HTML movies.&quot;&quot;&quot;</span>
+
+    <span class="s1">supported_formats = [</span><span class="s3">'png'</span><span class="s2">, </span><span class="s3">'jpeg'</span><span class="s2">, </span><span class="s3">'tiff'</span><span class="s2">, </span><span class="s3">'svg'</span><span class="s1">]</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">isAvailable(cls):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fps=</span><span class="s4">30</span><span class="s2">, </span><span class="s1">codec=</span><span class="s2">None, </span><span class="s1">bitrate=</span><span class="s2">None, </span><span class="s1">extra_args=</span><span class="s2">None,</span>
+                 <span class="s1">metadata=</span><span class="s2">None, </span><span class="s1">embed_frames=</span><span class="s2">False, </span><span class="s1">default_mode=</span><span class="s3">'loop'</span><span class="s2">,</span>
+                 <span class="s1">embed_limit=</span><span class="s2">None</span><span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">extra_args:</span>
+            <span class="s1">_log.warning(</span><span class="s3">&quot;HTMLWriter ignores 'extra_args'&quot;</span><span class="s1">)</span>
+        <span class="s1">extra_args = ()  </span><span class="s0"># Don't lookup nonexistent rcParam[args_key].</span>
+        <span class="s1">self.embed_frames = embed_frames</span>
+        <span class="s1">self.default_mode = default_mode.lower()</span>
+        <span class="s1">_api.check_in_list([</span><span class="s3">'loop'</span><span class="s2">, </span><span class="s3">'once'</span><span class="s2">, </span><span class="s3">'reflect'</span><span class="s1">]</span><span class="s2">,</span>
+                           <span class="s1">default_mode=self.default_mode)</span>
+
+        <span class="s0"># Save embed limit, which is given in MB</span>
+        <span class="s2">if </span><span class="s1">embed_limit </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._bytes_limit = mpl.rcParams[</span><span class="s3">'animation.embed_limit'</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._bytes_limit = embed_limit</span>
+        <span class="s0"># Convert from MB to bytes</span>
+        <span class="s1">self._bytes_limit *= </span><span class="s4">1024 </span><span class="s1">* </span><span class="s4">1024</span>
+
+        <span class="s1">super().__init__(fps</span><span class="s2">, </span><span class="s1">codec</span><span class="s2">, </span><span class="s1">bitrate</span><span class="s2">, </span><span class="s1">extra_args</span><span class="s2">, </span><span class="s1">metadata)</span>
+
+    <span class="s2">def </span><span class="s1">setup(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi=</span><span class="s2">None, </span><span class="s1">frame_dir=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">outfile = Path(outfile)</span>
+        <span class="s1">_api.check_in_list([</span><span class="s3">'.html'</span><span class="s2">, </span><span class="s3">'.htm'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">outfile_extension=outfile.suffix)</span>
+
+        <span class="s1">self._saved_frames = []</span>
+        <span class="s1">self._total_bytes = </span><span class="s4">0</span>
+        <span class="s1">self._hit_limit = </span><span class="s2">False</span>
+
+        <span class="s2">if not </span><span class="s1">self.embed_frames:</span>
+            <span class="s2">if </span><span class="s1">frame_dir </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">frame_dir = outfile.with_name(outfile.stem + </span><span class="s3">'_frames'</span><span class="s1">)</span>
+            <span class="s1">frame_dir.mkdir(parents=</span><span class="s2">True, </span><span class="s1">exist_ok=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">frame_prefix = frame_dir / </span><span class="s3">'frame'</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">frame_prefix = </span><span class="s2">None</span>
+
+        <span class="s1">super().setup(fig</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">, </span><span class="s1">dpi</span><span class="s2">, </span><span class="s1">frame_prefix)</span>
+        <span class="s1">self._clear_temp = </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">grab_frame(self</span><span class="s2">, </span><span class="s1">**savefig_kwargs):</span>
+        <span class="s2">if </span><span class="s1">self.embed_frames:</span>
+            <span class="s0"># Just stop processing if we hit the limit</span>
+            <span class="s2">if </span><span class="s1">self._hit_limit:</span>
+                <span class="s2">return</span>
+            <span class="s1">f = BytesIO()</span>
+            <span class="s1">self.fig.savefig(f</span><span class="s2">, </span><span class="s1">format=self.frame_format</span><span class="s2">,</span>
+                             <span class="s1">dpi=self.dpi</span><span class="s2">, </span><span class="s1">**savefig_kwargs)</span>
+            <span class="s1">imgdata64 = base64.encodebytes(f.getvalue()).decode(</span><span class="s3">'ascii'</span><span class="s1">)</span>
+            <span class="s1">self._total_bytes += len(imgdata64)</span>
+            <span class="s2">if </span><span class="s1">self._total_bytes &gt;= self._bytes_limit:</span>
+                <span class="s1">_log.warning(</span>
+                    <span class="s3">&quot;Animation size has reached %s bytes, exceeding the limit &quot;</span>
+                    <span class="s3">&quot;of %s. If you're sure you want a larger animation &quot;</span>
+                    <span class="s3">&quot;embedded, set the animation.embed_limit rc parameter to &quot;</span>
+                    <span class="s3">&quot;a larger value (in MB). This and further frames will be &quot;</span>
+                    <span class="s3">&quot;dropped.&quot;</span><span class="s2">, </span><span class="s1">self._total_bytes</span><span class="s2">, </span><span class="s1">self._bytes_limit)</span>
+                <span class="s1">self._hit_limit = </span><span class="s2">True</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self._saved_frames.append(imgdata64)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">super().grab_frame(**savefig_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">finish(self):</span>
+        <span class="s0"># save the frames to an html file</span>
+        <span class="s2">if </span><span class="s1">self.embed_frames:</span>
+            <span class="s1">fill_frames = _embedded_frames(self._saved_frames</span><span class="s2">,</span>
+                                           <span class="s1">self.frame_format)</span>
+            <span class="s1">frame_count = len(self._saved_frames)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s0"># temp names is filled by FileMovieWriter</span>
+            <span class="s1">frame_count = len(self._temp_paths)</span>
+            <span class="s1">fill_frames = _included_frames(</span>
+                <span class="s1">frame_count</span><span class="s2">, </span><span class="s1">self.frame_format</span><span class="s2">,</span>
+                <span class="s1">self._temp_paths[</span><span class="s4">0</span><span class="s1">].parent.relative_to(self.outfile.parent))</span>
+        <span class="s1">mode_dict = dict(once_checked=</span><span class="s3">''</span><span class="s2">,</span>
+                         <span class="s1">loop_checked=</span><span class="s3">''</span><span class="s2">,</span>
+                         <span class="s1">reflect_checked=</span><span class="s3">''</span><span class="s1">)</span>
+        <span class="s1">mode_dict[self.default_mode + </span><span class="s3">'_checked'</span><span class="s1">] = </span><span class="s3">'checked'</span>
+
+        <span class="s1">interval = </span><span class="s4">1000 </span><span class="s1">// self.fps</span>
+
+        <span class="s2">with </span><span class="s1">open(self.outfile</span><span class="s2">, </span><span class="s3">'w'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">of:</span>
+            <span class="s1">of.write(JS_INCLUDE + STYLE_INCLUDE)</span>
+            <span class="s1">of.write(DISPLAY_TEMPLATE.format(id=uuid.uuid4().hex</span><span class="s2">,</span>
+                                             <span class="s1">Nframes=frame_count</span><span class="s2">,</span>
+                                             <span class="s1">fill_frames=fill_frames</span><span class="s2">,</span>
+                                             <span class="s1">interval=interval</span><span class="s2">,</span>
+                                             <span class="s1">**mode_dict))</span>
+
+        <span class="s0"># Duplicate the temporary file clean up logic from</span>
+        <span class="s0"># FileMovieWriter.finish.  We can not call the inherited version of</span>
+        <span class="s0"># finish because it assumes that there is a subprocess that we either</span>
+        <span class="s0"># need to call to merge many frames together or that there is a</span>
+        <span class="s0"># subprocess call that we need to clean up.</span>
+        <span class="s2">if </span><span class="s1">self._tmpdir:</span>
+            <span class="s1">_log.debug(</span><span class="s3">'MovieWriter: clearing temporary path=%s'</span><span class="s2">, </span><span class="s1">self._tmpdir)</span>
+            <span class="s1">self._tmpdir.cleanup()</span>
+
+
+<span class="s2">class </span><span class="s1">Animation:</span>
+    <span class="s5">&quot;&quot;&quot; 
+    A base class for Animations. 
+ 
+    This class is not usable as is, and should be subclassed to provide needed 
+    behavior. 
+ 
+    .. note:: 
+ 
+        You must store the created Animation in a variable that lives as long 
+        as the animation should run. Otherwise, the Animation object will be 
+        garbage-collected and the animation stops. 
+ 
+    Parameters 
+    ---------- 
+    fig : `~matplotlib.figure.Figure` 
+        The figure object used to get needed events, such as draw or resize. 
+ 
+    event_source : object, optional 
+        A class that can run a callback when desired events 
+        are generated, as well as be stopped and started. 
+ 
+        Examples include timers (see `TimedAnimation`) and file 
+        system notifications. 
+ 
+    blit : bool, default: False 
+        Whether blitting is used to optimize drawing.  If the backend does not 
+        support blitting, then this parameter has no effect. 
+ 
+    See Also 
+    -------- 
+    FuncAnimation,  ArtistAnimation 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">event_source=</span><span class="s2">None, </span><span class="s1">blit=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s1">self._draw_was_started = </span><span class="s2">False</span>
+
+        <span class="s1">self._fig = fig</span>
+        <span class="s0"># Disables blitting for backends that don't support it.  This</span>
+        <span class="s0"># allows users to request it if available, but still have a</span>
+        <span class="s0"># fallback that works if it is not.</span>
+        <span class="s1">self._blit = blit </span><span class="s2">and </span><span class="s1">fig.canvas.supports_blit</span>
+
+        <span class="s0"># These are the basics of the animation.  The frame sequence represents</span>
+        <span class="s0"># information for each frame of the animation and depends on how the</span>
+        <span class="s0"># drawing is handled by the subclasses. The event source fires events</span>
+        <span class="s0"># that cause the frame sequence to be iterated.</span>
+        <span class="s1">self.frame_seq = self.new_frame_seq()</span>
+        <span class="s1">self.event_source = event_source</span>
+
+        <span class="s0"># Instead of starting the event source now, we connect to the figure's</span>
+        <span class="s0"># draw_event, so that we only start once the figure has been drawn.</span>
+        <span class="s1">self._first_draw_id = fig.canvas.mpl_connect(</span><span class="s3">'draw_event'</span><span class="s2">, </span><span class="s1">self._start)</span>
+
+        <span class="s0"># Connect to the figure's close_event so that we don't continue to</span>
+        <span class="s0"># fire events and try to draw to a deleted figure.</span>
+        <span class="s1">self._close_id = self._fig.canvas.mpl_connect(</span><span class="s3">'close_event'</span><span class="s2">,</span>
+                                                      <span class="s1">self._stop)</span>
+        <span class="s2">if </span><span class="s1">self._blit:</span>
+            <span class="s1">self._setup_blit()</span>
+
+    <span class="s2">def </span><span class="s1">__del__(self):</span>
+        <span class="s2">if not </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s3">'_draw_was_started'</span><span class="s2">, True</span><span class="s1">):</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s3">'Animation was deleted without rendering anything. This is '</span>
+                <span class="s3">'most likely not intended. To prevent deletion, assign the '</span>
+                <span class="s3">'Animation to a variable, e.g. `anim`, that exists until you '</span>
+                <span class="s3">'output the Animation using `plt.show()` or '</span>
+                <span class="s3">'`anim.save()`.'</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_start(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Starts interactive animation. Adds the draw frame command to the GUI 
+        handler, calls show to start the event loop. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Do not start the event source if saving() it.</span>
+        <span class="s2">if </span><span class="s1">self._fig.canvas.is_saving():</span>
+            <span class="s2">return</span>
+        <span class="s0"># First disconnect our draw event handler</span>
+        <span class="s1">self._fig.canvas.mpl_disconnect(self._first_draw_id)</span>
+
+        <span class="s0"># Now do any initial draw</span>
+        <span class="s1">self._init_draw()</span>
+
+        <span class="s0"># Add our callback for stepping the animation and</span>
+        <span class="s0"># actually start the event_source.</span>
+        <span class="s1">self.event_source.add_callback(self._step)</span>
+        <span class="s1">self.event_source.start()</span>
+
+    <span class="s2">def </span><span class="s1">_stop(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s0"># On stop we disconnect all of our events.</span>
+        <span class="s2">if </span><span class="s1">self._blit:</span>
+            <span class="s1">self._fig.canvas.mpl_disconnect(self._resize_id)</span>
+        <span class="s1">self._fig.canvas.mpl_disconnect(self._close_id)</span>
+        <span class="s1">self.event_source.remove_callback(self._step)</span>
+        <span class="s1">self.event_source = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">save(self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">writer=</span><span class="s2">None, </span><span class="s1">fps=</span><span class="s2">None, </span><span class="s1">dpi=</span><span class="s2">None, </span><span class="s1">codec=</span><span class="s2">None,</span>
+             <span class="s1">bitrate=</span><span class="s2">None, </span><span class="s1">extra_args=</span><span class="s2">None, </span><span class="s1">metadata=</span><span class="s2">None, </span><span class="s1">extra_anim=</span><span class="s2">None,</span>
+             <span class="s1">savefig_kwargs=</span><span class="s2">None, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">progress_callback=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Save the animation as a movie file by drawing every frame. 
+ 
+        Parameters 
+        ---------- 
+        filename : str 
+            The output filename, e.g., :file:`mymovie.mp4`. 
+ 
+        writer : `MovieWriter` or str, default: :rc:`animation.writer` 
+            A `MovieWriter` instance to use or a key that identifies a 
+            class to use, such as 'ffmpeg'. 
+ 
+        fps : int, optional 
+            Movie frame rate (per second).  If not set, the frame rate from the 
+            animation's frame interval. 
+ 
+        dpi : float, default: :rc:`savefig.dpi` 
+            Controls the dots per inch for the movie frames.  Together with 
+            the figure's size in inches, this controls the size of the movie. 
+ 
+        codec : str, default: :rc:`animation.codec`. 
+            The video codec to use.  Not all codecs are supported by a given 
+            `MovieWriter`. 
+ 
+        bitrate : int, default: :rc:`animation.bitrate` 
+            The bitrate of the movie, in kilobits per second.  Higher values 
+            means higher quality movies, but increase the file size.  A value 
+            of -1 lets the underlying movie encoder select the bitrate. 
+ 
+        extra_args : list of str or None, optional 
+            Extra command-line arguments passed to the underlying movie 
+            encoder.  The default, None, means to use 
+            :rc:`animation.[name-of-encoder]_args` for the builtin writers. 
+ 
+        metadata : dict[str, str], default: {} 
+            Dictionary of keys and values for metadata to include in 
+            the output file. Some keys that may be of use include: 
+            title, artist, genre, subject, copyright, srcform, comment. 
+ 
+        extra_anim : list, default: [] 
+            Additional `Animation` objects that should be included 
+            in the saved movie file. These need to be from the same 
+            `.Figure` instance. Also, animation frames will 
+            just be simply combined, so there should be a 1:1 correspondence 
+            between the frames from the different animations. 
+ 
+        savefig_kwargs : dict, default: {} 
+            Keyword arguments passed to each `~.Figure.savefig` call used to 
+            save the individual frames. 
+ 
+        progress_callback : function, optional 
+            A callback function that will be called for every frame to notify 
+            the saving progress. It must have the signature :: 
+ 
+                def func(current_frame: int, total_frames: int) -&gt; Any 
+ 
+            where *current_frame* is the current frame number and 
+            *total_frames* is the total number of frames to be saved. 
+            *total_frames* is set to None, if the total number of frames can 
+            not be determined. Return values may exist but are ignored. 
+ 
+            Example code to write the progress to stdout:: 
+ 
+                progress_callback = lambda i, n: print(f'Saving frame {i}/{n}') 
+ 
+        Notes 
+        ----- 
+        *fps*, *codec*, *bitrate*, *extra_args* and *metadata* are used to 
+        construct a `.MovieWriter` instance and can only be passed if 
+        *writer* is a string.  If they are passed as non-*None* and *writer* 
+        is a `.MovieWriter`, a `RuntimeError` will be raised. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">writer </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">writer = mpl.rcParams[</span><span class="s3">'animation.writer'</span><span class="s1">]</span>
+        <span class="s2">elif </span><span class="s1">(</span><span class="s2">not </span><span class="s1">isinstance(writer</span><span class="s2">, </span><span class="s1">str) </span><span class="s2">and</span>
+              <span class="s1">any(arg </span><span class="s2">is not None</span>
+                  <span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">(fps</span><span class="s2">, </span><span class="s1">codec</span><span class="s2">, </span><span class="s1">bitrate</span><span class="s2">, </span><span class="s1">extra_args</span><span class="s2">, </span><span class="s1">metadata))):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">'Passing in values for arguments '</span>
+                               <span class="s3">'fps, codec, bitrate, extra_args, or metadata '</span>
+                               <span class="s3">'is not supported when writer is an existing '</span>
+                               <span class="s3">'MovieWriter instance. These should instead be '</span>
+                               <span class="s3">'passed as arguments when creating the '</span>
+                               <span class="s3">'MovieWriter instance.'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">savefig_kwargs </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">savefig_kwargs = {}</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s0"># we are going to mutate this below</span>
+            <span class="s1">savefig_kwargs = dict(savefig_kwargs)</span>
+
+        <span class="s2">if </span><span class="s1">fps </span><span class="s2">is None and </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'_interval'</span><span class="s1">):</span>
+            <span class="s0"># Convert interval in ms to frames per second</span>
+            <span class="s1">fps = </span><span class="s4">1000. </span><span class="s1">/ self._interval</span>
+
+        <span class="s0"># Re-use the savefig DPI for ours if none is given</span>
+        <span class="s2">if </span><span class="s1">dpi </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dpi = mpl.rcParams[</span><span class="s3">'savefig.dpi'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">dpi == </span><span class="s3">'figure'</span><span class="s1">:</span>
+            <span class="s1">dpi = self._fig.dpi</span>
+
+        <span class="s1">writer_kwargs = {}</span>
+        <span class="s2">if </span><span class="s1">codec </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">writer_kwargs[</span><span class="s3">'codec'</span><span class="s1">] = codec</span>
+        <span class="s2">if </span><span class="s1">bitrate </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">writer_kwargs[</span><span class="s3">'bitrate'</span><span class="s1">] = bitrate</span>
+        <span class="s2">if </span><span class="s1">extra_args </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">writer_kwargs[</span><span class="s3">'extra_args'</span><span class="s1">] = extra_args</span>
+        <span class="s2">if </span><span class="s1">metadata </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">writer_kwargs[</span><span class="s3">'metadata'</span><span class="s1">] = metadata</span>
+
+        <span class="s1">all_anim = [self]</span>
+        <span class="s2">if </span><span class="s1">extra_anim </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">all_anim.extend(anim </span><span class="s2">for </span><span class="s1">anim </span><span class="s2">in </span><span class="s1">extra_anim</span>
+                            <span class="s2">if </span><span class="s1">anim._fig </span><span class="s2">is </span><span class="s1">self._fig)</span>
+
+        <span class="s0"># If we have the name of a writer, instantiate an instance of the</span>
+        <span class="s0"># registered class.</span>
+        <span class="s2">if </span><span class="s1">isinstance(writer</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">writer_cls = writers[writer]</span>
+            <span class="s2">except </span><span class="s1">RuntimeError:  </span><span class="s0"># Raised if not available.</span>
+                <span class="s1">writer_cls = PillowWriter  </span><span class="s0"># Always available.</span>
+                <span class="s1">_log.warning(</span><span class="s3">&quot;MovieWriter %s unavailable; using Pillow &quot;</span>
+                             <span class="s3">&quot;instead.&quot;</span><span class="s2">, </span><span class="s1">writer)</span>
+            <span class="s1">writer = writer_cls(fps</span><span class="s2">, </span><span class="s1">**writer_kwargs)</span>
+        <span class="s1">_log.info(</span><span class="s3">'Animation.save using %s'</span><span class="s2">, </span><span class="s1">type(writer))</span>
+
+        <span class="s2">if </span><span class="s3">'bbox_inches' </span><span class="s2">in </span><span class="s1">savefig_kwargs:</span>
+            <span class="s1">_log.warning(</span><span class="s3">&quot;Warning: discarding the 'bbox_inches' argument in &quot;</span>
+                         <span class="s3">&quot;'savefig_kwargs' as it may cause frame size &quot;</span>
+                         <span class="s3">&quot;to vary, which is inappropriate for animation.&quot;</span><span class="s1">)</span>
+            <span class="s1">savefig_kwargs.pop(</span><span class="s3">'bbox_inches'</span><span class="s1">)</span>
+
+        <span class="s0"># Create a new sequence of frames for saved data. This is different</span>
+        <span class="s0"># from new_frame_seq() to give the ability to save 'live' generated</span>
+        <span class="s0"># frame information to be saved later.</span>
+        <span class="s0"># TODO: Right now, after closing the figure, saving a movie won't work</span>
+        <span class="s0"># since GUI widgets are gone. Either need to remove extra code to</span>
+        <span class="s0"># allow for this non-existent use case or find a way to make it work.</span>
+        <span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s3">'savefig.bbox'</span><span class="s1">] == </span><span class="s3">'tight'</span><span class="s1">:</span>
+            <span class="s1">_log.info(</span><span class="s3">&quot;Disabling savefig.bbox = 'tight', as it may cause &quot;</span>
+                      <span class="s3">&quot;frame size to vary, which is inappropriate for &quot;</span>
+                      <span class="s3">&quot;animation.&quot;</span><span class="s1">)</span>
+
+        <span class="s1">facecolor = savefig_kwargs.get(</span><span class="s3">'facecolor'</span><span class="s2">,</span>
+                                       <span class="s1">mpl.rcParams[</span><span class="s3">'savefig.facecolor'</span><span class="s1">])</span>
+        <span class="s2">if </span><span class="s1">facecolor == </span><span class="s3">'auto'</span><span class="s1">:</span>
+            <span class="s1">facecolor = self._fig.get_facecolor()</span>
+
+        <span class="s2">def </span><span class="s1">_pre_composite_to_white(color):</span>
+            <span class="s1">r</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">a = mcolors.to_rgba(color)</span>
+            <span class="s2">return </span><span class="s1">a * np.array([r</span><span class="s2">, </span><span class="s1">g</span><span class="s2">, </span><span class="s1">b]) + </span><span class="s4">1 </span><span class="s1">- a</span>
+
+        <span class="s1">savefig_kwargs[</span><span class="s3">'facecolor'</span><span class="s1">] = _pre_composite_to_white(facecolor)</span>
+        <span class="s1">savefig_kwargs[</span><span class="s3">'transparent'</span><span class="s1">] = </span><span class="s2">False   </span><span class="s0"># just to be safe!</span>
+        <span class="s0"># canvas._is_saving = True makes the draw_event animation-starting</span>
+        <span class="s0"># callback a no-op; canvas.manager = None prevents resizing the GUI</span>
+        <span class="s0"># widget (both are likewise done in savefig()).</span>
+        <span class="s2">with </span><span class="s1">mpl.rc_context({</span><span class="s3">'savefig.bbox'</span><span class="s1">: </span><span class="s2">None</span><span class="s1">})</span><span class="s2">, </span><span class="s1">\</span>
+             <span class="s1">writer.saving(self._fig</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">dpi)</span><span class="s2">, </span><span class="s1">\</span>
+             <span class="s1">cbook._setattr_cm(self._fig.canvas</span><span class="s2">,</span>
+                               <span class="s1">_is_saving=</span><span class="s2">True, </span><span class="s1">manager=</span><span class="s2">None</span><span class="s1">):</span>
+            <span class="s2">for </span><span class="s1">anim </span><span class="s2">in </span><span class="s1">all_anim:</span>
+                <span class="s1">anim._init_draw()  </span><span class="s0"># Clear the initial frame</span>
+            <span class="s1">frame_number = </span><span class="s4">0</span>
+            <span class="s0"># TODO: Currently only FuncAnimation has a save_count</span>
+            <span class="s0">#       attribute. Can we generalize this to all Animations?</span>
+            <span class="s1">save_count_list = [getattr(a</span><span class="s2">, </span><span class="s3">'_save_count'</span><span class="s2">, None</span><span class="s1">)</span>
+                               <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">all_anim]</span>
+            <span class="s2">if None in </span><span class="s1">save_count_list:</span>
+                <span class="s1">total_frames = </span><span class="s2">None</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">total_frames = sum(save_count_list)</span>
+            <span class="s2">for </span><span class="s1">data </span><span class="s2">in </span><span class="s1">zip(*[a.new_saved_frame_seq() </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">all_anim]):</span>
+                <span class="s2">for </span><span class="s1">anim</span><span class="s2">, </span><span class="s1">d </span><span class="s2">in </span><span class="s1">zip(all_anim</span><span class="s2">, </span><span class="s1">data):</span>
+                    <span class="s0"># TODO: See if turning off blit is really necessary</span>
+                    <span class="s1">anim._draw_next_frame(d</span><span class="s2">, </span><span class="s1">blit=</span><span class="s2">False</span><span class="s1">)</span>
+                    <span class="s2">if </span><span class="s1">progress_callback </span><span class="s2">is not None</span><span class="s1">:</span>
+                        <span class="s1">progress_callback(frame_number</span><span class="s2">, </span><span class="s1">total_frames)</span>
+                        <span class="s1">frame_number += </span><span class="s4">1</span>
+                <span class="s1">writer.grab_frame(**savefig_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_step(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Handler for getting events. By default, gets the next frame in the 
+        sequence and hands the data off to be drawn. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Returns True to indicate that the event source should continue to</span>
+        <span class="s0"># call _step, until the frame sequence reaches the end of iteration,</span>
+        <span class="s0"># at which point False will be returned.</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">framedata = next(self.frame_seq)</span>
+            <span class="s1">self._draw_next_frame(framedata</span><span class="s2">, </span><span class="s1">self._blit)</span>
+            <span class="s2">return True</span>
+        <span class="s2">except </span><span class="s1">StopIteration:</span>
+            <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">new_frame_seq(self):</span>
+        <span class="s5">&quot;&quot;&quot;Return a new sequence of frame information.&quot;&quot;&quot;</span>
+        <span class="s0"># Default implementation is just an iterator over self._framedata</span>
+        <span class="s2">return </span><span class="s1">iter(self._framedata)</span>
+
+    <span class="s2">def </span><span class="s1">new_saved_frame_seq(self):</span>
+        <span class="s5">&quot;&quot;&quot;Return a new sequence of saved/cached frame information.&quot;&quot;&quot;</span>
+        <span class="s0"># Default is the same as the regular frame sequence</span>
+        <span class="s2">return </span><span class="s1">self.new_frame_seq()</span>
+
+    <span class="s2">def </span><span class="s1">_draw_next_frame(self</span><span class="s2">, </span><span class="s1">framedata</span><span class="s2">, </span><span class="s1">blit):</span>
+        <span class="s0"># Breaks down the drawing of the next frame into steps of pre- and</span>
+        <span class="s0"># post- draw, as well as the drawing of the frame itself.</span>
+        <span class="s1">self._pre_draw(framedata</span><span class="s2">, </span><span class="s1">blit)</span>
+        <span class="s1">self._draw_frame(framedata)</span>
+        <span class="s1">self._post_draw(framedata</span><span class="s2">, </span><span class="s1">blit)</span>
+
+    <span class="s2">def </span><span class="s1">_init_draw(self):</span>
+        <span class="s0"># Initial draw to clear the frame. Also used by the blitting code</span>
+        <span class="s0"># when a clean base is required.</span>
+        <span class="s1">self._draw_was_started = </span><span class="s2">True</span>
+
+    <span class="s2">def </span><span class="s1">_pre_draw(self</span><span class="s2">, </span><span class="s1">framedata</span><span class="s2">, </span><span class="s1">blit):</span>
+        <span class="s0"># Perform any cleaning or whatnot before the drawing of the frame.</span>
+        <span class="s0"># This default implementation allows blit to clear the frame.</span>
+        <span class="s2">if </span><span class="s1">blit:</span>
+            <span class="s1">self._blit_clear(self._drawn_artists)</span>
+
+    <span class="s2">def </span><span class="s1">_draw_frame(self</span><span class="s2">, </span><span class="s1">framedata):</span>
+        <span class="s0"># Performs actual drawing of the frame.</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s3">'Needs to be implemented by subclasses to'</span>
+                                  <span class="s3">' actually make an animation.'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_post_draw(self</span><span class="s2">, </span><span class="s1">framedata</span><span class="s2">, </span><span class="s1">blit):</span>
+        <span class="s0"># After the frame is rendered, this handles the actual flushing of</span>
+        <span class="s0"># the draw, which can be a direct draw_idle() or make use of the</span>
+        <span class="s0"># blitting.</span>
+        <span class="s2">if </span><span class="s1">blit </span><span class="s2">and </span><span class="s1">self._drawn_artists:</span>
+            <span class="s1">self._blit_draw(self._drawn_artists)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._fig.canvas.draw_idle()</span>
+
+    <span class="s0"># The rest of the code in this class is to facilitate easy blitting</span>
+    <span class="s2">def </span><span class="s1">_blit_draw(self</span><span class="s2">, </span><span class="s1">artists):</span>
+        <span class="s0"># Handles blitted drawing, which renders only the artists given instead</span>
+        <span class="s0"># of the entire figure.</span>
+        <span class="s1">updated_ax = {a.axes </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">artists}</span>
+        <span class="s0"># Enumerate artists to cache Axes backgrounds. We do not draw</span>
+        <span class="s0"># artists yet to not cache foreground from plots with shared axes</span>
+        <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">updated_ax:</span>
+            <span class="s0"># If we haven't cached the background for the current view of this</span>
+            <span class="s0"># Axes object, do so now. This might not always be reliable, but</span>
+            <span class="s0"># it's an attempt to automate the process.</span>
+            <span class="s1">cur_view = ax._get_view()</span>
+            <span class="s1">view</span><span class="s2">, </span><span class="s1">bg = self._blit_cache.get(ax</span><span class="s2">, </span><span class="s1">(object()</span><span class="s2">, None</span><span class="s1">))</span>
+            <span class="s2">if </span><span class="s1">cur_view != view:</span>
+                <span class="s1">self._blit_cache[ax] = (</span>
+                    <span class="s1">cur_view</span><span class="s2">, </span><span class="s1">ax.figure.canvas.copy_from_bbox(ax.bbox))</span>
+        <span class="s0"># Make a separate pass to draw foreground.</span>
+        <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">artists:</span>
+            <span class="s1">a.axes.draw_artist(a)</span>
+        <span class="s0"># After rendering all the needed artists, blit each Axes individually.</span>
+        <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">updated_ax:</span>
+            <span class="s1">ax.figure.canvas.blit(ax.bbox)</span>
+
+    <span class="s2">def </span><span class="s1">_blit_clear(self</span><span class="s2">, </span><span class="s1">artists):</span>
+        <span class="s0"># Get a list of the Axes that need clearing from the artists that</span>
+        <span class="s0"># have been drawn. Grab the appropriate saved background from the</span>
+        <span class="s0"># cache and restore.</span>
+        <span class="s1">axes = {a.axes </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">artists}</span>
+        <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">axes:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">view</span><span class="s2">, </span><span class="s1">bg = self._blit_cache[ax]</span>
+            <span class="s2">except </span><span class="s1">KeyError:</span>
+                <span class="s2">continue</span>
+            <span class="s2">if </span><span class="s1">ax._get_view() == view:</span>
+                <span class="s1">ax.figure.canvas.restore_region(bg)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self._blit_cache.pop(ax)</span>
+
+    <span class="s2">def </span><span class="s1">_setup_blit(self):</span>
+        <span class="s0"># Setting up the blit requires: a cache of the background for the Axes</span>
+        <span class="s1">self._blit_cache = dict()</span>
+        <span class="s1">self._drawn_artists = []</span>
+        <span class="s0"># _post_draw needs to be called first to initialize the renderer</span>
+        <span class="s1">self._post_draw(</span><span class="s2">None, </span><span class="s1">self._blit)</span>
+        <span class="s0"># Then we need to clear the Frame for the initial draw</span>
+        <span class="s0"># This is typically handled in _on_resize because QT and Tk</span>
+        <span class="s0"># emit a resize event on launch, but the macosx backend does not,</span>
+        <span class="s0"># thus we force it here for everyone for consistency</span>
+        <span class="s1">self._init_draw()</span>
+        <span class="s0"># Connect to future resize events</span>
+        <span class="s1">self._resize_id = self._fig.canvas.mpl_connect(</span><span class="s3">'resize_event'</span><span class="s2">,</span>
+                                                       <span class="s1">self._on_resize)</span>
+
+    <span class="s2">def </span><span class="s1">_on_resize(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0"># On resize, we need to disable the resize event handling so we don't</span>
+        <span class="s0"># get too many events. Also stop the animation events, so that</span>
+        <span class="s0"># we're paused. Reset the cache and re-init. Set up an event handler</span>
+        <span class="s0"># to catch once the draw has actually taken place.</span>
+        <span class="s1">self._fig.canvas.mpl_disconnect(self._resize_id)</span>
+        <span class="s1">self.event_source.stop()</span>
+        <span class="s1">self._blit_cache.clear()</span>
+        <span class="s1">self._init_draw()</span>
+        <span class="s1">self._resize_id = self._fig.canvas.mpl_connect(</span><span class="s3">'draw_event'</span><span class="s2">,</span>
+                                                       <span class="s1">self._end_redraw)</span>
+
+    <span class="s2">def </span><span class="s1">_end_redraw(self</span><span class="s2">, </span><span class="s1">event):</span>
+        <span class="s0"># Now that the redraw has happened, do the post draw flushing and</span>
+        <span class="s0"># blit handling. Then re-enable all of the original events.</span>
+        <span class="s1">self._post_draw(</span><span class="s2">None, False</span><span class="s1">)</span>
+        <span class="s1">self.event_source.start()</span>
+        <span class="s1">self._fig.canvas.mpl_disconnect(self._resize_id)</span>
+        <span class="s1">self._resize_id = self._fig.canvas.mpl_connect(</span><span class="s3">'resize_event'</span><span class="s2">,</span>
+                                                       <span class="s1">self._on_resize)</span>
+
+    <span class="s2">def </span><span class="s1">to_html5_video(self</span><span class="s2">, </span><span class="s1">embed_limit=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Convert the animation to an HTML5 ``&lt;video&gt;`` tag. 
+ 
+        This saves the animation as an h264 video, encoded in base64 
+        directly into the HTML5 video tag. This respects :rc:`animation.writer` 
+        and :rc:`animation.bitrate`. This also makes use of the 
+        *interval* to control the speed, and uses the *repeat* 
+        parameter to decide whether to loop. 
+ 
+        Parameters 
+        ---------- 
+        embed_limit : float, optional 
+            Limit, in MB, of the returned animation. No animation is created 
+            if the limit is exceeded. 
+            Defaults to :rc:`animation.embed_limit` = 20.0. 
+ 
+        Returns 
+        ------- 
+        str 
+            An HTML5 video tag with the animation embedded as base64 encoded 
+            h264 video. 
+            If the *embed_limit* is exceeded, this returns the string 
+            &quot;Video too large to embed.&quot; 
+        &quot;&quot;&quot;</span>
+        <span class="s1">VIDEO_TAG = </span><span class="s3">r'''&lt;video {size} {options}&gt; 
+  &lt;source type=&quot;video/mp4&quot; src=&quot;data:video/mp4;base64,{video}&quot;&gt; 
+  Your browser does not support the video tag. 
+&lt;/video&gt;'''</span>
+        <span class="s0"># Cache the rendering of the video as HTML</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'_base64_video'</span><span class="s1">):</span>
+            <span class="s0"># Save embed limit, which is given in MB</span>
+            <span class="s2">if </span><span class="s1">embed_limit </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">embed_limit = mpl.rcParams[</span><span class="s3">'animation.embed_limit'</span><span class="s1">]</span>
+
+            <span class="s0"># Convert from MB to bytes</span>
+            <span class="s1">embed_limit *= </span><span class="s4">1024 </span><span class="s1">* </span><span class="s4">1024</span>
+
+            <span class="s0"># Can't open a NamedTemporaryFile twice on Windows, so use a</span>
+            <span class="s0"># TemporaryDirectory instead.</span>
+            <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+                <span class="s1">path = Path(tmpdir</span><span class="s2">, </span><span class="s3">&quot;temp.m4v&quot;</span><span class="s1">)</span>
+                <span class="s0"># We create a writer manually so that we can get the</span>
+                <span class="s0"># appropriate size for the tag</span>
+                <span class="s1">Writer = writers[mpl.rcParams[</span><span class="s3">'animation.writer'</span><span class="s1">]]</span>
+                <span class="s1">writer = Writer(codec=</span><span class="s3">'h264'</span><span class="s2">,</span>
+                                <span class="s1">bitrate=mpl.rcParams[</span><span class="s3">'animation.bitrate'</span><span class="s1">]</span><span class="s2">,</span>
+                                <span class="s1">fps=</span><span class="s4">1000. </span><span class="s1">/ self._interval)</span>
+                <span class="s1">self.save(str(path)</span><span class="s2">, </span><span class="s1">writer=writer)</span>
+                <span class="s0"># Now open and base64 encode.</span>
+                <span class="s1">vid64 = base64.encodebytes(path.read_bytes())</span>
+
+            <span class="s1">vid_len = len(vid64)</span>
+            <span class="s2">if </span><span class="s1">vid_len &gt;= embed_limit:</span>
+                <span class="s1">_log.warning(</span>
+                    <span class="s3">&quot;Animation movie is %s bytes, exceeding the limit of %s. &quot;</span>
+                    <span class="s3">&quot;If you're sure you want a large animation embedded, set &quot;</span>
+                    <span class="s3">&quot;the animation.embed_limit rc parameter to a larger value &quot;</span>
+                    <span class="s3">&quot;(in MB).&quot;</span><span class="s2">, </span><span class="s1">vid_len</span><span class="s2">, </span><span class="s1">embed_limit)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self._base64_video = vid64.decode(</span><span class="s3">'ascii'</span><span class="s1">)</span>
+                <span class="s1">self._video_size = </span><span class="s3">'width=&quot;{}&quot; height=&quot;{}&quot;'</span><span class="s1">.format(</span>
+                        <span class="s1">*writer.frame_size)</span>
+
+        <span class="s0"># If we exceeded the size, this attribute won't exist</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'_base64_video'</span><span class="s1">):</span>
+            <span class="s0"># Default HTML5 options are to autoplay and display video controls</span>
+            <span class="s1">options = [</span><span class="s3">'controls'</span><span class="s2">, </span><span class="s3">'autoplay'</span><span class="s1">]</span>
+
+            <span class="s0"># If we're set to repeat, make it loop</span>
+            <span class="s2">if </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s3">'_repeat'</span><span class="s2">, False</span><span class="s1">):</span>
+                <span class="s1">options.append(</span><span class="s3">'loop'</span><span class="s1">)</span>
+
+            <span class="s2">return </span><span class="s1">VIDEO_TAG.format(video=self._base64_video</span><span class="s2">,</span>
+                                    <span class="s1">size=self._video_size</span><span class="s2">,</span>
+                                    <span class="s1">options=</span><span class="s3">' '</span><span class="s1">.join(options))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s3">'Video too large to embed.'</span>
+
+    <span class="s2">def </span><span class="s1">to_jshtml(self</span><span class="s2">, </span><span class="s1">fps=</span><span class="s2">None, </span><span class="s1">embed_frames=</span><span class="s2">True, </span><span class="s1">default_mode=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Generate HTML representation of the animation. 
+ 
+        Parameters 
+        ---------- 
+        fps : int, optional 
+            Movie frame rate (per second). If not set, the frame rate from 
+            the animation's frame interval. 
+        embed_frames : bool, optional 
+        default_mode : str, optional 
+            What to do when the animation ends. Must be one of ``{'loop', 
+            'once', 'reflect'}``. Defaults to ``'loop'`` if the *repeat* 
+            parameter is True, otherwise ``'once'``. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">fps </span><span class="s2">is None and </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'_interval'</span><span class="s1">):</span>
+            <span class="s0"># Convert interval in ms to frames per second</span>
+            <span class="s1">fps = </span><span class="s4">1000 </span><span class="s1">/ self._interval</span>
+
+        <span class="s0"># If we're not given a default mode, choose one base on the value of</span>
+        <span class="s0"># the _repeat attribute</span>
+        <span class="s2">if </span><span class="s1">default_mode </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">default_mode = </span><span class="s3">'loop' </span><span class="s2">if </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s3">'_repeat'</span><span class="s2">,</span>
+                                             <span class="s2">False</span><span class="s1">) </span><span class="s2">else </span><span class="s3">'once'</span>
+
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">&quot;_html_representation&quot;</span><span class="s1">):</span>
+            <span class="s0"># Can't open a NamedTemporaryFile twice on Windows, so use a</span>
+            <span class="s0"># TemporaryDirectory instead.</span>
+            <span class="s2">with </span><span class="s1">TemporaryDirectory() </span><span class="s2">as </span><span class="s1">tmpdir:</span>
+                <span class="s1">path = Path(tmpdir</span><span class="s2">, </span><span class="s3">&quot;temp.html&quot;</span><span class="s1">)</span>
+                <span class="s1">writer = HTMLWriter(fps=fps</span><span class="s2">,</span>
+                                    <span class="s1">embed_frames=embed_frames</span><span class="s2">,</span>
+                                    <span class="s1">default_mode=default_mode)</span>
+                <span class="s1">self.save(str(path)</span><span class="s2">, </span><span class="s1">writer=writer)</span>
+                <span class="s1">self._html_representation = path.read_text()</span>
+
+        <span class="s2">return </span><span class="s1">self._html_representation</span>
+
+    <span class="s2">def </span><span class="s1">_repr_html_(self):</span>
+        <span class="s5">&quot;&quot;&quot;IPython display hook for rendering.&quot;&quot;&quot;</span>
+        <span class="s1">fmt = mpl.rcParams[</span><span class="s3">'animation.html'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">fmt == </span><span class="s3">'html5'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.to_html5_video()</span>
+        <span class="s2">elif </span><span class="s1">fmt == </span><span class="s3">'jshtml'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.to_jshtml()</span>
+
+    <span class="s2">def </span><span class="s1">pause(self):</span>
+        <span class="s5">&quot;&quot;&quot;Pause the animation.&quot;&quot;&quot;</span>
+        <span class="s1">self.event_source.stop()</span>
+        <span class="s2">if </span><span class="s1">self._blit:</span>
+            <span class="s2">for </span><span class="s1">artist </span><span class="s2">in </span><span class="s1">self._drawn_artists:</span>
+                <span class="s1">artist.set_animated(</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">resume(self):</span>
+        <span class="s5">&quot;&quot;&quot;Resume the animation.&quot;&quot;&quot;</span>
+        <span class="s1">self.event_source.start()</span>
+        <span class="s2">if </span><span class="s1">self._blit:</span>
+            <span class="s2">for </span><span class="s1">artist </span><span class="s2">in </span><span class="s1">self._drawn_artists:</span>
+                <span class="s1">artist.set_animated(</span><span class="s2">True</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TimedAnimation(Animation):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    `Animation` subclass for time-based animation. 
+ 
+    A new frame is drawn every *interval* milliseconds. 
+ 
+    .. note:: 
+ 
+        You must store the created Animation in a variable that lives as long 
+        as the animation should run. Otherwise, the Animation object will be 
+        garbage-collected and the animation stops. 
+ 
+    Parameters 
+    ---------- 
+    fig : `~matplotlib.figure.Figure` 
+        The figure object used to get needed events, such as draw or resize. 
+    interval : int, default: 200 
+        Delay between frames in milliseconds. 
+    repeat_delay : int, default: 0 
+        The delay in milliseconds between consecutive animation runs, if 
+        *repeat* is True. 
+    repeat : bool, default: True 
+        Whether the animation repeats when the sequence of frames is completed. 
+    blit : bool, default: False 
+        Whether blitting is used to optimize drawing. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">interval=</span><span class="s4">200</span><span class="s2">, </span><span class="s1">repeat_delay=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">repeat=</span><span class="s2">True,</span>
+                 <span class="s1">event_source=</span><span class="s2">None, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._interval = interval</span>
+        <span class="s0"># Undocumented support for repeat_delay = None as backcompat.</span>
+        <span class="s1">self._repeat_delay = repeat_delay </span><span class="s2">if </span><span class="s1">repeat_delay </span><span class="s2">is not None else </span><span class="s4">0</span>
+        <span class="s1">self._repeat = repeat</span>
+        <span class="s0"># If we're not given an event source, create a new timer. This permits</span>
+        <span class="s0"># sharing timers between animation objects for syncing animations.</span>
+        <span class="s2">if </span><span class="s1">event_source </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">event_source = fig.canvas.new_timer(interval=self._interval)</span>
+        <span class="s1">super().__init__(fig</span><span class="s2">, </span><span class="s1">event_source=event_source</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_step(self</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s5">&quot;&quot;&quot;Handler for getting events.&quot;&quot;&quot;</span>
+        <span class="s0"># Extends the _step() method for the Animation class.  If</span>
+        <span class="s0"># Animation._step signals that it reached the end and we want to</span>
+        <span class="s0"># repeat, we refresh the frame sequence and return True. If</span>
+        <span class="s0"># _repeat_delay is set, change the event_source's interval to our loop</span>
+        <span class="s0"># delay and set the callback to one which will then set the interval</span>
+        <span class="s0"># back.</span>
+        <span class="s1">still_going = super()._step(*args)</span>
+        <span class="s2">if not </span><span class="s1">still_going:</span>
+            <span class="s2">if </span><span class="s1">self._repeat:</span>
+                <span class="s0"># Restart the draw loop</span>
+                <span class="s1">self._init_draw()</span>
+                <span class="s1">self.frame_seq = self.new_frame_seq()</span>
+                <span class="s1">self.event_source.interval = self._repeat_delay</span>
+                <span class="s2">return True</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s0"># We are done with the animation. Call pause to remove</span>
+                <span class="s0"># animated flags from artists that were using blitting</span>
+                <span class="s1">self.pause()</span>
+                <span class="s2">if </span><span class="s1">self._blit:</span>
+                    <span class="s0"># Remove the resize callback if we were blitting</span>
+                    <span class="s1">self._fig.canvas.mpl_disconnect(self._resize_id)</span>
+                <span class="s1">self._fig.canvas.mpl_disconnect(self._close_id)</span>
+                <span class="s1">self.event_source = </span><span class="s2">None</span>
+                <span class="s2">return False</span>
+
+        <span class="s1">self.event_source.interval = self._interval</span>
+        <span class="s2">return True</span>
+
+    <span class="s1">repeat = _api.deprecate_privatize_attribute(</span><span class="s3">&quot;3.7&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">ArtistAnimation(TimedAnimation):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    `TimedAnimation` subclass that creates an animation by using a fixed 
+    set of `.Artist` objects. 
+ 
+    Before creating an instance, all plotting should have taken place 
+    and the relevant artists saved. 
+ 
+    .. note:: 
+ 
+        You must store the created Animation in a variable that lives as long 
+        as the animation should run. Otherwise, the Animation object will be 
+        garbage-collected and the animation stops. 
+ 
+    Parameters 
+    ---------- 
+    fig : `~matplotlib.figure.Figure` 
+        The figure object used to get needed events, such as draw or resize. 
+    artists : list 
+        Each list entry is a collection of `.Artist` objects that are made 
+        visible on the corresponding frame.  Other artists are made invisible. 
+    interval : int, default: 200 
+        Delay between frames in milliseconds. 
+    repeat_delay : int, default: 0 
+        The delay in milliseconds between consecutive animation runs, if 
+        *repeat* is True. 
+    repeat : bool, default: True 
+        Whether the animation repeats when the sequence of frames is completed. 
+    blit : bool, default: False 
+        Whether blitting is used to optimize drawing. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">artists</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0"># Internal list of artists drawn in the most recent frame.</span>
+        <span class="s1">self._drawn_artists = []</span>
+
+        <span class="s0"># Use the list of artists as the framedata, which will be iterated</span>
+        <span class="s0"># over by the machinery.</span>
+        <span class="s1">self._framedata = artists</span>
+        <span class="s1">super().__init__(fig</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_init_draw(self):</span>
+        <span class="s1">super()._init_draw()</span>
+        <span class="s0"># Make all the artists involved in *any* frame invisible</span>
+        <span class="s1">figs = set()</span>
+        <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">self.new_frame_seq():</span>
+            <span class="s2">for </span><span class="s1">artist </span><span class="s2">in </span><span class="s1">f:</span>
+                <span class="s1">artist.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+                <span class="s1">artist.set_animated(self._blit)</span>
+                <span class="s0"># Assemble a list of unique figures that need flushing</span>
+                <span class="s2">if </span><span class="s1">artist.get_figure() </span><span class="s2">not in </span><span class="s1">figs:</span>
+                    <span class="s1">figs.add(artist.get_figure())</span>
+
+        <span class="s0"># Flush the needed figures</span>
+        <span class="s2">for </span><span class="s1">fig </span><span class="s2">in </span><span class="s1">figs:</span>
+            <span class="s1">fig.canvas.draw_idle()</span>
+
+    <span class="s2">def </span><span class="s1">_pre_draw(self</span><span class="s2">, </span><span class="s1">framedata</span><span class="s2">, </span><span class="s1">blit):</span>
+        <span class="s5">&quot;&quot;&quot;Clears artists from the last frame.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">blit:</span>
+            <span class="s0"># Let blit handle clearing</span>
+            <span class="s1">self._blit_clear(self._drawn_artists)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s0"># Otherwise, make all the artists from the previous frame invisible</span>
+            <span class="s2">for </span><span class="s1">artist </span><span class="s2">in </span><span class="s1">self._drawn_artists:</span>
+                <span class="s1">artist.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_draw_frame(self</span><span class="s2">, </span><span class="s1">artists):</span>
+        <span class="s0"># Save the artists that were passed in as framedata for the other</span>
+        <span class="s0"># steps (esp. blitting) to use.</span>
+        <span class="s1">self._drawn_artists = artists</span>
+
+        <span class="s0"># Make all the artists from the current frame visible</span>
+        <span class="s2">for </span><span class="s1">artist </span><span class="s2">in </span><span class="s1">artists:</span>
+            <span class="s1">artist.set_visible(</span><span class="s2">True</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">FuncAnimation(TimedAnimation):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    `TimedAnimation` subclass that makes an animation by repeatedly calling 
+    a function *func*. 
+ 
+    .. note:: 
+ 
+        You must store the created Animation in a variable that lives as long 
+        as the animation should run. Otherwise, the Animation object will be 
+        garbage-collected and the animation stops. 
+ 
+    Parameters 
+    ---------- 
+    fig : `~matplotlib.figure.Figure` 
+        The figure object used to get needed events, such as draw or resize. 
+ 
+    func : callable 
+        The function to call at each frame.  The first argument will 
+        be the next value in *frames*.   Any additional positional 
+        arguments can be supplied using `functools.partial` or via the *fargs* 
+        parameter. 
+ 
+        The required signature is:: 
+ 
+            def func(frame, *fargs) -&gt; iterable_of_artists 
+ 
+        It is often more convenient to provide the arguments using 
+        `functools.partial`. In this way it is also possible to pass keyword 
+        arguments. To pass a function with both positional and keyword 
+        arguments, set all arguments as keyword arguments, just leaving the 
+        *frame* argument unset:: 
+ 
+            def func(frame, art, *, y=None): 
+                ... 
+ 
+            ani = FuncAnimation(fig, partial(func, art=ln, y='foo')) 
+ 
+        If ``blit == True``, *func* must return an iterable of all artists 
+        that were modified or created. This information is used by the blitting 
+        algorithm to determine which parts of the figure have to be updated. 
+        The return value is unused if ``blit == False`` and may be omitted in 
+        that case. 
+ 
+    frames : iterable, int, generator function, or None, optional 
+        Source of data to pass *func* and each frame of the animation 
+ 
+        - If an iterable, then simply use the values provided.  If the 
+          iterable has a length, it will override the *save_count* kwarg. 
+ 
+        - If an integer, then equivalent to passing ``range(frames)`` 
+ 
+        - If a generator function, then must have the signature:: 
+ 
+             def gen_function() -&gt; obj 
+ 
+        - If *None*, then equivalent to passing ``itertools.count``. 
+ 
+        In all of these cases, the values in *frames* is simply passed through 
+        to the user-supplied *func* and thus can be of any type. 
+ 
+    init_func : callable, optional 
+        A function used to draw a clear frame. If not given, the results of 
+        drawing from the first item in the frames sequence will be used. This 
+        function will be called once before the first frame. 
+ 
+        The required signature is:: 
+ 
+            def init_func() -&gt; iterable_of_artists 
+ 
+        If ``blit == True``, *init_func* must return an iterable of artists 
+        to be re-drawn. This information is used by the blitting algorithm to 
+        determine which parts of the figure have to be updated.  The return 
+        value is unused if ``blit == False`` and may be omitted in that case. 
+ 
+    fargs : tuple or None, optional 
+        Additional arguments to pass to each call to *func*. Note: the use of 
+        `functools.partial` is preferred over *fargs*. See *func* for details. 
+ 
+    save_count : int, optional 
+        Fallback for the number of values from *frames* to cache. This is 
+        only used if the number of frames cannot be inferred from *frames*, 
+        i.e. when it's an iterator without length or a generator. 
+ 
+    interval : int, default: 200 
+        Delay between frames in milliseconds. 
+ 
+    repeat_delay : int, default: 0 
+        The delay in milliseconds between consecutive animation runs, if 
+        *repeat* is True. 
+ 
+    repeat : bool, default: True 
+        Whether the animation repeats when the sequence of frames is completed. 
+ 
+    blit : bool, default: False 
+        Whether blitting is used to optimize drawing.  Note: when using 
+        blitting, any animated artists will be drawn according to their zorder; 
+        however, they will be drawn on top of any previous artists, regardless 
+        of their zorder. 
+ 
+    cache_frame_data : bool, default: True 
+        Whether frame data is cached.  Disabling cache might be helpful when 
+        frames contain large objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fig</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">frames=</span><span class="s2">None, </span><span class="s1">init_func=</span><span class="s2">None, </span><span class="s1">fargs=</span><span class="s2">None,</span>
+                 <span class="s1">save_count=</span><span class="s2">None, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">cache_frame_data=</span><span class="s2">True, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if </span><span class="s1">fargs:</span>
+            <span class="s1">self._args = fargs</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._args = ()</span>
+        <span class="s1">self._func = func</span>
+        <span class="s1">self._init_func = init_func</span>
+
+        <span class="s0"># Amount of framedata to keep around for saving movies. This is only</span>
+        <span class="s0"># used if we don't know how many frames there will be: in the case</span>
+        <span class="s0"># of no generator or in the case of a callable.</span>
+        <span class="s1">self._save_count = save_count</span>
+        <span class="s0"># Set up a function that creates a new iterable when needed. If nothing</span>
+        <span class="s0"># is passed in for frames, just use itertools.count, which will just</span>
+        <span class="s0"># keep counting from 0. A callable passed in for frames is assumed to</span>
+        <span class="s0"># be a generator. An iterable will be used as is, and anything else</span>
+        <span class="s0"># will be treated as a number of frames.</span>
+        <span class="s2">if </span><span class="s1">frames </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._iter_gen = itertools.count</span>
+        <span class="s2">elif </span><span class="s1">callable(frames):</span>
+            <span class="s1">self._iter_gen = frames</span>
+        <span class="s2">elif </span><span class="s1">np.iterable(frames):</span>
+            <span class="s2">if </span><span class="s1">kwargs.get(</span><span class="s3">'repeat'</span><span class="s2">, True</span><span class="s1">):</span>
+                <span class="s1">self._tee_from = frames</span>
+                <span class="s2">def </span><span class="s1">iter_frames(frames=frames):</span>
+                    <span class="s1">this</span><span class="s2">, </span><span class="s1">self._tee_from = itertools.tee(self._tee_from</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span>
+                    <span class="s2">yield from </span><span class="s1">this</span>
+                <span class="s1">self._iter_gen = iter_frames</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self._iter_gen = </span><span class="s2">lambda</span><span class="s1">: iter(frames)</span>
+            <span class="s2">if </span><span class="s1">hasattr(frames</span><span class="s2">, </span><span class="s3">'__len__'</span><span class="s1">):</span>
+                <span class="s1">self._save_count = len(frames)</span>
+                <span class="s2">if </span><span class="s1">save_count </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">_api.warn_external(</span>
+                        <span class="s3">f&quot;You passed in an explicit </span><span class="s2">{</span><span class="s1">save_count=</span><span class="s2">} </span><span class="s3">&quot;</span>
+                        <span class="s3">&quot;which is being ignored in favor of &quot;</span>
+                        <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">len(frames)=</span><span class="s2">}</span><span class="s3">.&quot;</span>
+                    <span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._iter_gen = </span><span class="s2">lambda</span><span class="s1">: iter(range(frames))</span>
+            <span class="s1">self._save_count = frames</span>
+            <span class="s2">if </span><span class="s1">save_count </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">_api.warn_external(</span>
+                    <span class="s3">f&quot;You passed in an explicit </span><span class="s2">{</span><span class="s1">save_count=</span><span class="s2">} </span><span class="s3">which is being &quot;</span>
+                    <span class="s3">f&quot;ignored in favor of </span><span class="s2">{</span><span class="s1">frames=</span><span class="s2">}</span><span class="s3">.&quot;</span>
+                <span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self._save_count </span><span class="s2">is None and </span><span class="s1">cache_frame_data:</span>
+            <span class="s1">_api.warn_external(</span>
+                <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">frames=</span><span class="s2">!r} </span><span class="s3">which we can infer the length of, &quot;</span>
+                <span class="s3">&quot;did not pass an explicit *save_count* &quot;</span>
+                <span class="s3">f&quot;and passed </span><span class="s2">{</span><span class="s1">cache_frame_data=</span><span class="s2">}</span><span class="s3">.  To avoid a possibly &quot;</span>
+                <span class="s3">&quot;unbounded cache, frame data caching has been disabled. &quot;</span>
+                <span class="s3">&quot;To suppress this warning either pass &quot;</span>
+                <span class="s3">&quot;`cache_frame_data=False` or `save_count=MAX_FRAMES`.&quot;</span>
+            <span class="s1">)</span>
+            <span class="s1">cache_frame_data = </span><span class="s2">False</span>
+
+        <span class="s1">self._cache_frame_data = cache_frame_data</span>
+
+        <span class="s0"># Needs to be initialized so the draw functions work without checking</span>
+        <span class="s1">self._save_seq = []</span>
+
+        <span class="s1">super().__init__(fig</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s0"># Need to reset the saved seq, since right now it will contain data</span>
+        <span class="s0"># for a single frame from init, which is not what we want.</span>
+        <span class="s1">self._save_seq = []</span>
+
+    <span class="s2">def </span><span class="s1">new_frame_seq(self):</span>
+        <span class="s0"># Use the generating function to generate a new frame sequence</span>
+        <span class="s2">return </span><span class="s1">self._iter_gen()</span>
+
+    <span class="s2">def </span><span class="s1">new_saved_frame_seq(self):</span>
+        <span class="s0"># Generate an iterator for the sequence of saved data. If there are</span>
+        <span class="s0"># no saved frames, generate a new frame sequence and take the first</span>
+        <span class="s0"># save_count entries in it.</span>
+        <span class="s2">if </span><span class="s1">self._save_seq:</span>
+            <span class="s0"># While iterating we are going to update _save_seq</span>
+            <span class="s0"># so make a copy to safely iterate over</span>
+            <span class="s1">self._old_saved_seq = list(self._save_seq)</span>
+            <span class="s2">return </span><span class="s1">iter(self._old_saved_seq)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">self._save_count </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">frame_seq = self.new_frame_seq()</span>
+
+                <span class="s2">def </span><span class="s1">gen():</span>
+                    <span class="s2">try</span><span class="s1">:</span>
+                        <span class="s2">while True</span><span class="s1">:</span>
+                            <span class="s2">yield </span><span class="s1">next(frame_seq)</span>
+                    <span class="s2">except </span><span class="s1">StopIteration:</span>
+                        <span class="s2">pass</span>
+                <span class="s2">return </span><span class="s1">gen()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">itertools.islice(self.new_frame_seq()</span><span class="s2">, </span><span class="s1">self._save_count)</span>
+
+    <span class="s2">def </span><span class="s1">_init_draw(self):</span>
+        <span class="s1">super()._init_draw()</span>
+        <span class="s0"># Initialize the drawing either using the given init_func or by</span>
+        <span class="s0"># calling the draw function with the first item of the frame sequence.</span>
+        <span class="s0"># For blitting, the init_func should return a sequence of modified</span>
+        <span class="s0"># artists.</span>
+        <span class="s2">if </span><span class="s1">self._init_func </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">frame_data = next(self.new_frame_seq())</span>
+            <span class="s2">except </span><span class="s1">StopIteration:</span>
+                <span class="s0"># we can't start the iteration, it may have already been</span>
+                <span class="s0"># exhausted by a previous save or just be 0 length.</span>
+                <span class="s0"># warn and bail.</span>
+                <span class="s1">warnings.warn(</span>
+                    <span class="s3">&quot;Can not start iterating the frames for the initial draw. &quot;</span>
+                    <span class="s3">&quot;This can be caused by passing in a 0 length sequence &quot;</span>
+                    <span class="s3">&quot;for *frames*.</span><span class="s2">\n\n</span><span class="s3">&quot;</span>
+                    <span class="s3">&quot;If you passed *frames* as a generator &quot;</span>
+                    <span class="s3">&quot;it may be exhausted due to a previous display or save.&quot;</span>
+                <span class="s1">)</span>
+                <span class="s2">return</span>
+            <span class="s1">self._draw_frame(frame_data)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._drawn_artists = self._init_func()</span>
+            <span class="s2">if </span><span class="s1">self._blit:</span>
+                <span class="s2">if </span><span class="s1">self._drawn_artists </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">'The init_func must return a '</span>
+                                       <span class="s3">'sequence of Artist objects.'</span><span class="s1">)</span>
+                <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">self._drawn_artists:</span>
+                    <span class="s1">a.set_animated(self._blit)</span>
+        <span class="s1">self._save_seq = []</span>
+
+    <span class="s2">def </span><span class="s1">_draw_frame(self</span><span class="s2">, </span><span class="s1">framedata):</span>
+        <span class="s2">if </span><span class="s1">self._cache_frame_data:</span>
+            <span class="s0"># Save the data for potential saving of movies.</span>
+            <span class="s1">self._save_seq.append(framedata)</span>
+            <span class="s1">self._save_seq = self._save_seq[-self._save_count:]</span>
+
+        <span class="s0"># Call the func with framedata and args. If blitting is desired,</span>
+        <span class="s0"># func needs to return a sequence of any artists that were modified.</span>
+        <span class="s1">self._drawn_artists = self._func(framedata</span><span class="s2">, </span><span class="s1">*self._args)</span>
+
+        <span class="s2">if </span><span class="s1">self._blit:</span>
+
+            <span class="s1">err = RuntimeError(</span><span class="s3">'The animation function must return a sequence '</span>
+                               <span class="s3">'of Artist objects.'</span><span class="s1">)</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s0"># check if a sequence</span>
+                <span class="s1">iter(self._drawn_artists)</span>
+            <span class="s2">except </span><span class="s1">TypeError:</span>
+                <span class="s2">raise </span><span class="s1">err </span><span class="s2">from None</span>
+
+            <span class="s0"># check each item if it's artist</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">self._drawn_artists:</span>
+                <span class="s2">if not </span><span class="s1">isinstance(i</span><span class="s2">, </span><span class="s1">mpl.artist.Artist):</span>
+                    <span class="s2">raise </span><span class="s1">err</span>
+
+            <span class="s1">self._drawn_artists = sorted(self._drawn_artists</span><span class="s2">,</span>
+                                         <span class="s1">key=</span><span class="s2">lambda </span><span class="s1">x: x.get_zorder())</span>
+
+            <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">self._drawn_artists:</span>
+                <span class="s1">a.set_animated(self._blit)</span>
+
+    <span class="s1">save_count = _api.deprecate_privatize_attribute(</span><span class="s3">&quot;3.7&quot;</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

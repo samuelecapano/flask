@@ -1,0 +1,541 @@
+<html>
+<head>
+<title>compare.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+compare.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Utilities for comparing image results. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">atexit</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">hashlib</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">import </span><span class="s1">shutil</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">from </span><span class="s1">tempfile </span><span class="s2">import </span><span class="s1">TemporaryDirectory</span><span class="s2">, </span><span class="s1">TemporaryFile</span>
+<span class="s2">import </span><span class="s1">weakref</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">PIL </span><span class="s2">import </span><span class="s1">Image</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">cbook</span>
+<span class="s2">from </span><span class="s1">matplotlib.testing.exceptions </span><span class="s2">import </span><span class="s1">ImageComparisonFailure</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+<span class="s1">__all__ = [</span><span class="s3">'calculate_rms'</span><span class="s2">, </span><span class="s3">'comparable_formats'</span><span class="s2">, </span><span class="s3">'compare_images'</span><span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">make_test_filename(fname</span><span class="s2">, </span><span class="s1">purpose):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make a new filename by inserting *purpose* before the file's extension. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">base</span><span class="s2">, </span><span class="s1">ext = os.path.splitext(fname)</span>
+    <span class="s2">return </span><span class="s3">'%s-%s%s' </span><span class="s1">% (base</span><span class="s2">, </span><span class="s1">purpose</span><span class="s2">, </span><span class="s1">ext)</span>
+
+
+<span class="s2">def </span><span class="s1">_get_cache_path():</span>
+    <span class="s1">cache_dir = Path(mpl.get_cachedir()</span><span class="s2">, </span><span class="s3">'test_cache'</span><span class="s1">)</span>
+    <span class="s1">cache_dir.mkdir(parents=</span><span class="s2">True, </span><span class="s1">exist_ok=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">cache_dir</span>
+
+
+<span class="s2">def </span><span class="s1">get_cache_dir():</span>
+    <span class="s2">return </span><span class="s1">str(_get_cache_path())</span>
+
+
+<span class="s2">def </span><span class="s1">get_file_hash(path</span><span class="s2">, </span><span class="s1">block_size=</span><span class="s4">2 </span><span class="s1">** </span><span class="s4">20</span><span class="s1">):</span>
+    <span class="s1">md5 = hashlib.md5()</span>
+    <span class="s2">with </span><span class="s1">open(path</span><span class="s2">, </span><span class="s3">'rb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">fd:</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">data = fd.read(block_size)</span>
+            <span class="s2">if not </span><span class="s1">data:</span>
+                <span class="s2">break</span>
+            <span class="s1">md5.update(data)</span>
+
+    <span class="s2">if </span><span class="s1">Path(path).suffix == </span><span class="s3">'.pdf'</span><span class="s1">:</span>
+        <span class="s1">md5.update(str(mpl._get_executable_info(</span><span class="s3">&quot;gs&quot;</span><span class="s1">).version)</span>
+                   <span class="s1">.encode(</span><span class="s3">'utf-8'</span><span class="s1">))</span>
+    <span class="s2">elif </span><span class="s1">Path(path).suffix == </span><span class="s3">'.svg'</span><span class="s1">:</span>
+        <span class="s1">md5.update(str(mpl._get_executable_info(</span><span class="s3">&quot;inkscape&quot;</span><span class="s1">).version)</span>
+                   <span class="s1">.encode(</span><span class="s3">'utf-8'</span><span class="s1">))</span>
+
+    <span class="s2">return </span><span class="s1">md5.hexdigest()</span>
+
+
+<span class="s2">class </span><span class="s1">_ConverterError(Exception):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">_Converter:</span>
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._proc = </span><span class="s2">None</span>
+        <span class="s5"># Explicitly register deletion from an atexit handler because if we</span>
+        <span class="s5"># wait until the object is GC'd (which occurs later), then some module</span>
+        <span class="s5"># globals (e.g. signal.SIGKILL) has already been set to None, and</span>
+        <span class="s5"># kill() doesn't work anymore...</span>
+        <span class="s1">atexit.register(self.__del__)</span>
+
+    <span class="s2">def </span><span class="s1">__del__(self):</span>
+        <span class="s2">if </span><span class="s1">self._proc:</span>
+            <span class="s1">self._proc.kill()</span>
+            <span class="s1">self._proc.wait()</span>
+            <span class="s2">for </span><span class="s1">stream </span><span class="s2">in </span><span class="s1">filter(</span><span class="s2">None, </span><span class="s1">[self._proc.stdin</span><span class="s2">,</span>
+                                        <span class="s1">self._proc.stdout</span><span class="s2">,</span>
+                                        <span class="s1">self._proc.stderr]):</span>
+                <span class="s1">stream.close()</span>
+            <span class="s1">self._proc = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_read_until(self</span><span class="s2">, </span><span class="s1">terminator):</span>
+        <span class="s0">&quot;&quot;&quot;Read until the prompt is reached.&quot;&quot;&quot;</span>
+        <span class="s1">buf = bytearray()</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">c = self._proc.stdout.read(</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s2">if not </span><span class="s1">c:</span>
+                <span class="s2">raise </span><span class="s1">_ConverterError(os.fsdecode(bytes(buf)))</span>
+            <span class="s1">buf.extend(c)</span>
+            <span class="s2">if </span><span class="s1">buf.endswith(terminator):</span>
+                <span class="s2">return </span><span class="s1">bytes(buf)</span>
+
+
+<span class="s2">class </span><span class="s1">_GSConverter(_Converter):</span>
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">orig</span><span class="s2">, </span><span class="s1">dest):</span>
+        <span class="s2">if not </span><span class="s1">self._proc:</span>
+            <span class="s1">self._proc = subprocess.Popen(</span>
+                <span class="s1">[mpl._get_executable_info(</span><span class="s3">&quot;gs&quot;</span><span class="s1">).executable</span><span class="s2">,</span>
+                 <span class="s3">&quot;-dNOSAFER&quot;</span><span class="s2">, </span><span class="s3">&quot;-dNOPAUSE&quot;</span><span class="s2">, </span><span class="s3">&quot;-dEPSCrop&quot;</span><span class="s2">, </span><span class="s3">&quot;-sDEVICE=png16m&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s5"># As far as I can see, ghostscript never outputs to stderr.</span>
+                <span class="s1">stdin=subprocess.PIPE</span><span class="s2">, </span><span class="s1">stdout=subprocess.PIPE)</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">self._read_until(</span><span class="s6">b&quot;</span><span class="s2">\n</span><span class="s6">GS&quot;</span><span class="s1">)</span>
+            <span class="s2">except </span><span class="s1">_ConverterError </span><span class="s2">as </span><span class="s1">err:</span>
+                <span class="s2">raise </span><span class="s1">OSError(</span>
+                    <span class="s3">&quot;Failed to start Ghostscript:</span><span class="s2">\n\n</span><span class="s3">&quot; </span><span class="s1">+ err.args[</span><span class="s4">0</span><span class="s1">]) </span><span class="s2">from None</span>
+
+        <span class="s2">def </span><span class="s1">encode_and_escape(name):</span>
+            <span class="s2">return </span><span class="s1">(os.fsencode(name)</span>
+                    <span class="s1">.replace(</span><span class="s6">b&quot;</span><span class="s2">\\</span><span class="s6">&quot;</span><span class="s2">, </span><span class="s6">b&quot;</span><span class="s2">\\\\</span><span class="s6">&quot;</span><span class="s1">)</span>
+                    <span class="s1">.replace(</span><span class="s6">b&quot;(&quot;</span><span class="s2">, </span><span class="s6">br&quot;\(&quot;</span><span class="s1">)</span>
+                    <span class="s1">.replace(</span><span class="s6">b&quot;)&quot;</span><span class="s2">, </span><span class="s6">br&quot;\)&quot;</span><span class="s1">))</span>
+
+        <span class="s1">self._proc.stdin.write(</span>
+            <span class="s6">b&quot;&lt;&lt; /OutputFile (&quot;</span>
+            <span class="s1">+ encode_and_escape(dest)</span>
+            <span class="s1">+ </span><span class="s6">b&quot;) &gt;&gt; setpagedevice (&quot;</span>
+            <span class="s1">+ encode_and_escape(orig)</span>
+            <span class="s1">+ </span><span class="s6">b&quot;) run flush</span><span class="s2">\n</span><span class="s6">&quot;</span><span class="s1">)</span>
+        <span class="s1">self._proc.stdin.flush()</span>
+        <span class="s5"># GS&gt; if nothing left on the stack; GS&lt;n&gt; if n items left on the stack.</span>
+        <span class="s1">err = self._read_until((</span><span class="s6">b&quot;GS&lt;&quot;</span><span class="s2">, </span><span class="s6">b&quot;GS&gt;&quot;</span><span class="s1">))</span>
+        <span class="s1">stack = self._read_until(</span><span class="s6">b&quot;&gt;&quot;</span><span class="s1">) </span><span class="s2">if </span><span class="s1">err.endswith(</span><span class="s6">b&quot;GS&lt;&quot;</span><span class="s1">) </span><span class="s2">else </span><span class="s6">b&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">stack </span><span class="s2">or not </span><span class="s1">os.path.exists(dest):</span>
+            <span class="s1">stack_size = int(stack[:-</span><span class="s4">1</span><span class="s1">]) </span><span class="s2">if </span><span class="s1">stack </span><span class="s2">else </span><span class="s4">0</span>
+            <span class="s1">self._proc.stdin.write(</span><span class="s6">b&quot;pop</span><span class="s2">\n</span><span class="s6">&quot; </span><span class="s1">* stack_size)</span>
+            <span class="s5"># Using the systemencoding should at least get the filenames right.</span>
+            <span class="s2">raise </span><span class="s1">ImageComparisonFailure(</span>
+                <span class="s1">(err + stack).decode(sys.getfilesystemencoding()</span><span class="s2">, </span><span class="s3">&quot;replace&quot;</span><span class="s1">))</span>
+
+
+<span class="s2">class </span><span class="s1">_SVGConverter(_Converter):</span>
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">orig</span><span class="s2">, </span><span class="s1">dest):</span>
+        <span class="s1">old_inkscape = mpl._get_executable_info(</span><span class="s3">&quot;inkscape&quot;</span><span class="s1">).version.major &lt; </span><span class="s4">1</span>
+        <span class="s1">terminator = </span><span class="s6">b&quot;</span><span class="s2">\n</span><span class="s6">&gt;&quot; </span><span class="s2">if </span><span class="s1">old_inkscape </span><span class="s2">else </span><span class="s6">b&quot;&gt; &quot;</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">&quot;_tmpdir&quot;</span><span class="s1">):</span>
+            <span class="s1">self._tmpdir = TemporaryDirectory()</span>
+            <span class="s5"># On Windows, we must make sure that self._proc has terminated</span>
+            <span class="s5"># (which __del__ does) before clearing _tmpdir.</span>
+            <span class="s1">weakref.finalize(self._tmpdir</span><span class="s2">, </span><span class="s1">self.__del__)</span>
+        <span class="s2">if </span><span class="s1">(</span><span class="s2">not </span><span class="s1">self._proc  </span><span class="s5"># First run.</span>
+                <span class="s2">or </span><span class="s1">self._proc.poll() </span><span class="s2">is not None</span><span class="s1">):  </span><span class="s5"># Inkscape terminated.</span>
+            <span class="s2">if </span><span class="s1">self._proc </span><span class="s2">is not None and </span><span class="s1">self._proc.poll() </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">for </span><span class="s1">stream </span><span class="s2">in </span><span class="s1">filter(</span><span class="s2">None, </span><span class="s1">[self._proc.stdin</span><span class="s2">,</span>
+                                            <span class="s1">self._proc.stdout</span><span class="s2">,</span>
+                                            <span class="s1">self._proc.stderr]):</span>
+                    <span class="s1">stream.close()</span>
+            <span class="s1">env = {</span>
+                <span class="s1">**os.environ</span><span class="s2">,</span>
+                <span class="s5"># If one passes e.g. a png file to Inkscape, it will try to</span>
+                <span class="s5"># query the user for conversion options via a GUI (even with</span>
+                <span class="s5"># `--without-gui`).  Unsetting `DISPLAY` prevents this (and</span>
+                <span class="s5"># causes GTK to crash and Inkscape to terminate, but that'll</span>
+                <span class="s5"># just be reported as a regular exception below).</span>
+                <span class="s3">&quot;DISPLAY&quot;</span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s2">,</span>
+                <span class="s5"># Do not load any user options.</span>
+                <span class="s3">&quot;INKSCAPE_PROFILE_DIR&quot;</span><span class="s1">: self._tmpdir.name</span><span class="s2">,</span>
+            <span class="s1">}</span>
+            <span class="s5"># Old versions of Inkscape (e.g. 0.48.3.1) seem to sometimes</span>
+            <span class="s5"># deadlock when stderr is redirected to a pipe, so we redirect it</span>
+            <span class="s5"># to a temporary file instead.  This is not necessary anymore as of</span>
+            <span class="s5"># Inkscape 0.92.1.</span>
+            <span class="s1">stderr = TemporaryFile()</span>
+            <span class="s1">self._proc = subprocess.Popen(</span>
+                <span class="s1">[</span><span class="s3">&quot;inkscape&quot;</span><span class="s2">, </span><span class="s3">&quot;--without-gui&quot;</span><span class="s2">, </span><span class="s3">&quot;--shell&quot;</span><span class="s1">] </span><span class="s2">if </span><span class="s1">old_inkscape </span><span class="s2">else</span>
+                <span class="s1">[</span><span class="s3">&quot;inkscape&quot;</span><span class="s2">, </span><span class="s3">&quot;--shell&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">stdin=subprocess.PIPE</span><span class="s2">, </span><span class="s1">stdout=subprocess.PIPE</span><span class="s2">, </span><span class="s1">stderr=stderr</span><span class="s2">,</span>
+                <span class="s1">env=env</span><span class="s2">, </span><span class="s1">cwd=self._tmpdir.name)</span>
+            <span class="s5"># Slight abuse, but makes shutdown handling easier.</span>
+            <span class="s1">self._proc.stderr = stderr</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">self._read_until(terminator)</span>
+            <span class="s2">except </span><span class="s1">_ConverterError </span><span class="s2">as </span><span class="s1">err:</span>
+                <span class="s2">raise </span><span class="s1">OSError(</span>
+                    <span class="s3">&quot;Failed to start Inkscape in interactive mode:</span><span class="s2">\n\n</span><span class="s3">&quot;</span>
+                    <span class="s1">+ err.args[</span><span class="s4">0</span><span class="s1">]) </span><span class="s2">from </span><span class="s1">err</span>
+
+        <span class="s5"># Inkscape's shell mode does not support escaping metacharacters in the</span>
+        <span class="s5"># filename (&quot;\n&quot;, and &quot;:;&quot; for inkscape&gt;=1).  Avoid any problems by</span>
+        <span class="s5"># running from a temporary directory and using fixed filenames.</span>
+        <span class="s1">inkscape_orig = Path(self._tmpdir.name</span><span class="s2">, </span><span class="s1">os.fsdecode(</span><span class="s6">b&quot;f.svg&quot;</span><span class="s1">))</span>
+        <span class="s1">inkscape_dest = Path(self._tmpdir.name</span><span class="s2">, </span><span class="s1">os.fsdecode(</span><span class="s6">b&quot;f.png&quot;</span><span class="s1">))</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">inkscape_orig.symlink_to(Path(orig).resolve())</span>
+        <span class="s2">except </span><span class="s1">OSError:</span>
+            <span class="s1">shutil.copyfile(orig</span><span class="s2">, </span><span class="s1">inkscape_orig)</span>
+        <span class="s1">self._proc.stdin.write(</span>
+            <span class="s6">b&quot;f.svg --export-png=f.png</span><span class="s2">\n</span><span class="s6">&quot; </span><span class="s2">if </span><span class="s1">old_inkscape </span><span class="s2">else</span>
+            <span class="s6">b&quot;file-open:f.svg;export-filename:f.png;export-do;file-close</span><span class="s2">\n</span><span class="s6">&quot;</span><span class="s1">)</span>
+        <span class="s1">self._proc.stdin.flush()</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">self._read_until(terminator)</span>
+        <span class="s2">except </span><span class="s1">_ConverterError </span><span class="s2">as </span><span class="s1">err:</span>
+            <span class="s5"># Inkscape's output is not localized but gtk's is, so the output</span>
+            <span class="s5"># stream probably has a mixed encoding.  Using the filesystem</span>
+            <span class="s5"># encoding should at least get the filenames right...</span>
+            <span class="s1">self._proc.stderr.seek(</span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s2">raise </span><span class="s1">ImageComparisonFailure(</span>
+                <span class="s1">self._proc.stderr.read().decode(</span>
+                    <span class="s1">sys.getfilesystemencoding()</span><span class="s2">, </span><span class="s3">&quot;replace&quot;</span><span class="s1">)) </span><span class="s2">from </span><span class="s1">err</span>
+        <span class="s1">os.remove(inkscape_orig)</span>
+        <span class="s1">shutil.move(inkscape_dest</span><span class="s2">, </span><span class="s1">dest)</span>
+
+    <span class="s2">def </span><span class="s1">__del__(self):</span>
+        <span class="s1">super().__del__()</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">&quot;_tmpdir&quot;</span><span class="s1">):</span>
+            <span class="s1">self._tmpdir.cleanup()</span>
+
+
+<span class="s2">class </span><span class="s1">_SVGWithMatplotlibFontsConverter(_SVGConverter):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A SVG converter which explicitly adds the fonts shipped by Matplotlib to 
+    Inkspace's font search path, to better support `svg.fonttype = &quot;none&quot;` 
+    (which is in particular used by certain mathtext tests). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">orig</span><span class="s2">, </span><span class="s1">dest):</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">&quot;_tmpdir&quot;</span><span class="s1">):</span>
+            <span class="s1">self._tmpdir = TemporaryDirectory()</span>
+            <span class="s1">shutil.copytree(cbook._get_data_path(</span><span class="s3">&quot;fonts/ttf&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                            <span class="s1">Path(self._tmpdir.name</span><span class="s2">, </span><span class="s3">&quot;fonts&quot;</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">super().__call__(orig</span><span class="s2">, </span><span class="s1">dest)</span>
+
+
+<span class="s2">def </span><span class="s1">_update_converter():</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">mpl._get_executable_info(</span><span class="s3">&quot;gs&quot;</span><span class="s1">)</span>
+    <span class="s2">except </span><span class="s1">mpl.ExecutableNotFoundError:</span>
+        <span class="s2">pass</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">converter[</span><span class="s3">'pdf'</span><span class="s1">] = converter[</span><span class="s3">'eps'</span><span class="s1">] = _GSConverter()</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">mpl._get_executable_info(</span><span class="s3">&quot;inkscape&quot;</span><span class="s1">)</span>
+    <span class="s2">except </span><span class="s1">mpl.ExecutableNotFoundError:</span>
+        <span class="s2">pass</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">converter[</span><span class="s3">'svg'</span><span class="s1">] = _SVGConverter()</span>
+
+
+<span class="s5">#: A dictionary that maps filename extensions to functions which</span>
+<span class="s5">#: themselves map arguments `old` and `new` (filenames) to a list of strings.</span>
+<span class="s5">#: The list can then be passed to Popen to convert files with that</span>
+<span class="s5">#: extension to png format.</span>
+<span class="s1">converter = {}</span>
+<span class="s1">_update_converter()</span>
+<span class="s1">_svg_with_matplotlib_fonts_converter = _SVGWithMatplotlibFontsConverter()</span>
+
+
+<span class="s2">def </span><span class="s1">comparable_formats():</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return the list of file formats that `.compare_images` can compare 
+    on this system. 
+ 
+    Returns 
+    ------- 
+    list of str 
+        E.g. ``['png', 'pdf', 'svg', 'eps']``. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">[</span><span class="s3">'png'</span><span class="s2">, </span><span class="s1">*converter]</span>
+
+
+<span class="s2">def </span><span class="s1">convert(filename</span><span class="s2">, </span><span class="s1">cache):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert the named file to png; return the name of the created file. 
+ 
+    If *cache* is True, the result of the conversion is cached in 
+    `matplotlib.get_cachedir() + '/test_cache/'`.  The caching is based on a 
+    hash of the exact contents of the input file.  Old cache entries are 
+    automatically deleted as needed to keep the size of the cache capped to 
+    twice the size of all baseline images. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">path = Path(filename)</span>
+    <span class="s2">if not </span><span class="s1">path.exists():</span>
+        <span class="s2">raise </span><span class="s1">IOError(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">path</span><span class="s2">} </span><span class="s3">does not exist&quot;</span><span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">path.suffix[</span><span class="s4">1</span><span class="s1">:] </span><span class="s2">not in </span><span class="s1">converter:</span>
+        <span class="s2">import </span><span class="s1">pytest</span>
+        <span class="s1">pytest.skip(</span><span class="s3">f&quot;Don't know how to convert </span><span class="s2">{</span><span class="s1">path.suffix</span><span class="s2">} </span><span class="s3">files to png&quot;</span><span class="s1">)</span>
+    <span class="s1">newpath = path.parent / </span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">path.stem</span><span class="s2">}</span><span class="s3">_</span><span class="s2">{</span><span class="s1">path.suffix[</span><span class="s4">1</span><span class="s1">:]</span><span class="s2">}</span><span class="s3">.png&quot;</span>
+
+    <span class="s5"># Only convert the file if the destination doesn't already exist or</span>
+    <span class="s5"># is out of date.</span>
+    <span class="s2">if not </span><span class="s1">newpath.exists() </span><span class="s2">or </span><span class="s1">newpath.stat().st_mtime &lt; path.stat().st_mtime:</span>
+        <span class="s1">cache_dir = _get_cache_path() </span><span class="s2">if </span><span class="s1">cache </span><span class="s2">else None</span>
+
+        <span class="s2">if </span><span class="s1">cache_dir </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">_register_conversion_cache_cleaner_once()</span>
+            <span class="s1">hash_value = get_file_hash(path)</span>
+            <span class="s1">cached_path = cache_dir / (hash_value + newpath.suffix)</span>
+            <span class="s2">if </span><span class="s1">cached_path.exists():</span>
+                <span class="s1">_log.debug(</span><span class="s3">&quot;For %s: reusing cached conversion.&quot;</span><span class="s2">, </span><span class="s1">filename)</span>
+                <span class="s1">shutil.copyfile(cached_path</span><span class="s2">, </span><span class="s1">newpath)</span>
+                <span class="s2">return </span><span class="s1">str(newpath)</span>
+
+        <span class="s1">_log.debug(</span><span class="s3">&quot;For %s: converting to png.&quot;</span><span class="s2">, </span><span class="s1">filename)</span>
+        <span class="s1">convert = converter[path.suffix[</span><span class="s4">1</span><span class="s1">:]]</span>
+        <span class="s2">if </span><span class="s1">path.suffix == </span><span class="s3">&quot;.svg&quot;</span><span class="s1">:</span>
+            <span class="s1">contents = path.read_text()</span>
+            <span class="s2">if </span><span class="s3">'style=&quot;font:' </span><span class="s2">in </span><span class="s1">contents:</span>
+                <span class="s5"># for svg.fonttype = none, we explicitly patch the font search</span>
+                <span class="s5"># path so that fonts shipped by Matplotlib are found.</span>
+                <span class="s1">convert = _svg_with_matplotlib_fonts_converter</span>
+        <span class="s1">convert(path</span><span class="s2">, </span><span class="s1">newpath)</span>
+
+        <span class="s2">if </span><span class="s1">cache_dir </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">_log.debug(</span><span class="s3">&quot;For %s: caching conversion result.&quot;</span><span class="s2">, </span><span class="s1">filename)</span>
+            <span class="s1">shutil.copyfile(newpath</span><span class="s2">, </span><span class="s1">cached_path)</span>
+
+    <span class="s2">return </span><span class="s1">str(newpath)</span>
+
+
+<span class="s2">def </span><span class="s1">_clean_conversion_cache():</span>
+    <span class="s5"># This will actually ignore mpl_toolkits baseline images, but they're</span>
+    <span class="s5"># relatively small.</span>
+    <span class="s1">baseline_images_size = sum(</span>
+        <span class="s1">path.stat().st_size</span>
+        <span class="s2">for </span><span class="s1">path </span><span class="s2">in </span><span class="s1">Path(mpl.__file__).parent.glob(</span><span class="s3">&quot;**/baseline_images/**/*&quot;</span><span class="s1">))</span>
+    <span class="s5"># 2x: one full copy of baselines, and one full copy of test results</span>
+    <span class="s5"># (actually an overestimate: we don't convert png baselines and results).</span>
+    <span class="s1">max_cache_size = </span><span class="s4">2 </span><span class="s1">* baseline_images_size</span>
+    <span class="s5"># Reduce cache until it fits.</span>
+    <span class="s2">with </span><span class="s1">cbook._lock_path(_get_cache_path()):</span>
+        <span class="s1">cache_stat = {</span>
+            <span class="s1">path: path.stat() </span><span class="s2">for </span><span class="s1">path </span><span class="s2">in </span><span class="s1">_get_cache_path().glob(</span><span class="s3">&quot;*&quot;</span><span class="s1">)}</span>
+        <span class="s1">cache_size = sum(stat.st_size </span><span class="s2">for </span><span class="s1">stat </span><span class="s2">in </span><span class="s1">cache_stat.values())</span>
+        <span class="s1">paths_by_atime = sorted(  </span><span class="s5"># Oldest at the end.</span>
+            <span class="s1">cache_stat</span><span class="s2">, </span><span class="s1">key=</span><span class="s2">lambda </span><span class="s1">path: cache_stat[path].st_atime</span><span class="s2">,</span>
+            <span class="s1">reverse=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">while </span><span class="s1">cache_size &gt; max_cache_size:</span>
+            <span class="s1">path = paths_by_atime.pop()</span>
+            <span class="s1">cache_size -= cache_stat[path].st_size</span>
+            <span class="s1">path.unlink()</span>
+
+
+<span class="s1">@functools.lru_cache()  </span><span class="s5"># Ensure this is only registered once.</span>
+<span class="s2">def </span><span class="s1">_register_conversion_cache_cleaner_once():</span>
+    <span class="s1">atexit.register(_clean_conversion_cache)</span>
+
+
+<span class="s2">def </span><span class="s1">crop_to_same(actual_path</span><span class="s2">, </span><span class="s1">actual_image</span><span class="s2">, </span><span class="s1">expected_path</span><span class="s2">, </span><span class="s1">expected_image):</span>
+    <span class="s5"># clip the images to the same size -- this is useful only when</span>
+    <span class="s5"># comparing eps to pdf</span>
+    <span class="s2">if </span><span class="s1">actual_path[-</span><span class="s4">7</span><span class="s1">:-</span><span class="s4">4</span><span class="s1">] == </span><span class="s3">'eps' </span><span class="s2">and </span><span class="s1">expected_path[-</span><span class="s4">7</span><span class="s1">:-</span><span class="s4">4</span><span class="s1">] == </span><span class="s3">'pdf'</span><span class="s1">:</span>
+        <span class="s1">aw</span><span class="s2">, </span><span class="s1">ah</span><span class="s2">, </span><span class="s1">ad = actual_image.shape</span>
+        <span class="s1">ew</span><span class="s2">, </span><span class="s1">eh</span><span class="s2">, </span><span class="s1">ed = expected_image.shape</span>
+        <span class="s1">actual_image = actual_image[int(aw / </span><span class="s4">2 </span><span class="s1">- ew / </span><span class="s4">2</span><span class="s1">):int(</span>
+            <span class="s1">aw / </span><span class="s4">2 </span><span class="s1">+ ew / </span><span class="s4">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">int(ah / </span><span class="s4">2 </span><span class="s1">- eh / </span><span class="s4">2</span><span class="s1">):int(ah / </span><span class="s4">2 </span><span class="s1">+ eh / </span><span class="s4">2</span><span class="s1">)]</span>
+    <span class="s2">return </span><span class="s1">actual_image</span><span class="s2">, </span><span class="s1">expected_image</span>
+
+
+<span class="s2">def </span><span class="s1">calculate_rms(expected_image</span><span class="s2">, </span><span class="s1">actual_image):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Calculate the per-pixel errors, then compute the root mean square error. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">expected_image.shape != actual_image.shape:</span>
+        <span class="s2">raise </span><span class="s1">ImageComparisonFailure(</span>
+            <span class="s3">&quot;Image sizes do not match expected size: {} &quot;</span>
+            <span class="s3">&quot;actual size {}&quot;</span><span class="s1">.format(expected_image.shape</span><span class="s2">, </span><span class="s1">actual_image.shape))</span>
+    <span class="s5"># Convert to float to avoid overflowing finite integer types.</span>
+    <span class="s2">return </span><span class="s1">np.sqrt(((expected_image - actual_image).astype(float) ** </span><span class="s4">2</span><span class="s1">).mean())</span>
+
+
+<span class="s5"># NOTE: compare_image and save_diff_image assume that the image does not have</span>
+<span class="s5"># 16-bit depth, as Pillow converts these to RGB incorrectly.</span>
+
+
+<span class="s2">def </span><span class="s1">_load_image(path):</span>
+    <span class="s1">img = Image.open(path)</span>
+    <span class="s5"># In an RGBA image, if the smallest value in the alpha channel is 255, all</span>
+    <span class="s5"># values in it must be 255, meaning that the image is opaque. If so,</span>
+    <span class="s5"># discard the alpha channel so that it may compare equal to an RGB image.</span>
+    <span class="s2">if </span><span class="s1">img.mode != </span><span class="s3">&quot;RGBA&quot; </span><span class="s2">or </span><span class="s1">img.getextrema()[</span><span class="s4">3</span><span class="s1">][</span><span class="s4">0</span><span class="s1">] == </span><span class="s4">255</span><span class="s1">:</span>
+        <span class="s1">img = img.convert(</span><span class="s3">&quot;RGB&quot;</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">np.asarray(img)</span>
+
+
+<span class="s2">def </span><span class="s1">compare_images(expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">, </span><span class="s1">tol</span><span class="s2">, </span><span class="s1">in_decorator=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Compare two &quot;image&quot; files checking differences within a tolerance. 
+ 
+    The two given filenames may point to files which are convertible to 
+    PNG via the `.converter` dictionary. The underlying RMS is calculated 
+    with the `.calculate_rms` function. 
+ 
+    Parameters 
+    ---------- 
+    expected : str 
+        The filename of the expected image. 
+    actual : str 
+        The filename of the actual image. 
+    tol : float 
+        The tolerance (a color value difference, where 255 is the 
+        maximal difference).  The test fails if the average pixel 
+        difference is greater than this value. 
+    in_decorator : bool 
+        Determines the output format. If called from image_comparison 
+        decorator, this should be True. (default=False) 
+ 
+    Returns 
+    ------- 
+    None or dict or str 
+        Return *None* if the images are equal within the given tolerance. 
+ 
+        If the images differ, the return value depends on  *in_decorator*. 
+        If *in_decorator* is true, a dict with the following entries is 
+        returned: 
+ 
+        - *rms*: The RMS of the image difference. 
+        - *expected*: The filename of the expected image. 
+        - *actual*: The filename of the actual image. 
+        - *diff_image*: The filename of the difference image. 
+        - *tol*: The comparison tolerance. 
+ 
+        Otherwise, a human-readable multi-line string representation of this 
+        information is returned. 
+ 
+    Examples 
+    -------- 
+    :: 
+ 
+        img1 = &quot;./baseline/plot.png&quot; 
+        img2 = &quot;./output/plot.png&quot; 
+        compare_images(img1, img2, 0.001) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">actual = os.fspath(actual)</span>
+    <span class="s2">if not </span><span class="s1">os.path.exists(actual):</span>
+        <span class="s2">raise </span><span class="s1">Exception(</span><span class="s3">&quot;Output image %s does not exist.&quot; </span><span class="s1">% actual)</span>
+    <span class="s2">if </span><span class="s1">os.stat(actual).st_size == </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">Exception(</span><span class="s3">&quot;Output image file %s is empty.&quot; </span><span class="s1">% actual)</span>
+
+    <span class="s5"># Convert the image to png</span>
+    <span class="s1">expected = os.fspath(expected)</span>
+    <span class="s2">if not </span><span class="s1">os.path.exists(expected):</span>
+        <span class="s2">raise </span><span class="s1">IOError(</span><span class="s3">'Baseline image %r does not exist.' </span><span class="s1">% expected)</span>
+    <span class="s1">extension = expected.split(</span><span class="s3">'.'</span><span class="s1">)[-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">extension != </span><span class="s3">'png'</span><span class="s1">:</span>
+        <span class="s1">actual = convert(actual</span><span class="s2">, </span><span class="s1">cache=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">expected = convert(expected</span><span class="s2">, </span><span class="s1">cache=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s5"># open the image files</span>
+    <span class="s1">expected_image = _load_image(expected)</span>
+    <span class="s1">actual_image = _load_image(actual)</span>
+
+    <span class="s1">actual_image</span><span class="s2">, </span><span class="s1">expected_image = crop_to_same(</span>
+        <span class="s1">actual</span><span class="s2">, </span><span class="s1">actual_image</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">, </span><span class="s1">expected_image)</span>
+
+    <span class="s1">diff_image = make_test_filename(actual</span><span class="s2">, </span><span class="s3">'failed-diff'</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">tol &lt;= </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">np.array_equal(expected_image</span><span class="s2">, </span><span class="s1">actual_image):</span>
+            <span class="s2">return None</span>
+
+    <span class="s5"># convert to signed integers, so that the images can be subtracted without</span>
+    <span class="s5"># overflow</span>
+    <span class="s1">expected_image = expected_image.astype(np.int16)</span>
+    <span class="s1">actual_image = actual_image.astype(np.int16)</span>
+
+    <span class="s1">rms = calculate_rms(expected_image</span><span class="s2">, </span><span class="s1">actual_image)</span>
+
+    <span class="s2">if </span><span class="s1">rms &lt;= tol:</span>
+        <span class="s2">return None</span>
+
+    <span class="s1">save_diff_image(expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">, </span><span class="s1">diff_image)</span>
+
+    <span class="s1">results = dict(rms=rms</span><span class="s2">, </span><span class="s1">expected=str(expected)</span><span class="s2">,</span>
+                   <span class="s1">actual=str(actual)</span><span class="s2">, </span><span class="s1">diff=str(diff_image)</span><span class="s2">, </span><span class="s1">tol=tol)</span>
+
+    <span class="s2">if not </span><span class="s1">in_decorator:</span>
+        <span class="s5"># Then the results should be a string suitable for stdout.</span>
+        <span class="s1">template = [</span><span class="s3">'Error: Image files did not match.'</span><span class="s2">,</span>
+                    <span class="s3">'RMS Value: {rms}'</span><span class="s2">,</span>
+                    <span class="s3">'Expected:  </span><span class="s2">\n    </span><span class="s3">{expected}'</span><span class="s2">,</span>
+                    <span class="s3">'Actual:    </span><span class="s2">\n    </span><span class="s3">{actual}'</span><span class="s2">,</span>
+                    <span class="s3">'Difference:</span><span class="s2">\n    </span><span class="s3">{diff}'</span><span class="s2">,</span>
+                    <span class="s3">'Tolerance: </span><span class="s2">\n    </span><span class="s3">{tol}'</span><span class="s2">, </span><span class="s1">]</span>
+        <span class="s1">results = </span><span class="s3">'</span><span class="s2">\n  </span><span class="s3">'</span><span class="s1">.join([line.format(**results) </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">template])</span>
+    <span class="s2">return </span><span class="s1">results</span>
+
+
+<span class="s2">def </span><span class="s1">save_diff_image(expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">, </span><span class="s1">output):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parameters 
+    ---------- 
+    expected : str 
+        File path of expected image. 
+    actual : str 
+        File path of actual image. 
+    output : str 
+        File path to save difference image to. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">expected_image = _load_image(expected)</span>
+    <span class="s1">actual_image = _load_image(actual)</span>
+    <span class="s1">actual_image</span><span class="s2">, </span><span class="s1">expected_image = crop_to_same(</span>
+        <span class="s1">actual</span><span class="s2">, </span><span class="s1">actual_image</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">, </span><span class="s1">expected_image)</span>
+    <span class="s1">expected_image = np.array(expected_image</span><span class="s2">, </span><span class="s1">float)</span>
+    <span class="s1">actual_image = np.array(actual_image</span><span class="s2">, </span><span class="s1">float)</span>
+    <span class="s2">if </span><span class="s1">expected_image.shape != actual_image.shape:</span>
+        <span class="s2">raise </span><span class="s1">ImageComparisonFailure(</span>
+            <span class="s3">&quot;Image sizes do not match expected size: {} &quot;</span>
+            <span class="s3">&quot;actual size {}&quot;</span><span class="s1">.format(expected_image.shape</span><span class="s2">, </span><span class="s1">actual_image.shape))</span>
+    <span class="s1">abs_diff = np.abs(expected_image - actual_image)</span>
+
+    <span class="s5"># expand differences in luminance domain</span>
+    <span class="s1">abs_diff *= </span><span class="s4">10</span>
+    <span class="s1">abs_diff = np.clip(abs_diff</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">255</span><span class="s1">).astype(np.uint8)</span>
+
+    <span class="s2">if </span><span class="s1">abs_diff.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">4</span><span class="s1">:  </span><span class="s5"># Hard-code the alpha channel to fully solid</span>
+        <span class="s1">abs_diff[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s4">3</span><span class="s1">] = </span><span class="s4">255</span>
+
+    <span class="s1">Image.fromarray(abs_diff).save(output</span><span class="s2">, </span><span class="s1">format=</span><span class="s3">&quot;png&quot;</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

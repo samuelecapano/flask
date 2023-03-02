@@ -1,0 +1,360 @@
+<html>
+<head>
+<title>grid_finder.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+grid_finder.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">matplotlib </span><span class="s0">import </span><span class="s1">ticker </span><span class="s0">as </span><span class="s1">mticker</span>
+<span class="s0">from </span><span class="s1">matplotlib.transforms </span><span class="s0">import </span><span class="s1">Bbox</span><span class="s0">, </span><span class="s1">Transform</span>
+
+
+<span class="s0">def </span><span class="s1">_find_line_box_crossings(xys</span><span class="s0">, </span><span class="s1">bbox):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Find the points where a polyline crosses a bbox, and the crossing angles. 
+ 
+    Parameters 
+    ---------- 
+    xys : (N, 2) array 
+        The polyline coordinates. 
+    bbox : `.Bbox` 
+        The bounding box. 
+ 
+    Returns 
+    ------- 
+    list of ((float, float), float) 
+        Four separate lists of crossings, for the left, right, bottom, and top 
+        sides of the bbox, respectively.  For each list, the entries are the 
+        ``((x, y), ccw_angle_in_degrees)`` of the crossing, where an angle of 0 
+        means that the polyline is moving to the right at the crossing point. 
+ 
+        The entries are computed by linearly interpolating at each crossing 
+        between the nearest points on either side of the bbox edges. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">crossings = []</span>
+    <span class="s1">dxys = xys[</span><span class="s3">1</span><span class="s1">:] - xys[:-</span><span class="s3">1</span><span class="s1">]</span>
+    <span class="s0">for </span><span class="s1">sl </span><span class="s0">in </span><span class="s1">[slice(</span><span class="s0">None</span><span class="s1">)</span><span class="s0">, </span><span class="s1">slice(</span><span class="s0">None, None, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">)]:</span>
+        <span class="s1">us</span><span class="s0">, </span><span class="s1">vs = xys.T[sl]  </span><span class="s4"># &quot;this&quot; coord, &quot;other&quot; coord</span>
+        <span class="s1">dus</span><span class="s0">, </span><span class="s1">dvs = dxys.T[sl]</span>
+        <span class="s1">umin</span><span class="s0">, </span><span class="s1">vmin = bbox.min[sl]</span>
+        <span class="s1">umax</span><span class="s0">, </span><span class="s1">vmax = bbox.max[sl]</span>
+        <span class="s0">for </span><span class="s1">u0</span><span class="s0">, </span><span class="s1">inside </span><span class="s0">in </span><span class="s1">[(umin</span><span class="s0">, </span><span class="s1">us &gt; umin)</span><span class="s0">, </span><span class="s1">(umax</span><span class="s0">, </span><span class="s1">us &lt; umax)]:</span>
+            <span class="s1">crossings.append([])</span>
+            <span class="s1">idxs</span><span class="s0">, </span><span class="s1">= (inside[:-</span><span class="s3">1</span><span class="s1">] ^ inside[</span><span class="s3">1</span><span class="s1">:]).nonzero()</span>
+            <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">idxs:</span>
+                <span class="s1">v = vs[idx] + (u0 - us[idx]) * dvs[idx] / dus[idx]</span>
+                <span class="s0">if not </span><span class="s1">vmin &lt;= v &lt;= vmax:</span>
+                    <span class="s0">continue</span>
+                <span class="s1">crossing = (u0</span><span class="s0">, </span><span class="s1">v)[sl]</span>
+                <span class="s1">theta = np.degrees(np.arctan2(*dxys[idx][::-</span><span class="s3">1</span><span class="s1">]))</span>
+                <span class="s1">crossings[-</span><span class="s3">1</span><span class="s1">].append((crossing</span><span class="s0">, </span><span class="s1">theta))</span>
+    <span class="s0">return </span><span class="s1">crossings</span>
+
+
+<span class="s0">class </span><span class="s1">ExtremeFinderSimple:</span>
+    <span class="s2">&quot;&quot;&quot; 
+    A helper class to figure out the range of grid lines that need to be drawn. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">nx</span><span class="s0">, </span><span class="s1">ny):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        nx, ny : int 
+            The number of samples in each direction. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.nx = nx</span>
+        <span class="s1">self.ny = ny</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">transform_xy</span><span class="s0">, </span><span class="s1">x1</span><span class="s0">, </span><span class="s1">y1</span><span class="s0">, </span><span class="s1">x2</span><span class="s0">, </span><span class="s1">y2):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Compute an approximation of the bounding box obtained by applying 
+        *transform_xy* to the box delimited by ``(x1, y1, x2, y2)``. 
+ 
+        The intended use is to have ``(x1, y1, x2, y2)`` in axes coordinates, 
+        and have *transform_xy* be the transform from axes coordinates to data 
+        coordinates; this method then returns the range of data coordinates 
+        that span the actual axes. 
+ 
+        The computation is done by sampling ``nx * ny`` equispaced points in 
+        the ``(x1, y1, x2, y2)`` box and finding the resulting points with 
+        extremal coordinates; then adding some padding to take into account the 
+        finite sampling. 
+ 
+        As each sampling step covers a relative range of *1/nx* or *1/ny*, 
+        the padding is computed by expanding the span covered by the extremal 
+        coordinates by these fractions. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">x</span><span class="s0">, </span><span class="s1">y = np.meshgrid(</span>
+            <span class="s1">np.linspace(x1</span><span class="s0">, </span><span class="s1">x2</span><span class="s0">, </span><span class="s1">self.nx)</span><span class="s0">, </span><span class="s1">np.linspace(y1</span><span class="s0">, </span><span class="s1">y2</span><span class="s0">, </span><span class="s1">self.ny))</span>
+        <span class="s1">xt</span><span class="s0">, </span><span class="s1">yt = transform_xy(np.ravel(x)</span><span class="s0">, </span><span class="s1">np.ravel(y))</span>
+        <span class="s0">return </span><span class="s1">self._add_pad(xt.min()</span><span class="s0">, </span><span class="s1">xt.max()</span><span class="s0">, </span><span class="s1">yt.min()</span><span class="s0">, </span><span class="s1">yt.max())</span>
+
+    <span class="s0">def </span><span class="s1">_add_pad(self</span><span class="s0">, </span><span class="s1">x_min</span><span class="s0">, </span><span class="s1">x_max</span><span class="s0">, </span><span class="s1">y_min</span><span class="s0">, </span><span class="s1">y_max):</span>
+        <span class="s2">&quot;&quot;&quot;Perform the padding mentioned in `__call__`.&quot;&quot;&quot;</span>
+        <span class="s1">dx = (x_max - x_min) / self.nx</span>
+        <span class="s1">dy = (y_max - y_min) / self.ny</span>
+        <span class="s0">return </span><span class="s1">x_min - dx</span><span class="s0">, </span><span class="s1">x_max + dx</span><span class="s0">, </span><span class="s1">y_min - dy</span><span class="s0">, </span><span class="s1">y_max + dy</span>
+
+
+<span class="s0">class </span><span class="s1">_User2DTransform(Transform):</span>
+    <span class="s2">&quot;&quot;&quot;A transform defined by two user-set functions.&quot;&quot;&quot;</span>
+
+    <span class="s1">input_dims = output_dims = </span><span class="s3">2</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">forward</span><span class="s0">, </span><span class="s1">backward):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        forward, backward : callable 
+            The forward and backward transforms, taking ``x`` and ``y`` as 
+            separate arguments and returning ``(tr_x, tr_y)``. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># The normal Matplotlib convention would be to take and return an</span>
+        <span class="s4"># (N, 2) array but axisartist uses the transposed version.</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self._forward = forward</span>
+        <span class="s1">self._backward = backward</span>
+
+    <span class="s0">def </span><span class="s1">transform_non_affine(self</span><span class="s0">, </span><span class="s1">values):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s0">return </span><span class="s1">np.transpose(self._forward(*np.transpose(values)))</span>
+
+    <span class="s0">def </span><span class="s1">inverted(self):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s0">return </span><span class="s1">type(self)(self._backward</span><span class="s0">, </span><span class="s1">self._forward)</span>
+
+
+<span class="s0">class </span><span class="s1">GridFinder:</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">,</span>
+                 <span class="s1">transform</span><span class="s0">,</span>
+                 <span class="s1">extreme_finder=</span><span class="s0">None,</span>
+                 <span class="s1">grid_locator1=</span><span class="s0">None,</span>
+                 <span class="s1">grid_locator2=</span><span class="s0">None,</span>
+                 <span class="s1">tick_formatter1=</span><span class="s0">None,</span>
+                 <span class="s1">tick_formatter2=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        transform : transform from the image coordinate (which will be 
+        the transData of the axes to the world coordinate). 
+ 
+        or transform = (transform_xy, inv_transform_xy) 
+ 
+        locator1, locator2 : grid locator for 1st and 2nd axis. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">extreme_finder </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">extreme_finder = ExtremeFinderSimple(</span><span class="s3">20</span><span class="s0">, </span><span class="s3">20</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">grid_locator1 </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">grid_locator1 = MaxNLocator()</span>
+        <span class="s0">if </span><span class="s1">grid_locator2 </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">grid_locator2 = MaxNLocator()</span>
+        <span class="s0">if </span><span class="s1">tick_formatter1 </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">tick_formatter1 = FormatterPrettyPrint()</span>
+        <span class="s0">if </span><span class="s1">tick_formatter2 </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">tick_formatter2 = FormatterPrettyPrint()</span>
+        <span class="s1">self.extreme_finder = extreme_finder</span>
+        <span class="s1">self.grid_locator1 = grid_locator1</span>
+        <span class="s1">self.grid_locator2 = grid_locator2</span>
+        <span class="s1">self.tick_formatter1 = tick_formatter1</span>
+        <span class="s1">self.tick_formatter2 = tick_formatter2</span>
+        <span class="s1">self.set_transform(transform)</span>
+
+    <span class="s0">def </span><span class="s1">get_grid_info(self</span><span class="s0">, </span><span class="s1">x1</span><span class="s0">, </span><span class="s1">y1</span><span class="s0">, </span><span class="s1">x2</span><span class="s0">, </span><span class="s1">y2):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        lon_values, lat_values : list of grid values. if integer is given, 
+                           rough number of grids in each direction. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">extremes = self.extreme_finder(self.inv_transform_xy</span><span class="s0">, </span><span class="s1">x1</span><span class="s0">, </span><span class="s1">y1</span><span class="s0">, </span><span class="s1">x2</span><span class="s0">, </span><span class="s1">y2)</span>
+
+        <span class="s4"># min &amp; max rage of lat (or lon) for each grid line will be drawn.</span>
+        <span class="s4"># i.e., gridline of lon=0 will be drawn from lat_min to lat_max.</span>
+
+        <span class="s1">lon_min</span><span class="s0">, </span><span class="s1">lon_max</span><span class="s0">, </span><span class="s1">lat_min</span><span class="s0">, </span><span class="s1">lat_max = extremes</span>
+        <span class="s1">lon_levs</span><span class="s0">, </span><span class="s1">lon_n</span><span class="s0">, </span><span class="s1">lon_factor = self.grid_locator1(lon_min</span><span class="s0">, </span><span class="s1">lon_max)</span>
+        <span class="s1">lon_levs = np.asarray(lon_levs)</span>
+        <span class="s1">lat_levs</span><span class="s0">, </span><span class="s1">lat_n</span><span class="s0">, </span><span class="s1">lat_factor = self.grid_locator2(lat_min</span><span class="s0">, </span><span class="s1">lat_max)</span>
+        <span class="s1">lat_levs = np.asarray(lat_levs)</span>
+
+        <span class="s1">lon_values = lon_levs[:lon_n] / lon_factor</span>
+        <span class="s1">lat_values = lat_levs[:lat_n] / lat_factor</span>
+
+        <span class="s1">lon_lines</span><span class="s0">, </span><span class="s1">lat_lines = self._get_raw_grid_lines(lon_values</span><span class="s0">,</span>
+                                                        <span class="s1">lat_values</span><span class="s0">,</span>
+                                                        <span class="s1">lon_min</span><span class="s0">, </span><span class="s1">lon_max</span><span class="s0">,</span>
+                                                        <span class="s1">lat_min</span><span class="s0">, </span><span class="s1">lat_max)</span>
+
+        <span class="s1">ddx = (x2-x1)*</span><span class="s3">1.e-10</span>
+        <span class="s1">ddy = (y2-y1)*</span><span class="s3">1.e-10</span>
+        <span class="s1">bb = Bbox.from_extents(x1-ddx</span><span class="s0">, </span><span class="s1">y1-ddy</span><span class="s0">, </span><span class="s1">x2+ddx</span><span class="s0">, </span><span class="s1">y2+ddy)</span>
+
+        <span class="s1">grid_info = {</span>
+            <span class="s5">&quot;extremes&quot;</span><span class="s1">: extremes</span><span class="s0">,</span>
+            <span class="s5">&quot;lon_lines&quot;</span><span class="s1">: lon_lines</span><span class="s0">,</span>
+            <span class="s5">&quot;lat_lines&quot;</span><span class="s1">: lat_lines</span><span class="s0">,</span>
+            <span class="s5">&quot;lon&quot;</span><span class="s1">: self._clip_grid_lines_and_find_ticks(</span>
+                <span class="s1">lon_lines</span><span class="s0">, </span><span class="s1">lon_values</span><span class="s0">, </span><span class="s1">lon_levs</span><span class="s0">, </span><span class="s1">bb)</span><span class="s0">,</span>
+            <span class="s5">&quot;lat&quot;</span><span class="s1">: self._clip_grid_lines_and_find_ticks(</span>
+                <span class="s1">lat_lines</span><span class="s0">, </span><span class="s1">lat_values</span><span class="s0">, </span><span class="s1">lat_levs</span><span class="s0">, </span><span class="s1">bb)</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+        <span class="s1">tck_labels = grid_info[</span><span class="s5">&quot;lon&quot;</span><span class="s1">][</span><span class="s5">&quot;tick_labels&quot;</span><span class="s1">] = {}</span>
+        <span class="s0">for </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">[</span><span class="s5">&quot;left&quot;</span><span class="s0">, </span><span class="s5">&quot;bottom&quot;</span><span class="s0">, </span><span class="s5">&quot;right&quot;</span><span class="s0">, </span><span class="s5">&quot;top&quot;</span><span class="s1">]:</span>
+            <span class="s1">levs = grid_info[</span><span class="s5">&quot;lon&quot;</span><span class="s1">][</span><span class="s5">&quot;tick_levels&quot;</span><span class="s1">][direction]</span>
+            <span class="s1">tck_labels[direction] = self.tick_formatter1(</span>
+                <span class="s1">direction</span><span class="s0">, </span><span class="s1">lon_factor</span><span class="s0">, </span><span class="s1">levs)</span>
+
+        <span class="s1">tck_labels = grid_info[</span><span class="s5">&quot;lat&quot;</span><span class="s1">][</span><span class="s5">&quot;tick_labels&quot;</span><span class="s1">] = {}</span>
+        <span class="s0">for </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">[</span><span class="s5">&quot;left&quot;</span><span class="s0">, </span><span class="s5">&quot;bottom&quot;</span><span class="s0">, </span><span class="s5">&quot;right&quot;</span><span class="s0">, </span><span class="s5">&quot;top&quot;</span><span class="s1">]:</span>
+            <span class="s1">levs = grid_info[</span><span class="s5">&quot;lat&quot;</span><span class="s1">][</span><span class="s5">&quot;tick_levels&quot;</span><span class="s1">][direction]</span>
+            <span class="s1">tck_labels[direction] = self.tick_formatter2(</span>
+                <span class="s1">direction</span><span class="s0">, </span><span class="s1">lat_factor</span><span class="s0">, </span><span class="s1">levs)</span>
+
+        <span class="s0">return </span><span class="s1">grid_info</span>
+
+    <span class="s0">def </span><span class="s1">_get_raw_grid_lines(self</span><span class="s0">,</span>
+                            <span class="s1">lon_values</span><span class="s0">, </span><span class="s1">lat_values</span><span class="s0">,</span>
+                            <span class="s1">lon_min</span><span class="s0">, </span><span class="s1">lon_max</span><span class="s0">, </span><span class="s1">lat_min</span><span class="s0">, </span><span class="s1">lat_max):</span>
+
+        <span class="s1">lons_i = np.linspace(lon_min</span><span class="s0">, </span><span class="s1">lon_max</span><span class="s0">, </span><span class="s3">100</span><span class="s1">)  </span><span class="s4"># for interpolation</span>
+        <span class="s1">lats_i = np.linspace(lat_min</span><span class="s0">, </span><span class="s1">lat_max</span><span class="s0">, </span><span class="s3">100</span><span class="s1">)</span>
+
+        <span class="s1">lon_lines = [self.transform_xy(np.full_like(lats_i</span><span class="s0">, </span><span class="s1">lon)</span><span class="s0">, </span><span class="s1">lats_i)</span>
+                     <span class="s0">for </span><span class="s1">lon </span><span class="s0">in </span><span class="s1">lon_values]</span>
+        <span class="s1">lat_lines = [self.transform_xy(lons_i</span><span class="s0">, </span><span class="s1">np.full_like(lons_i</span><span class="s0">, </span><span class="s1">lat))</span>
+                     <span class="s0">for </span><span class="s1">lat </span><span class="s0">in </span><span class="s1">lat_values]</span>
+
+        <span class="s0">return </span><span class="s1">lon_lines</span><span class="s0">, </span><span class="s1">lat_lines</span>
+
+    <span class="s0">def </span><span class="s1">_clip_grid_lines_and_find_ticks(self</span><span class="s0">, </span><span class="s1">lines</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">levs</span><span class="s0">, </span><span class="s1">bb):</span>
+        <span class="s1">gi = {</span>
+            <span class="s5">&quot;values&quot;</span><span class="s1">: []</span><span class="s0">,</span>
+            <span class="s5">&quot;levels&quot;</span><span class="s1">: []</span><span class="s0">,</span>
+            <span class="s5">&quot;tick_levels&quot;</span><span class="s1">: dict(left=[]</span><span class="s0">, </span><span class="s1">bottom=[]</span><span class="s0">, </span><span class="s1">right=[]</span><span class="s0">, </span><span class="s1">top=[])</span><span class="s0">,</span>
+            <span class="s5">&quot;tick_locs&quot;</span><span class="s1">: dict(left=[]</span><span class="s0">, </span><span class="s1">bottom=[]</span><span class="s0">, </span><span class="s1">right=[]</span><span class="s0">, </span><span class="s1">top=[])</span><span class="s0">,</span>
+            <span class="s5">&quot;lines&quot;</span><span class="s1">: []</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+        <span class="s1">tck_levels = gi[</span><span class="s5">&quot;tick_levels&quot;</span><span class="s1">]</span>
+        <span class="s1">tck_locs = gi[</span><span class="s5">&quot;tick_locs&quot;</span><span class="s1">]</span>
+        <span class="s0">for </span><span class="s1">(lx</span><span class="s0">, </span><span class="s1">ly)</span><span class="s0">, </span><span class="s1">v</span><span class="s0">, </span><span class="s1">lev </span><span class="s0">in </span><span class="s1">zip(lines</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">levs):</span>
+            <span class="s1">tcks = _find_line_box_crossings(np.column_stack([lx</span><span class="s0">, </span><span class="s1">ly])</span><span class="s0">, </span><span class="s1">bb)</span>
+            <span class="s1">gi[</span><span class="s5">&quot;levels&quot;</span><span class="s1">].append(v)</span>
+            <span class="s1">gi[</span><span class="s5">&quot;lines&quot;</span><span class="s1">].append([(lx</span><span class="s0">, </span><span class="s1">ly)])</span>
+
+            <span class="s0">for </span><span class="s1">tck</span><span class="s0">, </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">zip(tcks</span><span class="s0">,</span>
+                                      <span class="s1">[</span><span class="s5">&quot;left&quot;</span><span class="s0">, </span><span class="s5">&quot;right&quot;</span><span class="s0">, </span><span class="s5">&quot;bottom&quot;</span><span class="s0">, </span><span class="s5">&quot;top&quot;</span><span class="s1">]):</span>
+                <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">tck:</span>
+                    <span class="s1">tck_levels[direction].append(lev)</span>
+                    <span class="s1">tck_locs[direction].append(t)</span>
+
+        <span class="s0">return </span><span class="s1">gi</span>
+
+    <span class="s0">def </span><span class="s1">set_transform(self</span><span class="s0">, </span><span class="s1">aux_trans):</span>
+        <span class="s0">if </span><span class="s1">isinstance(aux_trans</span><span class="s0">, </span><span class="s1">Transform):</span>
+            <span class="s1">self._aux_transform = aux_trans</span>
+        <span class="s0">elif </span><span class="s1">len(aux_trans) == </span><span class="s3">2 </span><span class="s0">and </span><span class="s1">all(map(callable</span><span class="s0">, </span><span class="s1">aux_trans)):</span>
+            <span class="s1">self._aux_transform = _User2DTransform(*aux_trans)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s5">&quot;'aux_trans' must be either a Transform &quot;</span>
+                            <span class="s5">&quot;instance or a pair of callables&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">get_transform(self):</span>
+        <span class="s0">return </span><span class="s1">self._aux_transform</span>
+
+    <span class="s1">update_transform = set_transform  </span><span class="s4"># backcompat alias.</span>
+
+    <span class="s0">def </span><span class="s1">transform_xy(self</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y):</span>
+        <span class="s0">return </span><span class="s1">self._aux_transform.transform(np.column_stack([x</span><span class="s0">, </span><span class="s1">y])).T</span>
+
+    <span class="s0">def </span><span class="s1">inv_transform_xy(self</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y):</span>
+        <span class="s0">return </span><span class="s1">self._aux_transform.inverted().transform(</span>
+            <span class="s1">np.column_stack([x</span><span class="s0">, </span><span class="s1">y])).T</span>
+
+    <span class="s0">def </span><span class="s1">update(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">kwargs.items():</span>
+            <span class="s0">if </span><span class="s1">k </span><span class="s0">in </span><span class="s1">[</span><span class="s5">&quot;extreme_finder&quot;</span><span class="s0">,</span>
+                     <span class="s5">&quot;grid_locator1&quot;</span><span class="s0">,</span>
+                     <span class="s5">&quot;grid_locator2&quot;</span><span class="s0">,</span>
+                     <span class="s5">&quot;tick_formatter1&quot;</span><span class="s0">,</span>
+                     <span class="s5">&quot;tick_formatter2&quot;</span><span class="s1">]:</span>
+                <span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s5">f&quot;Unknown update property </span><span class="s0">{</span><span class="s1">k</span><span class="s0">!r}</span><span class="s5">&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">MaxNLocator(mticker.MaxNLocator):</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">nbins=</span><span class="s3">10</span><span class="s0">, </span><span class="s1">steps=</span><span class="s0">None,</span>
+                 <span class="s1">trim=</span><span class="s0">True,</span>
+                 <span class="s1">integer=</span><span class="s0">False,</span>
+                 <span class="s1">symmetric=</span><span class="s0">False,</span>
+                 <span class="s1">prune=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s4"># trim argument has no effect. It has been left for API compatibility</span>
+        <span class="s1">super().__init__(nbins</span><span class="s0">, </span><span class="s1">steps=steps</span><span class="s0">, </span><span class="s1">integer=integer</span><span class="s0">,</span>
+                         <span class="s1">symmetric=symmetric</span><span class="s0">, </span><span class="s1">prune=prune)</span>
+        <span class="s1">self.create_dummy_axis()</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">v1</span><span class="s0">, </span><span class="s1">v2):</span>
+        <span class="s1">locs = super().tick_values(v1</span><span class="s0">, </span><span class="s1">v2)</span>
+        <span class="s0">return </span><span class="s1">np.array(locs)</span><span class="s0">, </span><span class="s1">len(locs)</span><span class="s0">, </span><span class="s3">1  </span><span class="s4"># 1: factor (see angle_helper)</span>
+
+
+<span class="s0">class </span><span class="s1">FixedLocator:</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">locs):</span>
+        <span class="s1">self._locs = locs</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">v1</span><span class="s0">, </span><span class="s1">v2):</span>
+        <span class="s1">v1</span><span class="s0">, </span><span class="s1">v2 = sorted([v1</span><span class="s0">, </span><span class="s1">v2])</span>
+        <span class="s1">locs = np.array([l </span><span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">self._locs </span><span class="s0">if </span><span class="s1">v1 &lt;= l &lt;= v2])</span>
+        <span class="s0">return </span><span class="s1">locs</span><span class="s0">, </span><span class="s1">len(locs)</span><span class="s0">, </span><span class="s3">1  </span><span class="s4"># 1: factor (see angle_helper)</span>
+
+
+<span class="s4"># Tick Formatter</span>
+
+<span class="s0">class </span><span class="s1">FormatterPrettyPrint:</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">useMathText=</span><span class="s0">True</span><span class="s1">):</span>
+        <span class="s1">self._fmt = mticker.ScalarFormatter(</span>
+            <span class="s1">useMathText=useMathText</span><span class="s0">, </span><span class="s1">useOffset=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s1">self._fmt.create_dummy_axis()</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">direction</span><span class="s0">, </span><span class="s1">factor</span><span class="s0">, </span><span class="s1">values):</span>
+        <span class="s0">return </span><span class="s1">self._fmt.format_ticks(values)</span>
+
+
+<span class="s0">class </span><span class="s1">DictFormatter:</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">format_dict</span><span class="s0">, </span><span class="s1">formatter=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        format_dict : dictionary for format strings to be used. 
+        formatter : fall-back formatter 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self._format_dict = format_dict</span>
+        <span class="s1">self._fallback_formatter = formatter</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">direction</span><span class="s0">, </span><span class="s1">factor</span><span class="s0">, </span><span class="s1">values):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        factor is ignored if value is found in the dictionary 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._fallback_formatter:</span>
+            <span class="s1">fallback_strings = self._fallback_formatter(</span>
+                <span class="s1">direction</span><span class="s0">, </span><span class="s1">factor</span><span class="s0">, </span><span class="s1">values)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">fallback_strings = [</span><span class="s5">&quot;&quot;</span><span class="s1">] * len(values)</span>
+        <span class="s0">return </span><span class="s1">[self._format_dict.get(k</span><span class="s0">, </span><span class="s1">v)</span>
+                <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">zip(values</span><span class="s0">, </span><span class="s1">fallback_strings)]</span>
+</pre>
+</body>
+</html>

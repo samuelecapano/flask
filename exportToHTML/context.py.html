@@ -1,0 +1,235 @@
+<html>
+<head>
+<title>context.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+context.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">subprocess</span>
+<span class="s0">import </span><span class="s1">contextlib</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">tempfile</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">operator</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">pushd(dir):</span>
+    <span class="s1">orig = os.getcwd()</span>
+    <span class="s1">os.chdir(dir)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">yield </span><span class="s1">dir</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">os.chdir(orig)</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">tarball_context(url</span><span class="s0">, </span><span class="s1">target_dir=</span><span class="s0">None, </span><span class="s1">runner=</span><span class="s0">None, </span><span class="s1">pushd=pushd):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Get a tarball, extract it, change to that directory, yield, then 
+    clean up. 
+    `runner` is the function to invoke commands. 
+    `pushd` is a context manager for changing the directory. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">target_dir </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">target_dir = os.path.basename(url).replace(</span><span class="s3">'.tar.gz'</span><span class="s0">, </span><span class="s3">''</span><span class="s1">).replace(</span><span class="s3">'.tgz'</span><span class="s0">, </span><span class="s3">''</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">runner </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">runner = functools.partial(subprocess.check_call</span><span class="s0">, </span><span class="s1">shell=</span><span class="s0">True</span><span class="s1">)</span>
+    <span class="s4"># In the tar command, use --strip-components=1 to strip the first path and</span>
+    <span class="s4">#  then</span>
+    <span class="s4">#  use -C to cause the files to be extracted to {target_dir}. This ensures</span>
+    <span class="s4">#  that we always know where the files were extracted.</span>
+    <span class="s1">runner(</span><span class="s3">'mkdir {target_dir}'</span><span class="s1">.format(**vars()))</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">getter = </span><span class="s3">'wget {url} -O -'</span>
+        <span class="s1">extract = </span><span class="s3">'tar x{compression} --strip-components=1 -C {target_dir}'</span>
+        <span class="s1">cmd = </span><span class="s3">' | '</span><span class="s1">.join((getter</span><span class="s0">, </span><span class="s1">extract))</span>
+        <span class="s1">runner(cmd.format(compression=infer_compression(url)</span><span class="s0">, </span><span class="s1">**vars()))</span>
+        <span class="s0">with </span><span class="s1">pushd(target_dir):</span>
+            <span class="s0">yield </span><span class="s1">target_dir</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">runner(</span><span class="s3">'rm -Rf {target_dir}'</span><span class="s1">.format(**vars()))</span>
+
+
+<span class="s0">def </span><span class="s1">infer_compression(url):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Given a URL or filename, infer the compression code for tar. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># cheat and just assume it's the last two characters</span>
+    <span class="s1">compression_indicator = url[-</span><span class="s5">2</span><span class="s1">:]</span>
+    <span class="s1">mapping = dict(gz=</span><span class="s3">'z'</span><span class="s0">, </span><span class="s1">bz=</span><span class="s3">'j'</span><span class="s0">, </span><span class="s1">xz=</span><span class="s3">'J'</span><span class="s1">)</span>
+    <span class="s4"># Assume 'z' (gzip) if no match</span>
+    <span class="s0">return </span><span class="s1">mapping.get(compression_indicator</span><span class="s0">, </span><span class="s3">'z'</span><span class="s1">)</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">temp_dir(remover=shutil.rmtree):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Create a temporary directory context. Pass a custom remover 
+    to override the removal behavior. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">temp_dir = tempfile.mkdtemp()</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">yield </span><span class="s1">temp_dir</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">remover(temp_dir)</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">repo_context(url</span><span class="s0">, </span><span class="s1">branch=</span><span class="s0">None, </span><span class="s1">quiet=</span><span class="s0">True, </span><span class="s1">dest_ctx=temp_dir):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Check out the repo indicated by url. 
+ 
+    If dest_ctx is supplied, it should be a context manager 
+    to yield the target directory for the check out. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">exe = </span><span class="s3">'git' </span><span class="s0">if </span><span class="s3">'git' </span><span class="s0">in </span><span class="s1">url </span><span class="s0">else </span><span class="s3">'hg'</span>
+    <span class="s0">with </span><span class="s1">dest_ctx() </span><span class="s0">as </span><span class="s1">repo_dir:</span>
+        <span class="s1">cmd = [exe</span><span class="s0">, </span><span class="s3">'clone'</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">repo_dir]</span>
+        <span class="s0">if </span><span class="s1">branch:</span>
+            <span class="s1">cmd.extend([</span><span class="s3">'--branch'</span><span class="s0">, </span><span class="s1">branch])</span>
+        <span class="s1">devnull = open(os.path.devnull</span><span class="s0">, </span><span class="s3">'w'</span><span class="s1">)</span>
+        <span class="s1">stdout = devnull </span><span class="s0">if </span><span class="s1">quiet </span><span class="s0">else None</span>
+        <span class="s1">subprocess.check_call(cmd</span><span class="s0">, </span><span class="s1">stdout=stdout)</span>
+        <span class="s0">yield </span><span class="s1">repo_dir</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">null():</span>
+    <span class="s0">yield</span>
+
+
+<span class="s0">class </span><span class="s1">ExceptionTrap:</span>
+    <span class="s2">&quot;&quot;&quot; 
+    A context manager that will catch certain exceptions and provide an 
+    indication they occurred. 
+ 
+    &gt;&gt;&gt; with ExceptionTrap() as trap: 
+    ...     raise Exception() 
+    &gt;&gt;&gt; bool(trap) 
+    True 
+ 
+    &gt;&gt;&gt; with ExceptionTrap() as trap: 
+    ...     pass 
+    &gt;&gt;&gt; bool(trap) 
+    False 
+ 
+    &gt;&gt;&gt; with ExceptionTrap(ValueError) as trap: 
+    ...     raise ValueError(&quot;1 + 1 is not 3&quot;) 
+    &gt;&gt;&gt; bool(trap) 
+    True 
+ 
+    &gt;&gt;&gt; with ExceptionTrap(ValueError) as trap: 
+    ...     raise Exception() 
+    Traceback (most recent call last): 
+    ... 
+    Exception 
+ 
+    &gt;&gt;&gt; bool(trap) 
+    False 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">exc_info = </span><span class="s0">None, None, None</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">exceptions=(Exception</span><span class="s0">,</span><span class="s1">)):</span>
+        <span class="s1">self.exceptions = exceptions</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">type(self):</span>
+        <span class="s0">return </span><span class="s1">self.exc_info[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">value(self):</span>
+        <span class="s0">return </span><span class="s1">self.exc_info[</span><span class="s5">1</span><span class="s1">]</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">tb(self):</span>
+        <span class="s0">return </span><span class="s1">self.exc_info[</span><span class="s5">2</span><span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">*exc_info):</span>
+        <span class="s1">type = exc_info[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">matches = type </span><span class="s0">and </span><span class="s1">issubclass(type</span><span class="s0">, </span><span class="s1">self.exceptions)</span>
+        <span class="s0">if </span><span class="s1">matches:</span>
+            <span class="s1">self.exc_info = exc_info</span>
+        <span class="s0">return </span><span class="s1">matches</span>
+
+    <span class="s0">def </span><span class="s1">__bool__(self):</span>
+        <span class="s0">return </span><span class="s1">bool(self.type)</span>
+
+    <span class="s0">def </span><span class="s1">raises(self</span><span class="s0">, </span><span class="s1">func</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">_test=bool):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Wrap func and replace the result with the truth 
+        value of the trap (True if an exception occurred). 
+ 
+        First, give the decorator an alias to support Python 3.8 
+        Syntax. 
+ 
+        &gt;&gt;&gt; raises = ExceptionTrap(ValueError).raises 
+ 
+        Now decorate a function that always fails. 
+ 
+        &gt;&gt;&gt; @raises 
+        ... def fail(): 
+        ...     raise ValueError('failed') 
+        &gt;&gt;&gt; fail() 
+        True 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">@functools.wraps(func)</span>
+        <span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+            <span class="s0">with </span><span class="s1">ExceptionTrap(self.exceptions) </span><span class="s0">as </span><span class="s1">trap:</span>
+                <span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s0">return </span><span class="s1">_test(trap)</span>
+
+        <span class="s0">return </span><span class="s1">wrapper</span>
+
+    <span class="s0">def </span><span class="s1">passes(self</span><span class="s0">, </span><span class="s1">func):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Wrap func and replace the result with the truth 
+        value of the trap (True if no exception). 
+ 
+        First, give the decorator an alias to support Python 3.8 
+        Syntax. 
+ 
+        &gt;&gt;&gt; passes = ExceptionTrap(ValueError).passes 
+ 
+        Now decorate a function that always fails. 
+ 
+        &gt;&gt;&gt; @passes 
+        ... def fail(): 
+        ...     raise ValueError('failed') 
+ 
+        &gt;&gt;&gt; fail() 
+        False 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.raises(func</span><span class="s0">, </span><span class="s1">_test=operator.not_)</span>
+
+
+<span class="s0">class </span><span class="s1">suppress(contextlib.suppress</span><span class="s0">, </span><span class="s1">contextlib.ContextDecorator):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    A version of contextlib.suppress with decorator support. 
+ 
+    &gt;&gt;&gt; @suppress(KeyError) 
+    ... def key_error(): 
+    ...     {}[''] 
+    &gt;&gt;&gt; key_error() 
+    &quot;&quot;&quot;</span>
+</pre>
+</body>
+</html>

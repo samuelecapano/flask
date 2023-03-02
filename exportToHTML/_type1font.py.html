@@ -1,0 +1,900 @@
+<html>
+<head>
+<title>_type1font.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_type1font.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A class representing a Type 1 font. 
+ 
+This version reads pfa and pfb files and splits them for embedding in 
+pdf files. It also supports SlantFont and ExtendFont transformations, 
+similarly to pdfTeX and friends. There is no support yet for subsetting. 
+ 
+Usage:: 
+ 
+    font = Type1Font(filename) 
+    clear_part, encrypted_part, finale = font.parts 
+    slanted_font = font.transform({'slant': 0.167}) 
+    extended_font = font.transform({'extend': 1.2}) 
+ 
+Sources: 
+ 
+* Adobe Technical Note #5040, Supporting Downloadable PostScript 
+  Language Fonts. 
+ 
+* Adobe Type 1 Font Format, Adobe Systems Incorporated, third printing, 
+  v1.1, 1993. ISBN 0-201-57044-0. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">binascii</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">string</span>
+<span class="s2">import </span><span class="s1">struct</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib.cbook </span><span class="s2">import </span><span class="s1">_format_approx</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">_api</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+
+<span class="s2">class </span><span class="s1">_Token:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A token in a PostScript stream. 
+ 
+    Attributes 
+    ---------- 
+    pos : int 
+        Position, i.e. offset from the beginning of the data. 
+    raw : str 
+        Raw text of the token. 
+    kind : str 
+        Description of the token (for debugging or testing). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ = (</span><span class="s3">'pos'</span><span class="s2">, </span><span class="s3">'raw'</span><span class="s1">)</span>
+    <span class="s1">kind = </span><span class="s3">'?'</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">pos</span><span class="s2">, </span><span class="s1">raw):</span>
+        <span class="s1">_log.debug(</span><span class="s3">'type1font._Token %s at %d: %r'</span><span class="s2">, </span><span class="s1">self.kind</span><span class="s2">, </span><span class="s1">pos</span><span class="s2">, </span><span class="s1">raw)</span>
+        <span class="s1">self.pos = pos</span>
+        <span class="s1">self.raw = raw</span>
+
+    <span class="s2">def </span><span class="s1">__str__(self):</span>
+        <span class="s2">return </span><span class="s3">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self.kind</span><span class="s2">} {</span><span class="s1">self.raw</span><span class="s2">} </span><span class="s3">@</span><span class="s2">{</span><span class="s1">self.pos</span><span class="s2">}</span><span class="s3">&gt;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">endpos(self):</span>
+        <span class="s0">&quot;&quot;&quot;Position one past the end of the token&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.pos + len(self.raw)</span>
+
+    <span class="s2">def </span><span class="s1">is_keyword(self</span><span class="s2">, </span><span class="s1">*names):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a name token with one of the names?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">is_slash_name(self):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a name token that starts with a slash?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">is_delim(self):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a delimiter token?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">is_number(self):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a number token?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">value(self):</span>
+        <span class="s2">return </span><span class="s1">self.raw</span>
+
+
+<span class="s2">class </span><span class="s1">_NameToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'name'</span>
+
+    <span class="s2">def </span><span class="s1">is_slash_name(self):</span>
+        <span class="s2">return </span><span class="s1">self.raw.startswith(</span><span class="s3">'/'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">value(self):</span>
+        <span class="s2">return </span><span class="s1">self.raw[</span><span class="s4">1</span><span class="s1">:]</span>
+
+
+<span class="s2">class </span><span class="s1">_BooleanToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'boolean'</span>
+
+    <span class="s2">def </span><span class="s1">value(self):</span>
+        <span class="s2">return </span><span class="s1">self.raw == </span><span class="s3">'true'</span>
+
+
+<span class="s2">class </span><span class="s1">_KeywordToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'keyword'</span>
+
+    <span class="s2">def </span><span class="s1">is_keyword(self</span><span class="s2">, </span><span class="s1">*names):</span>
+        <span class="s2">return </span><span class="s1">self.raw </span><span class="s2">in </span><span class="s1">names</span>
+
+
+<span class="s2">class </span><span class="s1">_DelimiterToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'delimiter'</span>
+
+    <span class="s2">def </span><span class="s1">is_delim(self):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">opposite(self):</span>
+        <span class="s2">return </span><span class="s1">{</span><span class="s3">'['</span><span class="s1">: </span><span class="s3">']'</span><span class="s2">, </span><span class="s3">']'</span><span class="s1">: </span><span class="s3">'['</span><span class="s2">,</span>
+                <span class="s3">'{'</span><span class="s1">: </span><span class="s3">'}'</span><span class="s2">, </span><span class="s3">'}'</span><span class="s1">: </span><span class="s3">'{'</span><span class="s2">,</span>
+                <span class="s3">'&lt;&lt;'</span><span class="s1">: </span><span class="s3">'&gt;&gt;'</span><span class="s2">, </span><span class="s3">'&gt;&gt;'</span><span class="s1">: </span><span class="s3">'&lt;&lt;'</span>
+                <span class="s1">}[self.raw]</span>
+
+
+<span class="s2">class </span><span class="s1">_WhitespaceToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'whitespace'</span>
+
+
+<span class="s2">class </span><span class="s1">_StringToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'string'</span>
+    <span class="s1">_escapes_re = re.compile(</span><span class="s3">r'\\([\\()nrtbf]|[0-7]{1,3})'</span><span class="s1">)</span>
+    <span class="s1">_replacements = {</span><span class="s3">'</span><span class="s2">\\</span><span class="s3">'</span><span class="s1">: </span><span class="s3">'</span><span class="s2">\\</span><span class="s3">'</span><span class="s2">, </span><span class="s3">'('</span><span class="s1">: </span><span class="s3">'('</span><span class="s2">, </span><span class="s3">')'</span><span class="s1">: </span><span class="s3">')'</span><span class="s2">, </span><span class="s3">'n'</span><span class="s1">: </span><span class="s3">'</span><span class="s2">\n</span><span class="s3">'</span><span class="s2">,</span>
+                     <span class="s3">'r'</span><span class="s1">: </span><span class="s3">'</span><span class="s2">\r</span><span class="s3">'</span><span class="s2">, </span><span class="s3">'t'</span><span class="s1">: </span><span class="s3">'</span><span class="s2">\t</span><span class="s3">'</span><span class="s2">, </span><span class="s3">'b'</span><span class="s1">: </span><span class="s3">'</span><span class="s2">\b</span><span class="s3">'</span><span class="s2">, </span><span class="s3">'f'</span><span class="s1">: </span><span class="s3">'</span><span class="s2">\f</span><span class="s3">'</span><span class="s1">}</span>
+    <span class="s1">_ws_re = re.compile(</span><span class="s3">'[</span><span class="s2">\0\t\r\f\n </span><span class="s3">]'</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_escape(cls</span><span class="s2">, </span><span class="s1">match):</span>
+        <span class="s1">group = match.group(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">cls._replacements[group]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s2">return </span><span class="s1">chr(int(group</span><span class="s2">, </span><span class="s4">8</span><span class="s1">))</span>
+
+    <span class="s1">@functools.lru_cache()</span>
+    <span class="s2">def </span><span class="s1">value(self):</span>
+        <span class="s2">if </span><span class="s1">self.raw[</span><span class="s4">0</span><span class="s1">] == </span><span class="s3">'('</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._escapes_re.sub(self._escape</span><span class="s2">, </span><span class="s1">self.raw[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">data = self._ws_re.sub(</span><span class="s3">''</span><span class="s2">, </span><span class="s1">self.raw[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">])</span>
+            <span class="s2">if </span><span class="s1">len(data) % </span><span class="s4">2 </span><span class="s1">== </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">data += </span><span class="s3">'0'</span>
+            <span class="s2">return </span><span class="s1">binascii.unhexlify(data)</span>
+
+
+<span class="s2">class </span><span class="s1">_BinaryToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'binary'</span>
+
+    <span class="s2">def </span><span class="s1">value(self):</span>
+        <span class="s2">return </span><span class="s1">self.raw[</span><span class="s4">1</span><span class="s1">:]</span>
+
+
+<span class="s2">class </span><span class="s1">_NumberToken(_Token):</span>
+    <span class="s1">kind = </span><span class="s3">'number'</span>
+
+    <span class="s2">def </span><span class="s1">is_number(self):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">value(self):</span>
+        <span class="s2">if </span><span class="s3">'.' </span><span class="s2">not in </span><span class="s1">self.raw:</span>
+            <span class="s2">return </span><span class="s1">int(self.raw)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">float(self.raw)</span>
+
+
+<span class="s2">def </span><span class="s1">_tokenize(data: bytes</span><span class="s2">, </span><span class="s1">skip_ws: bool):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A generator that produces _Token instances from Type-1 font code. 
+ 
+    The consumer of the generator may send an integer to the tokenizer to 
+    indicate that the next token should be _BinaryToken of the given length. 
+ 
+    Parameters 
+    ---------- 
+    data : bytes 
+        The data of the font to tokenize. 
+ 
+    skip_ws : bool 
+        If true, the generator will drop any _WhitespaceTokens from the output. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">text = data.decode(</span><span class="s3">'ascii'</span><span class="s2">, </span><span class="s3">'replace'</span><span class="s1">)</span>
+    <span class="s1">whitespace_or_comment_re = re.compile(</span><span class="s3">r'[\0\t\r\f\n ]+|%[^\r\n]*'</span><span class="s1">)</span>
+    <span class="s1">token_re = re.compile(</span><span class="s3">r'/{0,2}[^]\0\t\r\f\n ()&lt;&gt;{}/%[]+'</span><span class="s1">)</span>
+    <span class="s1">instring_re = re.compile(</span><span class="s3">r'[()\\]'</span><span class="s1">)</span>
+    <span class="s1">hex_re = re.compile(</span><span class="s3">r'^&lt;[0-9a-fA-F\0\t\r\f\n ]*&gt;$'</span><span class="s1">)</span>
+    <span class="s1">oct_re = re.compile(</span><span class="s3">r'[0-7]{1,3}'</span><span class="s1">)</span>
+    <span class="s1">pos = </span><span class="s4">0</span>
+    <span class="s1">next_binary = </span><span class="s2">None</span>
+
+    <span class="s2">while </span><span class="s1">pos &lt; len(text):</span>
+        <span class="s2">if </span><span class="s1">next_binary </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">n = next_binary</span>
+            <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_BinaryToken(pos</span><span class="s2">, </span><span class="s1">data[pos:pos+n]))</span>
+            <span class="s1">pos += n</span>
+            <span class="s2">continue</span>
+        <span class="s1">match = whitespace_or_comment_re.match(text</span><span class="s2">, </span><span class="s1">pos)</span>
+        <span class="s2">if </span><span class="s1">match:</span>
+            <span class="s2">if not </span><span class="s1">skip_ws:</span>
+                <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_WhitespaceToken(pos</span><span class="s2">, </span><span class="s1">match.group()))</span>
+            <span class="s1">pos = match.end()</span>
+        <span class="s2">elif </span><span class="s1">text[pos] == </span><span class="s3">'('</span><span class="s1">:</span>
+            <span class="s5"># PostScript string rules:</span>
+            <span class="s5"># - parentheses must be balanced</span>
+            <span class="s5"># - backslashes escape backslashes and parens</span>
+            <span class="s5"># - also codes \n\r\t\b\f and octal escapes are recognized</span>
+            <span class="s5"># - other backslashes do not escape anything</span>
+            <span class="s1">start = pos</span>
+            <span class="s1">pos += </span><span class="s4">1</span>
+            <span class="s1">depth = </span><span class="s4">1</span>
+            <span class="s2">while </span><span class="s1">depth:</span>
+                <span class="s1">match = instring_re.search(text</span><span class="s2">, </span><span class="s1">pos)</span>
+                <span class="s2">if </span><span class="s1">match </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span>
+                        <span class="s3">f'Unterminated string starting at </span><span class="s2">{</span><span class="s1">start</span><span class="s2">}</span><span class="s3">'</span><span class="s1">)</span>
+                <span class="s1">pos = match.end()</span>
+                <span class="s2">if </span><span class="s1">match.group() == </span><span class="s3">'('</span><span class="s1">:</span>
+                    <span class="s1">depth += </span><span class="s4">1</span>
+                <span class="s2">elif </span><span class="s1">match.group() == </span><span class="s3">')'</span><span class="s1">:</span>
+                    <span class="s1">depth -= </span><span class="s4">1</span>
+                <span class="s2">else</span><span class="s1">:  </span><span class="s5"># a backslash</span>
+                    <span class="s1">char = text[pos]</span>
+                    <span class="s2">if </span><span class="s1">char </span><span class="s2">in </span><span class="s3">r'\()nrtbf'</span><span class="s1">:</span>
+                        <span class="s1">pos += </span><span class="s4">1</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s1">octal = oct_re.match(text</span><span class="s2">, </span><span class="s1">pos)</span>
+                        <span class="s2">if </span><span class="s1">octal:</span>
+                            <span class="s1">pos = octal.end()</span>
+                        <span class="s2">else</span><span class="s1">:</span>
+                            <span class="s2">pass  </span><span class="s5"># non-escaping backslash</span>
+            <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_StringToken(start</span><span class="s2">, </span><span class="s1">text[start:pos]))</span>
+        <span class="s2">elif </span><span class="s1">text[pos:pos + </span><span class="s4">2</span><span class="s1">] </span><span class="s2">in </span><span class="s1">(</span><span class="s3">'&lt;&lt;'</span><span class="s2">, </span><span class="s3">'&gt;&gt;'</span><span class="s1">):</span>
+            <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_DelimiterToken(pos</span><span class="s2">, </span><span class="s1">text[pos:pos + </span><span class="s4">2</span><span class="s1">]))</span>
+            <span class="s1">pos += </span><span class="s4">2</span>
+        <span class="s2">elif </span><span class="s1">text[pos] == </span><span class="s3">'&lt;'</span><span class="s1">:</span>
+            <span class="s1">start = pos</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">pos = text.index(</span><span class="s3">'&gt;'</span><span class="s2">, </span><span class="s1">pos) + </span><span class="s4">1</span>
+            <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">f'Unterminated hex string starting at </span><span class="s2">{</span><span class="s1">start</span><span class="s2">}</span><span class="s3">'</span>
+                                 <span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+            <span class="s2">if not </span><span class="s1">hex_re.match(text[start:pos]):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">f'Malformed hex string starting at </span><span class="s2">{</span><span class="s1">start</span><span class="s2">}</span><span class="s3">'</span><span class="s1">)</span>
+            <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_StringToken(pos</span><span class="s2">, </span><span class="s1">text[start:pos]))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">match = token_re.match(text</span><span class="s2">, </span><span class="s1">pos)</span>
+            <span class="s2">if </span><span class="s1">match:</span>
+                <span class="s1">raw = match.group()</span>
+                <span class="s2">if </span><span class="s1">raw.startswith(</span><span class="s3">'/'</span><span class="s1">):</span>
+                    <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_NameToken(pos</span><span class="s2">, </span><span class="s1">raw))</span>
+                <span class="s2">elif </span><span class="s1">match.group() </span><span class="s2">in </span><span class="s1">(</span><span class="s3">'true'</span><span class="s2">, </span><span class="s3">'false'</span><span class="s1">):</span>
+                    <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_BooleanToken(pos</span><span class="s2">, </span><span class="s1">raw))</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">try</span><span class="s1">:</span>
+                        <span class="s1">float(raw)</span>
+                        <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_NumberToken(pos</span><span class="s2">, </span><span class="s1">raw))</span>
+                    <span class="s2">except </span><span class="s1">ValueError:</span>
+                        <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_KeywordToken(pos</span><span class="s2">, </span><span class="s1">raw))</span>
+                <span class="s1">pos = match.end()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">next_binary = (</span><span class="s2">yield </span><span class="s1">_DelimiterToken(pos</span><span class="s2">, </span><span class="s1">text[pos]))</span>
+                <span class="s1">pos += </span><span class="s4">1</span>
+
+
+<span class="s2">class </span><span class="s1">_BalancedExpression(_Token):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">def </span><span class="s1">_expression(initial</span><span class="s2">, </span><span class="s1">tokens</span><span class="s2">, </span><span class="s1">data):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Consume some number of tokens and return a balanced PostScript expression. 
+ 
+    Parameters 
+    ---------- 
+    initial : _Token 
+        The token that triggered parsing a balanced expression. 
+    tokens : iterator of _Token 
+        Following tokens. 
+    data : bytes 
+        Underlying data that the token positions point to. 
+ 
+    Returns 
+    ------- 
+    _BalancedExpression 
+    &quot;&quot;&quot;</span>
+    <span class="s1">delim_stack = []</span>
+    <span class="s1">token = initial</span>
+    <span class="s2">while True</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">token.is_delim():</span>
+            <span class="s2">if </span><span class="s1">token.raw </span><span class="s2">in </span><span class="s1">(</span><span class="s3">'['</span><span class="s2">, </span><span class="s3">'{'</span><span class="s1">):</span>
+                <span class="s1">delim_stack.append(token)</span>
+            <span class="s2">elif </span><span class="s1">token.raw </span><span class="s2">in </span><span class="s1">(</span><span class="s3">']'</span><span class="s2">, </span><span class="s3">'}'</span><span class="s1">):</span>
+                <span class="s2">if not </span><span class="s1">delim_stack:</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">f&quot;unmatched closing token </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+                <span class="s1">match = delim_stack.pop()</span>
+                <span class="s2">if </span><span class="s1">match.raw != token.opposite():</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                        <span class="s3">f&quot;opening token </span><span class="s2">{</span><span class="s1">match</span><span class="s2">} </span><span class="s3">closed by </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                    <span class="s1">)</span>
+                <span class="s2">if not </span><span class="s1">delim_stack:</span>
+                    <span class="s2">break</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">f'unknown delimiter </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s3">'</span><span class="s1">)</span>
+        <span class="s2">elif not </span><span class="s1">delim_stack:</span>
+            <span class="s2">break</span>
+        <span class="s1">token = next(tokens)</span>
+    <span class="s2">return </span><span class="s1">_BalancedExpression(</span>
+        <span class="s1">initial.pos</span><span class="s2">,</span>
+        <span class="s1">data[initial.pos:token.endpos()].decode(</span><span class="s3">'ascii'</span><span class="s2">, </span><span class="s3">'replace'</span><span class="s1">)</span>
+    <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">Type1Font:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A class representing a Type-1 font, for use by backends. 
+ 
+    Attributes 
+    ---------- 
+    parts : tuple 
+        A 3-tuple of the cleartext part, the encrypted part, and the finale of 
+        zeros. 
+ 
+    decrypted : bytes 
+        The decrypted form of ``parts[1]``. 
+ 
+    prop : dict[str, Any] 
+        A dictionary of font properties. Noteworthy keys include: 
+ 
+        - FontName: PostScript name of the font 
+        - Encoding: dict from numeric codes to glyph names 
+        - FontMatrix: bytes object encoding a matrix 
+        - UniqueID: optional font identifier, dropped when modifying the font 
+        - CharStrings: dict from glyph names to byte code 
+        - Subrs: array of byte code subroutines 
+        - OtherSubrs: bytes object encoding some PostScript code 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ = (</span><span class="s3">'parts'</span><span class="s2">, </span><span class="s3">'decrypted'</span><span class="s2">, </span><span class="s3">'prop'</span><span class="s2">, </span><span class="s3">'_pos'</span><span class="s2">, </span><span class="s3">'_abbr'</span><span class="s1">)</span>
+    <span class="s5"># the _pos dict contains (begin, end) indices to parts[0] + decrypted</span>
+    <span class="s5"># so that they can be replaced when transforming the font;</span>
+    <span class="s5"># but since sometimes a definition appears in both parts[0] and decrypted,</span>
+    <span class="s5"># _pos[name] is an array of such pairs</span>
+    <span class="s5">#</span>
+    <span class="s5"># _abbr maps three standard abbreviations to their particular names in</span>
+    <span class="s5"># this font (e.g. 'RD' is named '-|' in some fonts)</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">input):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize a Type-1 font. 
+ 
+        Parameters 
+        ---------- 
+        input : str or 3-tuple 
+            Either a pfb file name, or a 3-tuple of already-decoded Type-1 
+            font `~.Type1Font.parts`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance(input</span><span class="s2">, </span><span class="s1">tuple) </span><span class="s2">and </span><span class="s1">len(input) == </span><span class="s4">3</span><span class="s1">:</span>
+            <span class="s1">self.parts = input</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">with </span><span class="s1">open(input</span><span class="s2">, </span><span class="s3">'rb'</span><span class="s1">) </span><span class="s2">as </span><span class="s1">file:</span>
+                <span class="s1">data = self._read(file)</span>
+            <span class="s1">self.parts = self._split(data)</span>
+
+        <span class="s1">self.decrypted = self._decrypt(self.parts[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s3">'eexec'</span><span class="s1">)</span>
+        <span class="s1">self._abbr = {</span><span class="s3">'RD'</span><span class="s1">: </span><span class="s3">'RD'</span><span class="s2">, </span><span class="s3">'ND'</span><span class="s1">: </span><span class="s3">'ND'</span><span class="s2">, </span><span class="s3">'NP'</span><span class="s1">: </span><span class="s3">'NP'</span><span class="s1">}</span>
+        <span class="s1">self._parse()</span>
+
+    <span class="s2">def </span><span class="s1">_read(self</span><span class="s2">, </span><span class="s1">file):</span>
+        <span class="s0">&quot;&quot;&quot;Read the font from a file, decoding into usable parts.&quot;&quot;&quot;</span>
+        <span class="s1">rawdata = file.read()</span>
+        <span class="s2">if not </span><span class="s1">rawdata.startswith(</span><span class="s6">b'</span><span class="s2">\x80</span><span class="s6">'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">rawdata</span>
+
+        <span class="s1">data = </span><span class="s6">b''</span>
+        <span class="s2">while </span><span class="s1">rawdata:</span>
+            <span class="s2">if not </span><span class="s1">rawdata.startswith(</span><span class="s6">b'</span><span class="s2">\x80</span><span class="s6">'</span><span class="s1">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">'Broken pfb file (expected byte 128, '</span>
+                                   <span class="s3">'got %d)' </span><span class="s1">% rawdata[</span><span class="s4">0</span><span class="s1">])</span>
+            <span class="s1">type = rawdata[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s1">type </span><span class="s2">in </span><span class="s1">(</span><span class="s4">1</span><span class="s2">, </span><span class="s4">2</span><span class="s1">):</span>
+                <span class="s1">length</span><span class="s2">, </span><span class="s1">= struct.unpack(</span><span class="s3">'&lt;i'</span><span class="s2">, </span><span class="s1">rawdata[</span><span class="s4">2</span><span class="s1">:</span><span class="s4">6</span><span class="s1">])</span>
+                <span class="s1">segment = rawdata[</span><span class="s4">6</span><span class="s1">:</span><span class="s4">6 </span><span class="s1">+ length]</span>
+                <span class="s1">rawdata = rawdata[</span><span class="s4">6 </span><span class="s1">+ length:]</span>
+
+            <span class="s2">if </span><span class="s1">type == </span><span class="s4">1</span><span class="s1">:       </span><span class="s5"># ASCII text: include verbatim</span>
+                <span class="s1">data += segment</span>
+            <span class="s2">elif </span><span class="s1">type == </span><span class="s4">2</span><span class="s1">:     </span><span class="s5"># binary data: encode in hexadecimal</span>
+                <span class="s1">data += binascii.hexlify(segment)</span>
+            <span class="s2">elif </span><span class="s1">type == </span><span class="s4">3</span><span class="s1">:     </span><span class="s5"># end of file</span>
+                <span class="s2">break</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s3">'Unknown segment type %d in pfb file' </span><span class="s1">%</span>
+                                   <span class="s1">type)</span>
+
+        <span class="s2">return </span><span class="s1">data</span>
+
+    <span class="s2">def </span><span class="s1">_split(self</span><span class="s2">, </span><span class="s1">data):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Split the Type 1 font into its three main parts. 
+ 
+        The three parts are: (1) the cleartext part, which ends in a 
+        eexec operator; (2) the encrypted part; (3) the fixed part, 
+        which contains 512 ASCII zeros possibly divided on various 
+        lines, a cleartomark operator, and possibly something else. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s5"># Cleartext part: just find the eexec and skip whitespace</span>
+        <span class="s1">idx = data.index(</span><span class="s6">b'eexec'</span><span class="s1">)</span>
+        <span class="s1">idx += len(</span><span class="s6">b'eexec'</span><span class="s1">)</span>
+        <span class="s2">while </span><span class="s1">data[idx] </span><span class="s2">in </span><span class="s6">b' </span><span class="s2">\t\r\n</span><span class="s6">'</span><span class="s1">:</span>
+            <span class="s1">idx += </span><span class="s4">1</span>
+        <span class="s1">len1 = idx</span>
+
+        <span class="s5"># Encrypted part: find the cleartomark operator and count</span>
+        <span class="s5"># zeros backward</span>
+        <span class="s1">idx = data.rindex(</span><span class="s6">b'cleartomark'</span><span class="s1">) - </span><span class="s4">1</span>
+        <span class="s1">zeros = </span><span class="s4">512</span>
+        <span class="s2">while </span><span class="s1">zeros </span><span class="s2">and </span><span class="s1">data[idx] </span><span class="s2">in </span><span class="s6">b'0' </span><span class="s2">or </span><span class="s1">data[idx] </span><span class="s2">in </span><span class="s6">b'</span><span class="s2">\r\n</span><span class="s6">'</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">data[idx] </span><span class="s2">in </span><span class="s6">b'0'</span><span class="s1">:</span>
+                <span class="s1">zeros -= </span><span class="s4">1</span>
+            <span class="s1">idx -= </span><span class="s4">1</span>
+        <span class="s2">if </span><span class="s1">zeros:</span>
+            <span class="s5"># this may have been a problem on old implementations that</span>
+            <span class="s5"># used the zeros as necessary padding</span>
+            <span class="s1">_log.info(</span><span class="s3">'Insufficiently many zeros in Type 1 font'</span><span class="s1">)</span>
+
+        <span class="s5"># Convert encrypted part to binary (if we read a pfb file, we may end</span>
+        <span class="s5"># up converting binary to hexadecimal to binary again; but if we read</span>
+        <span class="s5"># a pfa file, this part is already in hex, and I am not quite sure if</span>
+        <span class="s5"># even the pfb format guarantees that it will be in binary).</span>
+        <span class="s1">idx1 = len1 + ((idx - len1 + </span><span class="s4">2</span><span class="s1">) &amp; ~</span><span class="s4">1</span><span class="s1">)  </span><span class="s5"># ensure an even number of bytes</span>
+        <span class="s1">binary = binascii.unhexlify(data[len1:idx1])</span>
+
+        <span class="s2">return </span><span class="s1">data[:len1]</span><span class="s2">, </span><span class="s1">binary</span><span class="s2">, </span><span class="s1">data[idx+</span><span class="s4">1</span><span class="s1">:]</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_decrypt(ciphertext</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">ndiscard=</span><span class="s4">4</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Decrypt ciphertext using the Type-1 font algorithm. 
+ 
+        The algorithm is described in Adobe's &quot;Adobe Type 1 Font Format&quot;. 
+        The key argument can be an integer, or one of the strings 
+        'eexec' and 'charstring', which map to the key specified for the 
+        corresponding part of Type-1 fonts. 
+ 
+        The ndiscard argument should be an integer, usually 4. 
+        That number of bytes is discarded from the beginning of plaintext. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">key = _api.check_getitem({</span><span class="s3">'eexec'</span><span class="s1">: </span><span class="s4">55665</span><span class="s2">, </span><span class="s3">'charstring'</span><span class="s1">: </span><span class="s4">4330</span><span class="s1">}</span><span class="s2">, </span><span class="s1">key=key)</span>
+        <span class="s1">plaintext = []</span>
+        <span class="s2">for </span><span class="s1">byte </span><span class="s2">in </span><span class="s1">ciphertext:</span>
+            <span class="s1">plaintext.append(byte ^ (key &gt;&gt; </span><span class="s4">8</span><span class="s1">))</span>
+            <span class="s1">key = ((key+byte) * </span><span class="s4">52845 </span><span class="s1">+ </span><span class="s4">22719</span><span class="s1">) &amp; </span><span class="s4">0xffff</span>
+
+        <span class="s2">return </span><span class="s1">bytes(plaintext[ndiscard:])</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_encrypt(plaintext</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">ndiscard=</span><span class="s4">4</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Encrypt plaintext using the Type-1 font algorithm. 
+ 
+        The algorithm is described in Adobe's &quot;Adobe Type 1 Font Format&quot;. 
+        The key argument can be an integer, or one of the strings 
+        'eexec' and 'charstring', which map to the key specified for the 
+        corresponding part of Type-1 fonts. 
+ 
+        The ndiscard argument should be an integer, usually 4. That 
+        number of bytes is prepended to the plaintext before encryption. 
+        This function prepends NUL bytes for reproducibility, even though 
+        the original algorithm uses random bytes, presumably to avoid 
+        cryptanalysis. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">key = _api.check_getitem({</span><span class="s3">'eexec'</span><span class="s1">: </span><span class="s4">55665</span><span class="s2">, </span><span class="s3">'charstring'</span><span class="s1">: </span><span class="s4">4330</span><span class="s1">}</span><span class="s2">, </span><span class="s1">key=key)</span>
+        <span class="s1">ciphertext = []</span>
+        <span class="s2">for </span><span class="s1">byte </span><span class="s2">in </span><span class="s6">b'</span><span class="s2">\0</span><span class="s6">' </span><span class="s1">* ndiscard + plaintext:</span>
+            <span class="s1">c = byte ^ (key &gt;&gt; </span><span class="s4">8</span><span class="s1">)</span>
+            <span class="s1">ciphertext.append(c)</span>
+            <span class="s1">key = ((key + c) * </span><span class="s4">52845 </span><span class="s1">+ </span><span class="s4">22719</span><span class="s1">) &amp; </span><span class="s4">0xffff</span>
+
+        <span class="s2">return </span><span class="s1">bytes(ciphertext)</span>
+
+    <span class="s2">def </span><span class="s1">_parse(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find the values of various font properties. This limited kind 
+        of parsing is described in Chapter 10 &quot;Adobe Type Manager 
+        Compatibility&quot; of the Type-1 spec. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># Start with reasonable defaults</span>
+        <span class="s1">prop = {</span><span class="s3">'Weight'</span><span class="s1">: </span><span class="s3">'Regular'</span><span class="s2">, </span><span class="s3">'ItalicAngle'</span><span class="s1">: </span><span class="s4">0.0</span><span class="s2">, </span><span class="s3">'isFixedPitch'</span><span class="s1">: </span><span class="s2">False,</span>
+                <span class="s3">'UnderlinePosition'</span><span class="s1">: -</span><span class="s4">100</span><span class="s2">, </span><span class="s3">'UnderlineThickness'</span><span class="s1">: </span><span class="s4">50</span><span class="s1">}</span>
+        <span class="s1">pos = {}</span>
+        <span class="s1">data = self.parts[</span><span class="s4">0</span><span class="s1">] + self.decrypted</span>
+
+        <span class="s1">source = _tokenize(data</span><span class="s2">, True</span><span class="s1">)</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s5"># See if there is a key to be assigned a value</span>
+            <span class="s5"># e.g. /FontName in /FontName /Helvetica def</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">token = next(source)</span>
+            <span class="s2">except </span><span class="s1">StopIteration:</span>
+                <span class="s2">break</span>
+            <span class="s2">if </span><span class="s1">token.is_delim():</span>
+                <span class="s5"># skip over this - we want top-level keys only</span>
+                <span class="s1">_expression(token</span><span class="s2">, </span><span class="s1">source</span><span class="s2">, </span><span class="s1">data)</span>
+            <span class="s2">if </span><span class="s1">token.is_slash_name():</span>
+                <span class="s1">key = token.value()</span>
+                <span class="s1">keypos = token.pos</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">continue</span>
+
+            <span class="s5"># Some values need special parsing</span>
+            <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">(</span><span class="s3">'Subrs'</span><span class="s2">, </span><span class="s3">'CharStrings'</span><span class="s2">, </span><span class="s3">'Encoding'</span><span class="s2">, </span><span class="s3">'OtherSubrs'</span><span class="s1">):</span>
+                <span class="s1">prop[key]</span><span class="s2">, </span><span class="s1">endpos = {</span>
+                    <span class="s3">'Subrs'</span><span class="s1">: self._parse_subrs</span><span class="s2">,</span>
+                    <span class="s3">'CharStrings'</span><span class="s1">: self._parse_charstrings</span><span class="s2">,</span>
+                    <span class="s3">'Encoding'</span><span class="s1">: self._parse_encoding</span><span class="s2">,</span>
+                    <span class="s3">'OtherSubrs'</span><span class="s1">: self._parse_othersubrs</span>
+                <span class="s1">}[key](source</span><span class="s2">, </span><span class="s1">data)</span>
+                <span class="s1">pos.setdefault(key</span><span class="s2">, </span><span class="s1">[]).append((keypos</span><span class="s2">, </span><span class="s1">endpos))</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">token = next(source)</span>
+            <span class="s2">except </span><span class="s1">StopIteration:</span>
+                <span class="s2">break</span>
+
+            <span class="s2">if </span><span class="s1">isinstance(token</span><span class="s2">, </span><span class="s1">_KeywordToken):</span>
+                <span class="s5"># constructs like</span>
+                <span class="s5"># FontDirectory /Helvetica known {...} {...} ifelse</span>
+                <span class="s5"># mean the key was not really a key</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">if </span><span class="s1">token.is_delim():</span>
+                <span class="s1">value = _expression(token</span><span class="s2">, </span><span class="s1">source</span><span class="s2">, </span><span class="s1">data).raw</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">value = token.value()</span>
+
+            <span class="s5"># look for a 'def' possibly preceded by access modifiers</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">kw = next(</span>
+                    <span class="s1">kw </span><span class="s2">for </span><span class="s1">kw </span><span class="s2">in </span><span class="s1">source</span>
+                    <span class="s2">if not </span><span class="s1">kw.is_keyword(</span><span class="s3">'readonly'</span><span class="s2">, </span><span class="s3">'noaccess'</span><span class="s2">, </span><span class="s3">'executeonly'</span><span class="s1">)</span>
+                <span class="s1">)</span>
+            <span class="s2">except </span><span class="s1">StopIteration:</span>
+                <span class="s2">break</span>
+
+            <span class="s5"># sometimes noaccess def and readonly def are abbreviated</span>
+            <span class="s2">if </span><span class="s1">kw.is_keyword(</span><span class="s3">'def'</span><span class="s2">, </span><span class="s1">self._abbr[</span><span class="s3">'ND'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self._abbr[</span><span class="s3">'NP'</span><span class="s1">]):</span>
+                <span class="s1">prop[key] = value</span>
+                <span class="s1">pos.setdefault(key</span><span class="s2">, </span><span class="s1">[]).append((keypos</span><span class="s2">, </span><span class="s1">kw.endpos()))</span>
+
+            <span class="s5"># detect the standard abbreviations</span>
+            <span class="s2">if </span><span class="s1">value == </span><span class="s3">'{noaccess def}'</span><span class="s1">:</span>
+                <span class="s1">self._abbr[</span><span class="s3">'ND'</span><span class="s1">] = key</span>
+            <span class="s2">elif </span><span class="s1">value == </span><span class="s3">'{noaccess put}'</span><span class="s1">:</span>
+                <span class="s1">self._abbr[</span><span class="s3">'NP'</span><span class="s1">] = key</span>
+            <span class="s2">elif </span><span class="s1">value == </span><span class="s3">'{string currentfile exch readstring pop}'</span><span class="s1">:</span>
+                <span class="s1">self._abbr[</span><span class="s3">'RD'</span><span class="s1">] = key</span>
+
+        <span class="s5"># Fill in the various *Name properties</span>
+        <span class="s2">if </span><span class="s3">'FontName' </span><span class="s2">not in </span><span class="s1">prop:</span>
+            <span class="s1">prop[</span><span class="s3">'FontName'</span><span class="s1">] = (prop.get(</span><span class="s3">'FullName'</span><span class="s1">) </span><span class="s2">or</span>
+                                <span class="s1">prop.get(</span><span class="s3">'FamilyName'</span><span class="s1">) </span><span class="s2">or</span>
+                                <span class="s3">'Unknown'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s3">'FullName' </span><span class="s2">not in </span><span class="s1">prop:</span>
+            <span class="s1">prop[</span><span class="s3">'FullName'</span><span class="s1">] = prop[</span><span class="s3">'FontName'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s3">'FamilyName' </span><span class="s2">not in </span><span class="s1">prop:</span>
+            <span class="s1">extras = (</span><span class="s3">'(?i)([ -](regular|plain|italic|oblique|(semi)?bold|'</span>
+                      <span class="s3">'(ultra)?light|extra|condensed))+$'</span><span class="s1">)</span>
+            <span class="s1">prop[</span><span class="s3">'FamilyName'</span><span class="s1">] = re.sub(extras</span><span class="s2">, </span><span class="s3">''</span><span class="s2">, </span><span class="s1">prop[</span><span class="s3">'FullName'</span><span class="s1">])</span>
+        <span class="s5"># Decrypt the encrypted parts</span>
+        <span class="s1">ndiscard = prop.get(</span><span class="s3">'lenIV'</span><span class="s2">, </span><span class="s4">4</span><span class="s1">)</span>
+        <span class="s1">cs = prop[</span><span class="s3">'CharStrings'</span><span class="s1">]</span>
+        <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">cs.items():</span>
+            <span class="s1">cs[key] = self._decrypt(value</span><span class="s2">, </span><span class="s3">'charstring'</span><span class="s2">, </span><span class="s1">ndiscard)</span>
+        <span class="s2">if </span><span class="s3">'Subrs' </span><span class="s2">in </span><span class="s1">prop:</span>
+            <span class="s1">prop[</span><span class="s3">'Subrs'</span><span class="s1">] = [</span>
+                <span class="s1">self._decrypt(value</span><span class="s2">, </span><span class="s3">'charstring'</span><span class="s2">, </span><span class="s1">ndiscard)</span>
+                <span class="s2">for </span><span class="s1">value </span><span class="s2">in </span><span class="s1">prop[</span><span class="s3">'Subrs'</span><span class="s1">]</span>
+            <span class="s1">]</span>
+
+        <span class="s1">self.prop = prop</span>
+        <span class="s1">self._pos = pos</span>
+
+    <span class="s2">def </span><span class="s1">_parse_subrs(self</span><span class="s2">, </span><span class="s1">tokens</span><span class="s2">, </span><span class="s1">_data):</span>
+        <span class="s1">count_token = next(tokens)</span>
+        <span class="s2">if not </span><span class="s1">count_token.is_number():</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s3">f&quot;Token following /Subrs must be a number, was </span><span class="s2">{</span><span class="s1">count_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+        <span class="s1">count = count_token.value()</span>
+        <span class="s1">array = [</span><span class="s2">None</span><span class="s1">] * count</span>
+        <span class="s1">next(t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens </span><span class="s2">if </span><span class="s1">t.is_keyword(</span><span class="s3">'array'</span><span class="s1">))</span>
+        <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(count):</span>
+            <span class="s1">next(t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens </span><span class="s2">if </span><span class="s1">t.is_keyword(</span><span class="s3">'dup'</span><span class="s1">))</span>
+            <span class="s1">index_token = next(tokens)</span>
+            <span class="s2">if not </span><span class="s1">index_token.is_number():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                    <span class="s3">&quot;Token following dup in Subrs definition must be a &quot;</span>
+                    <span class="s3">f&quot;number, was </span><span class="s2">{</span><span class="s1">index_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">nbytes_token = next(tokens)</span>
+            <span class="s2">if not </span><span class="s1">nbytes_token.is_number():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                    <span class="s3">&quot;Second token following dup in Subrs definition must &quot;</span>
+                    <span class="s3">f&quot;be a number, was </span><span class="s2">{</span><span class="s1">nbytes_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">token = next(tokens)</span>
+            <span class="s2">if not </span><span class="s1">token.is_keyword(self._abbr[</span><span class="s3">'RD'</span><span class="s1">]):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                    <span class="s3">f&quot;Token preceding subr must be </span><span class="s2">{</span><span class="s1">self._abbr[</span><span class="s3">'RD'</span><span class="s1">]</span><span class="s2">}</span><span class="s3">, &quot;</span>
+                    <span class="s3">f&quot;was </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">binary_token = tokens.send(</span><span class="s4">1</span><span class="s1">+nbytes_token.value())</span>
+            <span class="s1">array[index_token.value()] = binary_token.value()</span>
+
+        <span class="s2">return </span><span class="s1">array</span><span class="s2">, </span><span class="s1">next(tokens).endpos()</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_charstrings(tokens</span><span class="s2">, </span><span class="s1">_data):</span>
+        <span class="s1">count_token = next(tokens)</span>
+        <span class="s2">if not </span><span class="s1">count_token.is_number():</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s3">&quot;Token following /CharStrings must be a number, &quot;</span>
+                <span class="s3">f&quot;was </span><span class="s2">{</span><span class="s1">count_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+        <span class="s1">count = count_token.value()</span>
+        <span class="s1">charstrings = {}</span>
+        <span class="s1">next(t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens </span><span class="s2">if </span><span class="s1">t.is_keyword(</span><span class="s3">'begin'</span><span class="s1">))</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">token = next(t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens</span>
+                         <span class="s2">if </span><span class="s1">t.is_keyword(</span><span class="s3">'end'</span><span class="s1">) </span><span class="s2">or </span><span class="s1">t.is_slash_name())</span>
+            <span class="s2">if </span><span class="s1">token.raw == </span><span class="s3">'end'</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">charstrings</span><span class="s2">, </span><span class="s1">token.endpos()</span>
+            <span class="s1">glyphname = token.value()</span>
+            <span class="s1">nbytes_token = next(tokens)</span>
+            <span class="s2">if not </span><span class="s1">nbytes_token.is_number():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                    <span class="s3">f&quot;Token following /</span><span class="s2">{</span><span class="s1">glyphname</span><span class="s2">} </span><span class="s3">in CharStrings definition &quot;</span>
+                    <span class="s3">f&quot;must be a number, was </span><span class="s2">{</span><span class="s1">nbytes_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">next(tokens)  </span><span class="s5"># usually RD or |-</span>
+            <span class="s1">binary_token = tokens.send(</span><span class="s4">1</span><span class="s1">+nbytes_token.value())</span>
+            <span class="s1">charstrings[glyphname] = binary_token.value()</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_encoding(tokens</span><span class="s2">, </span><span class="s1">_data):</span>
+        <span class="s5"># this only works for encodings that follow the Adobe manual</span>
+        <span class="s5"># but some old fonts include non-compliant data - we log a warning</span>
+        <span class="s5"># and return a possibly incomplete encoding</span>
+        <span class="s1">encoding = {}</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">token = next(t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens</span>
+                         <span class="s2">if </span><span class="s1">t.is_keyword(</span><span class="s3">'StandardEncoding'</span><span class="s2">, </span><span class="s3">'dup'</span><span class="s2">, </span><span class="s3">'def'</span><span class="s1">))</span>
+            <span class="s2">if </span><span class="s1">token.is_keyword(</span><span class="s3">'StandardEncoding'</span><span class="s1">):</span>
+                <span class="s2">return </span><span class="s1">_StandardEncoding</span><span class="s2">, </span><span class="s1">token.endpos()</span>
+            <span class="s2">if </span><span class="s1">token.is_keyword(</span><span class="s3">'def'</span><span class="s1">):</span>
+                <span class="s2">return </span><span class="s1">encoding</span><span class="s2">, </span><span class="s1">token.endpos()</span>
+            <span class="s1">index_token = next(tokens)</span>
+            <span class="s2">if not </span><span class="s1">index_token.is_number():</span>
+                <span class="s1">_log.warning(</span>
+                    <span class="s3">f&quot;Parsing encoding: expected number, got </span><span class="s2">{</span><span class="s1">index_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+                <span class="s2">continue</span>
+            <span class="s1">name_token = next(tokens)</span>
+            <span class="s2">if not </span><span class="s1">name_token.is_slash_name():</span>
+                <span class="s1">_log.warning(</span>
+                    <span class="s3">f&quot;Parsing encoding: expected slash-name, got </span><span class="s2">{</span><span class="s1">name_token</span><span class="s2">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+                <span class="s2">continue</span>
+            <span class="s1">encoding[index_token.value()] = name_token.value()</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_othersubrs(tokens</span><span class="s2">, </span><span class="s1">data):</span>
+        <span class="s1">init_pos = </span><span class="s2">None</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">token = next(tokens)</span>
+            <span class="s2">if </span><span class="s1">init_pos </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">init_pos = token.pos</span>
+            <span class="s2">if </span><span class="s1">token.is_delim():</span>
+                <span class="s1">_expression(token</span><span class="s2">, </span><span class="s1">tokens</span><span class="s2">, </span><span class="s1">data)</span>
+            <span class="s2">elif </span><span class="s1">token.is_keyword(</span><span class="s3">'def'</span><span class="s2">, </span><span class="s3">'ND'</span><span class="s2">, </span><span class="s3">'|-'</span><span class="s1">):</span>
+                <span class="s2">return </span><span class="s1">data[init_pos:token.endpos()]</span><span class="s2">, </span><span class="s1">token.endpos()</span>
+
+    <span class="s2">def </span><span class="s1">transform(self</span><span class="s2">, </span><span class="s1">effects):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a new font that is slanted and/or extended. 
+ 
+        Parameters 
+        ---------- 
+        effects : dict 
+            A dict with optional entries: 
+ 
+            - 'slant' : float, default: 0 
+                Tangent of the angle that the font is to be slanted to the 
+                right. Negative values slant to the left. 
+            - 'extend' : float, default: 1 
+                Scaling factor for the font width. Values less than 1 condense 
+                the glyphs. 
+ 
+        Returns 
+        ------- 
+        `Type1Font` 
+        &quot;&quot;&quot;</span>
+        <span class="s1">fontname = self.prop[</span><span class="s3">'FontName'</span><span class="s1">]</span>
+        <span class="s1">italicangle = self.prop[</span><span class="s3">'ItalicAngle'</span><span class="s1">]</span>
+
+        <span class="s1">array = [</span>
+            <span class="s1">float(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">(self.prop[</span><span class="s3">'FontMatrix'</span><span class="s1">]</span>
+                               <span class="s1">.lstrip(</span><span class="s3">'['</span><span class="s1">).rstrip(</span><span class="s3">']'</span><span class="s1">).split())</span>
+        <span class="s1">]</span>
+        <span class="s1">oldmatrix = np.eye(</span><span class="s4">3</span><span class="s2">, </span><span class="s4">3</span><span class="s1">)</span>
+        <span class="s1">oldmatrix[</span><span class="s4">0</span><span class="s1">:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = array[::</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">oldmatrix[</span><span class="s4">0</span><span class="s1">:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">1</span><span class="s1">] = array[</span><span class="s4">1</span><span class="s1">::</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">modifier = np.eye(</span><span class="s4">3</span><span class="s2">, </span><span class="s4">3</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s3">'slant' </span><span class="s2">in </span><span class="s1">effects:</span>
+            <span class="s1">slant = effects[</span><span class="s3">'slant'</span><span class="s1">]</span>
+            <span class="s1">fontname += </span><span class="s3">'_Slant_%d' </span><span class="s1">% int(</span><span class="s4">1000 </span><span class="s1">* slant)</span>
+            <span class="s1">italicangle = round(</span>
+                <span class="s1">float(italicangle) - np.arctan(slant) / np.pi * </span><span class="s4">180</span><span class="s2">,</span>
+                <span class="s4">5</span>
+            <span class="s1">)</span>
+            <span class="s1">modifier[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = slant</span>
+
+        <span class="s2">if </span><span class="s3">'extend' </span><span class="s2">in </span><span class="s1">effects:</span>
+            <span class="s1">extend = effects[</span><span class="s3">'extend'</span><span class="s1">]</span>
+            <span class="s1">fontname += </span><span class="s3">'_Extend_%d' </span><span class="s1">% int(</span><span class="s4">1000 </span><span class="s1">* extend)</span>
+            <span class="s1">modifier[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = extend</span>
+
+        <span class="s1">newmatrix = np.dot(modifier</span><span class="s2">, </span><span class="s1">oldmatrix)</span>
+        <span class="s1">array[::</span><span class="s4">2</span><span class="s1">] = newmatrix[</span><span class="s4">0</span><span class="s1">:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">array[</span><span class="s4">1</span><span class="s1">::</span><span class="s4">2</span><span class="s1">] = newmatrix[</span><span class="s4">0</span><span class="s1">:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">fontmatrix = (</span>
+            <span class="s3">'[%s]' </span><span class="s1">% </span><span class="s3">' '</span><span class="s1">.join(_format_approx(x</span><span class="s2">, </span><span class="s4">6</span><span class="s1">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">array)</span>
+        <span class="s1">)</span>
+        <span class="s1">replacements = (</span>
+            <span class="s1">[(x</span><span class="s2">, </span><span class="s3">'/FontName/%s def' </span><span class="s1">% fontname)</span>
+             <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self._pos[</span><span class="s3">'FontName'</span><span class="s1">]]</span>
+            <span class="s1">+ [(x</span><span class="s2">, </span><span class="s3">'/ItalicAngle %a def' </span><span class="s1">% italicangle)</span>
+               <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self._pos[</span><span class="s3">'ItalicAngle'</span><span class="s1">]]</span>
+            <span class="s1">+ [(x</span><span class="s2">, </span><span class="s3">'/FontMatrix %s readonly def' </span><span class="s1">% fontmatrix)</span>
+               <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self._pos[</span><span class="s3">'FontMatrix'</span><span class="s1">]]</span>
+            <span class="s1">+ [(x</span><span class="s2">, </span><span class="s3">''</span><span class="s1">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self._pos.get(</span><span class="s3">'UniqueID'</span><span class="s2">, </span><span class="s1">[])]</span>
+        <span class="s1">)</span>
+
+        <span class="s1">data = bytearray(self.parts[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">data.extend(self.decrypted)</span>
+        <span class="s1">len0 = len(self.parts[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s2">for </span><span class="s1">(pos0</span><span class="s2">, </span><span class="s1">pos1)</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">sorted(replacements</span><span class="s2">, </span><span class="s1">reverse=</span><span class="s2">True</span><span class="s1">):</span>
+            <span class="s1">data[pos0:pos1] = value.encode(</span><span class="s3">'ascii'</span><span class="s2">, </span><span class="s3">'replace'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">pos0 &lt; len(self.parts[</span><span class="s4">0</span><span class="s1">]):</span>
+                <span class="s2">if </span><span class="s1">pos1 &gt;= len(self.parts[</span><span class="s4">0</span><span class="s1">]):</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                        <span class="s3">f&quot;text to be replaced with </span><span class="s2">{</span><span class="s1">value</span><span class="s2">} </span><span class="s3">spans &quot;</span>
+                        <span class="s3">&quot;the eexec boundary&quot;</span>
+                    <span class="s1">)</span>
+                <span class="s1">len0 += len(value) - pos1 + pos0</span>
+
+        <span class="s1">data = bytes(data)</span>
+        <span class="s2">return </span><span class="s1">Type1Font((</span>
+            <span class="s1">data[:len0]</span><span class="s2">,</span>
+            <span class="s1">self._encrypt(data[len0:]</span><span class="s2">, </span><span class="s3">'eexec'</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">self.parts[</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">))</span>
+
+
+<span class="s1">_StandardEncoding = {</span>
+    <span class="s1">**{ord(letter): letter </span><span class="s2">for </span><span class="s1">letter </span><span class="s2">in </span><span class="s1">string.ascii_letters}</span><span class="s2">,</span>
+    <span class="s4">0</span><span class="s1">: </span><span class="s3">'.notdef'</span><span class="s2">,</span>
+    <span class="s4">32</span><span class="s1">: </span><span class="s3">'space'</span><span class="s2">,</span>
+    <span class="s4">33</span><span class="s1">: </span><span class="s3">'exclam'</span><span class="s2">,</span>
+    <span class="s4">34</span><span class="s1">: </span><span class="s3">'quotedbl'</span><span class="s2">,</span>
+    <span class="s4">35</span><span class="s1">: </span><span class="s3">'numbersign'</span><span class="s2">,</span>
+    <span class="s4">36</span><span class="s1">: </span><span class="s3">'dollar'</span><span class="s2">,</span>
+    <span class="s4">37</span><span class="s1">: </span><span class="s3">'percent'</span><span class="s2">,</span>
+    <span class="s4">38</span><span class="s1">: </span><span class="s3">'ampersand'</span><span class="s2">,</span>
+    <span class="s4">39</span><span class="s1">: </span><span class="s3">'quoteright'</span><span class="s2">,</span>
+    <span class="s4">40</span><span class="s1">: </span><span class="s3">'parenleft'</span><span class="s2">,</span>
+    <span class="s4">41</span><span class="s1">: </span><span class="s3">'parenright'</span><span class="s2">,</span>
+    <span class="s4">42</span><span class="s1">: </span><span class="s3">'asterisk'</span><span class="s2">,</span>
+    <span class="s4">43</span><span class="s1">: </span><span class="s3">'plus'</span><span class="s2">,</span>
+    <span class="s4">44</span><span class="s1">: </span><span class="s3">'comma'</span><span class="s2">,</span>
+    <span class="s4">45</span><span class="s1">: </span><span class="s3">'hyphen'</span><span class="s2">,</span>
+    <span class="s4">46</span><span class="s1">: </span><span class="s3">'period'</span><span class="s2">,</span>
+    <span class="s4">47</span><span class="s1">: </span><span class="s3">'slash'</span><span class="s2">,</span>
+    <span class="s4">48</span><span class="s1">: </span><span class="s3">'zero'</span><span class="s2">,</span>
+    <span class="s4">49</span><span class="s1">: </span><span class="s3">'one'</span><span class="s2">,</span>
+    <span class="s4">50</span><span class="s1">: </span><span class="s3">'two'</span><span class="s2">,</span>
+    <span class="s4">51</span><span class="s1">: </span><span class="s3">'three'</span><span class="s2">,</span>
+    <span class="s4">52</span><span class="s1">: </span><span class="s3">'four'</span><span class="s2">,</span>
+    <span class="s4">53</span><span class="s1">: </span><span class="s3">'five'</span><span class="s2">,</span>
+    <span class="s4">54</span><span class="s1">: </span><span class="s3">'six'</span><span class="s2">,</span>
+    <span class="s4">55</span><span class="s1">: </span><span class="s3">'seven'</span><span class="s2">,</span>
+    <span class="s4">56</span><span class="s1">: </span><span class="s3">'eight'</span><span class="s2">,</span>
+    <span class="s4">57</span><span class="s1">: </span><span class="s3">'nine'</span><span class="s2">,</span>
+    <span class="s4">58</span><span class="s1">: </span><span class="s3">'colon'</span><span class="s2">,</span>
+    <span class="s4">59</span><span class="s1">: </span><span class="s3">'semicolon'</span><span class="s2">,</span>
+    <span class="s4">60</span><span class="s1">: </span><span class="s3">'less'</span><span class="s2">,</span>
+    <span class="s4">61</span><span class="s1">: </span><span class="s3">'equal'</span><span class="s2">,</span>
+    <span class="s4">62</span><span class="s1">: </span><span class="s3">'greater'</span><span class="s2">,</span>
+    <span class="s4">63</span><span class="s1">: </span><span class="s3">'question'</span><span class="s2">,</span>
+    <span class="s4">64</span><span class="s1">: </span><span class="s3">'at'</span><span class="s2">,</span>
+    <span class="s4">91</span><span class="s1">: </span><span class="s3">'bracketleft'</span><span class="s2">,</span>
+    <span class="s4">92</span><span class="s1">: </span><span class="s3">'backslash'</span><span class="s2">,</span>
+    <span class="s4">93</span><span class="s1">: </span><span class="s3">'bracketright'</span><span class="s2">,</span>
+    <span class="s4">94</span><span class="s1">: </span><span class="s3">'asciicircum'</span><span class="s2">,</span>
+    <span class="s4">95</span><span class="s1">: </span><span class="s3">'underscore'</span><span class="s2">,</span>
+    <span class="s4">96</span><span class="s1">: </span><span class="s3">'quoteleft'</span><span class="s2">,</span>
+    <span class="s4">123</span><span class="s1">: </span><span class="s3">'braceleft'</span><span class="s2">,</span>
+    <span class="s4">124</span><span class="s1">: </span><span class="s3">'bar'</span><span class="s2">,</span>
+    <span class="s4">125</span><span class="s1">: </span><span class="s3">'braceright'</span><span class="s2">,</span>
+    <span class="s4">126</span><span class="s1">: </span><span class="s3">'asciitilde'</span><span class="s2">,</span>
+    <span class="s4">161</span><span class="s1">: </span><span class="s3">'exclamdown'</span><span class="s2">,</span>
+    <span class="s4">162</span><span class="s1">: </span><span class="s3">'cent'</span><span class="s2">,</span>
+    <span class="s4">163</span><span class="s1">: </span><span class="s3">'sterling'</span><span class="s2">,</span>
+    <span class="s4">164</span><span class="s1">: </span><span class="s3">'fraction'</span><span class="s2">,</span>
+    <span class="s4">165</span><span class="s1">: </span><span class="s3">'yen'</span><span class="s2">,</span>
+    <span class="s4">166</span><span class="s1">: </span><span class="s3">'florin'</span><span class="s2">,</span>
+    <span class="s4">167</span><span class="s1">: </span><span class="s3">'section'</span><span class="s2">,</span>
+    <span class="s4">168</span><span class="s1">: </span><span class="s3">'currency'</span><span class="s2">,</span>
+    <span class="s4">169</span><span class="s1">: </span><span class="s3">'quotesingle'</span><span class="s2">,</span>
+    <span class="s4">170</span><span class="s1">: </span><span class="s3">'quotedblleft'</span><span class="s2">,</span>
+    <span class="s4">171</span><span class="s1">: </span><span class="s3">'guillemotleft'</span><span class="s2">,</span>
+    <span class="s4">172</span><span class="s1">: </span><span class="s3">'guilsinglleft'</span><span class="s2">,</span>
+    <span class="s4">173</span><span class="s1">: </span><span class="s3">'guilsinglright'</span><span class="s2">,</span>
+    <span class="s4">174</span><span class="s1">: </span><span class="s3">'fi'</span><span class="s2">,</span>
+    <span class="s4">175</span><span class="s1">: </span><span class="s3">'fl'</span><span class="s2">,</span>
+    <span class="s4">177</span><span class="s1">: </span><span class="s3">'endash'</span><span class="s2">,</span>
+    <span class="s4">178</span><span class="s1">: </span><span class="s3">'dagger'</span><span class="s2">,</span>
+    <span class="s4">179</span><span class="s1">: </span><span class="s3">'daggerdbl'</span><span class="s2">,</span>
+    <span class="s4">180</span><span class="s1">: </span><span class="s3">'periodcentered'</span><span class="s2">,</span>
+    <span class="s4">182</span><span class="s1">: </span><span class="s3">'paragraph'</span><span class="s2">,</span>
+    <span class="s4">183</span><span class="s1">: </span><span class="s3">'bullet'</span><span class="s2">,</span>
+    <span class="s4">184</span><span class="s1">: </span><span class="s3">'quotesinglbase'</span><span class="s2">,</span>
+    <span class="s4">185</span><span class="s1">: </span><span class="s3">'quotedblbase'</span><span class="s2">,</span>
+    <span class="s4">186</span><span class="s1">: </span><span class="s3">'quotedblright'</span><span class="s2">,</span>
+    <span class="s4">187</span><span class="s1">: </span><span class="s3">'guillemotright'</span><span class="s2">,</span>
+    <span class="s4">188</span><span class="s1">: </span><span class="s3">'ellipsis'</span><span class="s2">,</span>
+    <span class="s4">189</span><span class="s1">: </span><span class="s3">'perthousand'</span><span class="s2">,</span>
+    <span class="s4">191</span><span class="s1">: </span><span class="s3">'questiondown'</span><span class="s2">,</span>
+    <span class="s4">193</span><span class="s1">: </span><span class="s3">'grave'</span><span class="s2">,</span>
+    <span class="s4">194</span><span class="s1">: </span><span class="s3">'acute'</span><span class="s2">,</span>
+    <span class="s4">195</span><span class="s1">: </span><span class="s3">'circumflex'</span><span class="s2">,</span>
+    <span class="s4">196</span><span class="s1">: </span><span class="s3">'tilde'</span><span class="s2">,</span>
+    <span class="s4">197</span><span class="s1">: </span><span class="s3">'macron'</span><span class="s2">,</span>
+    <span class="s4">198</span><span class="s1">: </span><span class="s3">'breve'</span><span class="s2">,</span>
+    <span class="s4">199</span><span class="s1">: </span><span class="s3">'dotaccent'</span><span class="s2">,</span>
+    <span class="s4">200</span><span class="s1">: </span><span class="s3">'dieresis'</span><span class="s2">,</span>
+    <span class="s4">202</span><span class="s1">: </span><span class="s3">'ring'</span><span class="s2">,</span>
+    <span class="s4">203</span><span class="s1">: </span><span class="s3">'cedilla'</span><span class="s2">,</span>
+    <span class="s4">205</span><span class="s1">: </span><span class="s3">'hungarumlaut'</span><span class="s2">,</span>
+    <span class="s4">206</span><span class="s1">: </span><span class="s3">'ogonek'</span><span class="s2">,</span>
+    <span class="s4">207</span><span class="s1">: </span><span class="s3">'caron'</span><span class="s2">,</span>
+    <span class="s4">208</span><span class="s1">: </span><span class="s3">'emdash'</span><span class="s2">,</span>
+    <span class="s4">225</span><span class="s1">: </span><span class="s3">'AE'</span><span class="s2">,</span>
+    <span class="s4">227</span><span class="s1">: </span><span class="s3">'ordfeminine'</span><span class="s2">,</span>
+    <span class="s4">232</span><span class="s1">: </span><span class="s3">'Lslash'</span><span class="s2">,</span>
+    <span class="s4">233</span><span class="s1">: </span><span class="s3">'Oslash'</span><span class="s2">,</span>
+    <span class="s4">234</span><span class="s1">: </span><span class="s3">'OE'</span><span class="s2">,</span>
+    <span class="s4">235</span><span class="s1">: </span><span class="s3">'ordmasculine'</span><span class="s2">,</span>
+    <span class="s4">241</span><span class="s1">: </span><span class="s3">'ae'</span><span class="s2">,</span>
+    <span class="s4">245</span><span class="s1">: </span><span class="s3">'dotlessi'</span><span class="s2">,</span>
+    <span class="s4">248</span><span class="s1">: </span><span class="s3">'lslash'</span><span class="s2">,</span>
+    <span class="s4">249</span><span class="s1">: </span><span class="s3">'oslash'</span><span class="s2">,</span>
+    <span class="s4">250</span><span class="s1">: </span><span class="s3">'oe'</span><span class="s2">,</span>
+    <span class="s4">251</span><span class="s1">: </span><span class="s3">'germandbls'</span><span class="s2">,</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

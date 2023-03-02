@@ -1,0 +1,410 @@
+<html>
+<head>
+<title>argparse_flags.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+argparse_flags.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2018 The Abseil Authors.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;This module provides argparse integration with absl.flags. 
+ 
+``argparse_flags.ArgumentParser`` is a drop-in replacement for 
+:class:`argparse.ArgumentParser`. It takes care of collecting and defining absl 
+flags in :mod:`argparse`. 
+ 
+Here is a simple example:: 
+ 
+    # Assume the following absl.flags is defined in another module: 
+    # 
+    #     from absl import flags 
+    #     flags.DEFINE_string('echo', None, 'The echo message.') 
+    # 
+    parser = argparse_flags.ArgumentParser( 
+        description='A demo of absl.flags and argparse integration.') 
+    parser.add_argument('--header', help='Header message to print.') 
+ 
+    # The parser will also accept the absl flag `--echo`. 
+    # The `header` value is available as `args.header` just like a regular 
+    # argparse flag. The absl flag `--echo` continues to be available via 
+    # `absl.flags.FLAGS` if you want to access it. 
+    args = parser.parse_args() 
+ 
+    # Example usages: 
+    # ./program --echo='A message.' --header='A header' 
+    # ./program --header 'A header' --echo 'A message.' 
+ 
+ 
+Here is another example demonstrates subparsers:: 
+ 
+    parser = argparse_flags.ArgumentParser(description='A subcommands demo.') 
+    parser.add_argument('--header', help='The header message to print.') 
+ 
+    subparsers = parser.add_subparsers(help='The command to execute.') 
+ 
+    roll_dice_parser = subparsers.add_parser( 
+        'roll_dice', help='Roll a dice.', 
+        # By default, absl flags can also be specified after the sub-command. 
+        # To only allow them before sub-command, pass 
+        # `inherited_absl_flags=None`. 
+        inherited_absl_flags=None) 
+    roll_dice_parser.add_argument('--num_faces', type=int, default=6) 
+    roll_dice_parser.set_defaults(command=roll_dice) 
+ 
+    shuffle_parser = subparsers.add_parser('shuffle', help='Shuffle inputs.') 
+    shuffle_parser.add_argument( 
+        'inputs', metavar='I', nargs='+', help='Inputs to shuffle.') 
+    shuffle_parser.set_defaults(command=shuffle) 
+ 
+    args = parser.parse_args(argv[1:]) 
+    args.command(args) 
+ 
+    # Example usages: 
+    # ./program --echo='A message.' roll_dice --num_faces=6 
+    # ./program shuffle --echo='A message.' 1 2 3 4 
+ 
+ 
+There are several differences between :mod:`absl.flags` and 
+:mod:`~absl.flags.argparse_flags`: 
+ 
+1. Flags defined with absl.flags are parsed differently when using the 
+   argparse parser. Notably: 
+ 
+   1) absl.flags allows both single-dash and double-dash for any flag, and 
+      doesn't distinguish them; argparse_flags only allows double-dash for 
+      flag's regular name, and single-dash for flag's ``short_name``. 
+   2) Boolean flags in absl.flags can be specified with ``--bool``, 
+      ``--nobool``, as well as ``--bool=true/false`` (though not recommended); 
+      in argparse_flags, it only allows ``--bool``, ``--nobool``. 
+ 
+2. Help related flag differences: 
+ 
+   1) absl.flags does not define help flags, absl.app does that; argparse_flags 
+      defines help flags unless passed with ``add_help=False``. 
+   2) absl.app supports ``--helpxml``; argparse_flags does not. 
+   3) argparse_flags supports ``-h``; absl.app does not. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">argparse</span>
+<span class="s3">import </span><span class="s1">sys</span>
+
+<span class="s3">from </span><span class="s1">absl </span><span class="s3">import </span><span class="s1">flags</span>
+
+
+<span class="s1">_BUILT_IN_FLAGS = frozenset({</span>
+    <span class="s4">'help'</span><span class="s3">,</span>
+    <span class="s4">'helpshort'</span><span class="s3">,</span>
+    <span class="s4">'helpfull'</span><span class="s3">,</span>
+    <span class="s4">'helpxml'</span><span class="s3">,</span>
+    <span class="s4">'flagfile'</span><span class="s3">,</span>
+    <span class="s4">'undefok'</span><span class="s3">,</span>
+<span class="s1">})</span>
+
+
+<span class="s3">class </span><span class="s1">ArgumentParser(argparse.ArgumentParser):</span>
+  <span class="s2">&quot;&quot;&quot;Custom ArgumentParser class to support special absl flags.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes ArgumentParser. 
+ 
+    Args: 
+      **kwargs: same as argparse.ArgumentParser, except: 
+          1. It also accepts `inherited_absl_flags`: the absl flags to inherit. 
+             The default is the global absl.flags.FLAGS instance. Pass None to 
+             ignore absl flags. 
+          2. The `prefix_chars` argument must be the default value '-'. 
+ 
+    Raises: 
+      ValueError: Raised when prefix_chars is not '-'. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">prefix_chars = kwargs.get(</span><span class="s4">'prefix_chars'</span><span class="s3">, </span><span class="s4">'-'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">prefix_chars != </span><span class="s4">'-'</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">'argparse_flags.ArgumentParser only supports &quot;-&quot; as the prefix '</span>
+          <span class="s4">'character, found &quot;{}&quot;.'</span><span class="s1">.format(prefix_chars))</span>
+
+    <span class="s0"># Remove inherited_absl_flags before calling super.</span>
+    <span class="s1">self._inherited_absl_flags = kwargs.pop(</span><span class="s4">'inherited_absl_flags'</span><span class="s3">, </span><span class="s1">flags.FLAGS)</span>
+    <span class="s0"># Now call super to initialize argparse.ArgumentParser before calling</span>
+    <span class="s0"># add_argument in _define_absl_flags.</span>
+    <span class="s1">super(ArgumentParser</span><span class="s3">, </span><span class="s1">self).__init__(**kwargs)</span>
+
+    <span class="s3">if </span><span class="s1">self.add_help:</span>
+      <span class="s0"># -h and --help are defined in super.</span>
+      <span class="s0"># Also add the --helpshort and --helpfull flags.</span>
+      <span class="s1">self.add_argument(</span>
+          <span class="s0"># Action 'help' defines a similar flag to -h/--help.</span>
+          <span class="s4">'--helpshort'</span><span class="s3">, </span><span class="s1">action=</span><span class="s4">'help'</span><span class="s3">,</span>
+          <span class="s1">default=argparse.SUPPRESS</span><span class="s3">, </span><span class="s1">help=argparse.SUPPRESS)</span>
+      <span class="s1">self.add_argument(</span>
+          <span class="s4">'--helpfull'</span><span class="s3">, </span><span class="s1">action=_HelpFullAction</span><span class="s3">,</span>
+          <span class="s1">default=argparse.SUPPRESS</span><span class="s3">, </span><span class="s1">help=</span><span class="s4">'show full help message and exit'</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">self._inherited_absl_flags:</span>
+      <span class="s1">self.add_argument(</span>
+          <span class="s4">'--undefok'</span><span class="s3">, </span><span class="s1">default=argparse.SUPPRESS</span><span class="s3">, </span><span class="s1">help=argparse.SUPPRESS)</span>
+      <span class="s1">self._define_absl_flags(self._inherited_absl_flags)</span>
+
+  <span class="s3">def </span><span class="s1">parse_known_args(self</span><span class="s3">, </span><span class="s1">args=</span><span class="s3">None, </span><span class="s1">namespace=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s3">if </span><span class="s1">args </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s1">args = sys.argv[</span><span class="s5">1</span><span class="s1">:]</span>
+    <span class="s3">if </span><span class="s1">self._inherited_absl_flags:</span>
+      <span class="s0"># Handle --flagfile.</span>
+      <span class="s0"># Explicitly specify force_gnu=True, since argparse behaves like</span>
+      <span class="s0"># gnu_getopt: flags can be specified after positional arguments.</span>
+      <span class="s1">args = self._inherited_absl_flags.read_flags_from_files(</span>
+          <span class="s1">args</span><span class="s3">, </span><span class="s1">force_gnu=</span><span class="s3">True</span><span class="s1">)</span>
+
+    <span class="s1">undefok_missing = object()</span>
+    <span class="s1">undefok = getattr(namespace</span><span class="s3">, </span><span class="s4">'undefok'</span><span class="s3">, </span><span class="s1">undefok_missing)</span>
+
+    <span class="s1">namespace</span><span class="s3">, </span><span class="s1">args = super(ArgumentParser</span><span class="s3">, </span><span class="s1">self).parse_known_args(</span>
+        <span class="s1">args</span><span class="s3">, </span><span class="s1">namespace)</span>
+
+    <span class="s0"># For Python &lt;= 2.7.8: https://bugs.python.org/issue9351, a bug where</span>
+    <span class="s0"># sub-parsers don't preserve existing namespace attributes.</span>
+    <span class="s0"># Restore the undefok attribute if a sub-parser dropped it.</span>
+    <span class="s3">if </span><span class="s1">undefok </span><span class="s3">is not </span><span class="s1">undefok_missing:</span>
+      <span class="s1">namespace.undefok = undefok</span>
+
+    <span class="s3">if </span><span class="s1">self._inherited_absl_flags:</span>
+      <span class="s0"># Handle --undefok. At this point, `args` only contains unknown flags,</span>
+      <span class="s0"># so it won't strip defined flags that are also specified with --undefok.</span>
+      <span class="s0"># For Python &lt;= 2.7.8: https://bugs.python.org/issue9351, a bug where</span>
+      <span class="s0"># sub-parsers don't preserve existing namespace attributes. The undefok</span>
+      <span class="s0"># attribute might not exist because a subparser dropped it.</span>
+      <span class="s3">if </span><span class="s1">hasattr(namespace</span><span class="s3">, </span><span class="s4">'undefok'</span><span class="s1">):</span>
+        <span class="s1">args = _strip_undefok_args(namespace.undefok</span><span class="s3">, </span><span class="s1">args)</span>
+        <span class="s0"># absl flags are not exposed in the Namespace object. See Namespace:</span>
+        <span class="s0"># https://docs.python.org/3/library/argparse.html#argparse.Namespace.</span>
+        <span class="s3">del </span><span class="s1">namespace.undefok</span>
+      <span class="s1">self._inherited_absl_flags.mark_as_parsed()</span>
+      <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">self._inherited_absl_flags.validate_all_flags()</span>
+      <span class="s3">except </span><span class="s1">flags.IllegalFlagValueError </span><span class="s3">as </span><span class="s1">e:</span>
+        <span class="s1">self.error(str(e))</span>
+
+    <span class="s3">return </span><span class="s1">namespace</span><span class="s3">, </span><span class="s1">args</span>
+
+  <span class="s3">def </span><span class="s1">_define_absl_flags(self</span><span class="s3">, </span><span class="s1">absl_flags):</span>
+    <span class="s2">&quot;&quot;&quot;Defines flags from absl_flags.&quot;&quot;&quot;</span>
+    <span class="s1">key_flags = set(absl_flags.get_key_flags_for_module(sys.argv[</span><span class="s5">0</span><span class="s1">]))</span>
+    <span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">absl_flags:</span>
+      <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">_BUILT_IN_FLAGS:</span>
+        <span class="s0"># Do not inherit built-in flags.</span>
+        <span class="s3">continue</span>
+      <span class="s1">flag_instance = absl_flags[name]</span>
+      <span class="s0"># Each flags with short_name appears in FLAGS twice, so only define</span>
+      <span class="s0"># when the dictionary key is equal to the regular name.</span>
+      <span class="s3">if </span><span class="s1">name == flag_instance.name:</span>
+        <span class="s0"># Suppress the flag in the help short message if it's not a main</span>
+        <span class="s0"># module's key flag.</span>
+        <span class="s1">suppress = flag_instance </span><span class="s3">not in </span><span class="s1">key_flags</span>
+        <span class="s1">self._define_absl_flag(flag_instance</span><span class="s3">, </span><span class="s1">suppress)</span>
+
+  <span class="s3">def </span><span class="s1">_define_absl_flag(self</span><span class="s3">, </span><span class="s1">flag_instance</span><span class="s3">, </span><span class="s1">suppress):</span>
+    <span class="s2">&quot;&quot;&quot;Defines a flag from the flag_instance.&quot;&quot;&quot;</span>
+    <span class="s1">flag_name = flag_instance.name</span>
+    <span class="s1">short_name = flag_instance.short_name</span>
+    <span class="s1">argument_names = [</span><span class="s4">'--' </span><span class="s1">+ flag_name]</span>
+    <span class="s3">if </span><span class="s1">short_name:</span>
+      <span class="s1">argument_names.insert(</span><span class="s5">0</span><span class="s3">, </span><span class="s4">'-' </span><span class="s1">+ short_name)</span>
+    <span class="s3">if </span><span class="s1">suppress:</span>
+      <span class="s1">helptext = argparse.SUPPRESS</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s0"># argparse help string uses %-formatting. Escape the literal %'s.</span>
+      <span class="s1">helptext = flag_instance.help.replace(</span><span class="s4">'%'</span><span class="s3">, </span><span class="s4">'%%'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">flag_instance.boolean:</span>
+      <span class="s0"># Only add the `no` form to the long name.</span>
+      <span class="s1">argument_names.append(</span><span class="s4">'--no' </span><span class="s1">+ flag_name)</span>
+      <span class="s1">self.add_argument(</span>
+          <span class="s1">*argument_names</span><span class="s3">, </span><span class="s1">action=_BooleanFlagAction</span><span class="s3">, </span><span class="s1">help=helptext</span><span class="s3">,</span>
+          <span class="s1">metavar=flag_instance.name.upper()</span><span class="s3">,</span>
+          <span class="s1">flag_instance=flag_instance)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">self.add_argument(</span>
+          <span class="s1">*argument_names</span><span class="s3">, </span><span class="s1">action=_FlagAction</span><span class="s3">, </span><span class="s1">help=helptext</span><span class="s3">,</span>
+          <span class="s1">metavar=flag_instance.name.upper()</span><span class="s3">,</span>
+          <span class="s1">flag_instance=flag_instance)</span>
+
+
+<span class="s3">class </span><span class="s1">_FlagAction(argparse.Action):</span>
+  <span class="s2">&quot;&quot;&quot;Action class for Abseil non-boolean flags.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(</span>
+      <span class="s1">self</span><span class="s3">,</span>
+      <span class="s1">option_strings</span><span class="s3">,</span>
+      <span class="s1">dest</span><span class="s3">,</span>
+      <span class="s1">help</span><span class="s3">,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+      <span class="s1">metavar</span><span class="s3">,</span>
+      <span class="s1">flag_instance</span><span class="s3">,</span>
+      <span class="s1">default=argparse.SUPPRESS):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes _FlagAction. 
+ 
+    Args: 
+      option_strings: See argparse.Action. 
+      dest: Ignored. The flag is always defined with dest=argparse.SUPPRESS. 
+      help: See argparse.Action. 
+      metavar: See argparse.Action. 
+      flag_instance: absl.flags.Flag, the absl flag instance. 
+      default: Ignored. The flag always uses dest=argparse.SUPPRESS so it 
+          doesn't affect the parsing result. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">del </span><span class="s1">dest</span>
+    <span class="s1">self._flag_instance = flag_instance</span>
+    <span class="s1">super(_FlagAction</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">option_strings=option_strings</span><span class="s3">,</span>
+        <span class="s1">dest=argparse.SUPPRESS</span><span class="s3">,</span>
+        <span class="s1">help=help</span><span class="s3">,</span>
+        <span class="s1">metavar=metavar)</span>
+
+  <span class="s3">def </span><span class="s1">__call__(self</span><span class="s3">, </span><span class="s1">parser</span><span class="s3">, </span><span class="s1">namespace</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">option_string=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;See https://docs.python.org/3/library/argparse.html#action-classes.&quot;&quot;&quot;</span>
+    <span class="s1">self._flag_instance.parse(values)</span>
+    <span class="s1">self._flag_instance.using_default_value = </span><span class="s3">False</span>
+
+
+<span class="s3">class </span><span class="s1">_BooleanFlagAction(argparse.Action):</span>
+  <span class="s2">&quot;&quot;&quot;Action class for Abseil boolean flags.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(</span>
+      <span class="s1">self</span><span class="s3">,</span>
+      <span class="s1">option_strings</span><span class="s3">,</span>
+      <span class="s1">dest</span><span class="s3">,</span>
+      <span class="s1">help</span><span class="s3">,  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+      <span class="s1">metavar</span><span class="s3">,</span>
+      <span class="s1">flag_instance</span><span class="s3">,</span>
+      <span class="s1">default=argparse.SUPPRESS):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes _BooleanFlagAction. 
+ 
+    Args: 
+      option_strings: See argparse.Action. 
+      dest: Ignored. The flag is always defined with dest=argparse.SUPPRESS. 
+      help: See argparse.Action. 
+      metavar: See argparse.Action. 
+      flag_instance: absl.flags.Flag, the absl flag instance. 
+      default: Ignored. The flag always uses dest=argparse.SUPPRESS so it 
+          doesn't affect the parsing result. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">del </span><span class="s1">dest</span><span class="s3">, </span><span class="s1">default</span>
+    <span class="s1">self._flag_instance = flag_instance</span>
+    <span class="s1">flag_names = [self._flag_instance.name]</span>
+    <span class="s3">if </span><span class="s1">self._flag_instance.short_name:</span>
+      <span class="s1">flag_names.append(self._flag_instance.short_name)</span>
+    <span class="s1">self._flag_names = frozenset(flag_names)</span>
+    <span class="s1">super(_BooleanFlagAction</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">option_strings=option_strings</span><span class="s3">,</span>
+        <span class="s1">dest=argparse.SUPPRESS</span><span class="s3">,</span>
+        <span class="s1">nargs=</span><span class="s5">0</span><span class="s3">,  </span><span class="s0"># Does not accept values, only `--bool` or `--nobool`.</span>
+        <span class="s1">help=help</span><span class="s3">,</span>
+        <span class="s1">metavar=metavar)</span>
+
+  <span class="s3">def </span><span class="s1">__call__(self</span><span class="s3">, </span><span class="s1">parser</span><span class="s3">, </span><span class="s1">namespace</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">option_string=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;See https://docs.python.org/3/library/argparse.html#action-classes.&quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance(values</span><span class="s3">, </span><span class="s1">list) </span><span class="s3">or </span><span class="s1">values:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'values must be an empty list.'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">option_string.startswith(</span><span class="s4">'--'</span><span class="s1">):</span>
+      <span class="s1">option = option_string[</span><span class="s5">2</span><span class="s1">:]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">option = option_string[</span><span class="s5">1</span><span class="s1">:]</span>
+    <span class="s3">if </span><span class="s1">option </span><span class="s3">in </span><span class="s1">self._flag_names:</span>
+      <span class="s1">self._flag_instance.parse(</span><span class="s4">'true'</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">if not </span><span class="s1">option.startswith(</span><span class="s4">'no'</span><span class="s1">) </span><span class="s3">or </span><span class="s1">option[</span><span class="s5">2</span><span class="s1">:] </span><span class="s3">not in </span><span class="s1">self._flag_names:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'invalid option_string: ' </span><span class="s1">+ option_string)</span>
+      <span class="s1">self._flag_instance.parse(</span><span class="s4">'false'</span><span class="s1">)</span>
+    <span class="s1">self._flag_instance.using_default_value = </span><span class="s3">False</span>
+
+
+<span class="s3">class </span><span class="s1">_HelpFullAction(argparse.Action):</span>
+  <span class="s2">&quot;&quot;&quot;Action class for --helpfull flag.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">option_strings</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">, </span><span class="s1">default</span><span class="s3">, </span><span class="s1">help):  </span><span class="s0"># pylint: disable=redefined-builtin</span>
+    <span class="s2">&quot;&quot;&quot;Initializes _HelpFullAction. 
+ 
+    Args: 
+      option_strings: See argparse.Action. 
+      dest: Ignored. The flag is always defined with dest=argparse.SUPPRESS. 
+      default: Ignored. 
+      help: See argparse.Action. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">del </span><span class="s1">dest</span><span class="s3">, </span><span class="s1">default</span>
+    <span class="s1">super(_HelpFullAction</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+        <span class="s1">option_strings=option_strings</span><span class="s3">,</span>
+        <span class="s1">dest=argparse.SUPPRESS</span><span class="s3">,</span>
+        <span class="s1">default=argparse.SUPPRESS</span><span class="s3">,</span>
+        <span class="s1">nargs=</span><span class="s5">0</span><span class="s3">,</span>
+        <span class="s1">help=help)</span>
+
+  <span class="s3">def </span><span class="s1">__call__(self</span><span class="s3">, </span><span class="s1">parser</span><span class="s3">, </span><span class="s1">namespace</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">option_string=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;See https://docs.python.org/3/library/argparse.html#action-classes.&quot;&quot;&quot;</span>
+    <span class="s0"># This only prints flags when help is not argparse.SUPPRESS.</span>
+    <span class="s0"># It includes user defined argparse flags, as well as main module's</span>
+    <span class="s0"># key absl flags. Other absl flags use argparse.SUPPRESS, so they aren't</span>
+    <span class="s0"># printed here.</span>
+    <span class="s1">parser.print_help()</span>
+
+    <span class="s1">absl_flags = parser._inherited_absl_flags  </span><span class="s0"># pylint: disable=protected-access</span>
+    <span class="s3">if </span><span class="s1">absl_flags:</span>
+      <span class="s1">modules = sorted(absl_flags.flags_by_module_dict())</span>
+      <span class="s1">main_module = sys.argv[</span><span class="s5">0</span><span class="s1">]</span>
+      <span class="s3">if </span><span class="s1">main_module </span><span class="s3">in </span><span class="s1">modules:</span>
+        <span class="s0"># The main module flags are already printed in parser.print_help().</span>
+        <span class="s1">modules.remove(main_module)</span>
+      <span class="s1">print(absl_flags._get_help_for_modules(  </span><span class="s0"># pylint: disable=protected-access</span>
+          <span class="s1">modules</span><span class="s3">, </span><span class="s1">prefix=</span><span class="s4">''</span><span class="s3">, </span><span class="s1">include_special_flags=</span><span class="s3">True</span><span class="s1">))</span>
+    <span class="s1">parser.exit()</span>
+
+
+<span class="s3">def </span><span class="s1">_strip_undefok_args(undefok</span><span class="s3">, </span><span class="s1">args):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a new list of args after removing flags in --undefok.&quot;&quot;&quot;</span>
+  <span class="s3">if </span><span class="s1">undefok:</span>
+    <span class="s1">undefok_names = set(name.strip() </span><span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">undefok.split(</span><span class="s4">','</span><span class="s1">))</span>
+    <span class="s1">undefok_names |= set(</span><span class="s4">'no' </span><span class="s1">+ name </span><span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">undefok_names)</span>
+    <span class="s0"># Remove undefok flags.</span>
+    <span class="s1">args = [arg </span><span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">args </span><span class="s3">if not </span><span class="s1">_is_undefok(arg</span><span class="s3">, </span><span class="s1">undefok_names)]</span>
+  <span class="s3">return </span><span class="s1">args</span>
+
+
+<span class="s3">def </span><span class="s1">_is_undefok(arg</span><span class="s3">, </span><span class="s1">undefok_names):</span>
+  <span class="s2">&quot;&quot;&quot;Returns whether we can ignore arg based on a set of undefok flag names.&quot;&quot;&quot;</span>
+  <span class="s3">if not </span><span class="s1">arg.startswith(</span><span class="s4">'-'</span><span class="s1">):</span>
+    <span class="s3">return False</span>
+  <span class="s3">if </span><span class="s1">arg.startswith(</span><span class="s4">'--'</span><span class="s1">):</span>
+    <span class="s1">arg_without_dash = arg[</span><span class="s5">2</span><span class="s1">:]</span>
+  <span class="s3">else</span><span class="s1">:</span>
+    <span class="s1">arg_without_dash = arg[</span><span class="s5">1</span><span class="s1">:]</span>
+  <span class="s3">if </span><span class="s4">'=' </span><span class="s3">in </span><span class="s1">arg_without_dash:</span>
+    <span class="s1">name</span><span class="s3">, </span><span class="s1">_ = arg_without_dash.split(</span><span class="s4">'='</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+  <span class="s3">else</span><span class="s1">:</span>
+    <span class="s1">name = arg_without_dash</span>
+  <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">undefok_names:</span>
+    <span class="s3">return True</span>
+  <span class="s3">return False</span>
+</pre>
+</body>
+</html>

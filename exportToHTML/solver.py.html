@@ -1,0 +1,337 @@
+<html>
+<head>
+<title>solver.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+solver.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.varLib.models </span><span class="s0">import </span><span class="s1">supportScalar</span><span class="s0">, </span><span class="s1">normalizeValue</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.fixedTools </span><span class="s0">import </span><span class="s1">MAX_F2DOT14</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">lru_cache</span>
+
+<span class="s1">__all__ = [</span><span class="s2">&quot;rebaseTent&quot;</span><span class="s1">]</span>
+
+<span class="s1">EPSILON = </span><span class="s3">1 </span><span class="s1">/ (</span><span class="s3">1 </span><span class="s1">&lt;&lt; </span><span class="s3">14</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_reverse_negate(v):</span>
+    <span class="s0">return </span><span class="s1">(-v[</span><span class="s3">2</span><span class="s1">]</span><span class="s0">, </span><span class="s1">-v[</span><span class="s3">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">-v[</span><span class="s3">0</span><span class="s1">])</span>
+
+
+<span class="s0">def </span><span class="s1">_solve(tent</span><span class="s0">, </span><span class="s1">axisLimit</span><span class="s0">, </span><span class="s1">negative=</span><span class="s0">False</span><span class="s1">):</span>
+    <span class="s1">axisMin</span><span class="s0">, </span><span class="s1">axisDef</span><span class="s0">, </span><span class="s1">axisMax = axisLimit</span>
+    <span class="s1">lower</span><span class="s0">, </span><span class="s1">peak</span><span class="s0">, </span><span class="s1">upper = tent</span>
+
+    <span class="s4"># Mirror the problem such that axisDef &lt;= peak</span>
+    <span class="s0">if </span><span class="s1">axisDef &gt; peak:</span>
+        <span class="s0">return </span><span class="s1">[</span>
+            <span class="s1">(scalar</span><span class="s0">, </span><span class="s1">_reverse_negate(t) </span><span class="s0">if </span><span class="s1">t </span><span class="s0">is not None else None</span><span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">scalar</span><span class="s0">, </span><span class="s1">t </span><span class="s0">in </span><span class="s1">_solve(</span>
+                <span class="s1">_reverse_negate(tent)</span><span class="s0">, </span><span class="s1">_reverse_negate(axisLimit)</span><span class="s0">, not </span><span class="s1">negative</span>
+            <span class="s1">)</span>
+        <span class="s1">]</span>
+    <span class="s4"># axisDef &lt;= peak</span>
+
+    <span class="s4"># case 1: The whole deltaset falls outside the new limit; we can drop it</span>
+    <span class="s4">#</span>
+    <span class="s4">#                                          peak</span>
+    <span class="s4">#  1.........................................o..........</span>
+    <span class="s4">#                                           / \</span>
+    <span class="s4">#                                          /   \</span>
+    <span class="s4">#                                         /     \</span>
+    <span class="s4">#                                        /       \</span>
+    <span class="s4">#  0---|-----------|----------|-------- o         o----1</span>
+    <span class="s4">#    axisMin     axisDef    axisMax   lower     upper</span>
+    <span class="s4">#</span>
+    <span class="s0">if </span><span class="s1">axisMax &lt;= lower </span><span class="s0">and </span><span class="s1">axisMax &lt; peak:</span>
+        <span class="s0">return </span><span class="s1">[]  </span><span class="s4"># No overlap</span>
+
+    <span class="s4"># case 2: Only the peak and outermost bound fall outside the new limit;</span>
+    <span class="s4"># we keep the deltaset, update peak and outermost bound and and scale deltas</span>
+    <span class="s4"># by the scalar value for the restricted axis at the new limit, and solve</span>
+    <span class="s4"># recursively.</span>
+    <span class="s4">#</span>
+    <span class="s4">#                                  |peak</span>
+    <span class="s4">#  1...............................|.o..........</span>
+    <span class="s4">#                                  |/ \</span>
+    <span class="s4">#                                  /   \</span>
+    <span class="s4">#                                 /|    \</span>
+    <span class="s4">#                                / |     \</span>
+    <span class="s4">#  0--------------------------- o  |      o----1</span>
+    <span class="s4">#                           lower  |      upper</span>
+    <span class="s4">#                                  |</span>
+    <span class="s4">#                                axisMax</span>
+    <span class="s4">#</span>
+    <span class="s4"># Convert to:</span>
+    <span class="s4">#</span>
+    <span class="s4">#  1............................................</span>
+    <span class="s4">#                                  |</span>
+    <span class="s4">#                                  o peak</span>
+    <span class="s4">#                                 /|</span>
+    <span class="s4">#                                /x|</span>
+    <span class="s4">#  0--------------------------- o  o upper ----1</span>
+    <span class="s4">#                           lower  |</span>
+    <span class="s4">#                                  |</span>
+    <span class="s4">#                                axisMax</span>
+    <span class="s0">if </span><span class="s1">axisMax &lt; peak:</span>
+        <span class="s1">mult = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisMax}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+        <span class="s1">tent = (lower</span><span class="s0">, </span><span class="s1">axisMax</span><span class="s0">, </span><span class="s1">axisMax)</span>
+        <span class="s0">return </span><span class="s1">[(scalar * mult</span><span class="s0">, </span><span class="s1">t) </span><span class="s0">for </span><span class="s1">scalar</span><span class="s0">, </span><span class="s1">t </span><span class="s0">in </span><span class="s1">_solve(tent</span><span class="s0">, </span><span class="s1">axisLimit)]</span>
+
+    <span class="s4"># lower &lt;= axisDef &lt;= peak &lt;= axisMax</span>
+
+    <span class="s1">gain = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisDef}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+    <span class="s1">out = [(gain</span><span class="s0">, None</span><span class="s1">)]</span>
+
+    <span class="s4"># First, the positive side</span>
+
+    <span class="s4"># outGain is the scalar of axisMax at the tent.</span>
+    <span class="s1">outGain = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisMax}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+
+    <span class="s4"># Case 3a: Gain is more than outGain. The tent down-slope crosses</span>
+    <span class="s4"># the axis into negative. We have to split it into multiples.</span>
+    <span class="s4">#</span>
+    <span class="s4">#                      | peak  |</span>
+    <span class="s4">#  1...................|.o.....|..............</span>
+    <span class="s4">#                      |/x\_   |</span>
+    <span class="s4">#  gain................+....+_.|..............</span>
+    <span class="s4">#                     /|    |y\|</span>
+    <span class="s4">#  ................../.|....|..+_......outGain</span>
+    <span class="s4">#                   /  |    |  | \</span>
+    <span class="s4">#  0---|-----------o   |    |  |  o----------1</span>
+    <span class="s4">#    axisMin    lower  |    |  |   upper</span>
+    <span class="s4">#                      |    |  |</span>
+    <span class="s4">#                axisDef    |  axisMax</span>
+    <span class="s4">#                           |</span>
+    <span class="s4">#                      crossing</span>
+    <span class="s0">if </span><span class="s1">gain &gt; outGain:</span>
+
+        <span class="s4"># Crossing point on the axis.</span>
+        <span class="s1">crossing = peak + ((</span><span class="s3">1 </span><span class="s1">- gain) * (upper - peak) / (</span><span class="s3">1 </span><span class="s1">- outGain))</span>
+
+        <span class="s1">loc = (peak</span><span class="s0">, </span><span class="s1">peak</span><span class="s0">, </span><span class="s1">crossing)</span>
+        <span class="s1">scalar = </span><span class="s3">1</span>
+
+        <span class="s4"># The part before the crossing point.</span>
+        <span class="s1">out.append((scalar - gain</span><span class="s0">, </span><span class="s1">loc))</span>
+
+        <span class="s4"># The part after the crossing point may use one or two tents,</span>
+        <span class="s4"># depending on whether upper is before axisMax or not, in one</span>
+        <span class="s4"># case we need to keep it down to eternity.</span>
+
+        <span class="s4"># Case 3a1, similar to case 1neg; just one tent needed, as in</span>
+        <span class="s4"># the drawing above.</span>
+        <span class="s0">if </span><span class="s1">upper &gt;= axisMax:</span>
+            <span class="s1">loc = (crossing</span><span class="s0">, </span><span class="s1">axisMax</span><span class="s0">, </span><span class="s1">axisMax)</span>
+            <span class="s1">scalar = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisMax}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+
+            <span class="s1">out.append((scalar - gain</span><span class="s0">, </span><span class="s1">loc))</span>
+
+        <span class="s4"># Case 3a2: Similar to case 2neg; two tents needed, to keep</span>
+        <span class="s4"># down to eternity.</span>
+        <span class="s4">#</span>
+        <span class="s4">#                      | peak             |</span>
+        <span class="s4">#  1...................|.o................|...</span>
+        <span class="s4">#                      |/ \_              |</span>
+        <span class="s4">#  gain................+....+_............|...</span>
+        <span class="s4">#                     /|    | \xxxxxxxxxxy|</span>
+        <span class="s4">#                    / |    |  \_xxxxxyyyy|</span>
+        <span class="s4">#                   /  |    |    \xxyyyyyy|</span>
+        <span class="s4">#  0---|-----------o   |    |     o-------|--1</span>
+        <span class="s4">#    axisMin    lower  |    |      upper  |</span>
+        <span class="s4">#                      |    |             |</span>
+        <span class="s4">#                axisDef    |             axisMax</span>
+        <span class="s4">#                           |</span>
+        <span class="s4">#                      crossing</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s4"># A tent's peak cannot fall on axis default. Nudge it.</span>
+            <span class="s0">if </span><span class="s1">upper == axisDef:</span>
+                <span class="s1">upper += EPSILON</span>
+
+            <span class="s4"># Downslope.</span>
+            <span class="s1">loc1 = (crossing</span><span class="s0">, </span><span class="s1">upper</span><span class="s0">, </span><span class="s1">axisMax)</span>
+            <span class="s1">scalar1 = </span><span class="s3">0</span>
+
+            <span class="s4"># Eternity justify.</span>
+            <span class="s1">loc2 = (upper</span><span class="s0">, </span><span class="s1">axisMax</span><span class="s0">, </span><span class="s1">axisMax)</span>
+            <span class="s1">scalar2 = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisMax}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+
+            <span class="s1">out.append((scalar1 - gain</span><span class="s0">, </span><span class="s1">loc1))</span>
+            <span class="s1">out.append((scalar2 - gain</span><span class="s0">, </span><span class="s1">loc2))</span>
+
+    <span class="s4"># Case 3: Outermost limit still fits within F2Dot14 bounds;</span>
+    <span class="s4"># we keep deltas as is and only scale the axes bounds. Deltas beyond -1.0</span>
+    <span class="s4"># or +1.0 will never be applied as implementations must clamp to that range.</span>
+    <span class="s4">#</span>
+    <span class="s4"># A second tent is needed for cases when gain is positive, though we add it</span>
+    <span class="s4"># unconditionally and it will be dropped because scalar ends up 0.</span>
+    <span class="s4">#</span>
+    <span class="s4"># TODO: See if we can just move upper closer to adjust the slope, instead of</span>
+    <span class="s4"># second tent.</span>
+    <span class="s4">#</span>
+    <span class="s4">#            |           peak |</span>
+    <span class="s4">#  1.........|............o...|..................</span>
+    <span class="s4">#            |           /x\  |</span>
+    <span class="s4">#            |          /xxx\ |</span>
+    <span class="s4">#            |         /xxxxx\|</span>
+    <span class="s4">#            |        /xxxxxxx+</span>
+    <span class="s4">#            |       /xxxxxxxx|\</span>
+    <span class="s4">#  0---|-----|------oxxxxxxxxx|xo---------------1</span>
+    <span class="s4">#    axisMin |  lower         | upper</span>
+    <span class="s4">#            |                |</span>
+    <span class="s4">#          axisDef          axisMax</span>
+    <span class="s4">#</span>
+    <span class="s0">elif </span><span class="s1">axisDef + (axisMax - axisDef) * </span><span class="s3">2 </span><span class="s1">&gt;= upper:</span>
+
+        <span class="s0">if not </span><span class="s1">negative </span><span class="s0">and </span><span class="s1">axisDef + (axisMax - axisDef) * MAX_F2DOT14 &lt; upper:</span>
+            <span class="s4"># we clamp +2.0 to the max F2Dot14 (~1.99994) for convenience</span>
+            <span class="s1">upper = axisDef + (axisMax - axisDef) * MAX_F2DOT14</span>
+            <span class="s0">assert </span><span class="s1">peak &lt; upper</span>
+
+        <span class="s4"># Special-case if peak is at axisMax.</span>
+        <span class="s0">if </span><span class="s1">axisMax == peak:</span>
+            <span class="s1">upper = peak</span>
+
+        <span class="s1">loc1 = (max(axisDef</span><span class="s0">, </span><span class="s1">lower)</span><span class="s0">, </span><span class="s1">peak</span><span class="s0">, </span><span class="s1">upper)</span>
+        <span class="s1">scalar1 = </span><span class="s3">1</span>
+
+        <span class="s1">loc2 = (peak</span><span class="s0">, </span><span class="s1">upper</span><span class="s0">, </span><span class="s1">upper)</span>
+        <span class="s1">scalar2 = </span><span class="s3">0</span>
+
+        <span class="s4"># Don't add a dirac delta!</span>
+        <span class="s0">if </span><span class="s1">axisDef &lt; upper:</span>
+            <span class="s1">out.append((scalar1 - gain</span><span class="s0">, </span><span class="s1">loc1))</span>
+        <span class="s0">if </span><span class="s1">peak &lt; upper:</span>
+            <span class="s1">out.append((scalar2 - gain</span><span class="s0">, </span><span class="s1">loc2))</span>
+
+    <span class="s4"># Case 4: New limit doesn't fit; we need to chop into two tents,</span>
+    <span class="s4"># because the shape of a triangle with part of one side cut off</span>
+    <span class="s4"># cannot be represented as a triangle itself.</span>
+    <span class="s4">#</span>
+    <span class="s4">#            |   peak |</span>
+    <span class="s4">#  1.........|......o.|...................</span>
+    <span class="s4">#            |     /x\|</span>
+    <span class="s4">#            |    |xxy|\_</span>
+    <span class="s4">#            |   /xxxy|  \_</span>
+    <span class="s4">#            |  |xxxxy|    \_</span>
+    <span class="s4">#            |  /xxxxy|      \_</span>
+    <span class="s4">#  0---|-----|-oxxxxxx|        o----------1</span>
+    <span class="s4">#    axisMin | lower  |        upper</span>
+    <span class="s4">#            |        |</span>
+    <span class="s4">#          axisDef  axisMax</span>
+    <span class="s4">#</span>
+    <span class="s0">else</span><span class="s1">:</span>
+
+        <span class="s1">loc1 = (max(axisDef</span><span class="s0">, </span><span class="s1">lower)</span><span class="s0">, </span><span class="s1">peak</span><span class="s0">, </span><span class="s1">axisMax)</span>
+        <span class="s1">scalar1 = </span><span class="s3">1</span>
+
+        <span class="s1">loc2 = (peak</span><span class="s0">, </span><span class="s1">axisMax</span><span class="s0">, </span><span class="s1">axisMax)</span>
+        <span class="s1">scalar2 = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisMax}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+
+        <span class="s1">out.append((scalar1 - gain</span><span class="s0">, </span><span class="s1">loc1))</span>
+        <span class="s4"># Don't add a dirac delta!</span>
+        <span class="s0">if </span><span class="s1">peak &lt; axisMax:</span>
+            <span class="s1">out.append((scalar2 - gain</span><span class="s0">, </span><span class="s1">loc2))</span>
+
+    <span class="s4"># Now, the negative side</span>
+
+    <span class="s4"># Case 1neg: Lower extends beyond axisMin: we chop. Simple.</span>
+    <span class="s4">#</span>
+    <span class="s4">#                     |   |peak</span>
+    <span class="s4">#  1..................|...|.o.................</span>
+    <span class="s4">#                     |   |/ \</span>
+    <span class="s4">#  gain...............|...+...\...............</span>
+    <span class="s4">#                     |x_/|    \</span>
+    <span class="s4">#                     |/  |     \</span>
+    <span class="s4">#                   _/|   |      \</span>
+    <span class="s4">#  0---------------o  |   |       o----------1</span>
+    <span class="s4">#              lower  |   |       upper</span>
+    <span class="s4">#                     |   |</span>
+    <span class="s4">#               axisMin   axisDef</span>
+    <span class="s4">#</span>
+    <span class="s0">if </span><span class="s1">lower &lt;= axisMin:</span>
+        <span class="s1">loc = (axisMin</span><span class="s0">, </span><span class="s1">axisMin</span><span class="s0">, </span><span class="s1">axisDef)</span>
+        <span class="s1">scalar = supportScalar({</span><span class="s2">&quot;tag&quot;</span><span class="s1">: axisMin}</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;tag&quot;</span><span class="s1">: tent})</span>
+
+        <span class="s1">out.append((scalar - gain</span><span class="s0">, </span><span class="s1">loc))</span>
+
+    <span class="s4"># Case 2neg: Lower is betwen axisMin and axisDef: we add two</span>
+    <span class="s4"># tents to keep it down all the way to eternity.</span>
+    <span class="s4">#</span>
+    <span class="s4">#      |               |peak</span>
+    <span class="s4">#  1...|...............|.o.................</span>
+    <span class="s4">#      |               |/ \</span>
+    <span class="s4">#  gain|...............+...\...............</span>
+    <span class="s4">#      |yxxxxxxxxxxxxx/|    \</span>
+    <span class="s4">#      |yyyyyyxxxxxxx/ |     \</span>
+    <span class="s4">#      |yyyyyyyyyyyx/  |      \</span>
+    <span class="s4">#  0---|-----------o   |       o----------1</span>
+    <span class="s4">#    axisMin    lower  |       upper</span>
+    <span class="s4">#                      |</span>
+    <span class="s4">#                    axisDef</span>
+    <span class="s4">#</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s4"># A tent's peak cannot fall on axis default. Nudge it.</span>
+        <span class="s0">if </span><span class="s1">lower == axisDef:</span>
+            <span class="s1">lower -= EPSILON</span>
+
+        <span class="s4"># Downslope.</span>
+        <span class="s1">loc1 = (axisMin</span><span class="s0">, </span><span class="s1">lower</span><span class="s0">, </span><span class="s1">axisDef)</span>
+        <span class="s1">scalar1 = </span><span class="s3">0</span>
+
+        <span class="s4"># Eternity justify.</span>
+        <span class="s1">loc2 = (axisMin</span><span class="s0">, </span><span class="s1">axisMin</span><span class="s0">, </span><span class="s1">lower)</span>
+        <span class="s1">scalar2 = </span><span class="s3">0</span>
+
+        <span class="s1">out.append((scalar1 - gain</span><span class="s0">, </span><span class="s1">loc1))</span>
+        <span class="s1">out.append((scalar2 - gain</span><span class="s0">, </span><span class="s1">loc2))</span>
+
+    <span class="s0">return </span><span class="s1">out</span>
+
+
+<span class="s1">@lru_cache(</span><span class="s3">128</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">rebaseTent(tent</span><span class="s0">, </span><span class="s1">axisLimit):</span>
+    <span class="s5">&quot;&quot;&quot;Given a tuple (lower,peak,upper) &quot;tent&quot; and new axis limits 
+    (axisMin,axisDefault,axisMax), solves how to represent the tent 
+    under the new axis configuration.  All values are in normalized 
+    -1,0,+1 coordinate system. Tent values can be outside this range. 
+ 
+    Return value is a list of tuples. Each tuple is of the form 
+    (scalar,tent), where scalar is a multipler to multiply any 
+    delta-sets by, and tent is a new tent for that output delta-set. 
+    If tent value is None, that is a special deltaset that should 
+    be always-enabled (called &quot;gain&quot;).&quot;&quot;&quot;</span>
+
+    <span class="s1">axisMin</span><span class="s0">, </span><span class="s1">axisDef</span><span class="s0">, </span><span class="s1">axisMax = axisLimit</span>
+    <span class="s0">assert </span><span class="s1">-</span><span class="s3">1 </span><span class="s1">&lt;= axisMin &lt;= axisDef &lt;= axisMax &lt;= +</span><span class="s3">1</span>
+
+    <span class="s1">lower</span><span class="s0">, </span><span class="s1">peak</span><span class="s0">, </span><span class="s1">upper = tent</span>
+    <span class="s0">assert </span><span class="s1">-</span><span class="s3">2 </span><span class="s1">&lt;= lower &lt;= peak &lt;= upper &lt;= +</span><span class="s3">2</span>
+
+    <span class="s0">assert </span><span class="s1">peak != </span><span class="s3">0</span>
+
+    <span class="s1">sols = _solve(tent</span><span class="s0">, </span><span class="s1">axisLimit)</span>
+
+    <span class="s1">n = </span><span class="s0">lambda </span><span class="s1">v: normalizeValue(v</span><span class="s0">, </span><span class="s1">axisLimit</span><span class="s0">, </span><span class="s1">extrapolate=</span><span class="s0">True</span><span class="s1">)</span>
+    <span class="s1">sols = [</span>
+        <span class="s1">(scalar</span><span class="s0">, </span><span class="s1">(n(v[</span><span class="s3">0</span><span class="s1">])</span><span class="s0">, </span><span class="s1">n(v[</span><span class="s3">1</span><span class="s1">])</span><span class="s0">, </span><span class="s1">n(v[</span><span class="s3">2</span><span class="s1">])) </span><span class="s0">if </span><span class="s1">v </span><span class="s0">is not None else None</span><span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">scalar</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">sols</span>
+        <span class="s0">if </span><span class="s1">scalar</span>
+    <span class="s1">]</span>
+
+    <span class="s0">return </span><span class="s1">sols</span>
+</pre>
+</body>
+</html>

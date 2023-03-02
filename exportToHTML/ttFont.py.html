@@ -1,0 +1,1073 @@
+<html>
+<head>
+<title>ttFont.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ttFont.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.config </span><span class="s0">import </span><span class="s1">Config</span>
+<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">xmlWriter</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.configTools </span><span class="s0">import </span><span class="s1">AbstractConfig</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">Tag</span><span class="s0">, </span><span class="s1">byteord</span><span class="s0">, </span><span class="s1">tostr</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.loggingTools </span><span class="s0">import </span><span class="s1">deprecateArgument</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib </span><span class="s0">import </span><span class="s1">TTLibError</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.ttGlyphSet </span><span class="s0">import </span><span class="s1">_TTGlyph</span><span class="s0">, </span><span class="s1">_TTGlyphSetCFF</span><span class="s0">, </span><span class="s1">_TTGlyphSetGlyf</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.sfnt </span><span class="s0">import </span><span class="s1">SFNTReader</span><span class="s0">, </span><span class="s1">SFNTWriter</span>
+<span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">BytesIO</span><span class="s0">, </span><span class="s1">StringIO</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">traceback</span>
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s0">class </span><span class="s1">TTFont(object):</span>
+
+	<span class="s2">&quot;&quot;&quot;Represents a TrueType font. 
+ 
+    The object manages file input and output, and offers a convenient way of 
+    accessing tables. Tables will be only decompiled when necessary, ie. when 
+    they're actually accessed. This means that simple operations can be extremely fast. 
+ 
+    Example usage:: 
+ 
+        &gt;&gt; from fontTools import ttLib 
+        &gt;&gt; tt = ttLib.TTFont(&quot;afont.ttf&quot;) # Load an existing font file 
+        &gt;&gt; tt['maxp'].numGlyphs 
+        242 
+        &gt;&gt; tt['OS/2'].achVendID 
+        'B&amp;H\000' 
+        &gt;&gt; tt['head'].unitsPerEm 
+        2048 
+ 
+    For details of the objects returned when accessing each table, see :ref:`tables`. 
+    To add a table to the font, use the :py:func:`newTable` function:: 
+ 
+        &gt;&gt; os2 = newTable(&quot;OS/2&quot;) 
+        &gt;&gt; os2.version = 4 
+        &gt;&gt; # set other attributes 
+        &gt;&gt; font[&quot;OS/2&quot;] = os2 
+ 
+    TrueType fonts can also be serialized to and from XML format (see also the 
+    :ref:`ttx` binary):: 
+ 
+        &gt;&gt; tt.saveXML(&quot;afont.ttx&quot;) 
+        Dumping 'LTSH' table... 
+        Dumping 'OS/2' table... 
+        [...] 
+ 
+        &gt;&gt; tt2 = ttLib.TTFont() # Create a new font object 
+        &gt;&gt; tt2.importXML(&quot;afont.ttx&quot;) 
+        &gt;&gt; tt2['maxp'].numGlyphs 
+        242 
+ 
+    The TTFont object may be used as a context manager; this will cause the file 
+    reader to be closed after the context ``with`` block is exited:: 
+ 
+        with TTFont(filename) as f: 
+            # Do stuff 
+ 
+    Args: 
+        file: When reading a font from disk, either a pathname pointing to a file, 
+            or a readable file object. 
+        res_name_or_index: If running on a Macintosh, either a sfnt resource name or 
+            an sfnt resource index number. If the index number is zero, TTLib will 
+            autodetect whether the file is a flat file or a suitcase. (If it is a suitcase, 
+            only the first 'sfnt' resource will be read.) 
+        sfntVersion (str): When constructing a font object from scratch, sets the four-byte 
+            sfnt magic number to be used. Defaults to ``\0\1\0\0`` (TrueType). To create 
+            an OpenType file, use ``OTTO``. 
+        flavor (str): Set this to ``woff`` when creating a WOFF file or ``woff2`` for a WOFF2 
+            file. 
+        checkChecksums (int): How checksum data should be treated. Default is 0 
+            (no checking). Set to 1 to check and warn on wrong checksums; set to 2 to 
+            raise an exception if any wrong checksums are found. 
+        recalcBBoxes (bool): If true (the default), recalculates ``glyf``, ``CFF ``, 
+            ``head`` bounding box values and ``hhea``/``vhea`` min/max values on save. 
+            Also compiles the glyphs on importing, which saves memory consumption and 
+            time. 
+        ignoreDecompileErrors (bool): If true, exceptions raised during table decompilation 
+            will be ignored, and the binary data will be returned for those tables instead. 
+        recalcTimestamp (bool): If true (the default), sets the ``modified`` timestamp in 
+            the ``head`` table on save. 
+        fontNumber (int): The index of the font in a TrueType Collection file. 
+        lazy (bool): If lazy is set to True, many data structures are loaded lazily, upon 
+            access only. If it is set to False, many data structures are loaded immediately. 
+            The default is ``lazy=None`` which is somewhere in between. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">file=</span><span class="s0">None, </span><span class="s1">res_name_or_index=</span><span class="s0">None,</span>
+			<span class="s1">sfntVersion=</span><span class="s3">&quot;</span><span class="s0">\000\001\000\000</span><span class="s3">&quot;</span><span class="s0">, </span><span class="s1">flavor=</span><span class="s0">None, </span><span class="s1">checkChecksums=</span><span class="s4">0</span><span class="s0">,</span>
+			<span class="s1">verbose=</span><span class="s0">None, </span><span class="s1">recalcBBoxes=</span><span class="s0">True, </span><span class="s1">allowVID=NotImplemented</span><span class="s0">, </span><span class="s1">ignoreDecompileErrors=</span><span class="s0">False,</span>
+			<span class="s1">recalcTimestamp=</span><span class="s0">True, </span><span class="s1">fontNumber=-</span><span class="s4">1</span><span class="s0">, </span><span class="s1">lazy=</span><span class="s0">None, </span><span class="s1">quiet=</span><span class="s0">None,</span>
+			<span class="s1">_tableCache=</span><span class="s0">None, </span><span class="s1">cfg={}):</span>
+		<span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">(</span><span class="s3">&quot;verbose&quot;</span><span class="s0">, </span><span class="s3">&quot;quiet&quot;</span><span class="s1">):</span>
+			<span class="s1">val = locals().get(name)</span>
+			<span class="s0">if </span><span class="s1">val </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">deprecateArgument(name</span><span class="s0">, </span><span class="s3">&quot;configure logging instead&quot;</span><span class="s1">)</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">val)</span>
+
+		<span class="s1">self.lazy = lazy</span>
+		<span class="s1">self.recalcBBoxes = recalcBBoxes</span>
+		<span class="s1">self.recalcTimestamp = recalcTimestamp</span>
+		<span class="s1">self.tables = {}</span>
+		<span class="s1">self.reader = </span><span class="s0">None</span>
+		<span class="s1">self.cfg = cfg.copy() </span><span class="s0">if </span><span class="s1">isinstance(cfg</span><span class="s0">, </span><span class="s1">AbstractConfig) </span><span class="s0">else </span><span class="s1">Config(cfg)</span>
+		<span class="s1">self.ignoreDecompileErrors = ignoreDecompileErrors</span>
+
+		<span class="s0">if not </span><span class="s1">file:</span>
+			<span class="s1">self.sfntVersion = sfntVersion</span>
+			<span class="s1">self.flavor = flavor</span>
+			<span class="s1">self.flavorData = </span><span class="s0">None</span>
+			<span class="s0">return</span>
+		<span class="s0">if not </span><span class="s1">hasattr(file</span><span class="s0">, </span><span class="s3">&quot;read&quot;</span><span class="s1">):</span>
+			<span class="s1">closeStream = </span><span class="s0">True</span>
+			<span class="s5"># assume file is a string</span>
+			<span class="s0">if </span><span class="s1">res_name_or_index </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s5"># see if it contains 'sfnt' resources in the resource or data fork</span>
+				<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">macUtils</span>
+				<span class="s0">if </span><span class="s1">res_name_or_index == </span><span class="s4">0</span><span class="s1">:</span>
+					<span class="s0">if </span><span class="s1">macUtils.getSFNTResIndices(file):</span>
+						<span class="s5"># get the first available sfnt font.</span>
+						<span class="s1">file = macUtils.SFNTResourceReader(file</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s1">file = open(file</span><span class="s0">, </span><span class="s3">&quot;rb&quot;</span><span class="s1">)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">file = macUtils.SFNTResourceReader(file</span><span class="s0">, </span><span class="s1">res_name_or_index)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">file = open(file</span><span class="s0">, </span><span class="s3">&quot;rb&quot;</span><span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># assume &quot;file&quot; is a readable file object</span>
+			<span class="s1">closeStream = </span><span class="s0">False</span>
+			<span class="s1">file.seek(</span><span class="s4">0</span><span class="s1">)</span>
+
+		<span class="s0">if not </span><span class="s1">self.lazy:</span>
+			<span class="s5"># read input file in memory and wrap a stream around it to allow overwriting</span>
+			<span class="s1">file.seek(</span><span class="s4">0</span><span class="s1">)</span>
+			<span class="s1">tmp = BytesIO(file.read())</span>
+			<span class="s0">if </span><span class="s1">hasattr(file</span><span class="s0">, </span><span class="s3">'name'</span><span class="s1">):</span>
+				<span class="s5"># save reference to input file name</span>
+				<span class="s1">tmp.name = file.name</span>
+			<span class="s0">if </span><span class="s1">closeStream:</span>
+				<span class="s1">file.close()</span>
+			<span class="s1">file = tmp</span>
+		<span class="s1">self._tableCache = _tableCache</span>
+		<span class="s1">self.reader = SFNTReader(file</span><span class="s0">, </span><span class="s1">checkChecksums</span><span class="s0">, </span><span class="s1">fontNumber=fontNumber)</span>
+		<span class="s1">self.sfntVersion = self.reader.sfntVersion</span>
+		<span class="s1">self.flavor = self.reader.flavor</span>
+		<span class="s1">self.flavorData = self.reader.flavorData</span>
+
+	<span class="s0">def </span><span class="s1">__enter__(self):</span>
+		<span class="s0">return </span><span class="s1">self</span>
+
+	<span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">type</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">traceback):</span>
+		<span class="s1">self.close()</span>
+
+	<span class="s0">def </span><span class="s1">close(self):</span>
+		<span class="s2">&quot;&quot;&quot;If we still have a reader object, close it.&quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">self.reader </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">self.reader.close()</span>
+
+	<span class="s0">def </span><span class="s1">save(self</span><span class="s0">, </span><span class="s1">file</span><span class="s0">, </span><span class="s1">reorderTables=</span><span class="s0">True</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Save the font to disk. 
+ 
+        Args: 
+            file: Similarly to the constructor, can be either a pathname or a writable 
+                file object. 
+            reorderTables (Option[bool]): If true (the default), reorder the tables, 
+                sorting them by tag (recommended by the OpenType specification). If 
+                false, retain the original font order. If None, reorder by table 
+                dependency (fastest). 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if not </span><span class="s1">hasattr(file</span><span class="s0">, </span><span class="s3">&quot;write&quot;</span><span class="s1">):</span>
+			<span class="s0">if </span><span class="s1">self.lazy </span><span class="s0">and </span><span class="s1">self.reader.file.name == file:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span>
+					<span class="s3">&quot;Can't overwrite TTFont when 'lazy' attribute is True&quot;</span><span class="s1">)</span>
+			<span class="s1">createStream = </span><span class="s0">True</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># assume &quot;file&quot; is a writable file object</span>
+			<span class="s1">createStream = </span><span class="s0">False</span>
+
+		<span class="s1">tmp = BytesIO()</span>
+
+		<span class="s1">writer_reordersTables = self._save(tmp)</span>
+
+		<span class="s0">if not </span><span class="s1">(reorderTables </span><span class="s0">is None or </span><span class="s1">writer_reordersTables </span><span class="s0">or</span>
+				<span class="s1">(reorderTables </span><span class="s0">is False and </span><span class="s1">self.reader </span><span class="s0">is None</span><span class="s1">)):</span>
+			<span class="s0">if </span><span class="s1">reorderTables </span><span class="s0">is False</span><span class="s1">:</span>
+				<span class="s5"># sort tables using the original font's order</span>
+				<span class="s1">tableOrder = list(self.reader.keys())</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s5"># use the recommended order from the OpenType specification</span>
+				<span class="s1">tableOrder = </span><span class="s0">None</span>
+			<span class="s1">tmp.flush()</span>
+			<span class="s1">tmp2 = BytesIO()</span>
+			<span class="s1">reorderFontTables(tmp</span><span class="s0">, </span><span class="s1">tmp2</span><span class="s0">, </span><span class="s1">tableOrder)</span>
+			<span class="s1">tmp.close()</span>
+			<span class="s1">tmp = tmp2</span>
+
+		<span class="s0">if </span><span class="s1">createStream:</span>
+			<span class="s5"># &quot;file&quot; is a path</span>
+			<span class="s0">with </span><span class="s1">open(file</span><span class="s0">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">file:</span>
+				<span class="s1">file.write(tmp.getvalue())</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">file.write(tmp.getvalue())</span>
+
+		<span class="s1">tmp.close()</span>
+
+	<span class="s0">def </span><span class="s1">_save(self</span><span class="s0">, </span><span class="s1">file</span><span class="s0">, </span><span class="s1">tableCache=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Internal function, to be shared by save() and TTCollection.save()&quot;&quot;&quot;</span>
+
+		<span class="s0">if </span><span class="s1">self.recalcTimestamp </span><span class="s0">and </span><span class="s3">'head' </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s1">self[</span><span class="s3">'head'</span><span class="s1">]  </span><span class="s5"># make sure 'head' is loaded so the recalculation is actually done</span>
+
+		<span class="s1">tags = list(self.keys())</span>
+		<span class="s0">if </span><span class="s3">&quot;GlyphOrder&quot; </span><span class="s0">in </span><span class="s1">tags:</span>
+			<span class="s1">tags.remove(</span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">)</span>
+		<span class="s1">numTables = len(tags)</span>
+		<span class="s5"># write to a temporary stream to allow saving to unseekable streams</span>
+		<span class="s1">writer = SFNTWriter(file</span><span class="s0">, </span><span class="s1">numTables</span><span class="s0">, </span><span class="s1">self.sfntVersion</span><span class="s0">, </span><span class="s1">self.flavor</span><span class="s0">, </span><span class="s1">self.flavorData)</span>
+
+		<span class="s1">done = []</span>
+		<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">tags:</span>
+			<span class="s1">self._writeTable(tag</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">tableCache)</span>
+
+		<span class="s1">writer.close()</span>
+
+		<span class="s0">return </span><span class="s1">writer.reordersTables()</span>
+
+	<span class="s0">def </span><span class="s1">saveXML(self</span><span class="s0">, </span><span class="s1">fileOrPath</span><span class="s0">, </span><span class="s1">newlinestr=</span><span class="s3">&quot;</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+		<span class="s2">&quot;&quot;&quot;Export the font as TTX (an XML-based text file), or as a series of text 
+        files when splitTables is true. In the latter case, the 'fileOrPath' 
+        argument should be a path to a directory. 
+        The 'tables' argument must either be false (dump all tables) or a 
+        list of tables to dump. The 'skipTables' argument may be a list of tables 
+        to skip, but only when the 'tables' argument is false. 
+        &quot;&quot;&quot;</span>
+
+		<span class="s1">writer = xmlWriter.XMLWriter(fileOrPath</span><span class="s0">, </span><span class="s1">newlinestr=newlinestr)</span>
+		<span class="s1">self._saveXML(writer</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+		<span class="s1">writer.close()</span>
+
+	<span class="s0">def </span><span class="s1">_saveXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">,</span>
+		     <span class="s1">writeVersion=</span><span class="s0">True,</span>
+		     <span class="s1">quiet=</span><span class="s0">None, </span><span class="s1">tables=</span><span class="s0">None, </span><span class="s1">skipTables=</span><span class="s0">None, </span><span class="s1">splitTables=</span><span class="s0">False,</span>
+		     <span class="s1">splitGlyphs=</span><span class="s0">False, </span><span class="s1">disassembleInstructions=</span><span class="s0">True,</span>
+		     <span class="s1">bitmapGlyphDataFormat=</span><span class="s3">'raw'</span><span class="s1">):</span>
+
+		<span class="s0">if </span><span class="s1">quiet </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">deprecateArgument(</span><span class="s3">&quot;quiet&quot;</span><span class="s0">, </span><span class="s3">&quot;configure logging instead&quot;</span><span class="s1">)</span>
+
+		<span class="s1">self.disassembleInstructions = disassembleInstructions</span>
+		<span class="s1">self.bitmapGlyphDataFormat = bitmapGlyphDataFormat</span>
+		<span class="s0">if not </span><span class="s1">tables:</span>
+			<span class="s1">tables = list(self.keys())</span>
+			<span class="s0">if </span><span class="s3">&quot;GlyphOrder&quot; </span><span class="s0">not in </span><span class="s1">tables:</span>
+				<span class="s1">tables = [</span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">] + tables</span>
+			<span class="s0">if </span><span class="s1">skipTables:</span>
+				<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">skipTables:</span>
+					<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">tables:</span>
+						<span class="s1">tables.remove(tag)</span>
+		<span class="s1">numTables = len(tables)</span>
+
+		<span class="s0">if </span><span class="s1">writeVersion:</span>
+			<span class="s0">from </span><span class="s1">fontTools </span><span class="s0">import </span><span class="s1">version</span>
+			<span class="s1">version = </span><span class="s3">&quot;.&quot;</span><span class="s1">.join(version.split(</span><span class="s3">'.'</span><span class="s1">)[:</span><span class="s4">2</span><span class="s1">])</span>
+			<span class="s1">writer.begintag(</span><span class="s3">&quot;ttFont&quot;</span><span class="s0">, </span><span class="s1">sfntVersion=repr(tostr(self.sfntVersion))[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">,</span>
+					<span class="s1">ttLibVersion=version)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">writer.begintag(</span><span class="s3">&quot;ttFont&quot;</span><span class="s0">, </span><span class="s1">sfntVersion=repr(tostr(self.sfntVersion))[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">])</span>
+		<span class="s1">writer.newline()</span>
+
+		<span class="s5"># always splitTables if splitGlyphs is enabled</span>
+		<span class="s1">splitTables = splitTables </span><span class="s0">or </span><span class="s1">splitGlyphs</span>
+
+		<span class="s0">if not </span><span class="s1">splitTables:</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">path</span><span class="s0">, </span><span class="s1">ext = os.path.splitext(writer.filename)</span>
+			<span class="s1">fileNameTemplate = path + </span><span class="s3">&quot;.%s&quot; </span><span class="s1">+ ext</span>
+
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numTables):</span>
+			<span class="s1">tag = tables[i]</span>
+			<span class="s0">if </span><span class="s1">splitTables:</span>
+				<span class="s1">tablePath = fileNameTemplate % tagToIdentifier(tag)</span>
+				<span class="s1">tableWriter = xmlWriter.XMLWriter(tablePath</span><span class="s0">,</span>
+						<span class="s1">newlinestr=writer.newlinestr)</span>
+				<span class="s1">tableWriter.begintag(</span><span class="s3">&quot;ttFont&quot;</span><span class="s0">, </span><span class="s1">ttLibVersion=version)</span>
+				<span class="s1">tableWriter.newline()</span>
+				<span class="s1">tableWriter.newline()</span>
+				<span class="s1">writer.simpletag(tagToXML(tag)</span><span class="s0">, </span><span class="s1">src=os.path.basename(tablePath))</span>
+				<span class="s1">writer.newline()</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">tableWriter = writer</span>
+			<span class="s1">self._tableToXML(tableWriter</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">splitGlyphs=splitGlyphs)</span>
+			<span class="s0">if </span><span class="s1">splitTables:</span>
+				<span class="s1">tableWriter.endtag(</span><span class="s3">&quot;ttFont&quot;</span><span class="s1">)</span>
+				<span class="s1">tableWriter.newline()</span>
+				<span class="s1">tableWriter.close()</span>
+		<span class="s1">writer.endtag(</span><span class="s3">&quot;ttFont&quot;</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">_tableToXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">quiet=</span><span class="s0">None, </span><span class="s1">splitGlyphs=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">quiet </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">deprecateArgument(</span><span class="s3">&quot;quiet&quot;</span><span class="s0">, </span><span class="s3">&quot;configure logging instead&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s1">table = self[tag]</span>
+			<span class="s1">report = </span><span class="s3">&quot;Dumping '%s' table...&quot; </span><span class="s1">% tag</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">report = </span><span class="s3">&quot;No '%s' table found.&quot; </span><span class="s1">% tag</span>
+		<span class="s1">log.info(report)</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">not in </span><span class="s1">self:</span>
+			<span class="s0">return</span>
+		<span class="s1">xmlTag = tagToXML(tag)</span>
+		<span class="s1">attrs = dict()</span>
+		<span class="s0">if </span><span class="s1">hasattr(table</span><span class="s0">, </span><span class="s3">&quot;ERROR&quot;</span><span class="s1">):</span>
+			<span class="s1">attrs[</span><span class="s3">'ERROR'</span><span class="s1">] = </span><span class="s3">&quot;decompilation error&quot;</span>
+		<span class="s0">from </span><span class="s1">.tables.DefaultTable </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+		<span class="s0">if </span><span class="s1">table.__class__ == DefaultTable:</span>
+			<span class="s1">attrs[</span><span class="s3">'raw'</span><span class="s1">] = </span><span class="s0">True</span>
+		<span class="s1">writer.begintag(xmlTag</span><span class="s0">, </span><span class="s1">**attrs)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">if </span><span class="s1">tag == </span><span class="s3">&quot;glyf&quot;</span><span class="s1">:</span>
+			<span class="s1">table.toXML(writer</span><span class="s0">, </span><span class="s1">self</span><span class="s0">, </span><span class="s1">splitGlyphs=splitGlyphs)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">table.toXML(writer</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">writer.endtag(xmlTag)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">importXML(self</span><span class="s0">, </span><span class="s1">fileOrPath</span><span class="s0">, </span><span class="s1">quiet=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Import a TTX file (an XML-based text format), so as to recreate 
+        a font object. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">quiet </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">deprecateArgument(</span><span class="s3">&quot;quiet&quot;</span><span class="s0">, </span><span class="s3">&quot;configure logging instead&quot;</span><span class="s1">)</span>
+
+		<span class="s0">if </span><span class="s3">&quot;maxp&quot; </span><span class="s0">in </span><span class="s1">self </span><span class="s0">and </span><span class="s3">&quot;post&quot; </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s5"># Make sure the glyph order is loaded, as it otherwise gets</span>
+			<span class="s5"># lost if the XML doesn't contain the glyph order, yet does</span>
+			<span class="s5"># contain the table which was originally used to extract the</span>
+			<span class="s5"># glyph names from (ie. 'post', 'cmap' or 'CFF ').</span>
+			<span class="s1">self.getGlyphOrder()</span>
+
+		<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">xmlReader</span>
+
+		<span class="s1">reader = xmlReader.XMLReader(fileOrPath</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">reader.read()</span>
+
+	<span class="s0">def </span><span class="s1">isLoaded(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s2">&quot;&quot;&quot;Return true if the table identified by ``tag`` has been 
+        decompiled and loaded into memory.&quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.tables</span>
+
+	<span class="s0">def </span><span class="s1">has_key(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s2">&quot;&quot;&quot;Test if the table identified by ``tag`` is present in the font. 
+ 
+        As well as this method, ``tag in font`` can also be used to determine the 
+        presence of the table.&quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">self.isLoaded(tag):</span>
+			<span class="s0">return True</span>
+		<span class="s0">elif </span><span class="s1">self.reader </span><span class="s0">and </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.reader:</span>
+			<span class="s0">return True</span>
+		<span class="s0">elif </span><span class="s1">tag == </span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">:</span>
+			<span class="s0">return True</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return False</span>
+
+	<span class="s1">__contains__ = has_key</span>
+
+	<span class="s0">def </span><span class="s1">keys(self):</span>
+		<span class="s2">&quot;&quot;&quot;Returns the list of tables in the font, along with the ``GlyphOrder`` pseudo-table.&quot;&quot;&quot;</span>
+		<span class="s1">keys = list(self.tables.keys())</span>
+		<span class="s0">if </span><span class="s1">self.reader:</span>
+			<span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">list(self.reader.keys()):</span>
+				<span class="s0">if </span><span class="s1">key </span><span class="s0">not in </span><span class="s1">keys:</span>
+					<span class="s1">keys.append(key)</span>
+
+		<span class="s0">if </span><span class="s3">&quot;GlyphOrder&quot; </span><span class="s0">in </span><span class="s1">keys:</span>
+			<span class="s1">keys.remove(</span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">)</span>
+		<span class="s1">keys = sortedTagList(keys)</span>
+		<span class="s0">return </span><span class="s1">[</span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">] + keys</span>
+
+	<span class="s0">def </span><span class="s1">ensureDecompiled(self</span><span class="s0">, </span><span class="s1">recurse=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Decompile all the tables, even if a TTFont was opened in 'lazy' mode.&quot;&quot;&quot;</span>
+		<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.keys():</span>
+			<span class="s1">table = self[tag]</span>
+			<span class="s0">if </span><span class="s1">recurse </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s1">recurse = self.lazy </span><span class="s0">is not False</span>
+			<span class="s0">if </span><span class="s1">recurse </span><span class="s0">and </span><span class="s1">hasattr(table</span><span class="s0">, </span><span class="s3">&quot;ensureDecompiled&quot;</span><span class="s1">):</span>
+				<span class="s1">table.ensureDecompiled(recurse=recurse)</span>
+		<span class="s1">self.lazy = </span><span class="s0">False</span>
+
+	<span class="s0">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">return </span><span class="s1">len(list(self.keys()))</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s1">tag = Tag(tag)</span>
+		<span class="s1">table = self.tables.get(tag)</span>
+		<span class="s0">if </span><span class="s1">table </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">tag == </span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">:</span>
+				<span class="s1">table = GlyphOrder(tag)</span>
+				<span class="s1">self.tables[tag] = table</span>
+			<span class="s0">elif </span><span class="s1">self.reader </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">table = self._readTable(tag)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">raise </span><span class="s1">KeyError(</span><span class="s3">&quot;'%s' table not found&quot; </span><span class="s1">% tag)</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">_readTable(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s1">log.debug(</span><span class="s3">&quot;Reading '%s' table from disk&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+		<span class="s1">data = self.reader[tag]</span>
+		<span class="s0">if </span><span class="s1">self._tableCache </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">table = self._tableCache.get((tag</span><span class="s0">, </span><span class="s1">data))</span>
+			<span class="s0">if </span><span class="s1">table </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s0">return </span><span class="s1">table</span>
+		<span class="s1">tableClass = getTableClass(tag)</span>
+		<span class="s1">table = tableClass(tag)</span>
+		<span class="s1">self.tables[tag] = table</span>
+		<span class="s1">log.debug(</span><span class="s3">&quot;Decompiling '%s' table&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">table.decompile(data</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">except </span><span class="s1">Exception:</span>
+			<span class="s0">if not </span><span class="s1">self.ignoreDecompileErrors:</span>
+				<span class="s0">raise</span>
+			<span class="s5"># fall back to DefaultTable, retaining the binary table data</span>
+			<span class="s1">log.exception(</span>
+				<span class="s3">&quot;An exception occurred during the decompilation of the '%s' table&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+			<span class="s0">from </span><span class="s1">.tables.DefaultTable </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+			<span class="s1">file = StringIO()</span>
+			<span class="s1">traceback.print_exc(file=file)</span>
+			<span class="s1">table = DefaultTable(tag)</span>
+			<span class="s1">table.ERROR = file.getvalue()</span>
+			<span class="s1">self.tables[tag] = table</span>
+			<span class="s1">table.decompile(data</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">if </span><span class="s1">self._tableCache </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">self._tableCache[(tag</span><span class="s0">, </span><span class="s1">data)] = table</span>
+		<span class="s0">return </span><span class="s1">table</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">table):</span>
+		<span class="s1">self.tables[Tag(tag)] = table</span>
+
+	<span class="s0">def </span><span class="s1">__delitem__(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">not in </span><span class="s1">self:</span>
+			<span class="s0">raise </span><span class="s1">KeyError(</span><span class="s3">&quot;'%s' table not found&quot; </span><span class="s1">% tag)</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.tables:</span>
+			<span class="s0">del </span><span class="s1">self.tables[tag]</span>
+		<span class="s0">if </span><span class="s1">self.reader </span><span class="s0">and </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.reader:</span>
+			<span class="s0">del </span><span class="s1">self.reader[tag]</span>
+
+	<span class="s0">def </span><span class="s1">get(self</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">default=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Returns the table if it exists or (optionally) a default if it doesn't.&quot;&quot;&quot;</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self[tag]</span>
+		<span class="s0">except </span><span class="s1">KeyError:</span>
+			<span class="s0">return </span><span class="s1">default</span>
+
+	<span class="s0">def </span><span class="s1">setGlyphOrder(self</span><span class="s0">, </span><span class="s1">glyphOrder):</span>
+		<span class="s2">&quot;&quot;&quot;Set the glyph order 
+ 
+        Args: 
+            glyphOrder ([str]): List of glyph names in order. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">self.glyphOrder = glyphOrder</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'_reverseGlyphOrderDict'</span><span class="s1">):</span>
+			<span class="s0">del </span><span class="s1">self._reverseGlyphOrderDict</span>
+		<span class="s0">if </span><span class="s1">self.isLoaded(</span><span class="s3">&quot;glyf&quot;</span><span class="s1">):</span>
+			<span class="s1">self[</span><span class="s3">&quot;glyf&quot;</span><span class="s1">].setGlyphOrder(glyphOrder)</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphOrder(self):</span>
+		<span class="s2">&quot;&quot;&quot;Returns a list of glyph names ordered by their position in the font.&quot;&quot;&quot;</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.glyphOrder</span>
+		<span class="s0">except </span><span class="s1">AttributeError:</span>
+			<span class="s0">pass</span>
+		<span class="s0">if </span><span class="s3">'CFF ' </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s1">cff = self[</span><span class="s3">'CFF '</span><span class="s1">]</span>
+			<span class="s1">self.glyphOrder = cff.getGlyphOrder()</span>
+		<span class="s0">elif </span><span class="s3">'post' </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s5"># TrueType font</span>
+			<span class="s1">glyphOrder = self[</span><span class="s3">'post'</span><span class="s1">].getGlyphOrder()</span>
+			<span class="s0">if </span><span class="s1">glyphOrder </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s5">#</span>
+				<span class="s5"># No names found in the 'post' table.</span>
+				<span class="s5"># Try to create glyph names from the unicode cmap (if available)</span>
+				<span class="s5"># in combination with the Adobe Glyph List (AGL).</span>
+				<span class="s5">#</span>
+				<span class="s1">self._getGlyphNamesFromCmap()</span>
+			<span class="s0">elif </span><span class="s1">len(glyphOrder) &lt; self[</span><span class="s3">'maxp'</span><span class="s1">].numGlyphs:</span>
+				<span class="s5">#</span>
+				<span class="s5"># Not enough names found in the 'post' table.</span>
+				<span class="s5"># Can happen when 'post' format 1 is improperly used on a font that</span>
+				<span class="s5"># has more than 258 glyphs (the lenght of 'standardGlyphOrder').</span>
+				<span class="s5">#</span>
+				<span class="s1">log.warning(</span><span class="s3">&quot;Not enough names found in the 'post' table, generating them from cmap instead&quot;</span><span class="s1">)</span>
+				<span class="s1">self._getGlyphNamesFromCmap()</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">self.glyphOrder = glyphOrder</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self._getGlyphNamesFromCmap()</span>
+		<span class="s0">return </span><span class="s1">self.glyphOrder</span>
+
+	<span class="s0">def </span><span class="s1">_getGlyphNamesFromCmap(self):</span>
+		<span class="s5">#</span>
+		<span class="s5"># This is rather convoluted, but then again, it's an interesting problem:</span>
+		<span class="s5"># - we need to use the unicode values found in the cmap table to</span>
+		<span class="s5">#   build glyph names (eg. because there is only a minimal post table,</span>
+		<span class="s5">#   or none at all).</span>
+		<span class="s5"># - but the cmap parser also needs glyph names to work with...</span>
+		<span class="s5"># So here's what we do:</span>
+		<span class="s5"># - make up glyph names based on glyphID</span>
+		<span class="s5"># - load a temporary cmap table based on those names</span>
+		<span class="s5"># - extract the unicode values, build the &quot;real&quot; glyph names</span>
+		<span class="s5"># - unload the temporary cmap table</span>
+		<span class="s5">#</span>
+		<span class="s0">if </span><span class="s1">self.isLoaded(</span><span class="s3">&quot;cmap&quot;</span><span class="s1">):</span>
+			<span class="s5"># Bootstrapping: we're getting called by the cmap parser</span>
+			<span class="s5"># itself. This means self.tables['cmap'] contains a partially</span>
+			<span class="s5"># loaded cmap, making it impossible to get at a unicode</span>
+			<span class="s5"># subtable here. We remove the partially loaded cmap and</span>
+			<span class="s5"># restore it later.</span>
+			<span class="s5"># This only happens if the cmap table is loaded before any</span>
+			<span class="s5"># other table that does f.getGlyphOrder()  or f.getGlyphName().</span>
+			<span class="s1">cmapLoading = self.tables[</span><span class="s3">'cmap'</span><span class="s1">]</span>
+			<span class="s0">del </span><span class="s1">self.tables[</span><span class="s3">'cmap'</span><span class="s1">]</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">cmapLoading = </span><span class="s0">None</span>
+		<span class="s5"># Make up glyph names based on glyphID, which will be used by the</span>
+		<span class="s5"># temporary cmap and by the real cmap in case we don't find a unicode</span>
+		<span class="s5"># cmap.</span>
+		<span class="s1">numGlyphs = int(self[</span><span class="s3">'maxp'</span><span class="s1">].numGlyphs)</span>
+		<span class="s1">glyphOrder = [</span><span class="s0">None</span><span class="s1">] * numGlyphs</span>
+		<span class="s1">glyphOrder[</span><span class="s4">0</span><span class="s1">] = </span><span class="s3">&quot;.notdef&quot;</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s4">1</span><span class="s0">, </span><span class="s1">numGlyphs):</span>
+			<span class="s1">glyphOrder[i] = </span><span class="s3">&quot;glyph%.5d&quot; </span><span class="s1">% i</span>
+		<span class="s5"># Set the glyph order, so the cmap parser has something</span>
+		<span class="s5"># to work with (so we don't get called recursively).</span>
+		<span class="s1">self.glyphOrder = glyphOrder</span>
+
+		<span class="s5"># Make up glyph names based on the reversed cmap table. Because some</span>
+		<span class="s5"># glyphs (eg. ligatures or alternates) may not be reachable via cmap,</span>
+		<span class="s5"># this naming table will usually not cover all glyphs in the font.</span>
+		<span class="s5"># If the font has no Unicode cmap table, reversecmap will be empty.</span>
+		<span class="s0">if </span><span class="s3">'cmap' </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s1">reversecmap = self[</span><span class="s3">'cmap'</span><span class="s1">].buildReversed()</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">reversecmap = {}</span>
+		<span class="s1">useCount = {}</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numGlyphs):</span>
+			<span class="s1">tempName = glyphOrder[i]</span>
+			<span class="s0">if </span><span class="s1">tempName </span><span class="s0">in </span><span class="s1">reversecmap:</span>
+				<span class="s5"># If a font maps both U+0041 LATIN CAPITAL LETTER A and</span>
+				<span class="s5"># U+0391 GREEK CAPITAL LETTER ALPHA to the same glyph,</span>
+				<span class="s5"># we prefer naming the glyph as &quot;A&quot;.</span>
+				<span class="s1">glyphName = self._makeGlyphName(min(reversecmap[tempName]))</span>
+				<span class="s1">numUses = useCount[glyphName] = useCount.get(glyphName</span><span class="s0">, </span><span class="s4">0</span><span class="s1">) + </span><span class="s4">1</span>
+				<span class="s0">if </span><span class="s1">numUses &gt; </span><span class="s4">1</span><span class="s1">:</span>
+					<span class="s1">glyphName = </span><span class="s3">&quot;%s.alt%d&quot; </span><span class="s1">% (glyphName</span><span class="s0">, </span><span class="s1">numUses - </span><span class="s4">1</span><span class="s1">)</span>
+				<span class="s1">glyphOrder[i] = glyphName</span>
+
+		<span class="s0">if </span><span class="s3">'cmap' </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s5"># Delete the temporary cmap table from the cache, so it can</span>
+			<span class="s5"># be parsed again with the right names.</span>
+			<span class="s0">del </span><span class="s1">self.tables[</span><span class="s3">'cmap'</span><span class="s1">]</span>
+			<span class="s1">self.glyphOrder = glyphOrder</span>
+			<span class="s0">if </span><span class="s1">cmapLoading:</span>
+				<span class="s5"># restore partially loaded cmap, so it can continue loading</span>
+				<span class="s5"># using the proper names.</span>
+				<span class="s1">self.tables[</span><span class="s3">'cmap'</span><span class="s1">] = cmapLoading</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">_makeGlyphName(codepoint):</span>
+		<span class="s0">from </span><span class="s1">fontTools </span><span class="s0">import </span><span class="s1">agl  </span><span class="s5"># Adobe Glyph List</span>
+		<span class="s0">if </span><span class="s1">codepoint </span><span class="s0">in </span><span class="s1">agl.UV2AGL:</span>
+			<span class="s0">return </span><span class="s1">agl.UV2AGL[codepoint]</span>
+		<span class="s0">elif </span><span class="s1">codepoint &lt;= </span><span class="s4">0xFFFF</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s3">&quot;uni%04X&quot; </span><span class="s1">% codepoint</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s3">&quot;u%X&quot; </span><span class="s1">% codepoint</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphNames(self):</span>
+		<span class="s2">&quot;&quot;&quot;Get a list of glyph names, sorted alphabetically.&quot;&quot;&quot;</span>
+		<span class="s1">glyphNames = sorted(self.getGlyphOrder())</span>
+		<span class="s0">return </span><span class="s1">glyphNames</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphNames2(self):</span>
+		<span class="s2">&quot;&quot;&quot;Get a list of glyph names, sorted alphabetically, 
+        but not case sensitive. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">textTools</span>
+		<span class="s0">return </span><span class="s1">textTools.caselessSort(self.getGlyphOrder())</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphName(self</span><span class="s0">, </span><span class="s1">glyphID):</span>
+		<span class="s2">&quot;&quot;&quot;Returns the name for the glyph with the given ID. 
+ 
+        If no name is available, synthesises one with the form ``glyphXXXXX``` where 
+        ```XXXXX`` is the zero-padded glyph ID. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.getGlyphOrder()[glyphID]</span>
+		<span class="s0">except </span><span class="s1">IndexError:</span>
+			<span class="s0">return </span><span class="s3">&quot;glyph%.5d&quot; </span><span class="s1">% glyphID</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphNameMany(self</span><span class="s0">, </span><span class="s1">lst):</span>
+		<span class="s2">&quot;&quot;&quot;Converts a list of glyph IDs into a list of glyph names.&quot;&quot;&quot;</span>
+		<span class="s1">glyphOrder = self.getGlyphOrder();</span>
+		<span class="s1">cnt = len(glyphOrder)</span>
+		<span class="s0">return </span><span class="s1">[glyphOrder[gid] </span><span class="s0">if </span><span class="s1">gid &lt; cnt </span><span class="s0">else </span><span class="s3">&quot;glyph%.5d&quot; </span><span class="s1">% gid</span>
+			<span class="s0">for </span><span class="s1">gid </span><span class="s0">in </span><span class="s1">lst]</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphID(self</span><span class="s0">, </span><span class="s1">glyphName):</span>
+		<span class="s2">&quot;&quot;&quot;Returns the ID of the glyph with the given name.&quot;&quot;&quot;</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">self.getReverseGlyphMap()[glyphName]</span>
+		<span class="s0">except </span><span class="s1">KeyError:</span>
+			<span class="s0">if </span><span class="s1">glyphName[:</span><span class="s4">5</span><span class="s1">] == </span><span class="s3">&quot;glyph&quot;</span><span class="s1">:</span>
+				<span class="s0">try</span><span class="s1">:</span>
+					<span class="s0">return </span><span class="s1">int(glyphName[</span><span class="s4">5</span><span class="s1">:])</span>
+				<span class="s0">except </span><span class="s1">(NameError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+					<span class="s0">raise </span><span class="s1">KeyError(glyphName)</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphIDMany(self</span><span class="s0">, </span><span class="s1">lst):</span>
+		<span class="s2">&quot;&quot;&quot;Converts a list of glyph names into a list of glyph IDs.&quot;&quot;&quot;</span>
+		<span class="s1">d = self.getReverseGlyphMap()</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">[d[glyphName] </span><span class="s0">for </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">lst]</span>
+		<span class="s0">except </span><span class="s1">KeyError:</span>
+			<span class="s1">getGlyphID = self.getGlyphID</span>
+			<span class="s0">return </span><span class="s1">[getGlyphID(glyphName) </span><span class="s0">for </span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">lst]</span>
+
+	<span class="s0">def </span><span class="s1">getReverseGlyphMap(self</span><span class="s0">, </span><span class="s1">rebuild=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Returns a mapping of glyph names to glyph IDs.&quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">rebuild </span><span class="s0">or not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;_reverseGlyphOrderDict&quot;</span><span class="s1">):</span>
+			<span class="s1">self._buildReverseGlyphOrderDict()</span>
+		<span class="s0">return </span><span class="s1">self._reverseGlyphOrderDict</span>
+
+	<span class="s0">def </span><span class="s1">_buildReverseGlyphOrderDict(self):</span>
+		<span class="s1">self._reverseGlyphOrderDict = d = {}</span>
+		<span class="s0">for </span><span class="s1">glyphID</span><span class="s0">,</span><span class="s1">glyphName </span><span class="s0">in </span><span class="s1">enumerate(self.getGlyphOrder()):</span>
+			<span class="s1">d[glyphName] = glyphID</span>
+		<span class="s0">return </span><span class="s1">d</span>
+
+	<span class="s0">def </span><span class="s1">_writeTable(self</span><span class="s0">, </span><span class="s1">tag</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">tableCache=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Internal helper function for self.save(). Keeps track of 
+        inter-table dependencies. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">done:</span>
+			<span class="s0">return</span>
+		<span class="s1">tableClass = getTableClass(tag)</span>
+		<span class="s0">for </span><span class="s1">masterTable </span><span class="s0">in </span><span class="s1">tableClass.dependencies:</span>
+			<span class="s0">if </span><span class="s1">masterTable </span><span class="s0">not in </span><span class="s1">done:</span>
+				<span class="s0">if </span><span class="s1">masterTable </span><span class="s0">in </span><span class="s1">self:</span>
+					<span class="s1">self._writeTable(masterTable</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">tableCache)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">done.append(masterTable)</span>
+		<span class="s1">done.append(tag)</span>
+		<span class="s1">tabledata = self.getTableData(tag)</span>
+		<span class="s0">if </span><span class="s1">tableCache </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">entry = tableCache.get((Tag(tag)</span><span class="s0">, </span><span class="s1">tabledata))</span>
+			<span class="s0">if </span><span class="s1">entry </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">log.debug(</span><span class="s3">&quot;reusing '%s' table&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+				<span class="s1">writer.setEntry(tag</span><span class="s0">, </span><span class="s1">entry)</span>
+				<span class="s0">return</span>
+		<span class="s1">log.debug(</span><span class="s3">&quot;Writing '%s' table to disk&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+		<span class="s1">writer[tag] = tabledata</span>
+		<span class="s0">if </span><span class="s1">tableCache </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">tableCache[(Tag(tag)</span><span class="s0">, </span><span class="s1">tabledata)] = writer[tag]</span>
+
+	<span class="s0">def </span><span class="s1">getTableData(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s2">&quot;&quot;&quot;Returns the binary representation of a table. 
+ 
+        If the table is currently loaded and in memory, the data is compiled to 
+        binary and returned; if it is not currently loaded, the binary data is 
+        read from the font file and returned. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">tag = Tag(tag)</span>
+		<span class="s0">if </span><span class="s1">self.isLoaded(tag):</span>
+			<span class="s1">log.debug(</span><span class="s3">&quot;Compiling '%s' table&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+			<span class="s0">return </span><span class="s1">self.tables[tag].compile(self)</span>
+		<span class="s0">elif </span><span class="s1">self.reader </span><span class="s0">and </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">self.reader:</span>
+			<span class="s1">log.debug(</span><span class="s3">&quot;Reading '%s' table from disk&quot;</span><span class="s0">, </span><span class="s1">tag)</span>
+			<span class="s0">return </span><span class="s1">self.reader[tag]</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">KeyError(tag)</span>
+
+	<span class="s0">def </span><span class="s1">getGlyphSet(self</span><span class="s0">, </span><span class="s1">preferCFF=</span><span class="s0">True, </span><span class="s1">location=</span><span class="s0">None, </span><span class="s1">normalized=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s2">&quot;&quot;&quot;Return a generic GlyphSet, which is a dict-like object 
+        mapping glyph names to glyph objects. The returned glyph objects 
+        have a ``.draw()`` method that supports the Pen protocol, and will 
+        have an attribute named 'width'. 
+ 
+        If the font is CFF-based, the outlines will be taken from the ``CFF `` 
+        or ``CFF2`` tables. Otherwise the outlines will be taken from the 
+        ``glyf`` table. 
+ 
+        If the font contains both a ``CFF ``/``CFF2`` and a ``glyf`` table, you 
+        can use the ``preferCFF`` argument to specify which one should be taken. 
+        If the font contains both a ``CFF `` and a ``CFF2`` table, the latter is 
+        taken. 
+ 
+        If the ``location`` parameter is set, it should be a dictionary mapping 
+        four-letter variation tags to their float values, and the returned 
+        glyph-set will represent an instance of a variable font at that 
+        location. 
+ 
+        If the ``normalized`` variable is set to True, that location is 
+        interpreted as in the normalized (-1..+1) space, otherwise it is in the 
+        font's defined axes space. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">location </span><span class="s0">and </span><span class="s3">&quot;fvar&quot; </span><span class="s0">not in </span><span class="s1">self:</span>
+			<span class="s1">location = </span><span class="s0">None</span>
+		<span class="s0">if </span><span class="s1">location </span><span class="s0">and not </span><span class="s1">normalized:</span>
+			<span class="s1">location = self.normalizeLocation(location)</span>
+		<span class="s0">if </span><span class="s1">(</span><span class="s3">&quot;CFF &quot; </span><span class="s0">in </span><span class="s1">self </span><span class="s0">or </span><span class="s3">&quot;CFF2&quot; </span><span class="s0">in </span><span class="s1">self) </span><span class="s0">and </span><span class="s1">(preferCFF </span><span class="s0">or </span><span class="s3">&quot;glyf&quot; </span><span class="s0">not in </span><span class="s1">self):</span>
+			<span class="s0">return </span><span class="s1">_TTGlyphSetCFF(self</span><span class="s0">, </span><span class="s1">location)</span>
+		<span class="s0">elif </span><span class="s3">&quot;glyf&quot; </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s0">return </span><span class="s1">_TTGlyphSetGlyf(self</span><span class="s0">, </span><span class="s1">location)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s3">&quot;Font contains no outlines&quot;</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">normalizeLocation(self</span><span class="s0">, </span><span class="s1">location):</span>
+		<span class="s2">&quot;&quot;&quot;Normalize a ``location`` from the font's defined axes space (also 
+        known as user space) into the normalized (-1..+1) space. It applies 
+        ``avar`` mapping if the font contains an ``avar`` table. 
+ 
+        The ``location`` parameter should be a dictionary mapping four-letter 
+        variation tags to their float values. 
+ 
+        Raises ``TTLibError`` if the font is not a variable font. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">from </span><span class="s1">fontTools.varLib.models </span><span class="s0">import </span><span class="s1">normalizeLocation</span><span class="s0">, </span><span class="s1">piecewiseLinearMap</span>
+
+		<span class="s0">if </span><span class="s3">&quot;fvar&quot; </span><span class="s0">not in </span><span class="s1">self:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s3">&quot;Not a variable font&quot;</span><span class="s1">)</span>
+
+		<span class="s1">axes = {</span>
+			<span class="s1">a.axisTag: (a.minValue</span><span class="s0">, </span><span class="s1">a.defaultValue</span><span class="s0">, </span><span class="s1">a.maxValue) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">self[</span><span class="s3">&quot;fvar&quot;</span><span class="s1">].axes</span>
+		<span class="s1">}</span>
+		<span class="s1">location = normalizeLocation(location</span><span class="s0">, </span><span class="s1">axes)</span>
+		<span class="s0">if </span><span class="s3">&quot;avar&quot; </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s1">avar = self[</span><span class="s3">&quot;avar&quot;</span><span class="s1">]</span>
+			<span class="s1">avarSegments = avar.segments</span>
+			<span class="s1">mappedLocation = {}</span>
+			<span class="s0">for </span><span class="s1">axisTag</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">location.items():</span>
+				<span class="s1">avarMapping = avarSegments.get(axisTag</span><span class="s0">, None</span><span class="s1">)</span>
+				<span class="s0">if </span><span class="s1">avarMapping </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">value = piecewiseLinearMap(value</span><span class="s0">, </span><span class="s1">avarMapping)</span>
+				<span class="s1">mappedLocation[axisTag] = value</span>
+			<span class="s1">location = mappedLocation</span>
+		<span class="s0">return </span><span class="s1">location</span>
+
+	<span class="s0">def </span><span class="s1">getBestCmap(self</span><span class="s0">, </span><span class="s1">cmapPreferences=((</span><span class="s4">3</span><span class="s0">, </span><span class="s4">10</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">6</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">4</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">3</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">3</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">2</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">0</span><span class="s1">))):</span>
+		<span class="s2">&quot;&quot;&quot;Returns the 'best' Unicode cmap dictionary available in the font 
+        or ``None``, if no Unicode cmap subtable is available. 
+ 
+        By default it will search for the following (platformID, platEncID) 
+        pairs in order:: 
+ 
+                (3, 10), # Windows Unicode full repertoire 
+                (0, 6),  # Unicode full repertoire (format 13 subtable) 
+                (0, 4),  # Unicode 2.0 full repertoire 
+                (3, 1),  # Windows Unicode BMP 
+                (0, 3),  # Unicode 2.0 BMP 
+                (0, 2),  # Unicode ISO/IEC 10646 
+                (0, 1),  # Unicode 1.1 
+                (0, 0)   # Unicode 1.0 
+ 
+        This particular order matches what HarfBuzz uses to choose what 
+        subtable to use by default. This order prefers the largest-repertoire 
+        subtable, and among those, prefers the Windows-platform over the 
+        Unicode-platform as the former has wider support. 
+ 
+        This order can be customized via the ``cmapPreferences`` argument. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">self[</span><span class="s3">&quot;cmap&quot;</span><span class="s1">].getBestCmap(cmapPreferences=cmapPreferences)</span>
+
+
+<span class="s0">class </span><span class="s1">GlyphOrder(object):</span>
+
+	<span class="s2">&quot;&quot;&quot;A pseudo table. The glyph order isn't in the font as a separate 
+    table, but it's nice to present it as such in the TTX format. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">tag=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">pass</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">glyphOrder = ttFont.getGlyphOrder()</span>
+		<span class="s1">writer.comment(</span><span class="s3">&quot;The 'id' attribute is only for humans; &quot;</span>
+				<span class="s3">&quot;it is ignored when parsed.&quot;</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(glyphOrder)):</span>
+			<span class="s1">glyphName = glyphOrder[i]</span>
+			<span class="s1">writer.simpletag(</span><span class="s3">&quot;GlyphID&quot;</span><span class="s0">, </span><span class="s1">id=i</span><span class="s0">, </span><span class="s1">name=glyphName)</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;glyphOrder&quot;</span><span class="s1">):</span>
+			<span class="s1">self.glyphOrder = []</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s3">&quot;GlyphID&quot;</span><span class="s1">:</span>
+			<span class="s1">self.glyphOrder.append(attrs[</span><span class="s3">&quot;name&quot;</span><span class="s1">])</span>
+		<span class="s1">ttFont.setGlyphOrder(self.glyphOrder)</span>
+
+
+<span class="s0">def </span><span class="s1">getTableModule(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Fetch the packer/unpacker module for a table. 
+    Return None when no module is found. 
+    &quot;&quot;&quot;</span>
+	<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">tables</span>
+	<span class="s1">pyTag = tagToIdentifier(tag)</span>
+	<span class="s0">try</span><span class="s1">:</span>
+		<span class="s1">__import__(</span><span class="s3">&quot;fontTools.ttLib.tables.&quot; </span><span class="s1">+ pyTag)</span>
+	<span class="s0">except </span><span class="s1">ImportError </span><span class="s0">as </span><span class="s1">err:</span>
+		<span class="s5"># If pyTag is found in the ImportError message,</span>
+		<span class="s5"># means table is not implemented.  If it's not</span>
+		<span class="s5"># there, then some other module is missing, don't</span>
+		<span class="s5"># suppress the error.</span>
+		<span class="s0">if </span><span class="s1">str(err).find(pyTag) &gt;= </span><span class="s4">0</span><span class="s1">:</span>
+			<span class="s0">return None</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">err</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">getattr(tables</span><span class="s0">, </span><span class="s1">pyTag)</span>
+
+
+<span class="s5"># Registry for custom table packer/unpacker classes. Keys are table</span>
+<span class="s5"># tags, values are (moduleName, className) tuples.</span>
+<span class="s5"># See registerCustomTableClass() and getCustomTableClass()</span>
+<span class="s1">_customTableRegistry = {}</span>
+
+
+<span class="s0">def </span><span class="s1">registerCustomTableClass(tag</span><span class="s0">, </span><span class="s1">moduleName</span><span class="s0">, </span><span class="s1">className=</span><span class="s0">None</span><span class="s1">):</span>
+	<span class="s2">&quot;&quot;&quot;Register a custom packer/unpacker class for a table. 
+ 
+    The 'moduleName' must be an importable module. If no 'className' 
+    is given, it is derived from the tag, for example it will be 
+    ``table_C_U_S_T_`` for a 'CUST' tag. 
+ 
+    The registered table class should be a subclass of 
+    :py:class:`fontTools.ttLib.tables.DefaultTable.DefaultTable` 
+    &quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">className </span><span class="s0">is None</span><span class="s1">:</span>
+		<span class="s1">className = </span><span class="s3">&quot;table_&quot; </span><span class="s1">+ tagToIdentifier(tag)</span>
+	<span class="s1">_customTableRegistry[tag] = (moduleName</span><span class="s0">, </span><span class="s1">className)</span>
+
+
+<span class="s0">def </span><span class="s1">unregisterCustomTableClass(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Unregister the custom packer/unpacker class for a table.&quot;&quot;&quot;</span>
+	<span class="s0">del </span><span class="s1">_customTableRegistry[tag]</span>
+
+
+<span class="s0">def </span><span class="s1">getCustomTableClass(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Return the custom table class for tag, if one has been registered 
+    with 'registerCustomTableClass()'. Else return None. 
+    &quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">tag </span><span class="s0">not in </span><span class="s1">_customTableRegistry:</span>
+		<span class="s0">return None</span>
+	<span class="s0">import </span><span class="s1">importlib</span>
+	<span class="s1">moduleName</span><span class="s0">, </span><span class="s1">className = _customTableRegistry[tag]</span>
+	<span class="s1">module = importlib.import_module(moduleName)</span>
+	<span class="s0">return </span><span class="s1">getattr(module</span><span class="s0">, </span><span class="s1">className)</span>
+
+
+<span class="s0">def </span><span class="s1">getTableClass(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Fetch the packer/unpacker class for a table.&quot;&quot;&quot;</span>
+	<span class="s1">tableClass = getCustomTableClass(tag)</span>
+	<span class="s0">if </span><span class="s1">tableClass </span><span class="s0">is not None</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">tableClass</span>
+	<span class="s1">module = getTableModule(tag)</span>
+	<span class="s0">if </span><span class="s1">module </span><span class="s0">is None</span><span class="s1">:</span>
+		<span class="s0">from </span><span class="s1">.tables.DefaultTable </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+		<span class="s0">return </span><span class="s1">DefaultTable</span>
+	<span class="s1">pyTag = tagToIdentifier(tag)</span>
+	<span class="s1">tableClass = getattr(module</span><span class="s0">, </span><span class="s3">&quot;table_&quot; </span><span class="s1">+ pyTag)</span>
+	<span class="s0">return </span><span class="s1">tableClass</span>
+
+
+<span class="s0">def </span><span class="s1">getClassTag(klass):</span>
+	<span class="s2">&quot;&quot;&quot;Fetch the table tag for a class object.&quot;&quot;&quot;</span>
+	<span class="s1">name = klass.__name__</span>
+	<span class="s0">assert </span><span class="s1">name[:</span><span class="s4">6</span><span class="s1">] == </span><span class="s3">'table_'</span>
+	<span class="s1">name = name[</span><span class="s4">6</span><span class="s1">:] </span><span class="s5"># Chop 'table_'</span>
+	<span class="s0">return </span><span class="s1">identifierToTag(name)</span>
+
+
+<span class="s0">def </span><span class="s1">newTable(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Return a new instance of a table.&quot;&quot;&quot;</span>
+	<span class="s1">tableClass = getTableClass(tag)</span>
+	<span class="s0">return </span><span class="s1">tableClass(tag)</span>
+
+
+<span class="s0">def </span><span class="s1">_escapechar(c):</span>
+	<span class="s2">&quot;&quot;&quot;Helper function for tagToIdentifier()&quot;&quot;&quot;</span>
+	<span class="s0">import </span><span class="s1">re</span>
+	<span class="s0">if </span><span class="s1">re.match(</span><span class="s3">&quot;[a-z0-9]&quot;</span><span class="s0">, </span><span class="s1">c):</span>
+		<span class="s0">return </span><span class="s3">&quot;_&quot; </span><span class="s1">+ c</span>
+	<span class="s0">elif </span><span class="s1">re.match(</span><span class="s3">&quot;[A-Z]&quot;</span><span class="s0">, </span><span class="s1">c):</span>
+		<span class="s0">return </span><span class="s1">c + </span><span class="s3">&quot;_&quot;</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">hex(byteord(c))[</span><span class="s4">2</span><span class="s1">:]</span>
+
+
+<span class="s0">def </span><span class="s1">tagToIdentifier(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Convert a table tag to a valid (but UGLY) python identifier, 
+    as well as a filename that's guaranteed to be unique even on a 
+    caseless file system. Each character is mapped to two characters. 
+    Lowercase letters get an underscore before the letter, uppercase 
+    letters get an underscore after the letter. Trailing spaces are 
+    trimmed. Illegal characters are escaped as two hex bytes. If the 
+    result starts with a number (as the result of a hex escape), an 
+    extra underscore is prepended. Examples:: 
+ 
+        &gt;&gt;&gt; tagToIdentifier('glyf') 
+        '_g_l_y_f' 
+        &gt;&gt;&gt; tagToIdentifier('cvt ') 
+        '_c_v_t' 
+        &gt;&gt;&gt; tagToIdentifier('OS/2') 
+        'O_S_2f_2' 
+    &quot;&quot;&quot;</span>
+	<span class="s0">import </span><span class="s1">re</span>
+	<span class="s1">tag = Tag(tag)</span>
+	<span class="s0">if </span><span class="s1">tag == </span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">tag</span>
+	<span class="s0">assert </span><span class="s1">len(tag) == </span><span class="s4">4</span><span class="s0">, </span><span class="s3">&quot;tag should be 4 characters long&quot;</span>
+	<span class="s0">while </span><span class="s1">len(tag) &gt; </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">tag[-</span><span class="s4">1</span><span class="s1">] == </span><span class="s3">' '</span><span class="s1">:</span>
+		<span class="s1">tag = tag[:-</span><span class="s4">1</span><span class="s1">]</span>
+	<span class="s1">ident = </span><span class="s3">&quot;&quot;</span>
+	<span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">tag:</span>
+		<span class="s1">ident = ident + _escapechar(c)</span>
+	<span class="s0">if </span><span class="s1">re.match(</span><span class="s3">&quot;[0-9]&quot;</span><span class="s0">, </span><span class="s1">ident):</span>
+		<span class="s1">ident = </span><span class="s3">&quot;_&quot; </span><span class="s1">+ ident</span>
+	<span class="s0">return </span><span class="s1">ident</span>
+
+
+<span class="s0">def </span><span class="s1">identifierToTag(ident):</span>
+	<span class="s2">&quot;&quot;&quot;the opposite of tagToIdentifier()&quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">ident == </span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">ident</span>
+	<span class="s0">if </span><span class="s1">len(ident) % </span><span class="s4">2 </span><span class="s0">and </span><span class="s1">ident[</span><span class="s4">0</span><span class="s1">] == </span><span class="s3">&quot;_&quot;</span><span class="s1">:</span>
+		<span class="s1">ident = ident[</span><span class="s4">1</span><span class="s1">:]</span>
+	<span class="s0">assert not </span><span class="s1">(len(ident) % </span><span class="s4">2</span><span class="s1">)</span>
+	<span class="s1">tag = </span><span class="s3">&quot;&quot;</span>
+	<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">len(ident)</span><span class="s0">, </span><span class="s4">2</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">ident[i] == </span><span class="s3">&quot;_&quot;</span><span class="s1">:</span>
+			<span class="s1">tag = tag + ident[i+</span><span class="s4">1</span><span class="s1">]</span>
+		<span class="s0">elif </span><span class="s1">ident[i+</span><span class="s4">1</span><span class="s1">] == </span><span class="s3">&quot;_&quot;</span><span class="s1">:</span>
+			<span class="s1">tag = tag + ident[i]</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s5"># assume hex</span>
+			<span class="s1">tag = tag + chr(int(ident[i:i+</span><span class="s4">2</span><span class="s1">]</span><span class="s0">, </span><span class="s4">16</span><span class="s1">))</span>
+	<span class="s5"># append trailing spaces</span>
+	<span class="s1">tag = tag + (</span><span class="s4">4 </span><span class="s1">- len(tag)) * </span><span class="s3">' '</span>
+	<span class="s0">return </span><span class="s1">Tag(tag)</span>
+
+
+<span class="s0">def </span><span class="s1">tagToXML(tag):</span>
+	<span class="s2">&quot;&quot;&quot;Similarly to tagToIdentifier(), this converts a TT tag 
+    to a valid XML element name. Since XML element names are 
+    case sensitive, this is a fairly simple/readable translation. 
+    &quot;&quot;&quot;</span>
+	<span class="s0">import </span><span class="s1">re</span>
+	<span class="s1">tag = Tag(tag)</span>
+	<span class="s0">if </span><span class="s1">tag == </span><span class="s3">&quot;OS/2&quot;</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s3">&quot;OS_2&quot;</span>
+	<span class="s0">elif </span><span class="s1">tag == </span><span class="s3">&quot;GlyphOrder&quot;</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">tag</span>
+	<span class="s0">if </span><span class="s1">re.match(</span><span class="s3">&quot;[A-Za-z_][A-Za-z_0-9]* *$&quot;</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s0">return </span><span class="s1">tag.strip()</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">tagToIdentifier(tag)</span>
+
+
+<span class="s0">def </span><span class="s1">xmlToTag(tag):</span>
+	<span class="s2">&quot;&quot;&quot;The opposite of tagToXML()&quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">tag == </span><span class="s3">&quot;OS_2&quot;</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">Tag(</span><span class="s3">&quot;OS/2&quot;</span><span class="s1">)</span>
+	<span class="s0">if </span><span class="s1">len(tag) == </span><span class="s4">8</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">identifierToTag(tag)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">Tag(tag + </span><span class="s3">&quot; &quot; </span><span class="s1">* (</span><span class="s4">4 </span><span class="s1">- len(tag)))</span>
+
+
+
+<span class="s5"># Table order as recommended in the OpenType specification 1.4</span>
+<span class="s1">TTFTableOrder = [</span><span class="s3">&quot;head&quot;</span><span class="s0">, </span><span class="s3">&quot;hhea&quot;</span><span class="s0">, </span><span class="s3">&quot;maxp&quot;</span><span class="s0">, </span><span class="s3">&quot;OS/2&quot;</span><span class="s0">, </span><span class="s3">&quot;hmtx&quot;</span><span class="s0">, </span><span class="s3">&quot;LTSH&quot;</span><span class="s0">, </span><span class="s3">&quot;VDMX&quot;</span><span class="s0">,</span>
+				<span class="s3">&quot;hdmx&quot;</span><span class="s0">, </span><span class="s3">&quot;cmap&quot;</span><span class="s0">, </span><span class="s3">&quot;fpgm&quot;</span><span class="s0">, </span><span class="s3">&quot;prep&quot;</span><span class="s0">, </span><span class="s3">&quot;cvt &quot;</span><span class="s0">, </span><span class="s3">&quot;loca&quot;</span><span class="s0">, </span><span class="s3">&quot;glyf&quot;</span><span class="s0">,</span>
+				<span class="s3">&quot;kern&quot;</span><span class="s0">, </span><span class="s3">&quot;name&quot;</span><span class="s0">, </span><span class="s3">&quot;post&quot;</span><span class="s0">, </span><span class="s3">&quot;gasp&quot;</span><span class="s0">, </span><span class="s3">&quot;PCLT&quot;</span><span class="s1">]</span>
+
+<span class="s1">OTFTableOrder = [</span><span class="s3">&quot;head&quot;</span><span class="s0">, </span><span class="s3">&quot;hhea&quot;</span><span class="s0">, </span><span class="s3">&quot;maxp&quot;</span><span class="s0">, </span><span class="s3">&quot;OS/2&quot;</span><span class="s0">, </span><span class="s3">&quot;name&quot;</span><span class="s0">, </span><span class="s3">&quot;cmap&quot;</span><span class="s0">, </span><span class="s3">&quot;post&quot;</span><span class="s0">,</span>
+				<span class="s3">&quot;CFF &quot;</span><span class="s1">]</span>
+
+<span class="s0">def </span><span class="s1">sortedTagList(tagList</span><span class="s0">, </span><span class="s1">tableOrder=</span><span class="s0">None</span><span class="s1">):</span>
+	<span class="s2">&quot;&quot;&quot;Return a sorted copy of tagList, sorted according to the OpenType 
+    specification, or according to a custom tableOrder. If given and not 
+    None, tableOrder needs to be a list of tag names. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">tagList = sorted(tagList)</span>
+	<span class="s0">if </span><span class="s1">tableOrder </span><span class="s0">is None</span><span class="s1">:</span>
+		<span class="s0">if </span><span class="s3">&quot;DSIG&quot; </span><span class="s0">in </span><span class="s1">tagList:</span>
+			<span class="s5"># DSIG should be last (XXX spec reference?)</span>
+			<span class="s1">tagList.remove(</span><span class="s3">&quot;DSIG&quot;</span><span class="s1">)</span>
+			<span class="s1">tagList.append(</span><span class="s3">&quot;DSIG&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s3">&quot;CFF &quot; </span><span class="s0">in </span><span class="s1">tagList:</span>
+			<span class="s1">tableOrder = OTFTableOrder</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">tableOrder = TTFTableOrder</span>
+	<span class="s1">orderedTables = []</span>
+	<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">tableOrder:</span>
+		<span class="s0">if </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">tagList:</span>
+			<span class="s1">orderedTables.append(tag)</span>
+			<span class="s1">tagList.remove(tag)</span>
+	<span class="s1">orderedTables.extend(tagList)</span>
+	<span class="s0">return </span><span class="s1">orderedTables</span>
+
+
+<span class="s0">def </span><span class="s1">reorderFontTables(inFile</span><span class="s0">, </span><span class="s1">outFile</span><span class="s0">, </span><span class="s1">tableOrder=</span><span class="s0">None, </span><span class="s1">checkChecksums=</span><span class="s0">False</span><span class="s1">):</span>
+	<span class="s2">&quot;&quot;&quot;Rewrite a font file, ordering the tables as recommended by the 
+    OpenType specification 1.4. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">inFile.seek(</span><span class="s4">0</span><span class="s1">)</span>
+	<span class="s1">outFile.seek(</span><span class="s4">0</span><span class="s1">)</span>
+	<span class="s1">reader = SFNTReader(inFile</span><span class="s0">, </span><span class="s1">checkChecksums=checkChecksums)</span>
+	<span class="s1">writer = SFNTWriter(outFile</span><span class="s0">, </span><span class="s1">len(reader.tables)</span><span class="s0">, </span><span class="s1">reader.sfntVersion</span><span class="s0">, </span><span class="s1">reader.flavor</span><span class="s0">, </span><span class="s1">reader.flavorData)</span>
+	<span class="s1">tables = list(reader.keys())</span>
+	<span class="s0">for </span><span class="s1">tag </span><span class="s0">in </span><span class="s1">sortedTagList(tables</span><span class="s0">, </span><span class="s1">tableOrder):</span>
+		<span class="s1">writer[tag] = reader[tag]</span>
+	<span class="s1">writer.close()</span>
+
+
+<span class="s0">def </span><span class="s1">maxPowerOfTwo(x):</span>
+	<span class="s2">&quot;&quot;&quot;Return the highest exponent of two, so that 
+    (2 ** exponent) &lt;= x.  Return 0 if x is 0. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">exponent = </span><span class="s4">0</span>
+	<span class="s0">while </span><span class="s1">x:</span>
+		<span class="s1">x = x &gt;&gt; </span><span class="s4">1</span>
+		<span class="s1">exponent = exponent + </span><span class="s4">1</span>
+	<span class="s0">return </span><span class="s1">max(exponent - </span><span class="s4">1</span><span class="s0">, </span><span class="s4">0</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">getSearchRange(n</span><span class="s0">, </span><span class="s1">itemSize=</span><span class="s4">16</span><span class="s1">):</span>
+	<span class="s2">&quot;&quot;&quot;Calculate searchRange, entrySelector, rangeShift. 
+    &quot;&quot;&quot;</span>
+	<span class="s5"># itemSize defaults to 16, for backward compatibility</span>
+	<span class="s5"># with upstream fonttools.</span>
+	<span class="s1">exponent = maxPowerOfTwo(n)</span>
+	<span class="s1">searchRange = (</span><span class="s4">2 </span><span class="s1">** exponent) * itemSize</span>
+	<span class="s1">entrySelector = exponent</span>
+	<span class="s1">rangeShift = max(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">n * itemSize - searchRange)</span>
+	<span class="s0">return </span><span class="s1">searchRange</span><span class="s0">, </span><span class="s1">entrySelector</span><span class="s0">, </span><span class="s1">rangeShift</span>
+</pre>
+</body>
+</html>

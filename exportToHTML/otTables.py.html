@@ -1,0 +1,2116 @@
+<html>
+<head>
+<title>otTables.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+otTables.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># coding: utf-8</span>
+<span class="s2">&quot;&quot;&quot;fontTools.ttLib.tables.otTables -- A collection of classes representing the various 
+OpenType subtables. 
+ 
+Most are constructed upon import from data in otData.py, all are populated with 
+converter objects from otConverters.py. 
+&quot;&quot;&quot;</span>
+<span class="s3">import </span><span class="s1">copy</span>
+<span class="s3">from </span><span class="s1">enum </span><span class="s3">import </span><span class="s1">IntEnum</span>
+<span class="s3">import </span><span class="s1">itertools</span>
+<span class="s3">from </span><span class="s1">collections </span><span class="s3">import </span><span class="s1">defaultdict</span><span class="s3">, </span><span class="s1">namedtuple</span>
+<span class="s3">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s3">import </span><span class="s1">otRound</span>
+<span class="s3">from </span><span class="s1">fontTools.misc.textTools </span><span class="s3">import </span><span class="s1">bytesjoin</span><span class="s3">, </span><span class="s1">pad</span><span class="s3">, </span><span class="s1">safeEval</span>
+<span class="s3">from </span><span class="s1">.otBase </span><span class="s3">import </span><span class="s1">(</span>
+	<span class="s1">BaseTable</span><span class="s3">, </span><span class="s1">FormatSwitchingBaseTable</span><span class="s3">, </span><span class="s1">ValueRecord</span><span class="s3">, </span><span class="s1">CountReference</span><span class="s3">,</span>
+	<span class="s1">getFormatSwitchingBaseTableClass</span><span class="s3">,</span>
+<span class="s1">)</span>
+<span class="s3">from </span><span class="s1">fontTools.feaLib.lookupDebugInfo </span><span class="s3">import </span><span class="s1">LookupDebugInfo</span><span class="s3">, </span><span class="s1">LOOKUP_DEBUG_INFO_KEY</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">import </span><span class="s1">struct</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+
+<span class="s3">class </span><span class="s1">AATStateTable(object):</span>
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.GlyphClasses = {}  </span><span class="s0"># GlyphID --&gt; GlyphClass</span>
+		<span class="s1">self.States = []  </span><span class="s0"># List of AATState, indexed by state number</span>
+		<span class="s1">self.PerGlyphLookups = []  </span><span class="s0"># [{GlyphID:GlyphID}, ...]</span>
+
+
+<span class="s3">class </span><span class="s1">AATState(object):</span>
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.Transitions = {}  </span><span class="s0"># GlyphClass --&gt; AATAction</span>
+
+
+<span class="s3">class </span><span class="s1">AATAction(object):</span>
+	<span class="s1">_FLAGS = </span><span class="s3">None</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s3">def </span><span class="s1">compileActions(font</span><span class="s3">, </span><span class="s1">states):</span>
+		<span class="s3">return </span><span class="s1">(</span><span class="s3">None, None</span><span class="s1">)</span>
+
+	<span class="s3">def </span><span class="s1">_writeFlagsToXML(self</span><span class="s3">, </span><span class="s1">xmlWriter):</span>
+		<span class="s1">flags = [f </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">self._FLAGS </span><span class="s3">if </span><span class="s1">self.__dict__[f]]</span>
+		<span class="s3">if </span><span class="s1">flags:</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Flags&quot;</span><span class="s3">, </span><span class="s1">value=</span><span class="s4">&quot;,&quot;</span><span class="s1">.join(flags))</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s3">if </span><span class="s1">self.ReservedFlags != </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">xmlWriter.simpletag(</span>
+				<span class="s4">&quot;ReservedFlags&quot;</span><span class="s3">,</span>
+				<span class="s1">value=</span><span class="s4">'0x%04X' </span><span class="s1">% self.ReservedFlags)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">_setFlag(self</span><span class="s3">, </span><span class="s1">flag):</span>
+		<span class="s3">assert </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">self._FLAGS</span><span class="s3">, </span><span class="s4">&quot;unsupported flag %s&quot; </span><span class="s1">% flag</span>
+		<span class="s1">self.__dict__[flag] = </span><span class="s3">True</span>
+
+
+<span class="s3">class </span><span class="s1">RearrangementMorphAction(AATAction):</span>
+	<span class="s1">staticSize = </span><span class="s5">4</span>
+	<span class="s1">actionHeaderSize = </span><span class="s5">0</span>
+	<span class="s1">_FLAGS = [</span><span class="s4">&quot;MarkFirst&quot;</span><span class="s3">, </span><span class="s4">&quot;DontAdvance&quot;</span><span class="s3">, </span><span class="s4">&quot;MarkLast&quot;</span><span class="s1">]</span>
+
+	<span class="s1">_VERBS = {</span>
+		<span class="s5">0</span><span class="s1">: </span><span class="s4">&quot;no change&quot;</span><span class="s3">,</span>
+		<span class="s5">1</span><span class="s1">: </span><span class="s4">&quot;Ax ⇒ xA&quot;</span><span class="s3">,</span>
+		<span class="s5">2</span><span class="s1">: </span><span class="s4">&quot;xD ⇒ Dx&quot;</span><span class="s3">,</span>
+		<span class="s5">3</span><span class="s1">: </span><span class="s4">&quot;AxD ⇒ DxA&quot;</span><span class="s3">,</span>
+		<span class="s5">4</span><span class="s1">: </span><span class="s4">&quot;ABx ⇒ xAB&quot;</span><span class="s3">,</span>
+		<span class="s5">5</span><span class="s1">: </span><span class="s4">&quot;ABx ⇒ xBA&quot;</span><span class="s3">,</span>
+		<span class="s5">6</span><span class="s1">: </span><span class="s4">&quot;xCD ⇒ CDx&quot;</span><span class="s3">,</span>
+		<span class="s5">7</span><span class="s1">: </span><span class="s4">&quot;xCD ⇒ DCx&quot;</span><span class="s3">,</span>
+		<span class="s5">8</span><span class="s1">: </span><span class="s4">&quot;AxCD ⇒ CDxA&quot;</span><span class="s3">,</span>
+		<span class="s5">9</span><span class="s1">: </span><span class="s4">&quot;AxCD ⇒ DCxA&quot;</span><span class="s3">,</span>
+		<span class="s5">10</span><span class="s1">: </span><span class="s4">&quot;ABxD ⇒ DxAB&quot;</span><span class="s3">,</span>
+		<span class="s5">11</span><span class="s1">: </span><span class="s4">&quot;ABxD ⇒ DxBA&quot;</span><span class="s3">,</span>
+		<span class="s5">12</span><span class="s1">: </span><span class="s4">&quot;ABxCD ⇒ CDxAB&quot;</span><span class="s3">,</span>
+		<span class="s5">13</span><span class="s1">: </span><span class="s4">&quot;ABxCD ⇒ CDxBA&quot;</span><span class="s3">,</span>
+		<span class="s5">14</span><span class="s1">: </span><span class="s4">&quot;ABxCD ⇒ DCxAB&quot;</span><span class="s3">,</span>
+		<span class="s5">15</span><span class="s1">: </span><span class="s4">&quot;ABxCD ⇒ DCxBA&quot;</span><span class="s3">,</span>
+        <span class="s1">}</span>
+
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.NewState = </span><span class="s5">0</span>
+		<span class="s1">self.Verb = </span><span class="s5">0</span>
+		<span class="s1">self.MarkFirst = </span><span class="s3">False</span>
+		<span class="s1">self.DontAdvance = </span><span class="s3">False</span>
+		<span class="s1">self.MarkLast = </span><span class="s3">False</span>
+		<span class="s1">self.ReservedFlags = </span><span class="s5">0</span>
+
+	<span class="s3">def </span><span class="s1">compile(self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionIndex):</span>
+		<span class="s3">assert </span><span class="s1">actionIndex </span><span class="s3">is None</span>
+		<span class="s1">writer.writeUShort(self.NewState)</span>
+		<span class="s3">assert </span><span class="s1">self.Verb &gt;= </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">self.Verb &lt;= </span><span class="s5">15</span><span class="s3">, </span><span class="s1">self.Verb</span>
+		<span class="s1">flags = self.Verb | self.ReservedFlags</span>
+		<span class="s3">if </span><span class="s1">self.MarkFirst: flags |= </span><span class="s5">0x8000</span>
+		<span class="s3">if </span><span class="s1">self.DontAdvance: flags |= </span><span class="s5">0x4000</span>
+		<span class="s3">if </span><span class="s1">self.MarkLast: flags |= </span><span class="s5">0x2000</span>
+		<span class="s1">writer.writeUShort(flags)</span>
+
+	<span class="s3">def </span><span class="s1">decompile(self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionReader):</span>
+		<span class="s3">assert </span><span class="s1">actionReader </span><span class="s3">is None</span>
+		<span class="s1">self.NewState = reader.readUShort()</span>
+		<span class="s1">flags = reader.readUShort()</span>
+		<span class="s1">self.Verb = flags &amp; </span><span class="s5">0xF</span>
+		<span class="s1">self.MarkFirst = bool(flags &amp; </span><span class="s5">0x8000</span><span class="s1">)</span>
+		<span class="s1">self.DontAdvance = bool(flags &amp; </span><span class="s5">0x4000</span><span class="s1">)</span>
+		<span class="s1">self.MarkLast = bool(flags &amp; </span><span class="s5">0x2000</span><span class="s1">)</span>
+		<span class="s1">self.ReservedFlags = flags &amp; </span><span class="s5">0x1FF0</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">name):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s3">, </span><span class="s1">**attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;NewState&quot;</span><span class="s3">, </span><span class="s1">value=self.NewState)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self._writeFlagsToXML(xmlWriter)</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Verb&quot;</span><span class="s3">, </span><span class="s1">value=self.Verb)</span>
+		<span class="s1">verbComment = self._VERBS.get(self.Verb)</span>
+		<span class="s3">if </span><span class="s1">verbComment </span><span class="s3">is not None</span><span class="s1">:</span>
+			<span class="s1">xmlWriter.comment(verbComment)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.NewState = self.Verb = self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.MarkFirst = self.DontAdvance = self.MarkLast = </span><span class="s3">False</span>
+		<span class="s1">content = [t </span><span class="s3">for </span><span class="s1">t </span><span class="s3">in </span><span class="s1">content </span><span class="s3">if </span><span class="s1">isinstance(t</span><span class="s3">, </span><span class="s1">tuple)]</span>
+		<span class="s3">for </span><span class="s1">eltName</span><span class="s3">, </span><span class="s1">eltAttrs</span><span class="s3">, </span><span class="s1">eltContent </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if </span><span class="s1">eltName == </span><span class="s4">&quot;NewState&quot;</span><span class="s1">:</span>
+				<span class="s1">self.NewState = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;Verb&quot;</span><span class="s1">:</span>
+				<span class="s1">self.Verb = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;ReservedFlags&quot;</span><span class="s1">:</span>
+				<span class="s1">self.ReservedFlags = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;Flags&quot;</span><span class="s1">:</span>
+				<span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">].split(</span><span class="s4">&quot;,&quot;</span><span class="s1">):</span>
+					<span class="s1">self._setFlag(flag.strip())</span>
+
+
+<span class="s3">class </span><span class="s1">ContextualMorphAction(AATAction):</span>
+	<span class="s1">staticSize = </span><span class="s5">8</span>
+	<span class="s1">actionHeaderSize = </span><span class="s5">0</span>
+	<span class="s1">_FLAGS = [</span><span class="s4">&quot;SetMark&quot;</span><span class="s3">, </span><span class="s4">&quot;DontAdvance&quot;</span><span class="s1">]</span>
+
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.NewState = </span><span class="s5">0</span>
+		<span class="s1">self.SetMark</span><span class="s3">, </span><span class="s1">self.DontAdvance = </span><span class="s3">False, False</span>
+		<span class="s1">self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.MarkIndex</span><span class="s3">, </span><span class="s1">self.CurrentIndex = </span><span class="s5">0xFFFF</span><span class="s3">, </span><span class="s5">0xFFFF</span>
+
+	<span class="s3">def </span><span class="s1">compile(self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionIndex):</span>
+		<span class="s3">assert </span><span class="s1">actionIndex </span><span class="s3">is None</span>
+		<span class="s1">writer.writeUShort(self.NewState)</span>
+		<span class="s1">flags = self.ReservedFlags</span>
+		<span class="s3">if </span><span class="s1">self.SetMark: flags |= </span><span class="s5">0x8000</span>
+		<span class="s3">if </span><span class="s1">self.DontAdvance: flags |= </span><span class="s5">0x4000</span>
+		<span class="s1">writer.writeUShort(flags)</span>
+		<span class="s1">writer.writeUShort(self.MarkIndex)</span>
+		<span class="s1">writer.writeUShort(self.CurrentIndex)</span>
+
+	<span class="s3">def </span><span class="s1">decompile(self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionReader):</span>
+		<span class="s3">assert </span><span class="s1">actionReader </span><span class="s3">is None</span>
+		<span class="s1">self.NewState = reader.readUShort()</span>
+		<span class="s1">flags = reader.readUShort()</span>
+		<span class="s1">self.SetMark = bool(flags &amp; </span><span class="s5">0x8000</span><span class="s1">)</span>
+		<span class="s1">self.DontAdvance = bool(flags &amp; </span><span class="s5">0x4000</span><span class="s1">)</span>
+		<span class="s1">self.ReservedFlags = flags &amp; </span><span class="s5">0x3FFF</span>
+		<span class="s1">self.MarkIndex = reader.readUShort()</span>
+		<span class="s1">self.CurrentIndex = reader.readUShort()</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">name):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s3">, </span><span class="s1">**attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;NewState&quot;</span><span class="s3">, </span><span class="s1">value=self.NewState)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self._writeFlagsToXML(xmlWriter)</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;MarkIndex&quot;</span><span class="s3">, </span><span class="s1">value=self.MarkIndex)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;CurrentIndex&quot;</span><span class="s3">,</span>
+		                    <span class="s1">value=self.CurrentIndex)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.NewState = self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.SetMark = self.DontAdvance = </span><span class="s3">False</span>
+		<span class="s1">self.MarkIndex</span><span class="s3">, </span><span class="s1">self.CurrentIndex = </span><span class="s5">0xFFFF</span><span class="s3">, </span><span class="s5">0xFFFF</span>
+		<span class="s1">content = [t </span><span class="s3">for </span><span class="s1">t </span><span class="s3">in </span><span class="s1">content </span><span class="s3">if </span><span class="s1">isinstance(t</span><span class="s3">, </span><span class="s1">tuple)]</span>
+		<span class="s3">for </span><span class="s1">eltName</span><span class="s3">, </span><span class="s1">eltAttrs</span><span class="s3">, </span><span class="s1">eltContent </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if </span><span class="s1">eltName == </span><span class="s4">&quot;NewState&quot;</span><span class="s1">:</span>
+				<span class="s1">self.NewState = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;Flags&quot;</span><span class="s1">:</span>
+				<span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">].split(</span><span class="s4">&quot;,&quot;</span><span class="s1">):</span>
+					<span class="s1">self._setFlag(flag.strip())</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;ReservedFlags&quot;</span><span class="s1">:</span>
+				<span class="s1">self.ReservedFlags = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;MarkIndex&quot;</span><span class="s1">:</span>
+				<span class="s1">self.MarkIndex = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;CurrentIndex&quot;</span><span class="s1">:</span>
+				<span class="s1">self.CurrentIndex = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+
+
+<span class="s3">class </span><span class="s1">LigAction(object):</span>
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.Store = </span><span class="s3">False</span>
+		<span class="s0"># GlyphIndexDelta is a (possibly negative) delta that gets</span>
+		<span class="s0"># added to the glyph ID at the top of the AAT runtime</span>
+		<span class="s0"># execution stack. It is *not* a byte offset into the</span>
+		<span class="s0"># morx table. The result of the addition, which is performed</span>
+		<span class="s0"># at run time by the shaping engine, is an index into</span>
+		<span class="s0"># the ligature components table. See 'morx' specification.</span>
+		<span class="s0"># In the AAT specification, this field is called Offset;</span>
+		<span class="s0"># but its meaning is quite different from other offsets</span>
+		<span class="s0"># in either AAT or OpenType, so we use a different name.</span>
+		<span class="s1">self.GlyphIndexDelta = </span><span class="s5">0</span>
+
+
+<span class="s3">class </span><span class="s1">LigatureMorphAction(AATAction):</span>
+	<span class="s1">staticSize = </span><span class="s5">6</span>
+
+	<span class="s0"># 4 bytes for each of {action,ligComponents,ligatures}Offset</span>
+	<span class="s1">actionHeaderSize = </span><span class="s5">12</span>
+
+	<span class="s1">_FLAGS = [</span><span class="s4">&quot;SetComponent&quot;</span><span class="s3">, </span><span class="s4">&quot;DontAdvance&quot;</span><span class="s1">]</span>
+
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.NewState = </span><span class="s5">0</span>
+		<span class="s1">self.SetComponent</span><span class="s3">, </span><span class="s1">self.DontAdvance = </span><span class="s3">False, False</span>
+		<span class="s1">self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.Actions = []</span>
+
+	<span class="s3">def </span><span class="s1">compile(self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionIndex):</span>
+		<span class="s3">assert </span><span class="s1">actionIndex </span><span class="s3">is not None</span>
+		<span class="s1">writer.writeUShort(self.NewState)</span>
+		<span class="s1">flags = self.ReservedFlags</span>
+		<span class="s3">if </span><span class="s1">self.SetComponent: flags |= </span><span class="s5">0x8000</span>
+		<span class="s3">if </span><span class="s1">self.DontAdvance: flags |= </span><span class="s5">0x4000</span>
+		<span class="s3">if </span><span class="s1">len(self.Actions) &gt; </span><span class="s5">0</span><span class="s1">: flags |= </span><span class="s5">0x2000</span>
+		<span class="s1">writer.writeUShort(flags)</span>
+		<span class="s3">if </span><span class="s1">len(self.Actions) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">actions = self.compileLigActions()</span>
+			<span class="s1">writer.writeUShort(actionIndex[actions])</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">writer.writeUShort(</span><span class="s5">0</span><span class="s1">)</span>
+
+	<span class="s3">def </span><span class="s1">decompile(self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionReader):</span>
+		<span class="s3">assert </span><span class="s1">actionReader </span><span class="s3">is not None</span>
+		<span class="s1">self.NewState = reader.readUShort()</span>
+		<span class="s1">flags = reader.readUShort()</span>
+		<span class="s1">self.SetComponent = bool(flags &amp; </span><span class="s5">0x8000</span><span class="s1">)</span>
+		<span class="s1">self.DontAdvance = bool(flags &amp; </span><span class="s5">0x4000</span><span class="s1">)</span>
+		<span class="s1">performAction = bool(flags &amp; </span><span class="s5">0x2000</span><span class="s1">)</span>
+		<span class="s0"># As of 2017-09-12, the 'morx' specification says that</span>
+		<span class="s0"># the reserved bitmask in ligature subtables is 0x3FFF.</span>
+		<span class="s0"># However, the specification also defines a flag 0x2000,</span>
+		<span class="s0"># so the reserved value should actually be 0x1FFF.</span>
+		<span class="s0"># TODO: Report this specification bug to Apple.</span>
+		<span class="s1">self.ReservedFlags = flags &amp; </span><span class="s5">0x1FFF</span>
+		<span class="s1">actionIndex = reader.readUShort()</span>
+		<span class="s3">if </span><span class="s1">performAction:</span>
+			<span class="s1">self.Actions = self._decompileLigActions(</span>
+				<span class="s1">actionReader</span><span class="s3">, </span><span class="s1">actionIndex)</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">self.Actions = []</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s3">def </span><span class="s1">compileActions(font</span><span class="s3">, </span><span class="s1">states):</span>
+		<span class="s1">result</span><span class="s3">, </span><span class="s1">actions</span><span class="s3">, </span><span class="s1">actionIndex = </span><span class="s6">b&quot;&quot;</span><span class="s3">, </span><span class="s1">set()</span><span class="s3">, </span><span class="s1">{}</span>
+		<span class="s3">for </span><span class="s1">state </span><span class="s3">in </span><span class="s1">states:</span>
+			<span class="s3">for </span><span class="s1">_glyphClass</span><span class="s3">, </span><span class="s1">trans </span><span class="s3">in </span><span class="s1">state.Transitions.items():</span>
+				<span class="s1">actions.add(trans.compileLigActions())</span>
+		<span class="s0"># Sort the compiled actions in decreasing order of</span>
+		<span class="s0"># length, so that the longer sequence come before the</span>
+		<span class="s0"># shorter ones.  For each compiled action ABCD, its</span>
+		<span class="s0"># suffixes BCD, CD, and D do not be encoded separately</span>
+		<span class="s0"># (in case they occur); instead, we can just store an</span>
+		<span class="s0"># index that points into the middle of the longer</span>
+		<span class="s0"># sequence. Every compiled AAT ligature sequence is</span>
+		<span class="s0"># terminated with an end-of-sequence flag, which can</span>
+		<span class="s0"># only be set on the last element of the sequence.</span>
+		<span class="s0"># Therefore, it is sufficient to consider just the</span>
+		<span class="s0"># suffixes.</span>
+		<span class="s3">for </span><span class="s1">a </span><span class="s3">in </span><span class="s1">sorted(actions</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">x:(-len(x)</span><span class="s3">, </span><span class="s1">x)):</span>
+			<span class="s3">if </span><span class="s1">a </span><span class="s3">not in </span><span class="s1">actionIndex:</span>
+				<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">len(a)</span><span class="s3">, </span><span class="s5">4</span><span class="s1">):</span>
+					<span class="s1">suffix = a[i:]</span>
+					<span class="s1">suffixIndex = (len(result) + i) // </span><span class="s5">4</span>
+					<span class="s1">actionIndex.setdefault(</span>
+						<span class="s1">suffix</span><span class="s3">, </span><span class="s1">suffixIndex)</span>
+				<span class="s1">result += a</span>
+		<span class="s1">result = pad(result</span><span class="s3">, </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s3">return </span><span class="s1">(result</span><span class="s3">, </span><span class="s1">actionIndex)</span>
+
+	<span class="s3">def </span><span class="s1">compileLigActions(self):</span>
+		<span class="s1">result = []</span>
+		<span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">action </span><span class="s3">in </span><span class="s1">enumerate(self.Actions):</span>
+			<span class="s1">last = (i == len(self.Actions) - </span><span class="s5">1</span><span class="s1">)</span>
+			<span class="s1">value = action.GlyphIndexDelta &amp; </span><span class="s5">0x3FFFFFFF</span>
+			<span class="s1">value |= </span><span class="s5">0x80000000 </span><span class="s3">if </span><span class="s1">last </span><span class="s3">else </span><span class="s5">0</span>
+			<span class="s1">value |= </span><span class="s5">0x40000000 </span><span class="s3">if </span><span class="s1">action.Store </span><span class="s3">else </span><span class="s5">0</span>
+			<span class="s1">result.append(struct.pack(</span><span class="s4">&quot;&gt;L&quot;</span><span class="s3">, </span><span class="s1">value))</span>
+		<span class="s3">return </span><span class="s1">bytesjoin(result)</span>
+
+	<span class="s3">def </span><span class="s1">_decompileLigActions(self</span><span class="s3">, </span><span class="s1">actionReader</span><span class="s3">, </span><span class="s1">actionIndex):</span>
+		<span class="s1">actions = []</span>
+		<span class="s1">last = </span><span class="s3">False</span>
+		<span class="s1">reader = actionReader.getSubReader(</span>
+			<span class="s1">actionReader.pos + actionIndex * </span><span class="s5">4</span><span class="s1">)</span>
+		<span class="s3">while not </span><span class="s1">last:</span>
+			<span class="s1">value = reader.readULong()</span>
+			<span class="s1">last = bool(value &amp; </span><span class="s5">0x80000000</span><span class="s1">)</span>
+			<span class="s1">action = LigAction()</span>
+			<span class="s1">actions.append(action)</span>
+			<span class="s1">action.Store = bool(value &amp; </span><span class="s5">0x40000000</span><span class="s1">)</span>
+			<span class="s1">delta = value &amp; </span><span class="s5">0x3FFFFFFF</span>
+			<span class="s3">if </span><span class="s1">delta &gt;= </span><span class="s5">0x20000000</span><span class="s1">: </span><span class="s0"># sign-extend 30-bit value</span>
+				<span class="s1">delta = -</span><span class="s5">0x40000000 </span><span class="s1">+ delta</span>
+			<span class="s1">action.GlyphIndexDelta = delta</span>
+		<span class="s3">return </span><span class="s1">actions</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.NewState = self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.SetComponent = self.DontAdvance = </span><span class="s3">False</span>
+		<span class="s1">self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.Actions = []</span>
+		<span class="s1">content = [t </span><span class="s3">for </span><span class="s1">t </span><span class="s3">in </span><span class="s1">content </span><span class="s3">if </span><span class="s1">isinstance(t</span><span class="s3">, </span><span class="s1">tuple)]</span>
+		<span class="s3">for </span><span class="s1">eltName</span><span class="s3">, </span><span class="s1">eltAttrs</span><span class="s3">, </span><span class="s1">eltContent </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if </span><span class="s1">eltName == </span><span class="s4">&quot;NewState&quot;</span><span class="s1">:</span>
+				<span class="s1">self.NewState = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;Flags&quot;</span><span class="s1">:</span>
+				<span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">].split(</span><span class="s4">&quot;,&quot;</span><span class="s1">):</span>
+					<span class="s1">self._setFlag(flag.strip())</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;ReservedFlags&quot;</span><span class="s1">:</span>
+				<span class="s1">self.ReservedFlags = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;Action&quot;</span><span class="s1">:</span>
+				<span class="s1">action = LigAction()</span>
+				<span class="s1">flags = eltAttrs.get(</span><span class="s4">&quot;Flags&quot;</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s1">).split(</span><span class="s4">&quot;,&quot;</span><span class="s1">)</span>
+				<span class="s1">flags = [f.strip() </span><span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">flags]</span>
+				<span class="s1">action.Store = </span><span class="s4">&quot;Store&quot; </span><span class="s3">in </span><span class="s1">flags</span>
+				<span class="s1">action.GlyphIndexDelta = safeEval(</span>
+					<span class="s1">eltAttrs[</span><span class="s4">&quot;GlyphIndexDelta&quot;</span><span class="s1">])</span>
+				<span class="s1">self.Actions.append(action)</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">name):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s3">, </span><span class="s1">**attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;NewState&quot;</span><span class="s3">, </span><span class="s1">value=self.NewState)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self._writeFlagsToXML(xmlWriter)</span>
+		<span class="s3">for </span><span class="s1">action </span><span class="s3">in </span><span class="s1">self.Actions:</span>
+			<span class="s1">attribs = [(</span><span class="s4">&quot;GlyphIndexDelta&quot;</span><span class="s3">, </span><span class="s1">action.GlyphIndexDelta)]</span>
+			<span class="s3">if </span><span class="s1">action.Store:</span>
+				<span class="s1">attribs.append((</span><span class="s4">&quot;Flags&quot;</span><span class="s3">, </span><span class="s4">&quot;Store&quot;</span><span class="s1">))</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Action&quot;</span><span class="s3">, </span><span class="s1">attribs)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+
+<span class="s3">class </span><span class="s1">InsertionMorphAction(AATAction):</span>
+	<span class="s1">staticSize = </span><span class="s5">8</span>
+	<span class="s1">actionHeaderSize = </span><span class="s5">4  </span><span class="s0"># 4 bytes for actionOffset</span>
+	<span class="s1">_FLAGS = [</span><span class="s4">&quot;SetMark&quot;</span><span class="s3">, </span><span class="s4">&quot;DontAdvance&quot;</span><span class="s3">,</span>
+	          <span class="s4">&quot;CurrentIsKashidaLike&quot;</span><span class="s3">, </span><span class="s4">&quot;MarkedIsKashidaLike&quot;</span><span class="s3">,</span>
+	          <span class="s4">&quot;CurrentInsertBefore&quot;</span><span class="s3">, </span><span class="s4">&quot;MarkedInsertBefore&quot;</span><span class="s1">]</span>
+
+	<span class="s3">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.NewState = </span><span class="s5">0</span>
+		<span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">self._FLAGS:</span>
+			<span class="s1">setattr(self</span><span class="s3">, </span><span class="s1">flag</span><span class="s3">, False</span><span class="s1">)</span>
+		<span class="s1">self.ReservedFlags = </span><span class="s5">0</span>
+		<span class="s1">self.CurrentInsertionAction</span><span class="s3">, </span><span class="s1">self.MarkedInsertionAction = []</span><span class="s3">, </span><span class="s1">[]</span>
+
+	<span class="s3">def </span><span class="s1">compile(self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionIndex):</span>
+		<span class="s3">assert </span><span class="s1">actionIndex </span><span class="s3">is not None</span>
+		<span class="s1">writer.writeUShort(self.NewState)</span>
+		<span class="s1">flags = self.ReservedFlags</span>
+		<span class="s3">if </span><span class="s1">self.SetMark: flags |= </span><span class="s5">0x8000</span>
+		<span class="s3">if </span><span class="s1">self.DontAdvance: flags |= </span><span class="s5">0x4000</span>
+		<span class="s3">if </span><span class="s1">self.CurrentIsKashidaLike: flags |= </span><span class="s5">0x2000</span>
+		<span class="s3">if </span><span class="s1">self.MarkedIsKashidaLike: flags |= </span><span class="s5">0x1000</span>
+		<span class="s3">if </span><span class="s1">self.CurrentInsertBefore: flags |= </span><span class="s5">0x0800</span>
+		<span class="s3">if </span><span class="s1">self.MarkedInsertBefore: flags |= </span><span class="s5">0x0400</span>
+		<span class="s1">flags |= len(self.CurrentInsertionAction) &lt;&lt; </span><span class="s5">5</span>
+		<span class="s1">flags |= len(self.MarkedInsertionAction)</span>
+		<span class="s1">writer.writeUShort(flags)</span>
+		<span class="s3">if </span><span class="s1">len(self.CurrentInsertionAction) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">currentIndex = actionIndex[</span>
+				<span class="s1">tuple(self.CurrentInsertionAction)]</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">currentIndex = </span><span class="s5">0xFFFF</span>
+		<span class="s1">writer.writeUShort(currentIndex)</span>
+		<span class="s3">if </span><span class="s1">len(self.MarkedInsertionAction) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">markedIndex = actionIndex[</span>
+				<span class="s1">tuple(self.MarkedInsertionAction)]</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">markedIndex = </span><span class="s5">0xFFFF</span>
+		<span class="s1">writer.writeUShort(markedIndex)</span>
+
+	<span class="s3">def </span><span class="s1">decompile(self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">actionReader):</span>
+		<span class="s3">assert </span><span class="s1">actionReader </span><span class="s3">is not None</span>
+		<span class="s1">self.NewState = reader.readUShort()</span>
+		<span class="s1">flags = reader.readUShort()</span>
+		<span class="s1">self.SetMark = bool(flags &amp; </span><span class="s5">0x8000</span><span class="s1">)</span>
+		<span class="s1">self.DontAdvance = bool(flags &amp; </span><span class="s5">0x4000</span><span class="s1">)</span>
+		<span class="s1">self.CurrentIsKashidaLike = bool(flags &amp; </span><span class="s5">0x2000</span><span class="s1">)</span>
+		<span class="s1">self.MarkedIsKashidaLike = bool(flags &amp; </span><span class="s5">0x1000</span><span class="s1">)</span>
+		<span class="s1">self.CurrentInsertBefore = bool(flags &amp; </span><span class="s5">0x0800</span><span class="s1">)</span>
+		<span class="s1">self.MarkedInsertBefore = bool(flags &amp; </span><span class="s5">0x0400</span><span class="s1">)</span>
+		<span class="s1">self.CurrentInsertionAction = self._decompileInsertionAction(</span>
+			<span class="s1">actionReader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">,</span>
+			<span class="s1">index=reader.readUShort()</span><span class="s3">,</span>
+			<span class="s1">count=((flags &amp; </span><span class="s5">0x03E0</span><span class="s1">) &gt;&gt; </span><span class="s5">5</span><span class="s1">))</span>
+		<span class="s1">self.MarkedInsertionAction = self._decompileInsertionAction(</span>
+			<span class="s1">actionReader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">,</span>
+			<span class="s1">index=reader.readUShort()</span><span class="s3">,</span>
+			<span class="s1">count=(flags &amp; </span><span class="s5">0x001F</span><span class="s1">))</span>
+
+	<span class="s3">def </span><span class="s1">_decompileInsertionAction(self</span><span class="s3">, </span><span class="s1">actionReader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">count):</span>
+		<span class="s3">if </span><span class="s1">index == </span><span class="s5">0xFFFF </span><span class="s3">or </span><span class="s1">count == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s3">return </span><span class="s1">[]</span>
+		<span class="s1">reader = actionReader.getSubReader(</span>
+			<span class="s1">actionReader.pos + index * </span><span class="s5">2</span><span class="s1">)</span>
+		<span class="s3">return </span><span class="s1">font.getGlyphNameMany(reader.readUShortArray(count))</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">name):</span>
+		<span class="s1">xmlWriter.begintag(name</span><span class="s3">, </span><span class="s1">**attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;NewState&quot;</span><span class="s3">, </span><span class="s1">value=self.NewState)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self._writeFlagsToXML(xmlWriter)</span>
+		<span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">self.CurrentInsertionAction:</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;CurrentInsertionAction&quot;</span><span class="s3">, </span><span class="s1">glyph=g)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">self.MarkedInsertionAction:</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;MarkedInsertionAction&quot;</span><span class="s3">, </span><span class="s1">glyph=g)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(name)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.__init__()</span>
+		<span class="s1">content = [t </span><span class="s3">for </span><span class="s1">t </span><span class="s3">in </span><span class="s1">content </span><span class="s3">if </span><span class="s1">isinstance(t</span><span class="s3">, </span><span class="s1">tuple)]</span>
+		<span class="s3">for </span><span class="s1">eltName</span><span class="s3">, </span><span class="s1">eltAttrs</span><span class="s3">, </span><span class="s1">eltContent </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if </span><span class="s1">eltName == </span><span class="s4">&quot;NewState&quot;</span><span class="s1">:</span>
+				<span class="s1">self.NewState = safeEval(eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;Flags&quot;</span><span class="s1">:</span>
+				<span class="s3">for </span><span class="s1">flag </span><span class="s3">in </span><span class="s1">eltAttrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">].split(</span><span class="s4">&quot;,&quot;</span><span class="s1">):</span>
+					<span class="s1">self._setFlag(flag.strip())</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;CurrentInsertionAction&quot;</span><span class="s1">:</span>
+				<span class="s1">self.CurrentInsertionAction.append(</span>
+					<span class="s1">eltAttrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">eltName == </span><span class="s4">&quot;MarkedInsertionAction&quot;</span><span class="s1">:</span>
+				<span class="s1">self.MarkedInsertionAction.append(</span>
+					<span class="s1">eltAttrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">])</span>
+			<span class="s3">else</span><span class="s1">:</span>
+				<span class="s3">assert False, </span><span class="s1">eltName</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s3">def </span><span class="s1">compileActions(font</span><span class="s3">, </span><span class="s1">states):</span>
+		<span class="s1">actions</span><span class="s3">, </span><span class="s1">actionIndex</span><span class="s3">, </span><span class="s1">result = set()</span><span class="s3">, </span><span class="s1">{}</span><span class="s3">, </span><span class="s6">b&quot;&quot;</span>
+		<span class="s3">for </span><span class="s1">state </span><span class="s3">in </span><span class="s1">states:</span>
+			<span class="s3">for </span><span class="s1">_glyphClass</span><span class="s3">, </span><span class="s1">trans </span><span class="s3">in </span><span class="s1">state.Transitions.items():</span>
+				<span class="s3">if </span><span class="s1">trans.CurrentInsertionAction </span><span class="s3">is not None</span><span class="s1">:</span>
+					<span class="s1">actions.add(tuple(trans.CurrentInsertionAction))</span>
+				<span class="s3">if </span><span class="s1">trans.MarkedInsertionAction </span><span class="s3">is not None</span><span class="s1">:</span>
+					<span class="s1">actions.add(tuple(trans.MarkedInsertionAction))</span>
+		<span class="s0"># Sort the compiled actions in decreasing order of</span>
+		<span class="s0"># length, so that the longer sequence come before the</span>
+		<span class="s0"># shorter ones.</span>
+		<span class="s3">for </span><span class="s1">action </span><span class="s3">in </span><span class="s1">sorted(actions</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">x:(-len(x)</span><span class="s3">, </span><span class="s1">x)):</span>
+			<span class="s0"># We insert all sub-sequences of the action glyph sequence</span>
+			<span class="s0"># into actionIndex. For example, if one action triggers on</span>
+			<span class="s0"># glyph sequence [A, B, C, D, E] and another action triggers</span>
+			<span class="s0"># on [C, D], we return result=[A, B, C, D, E] (as list of</span>
+			<span class="s0"># encoded glyph IDs), and actionIndex={('A','B','C','D','E'): 0,</span>
+			<span class="s0"># ('C','D'): 2}.</span>
+			<span class="s3">if </span><span class="s1">action </span><span class="s3">in </span><span class="s1">actionIndex:</span>
+				<span class="s3">continue</span>
+			<span class="s3">for </span><span class="s1">start </span><span class="s3">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">len(action)):</span>
+				<span class="s1">startIndex = (len(result) // </span><span class="s5">2</span><span class="s1">) + start</span>
+				<span class="s3">for </span><span class="s1">limit </span><span class="s3">in </span><span class="s1">range(start</span><span class="s3">, </span><span class="s1">len(action)):</span>
+					<span class="s1">glyphs = action[start : limit + </span><span class="s5">1</span><span class="s1">]</span>
+					<span class="s1">actionIndex.setdefault(glyphs</span><span class="s3">, </span><span class="s1">startIndex)</span>
+			<span class="s3">for </span><span class="s1">glyph </span><span class="s3">in </span><span class="s1">action:</span>
+				<span class="s1">glyphID = font.getGlyphID(glyph)</span>
+				<span class="s1">result += struct.pack(</span><span class="s4">&quot;&gt;H&quot;</span><span class="s3">, </span><span class="s1">glyphID)</span>
+		<span class="s3">return </span><span class="s1">result</span><span class="s3">, </span><span class="s1">actionIndex</span>
+
+
+<span class="s3">class </span><span class="s1">FeatureParams(BaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">compile(self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">assert </span><span class="s1">featureParamTypes.get(writer[</span><span class="s4">'FeatureTag'</span><span class="s1">]) == self.__class__</span><span class="s3">, </span><span class="s4">&quot;Wrong FeatureParams type for feature '%s': %s&quot; </span><span class="s1">% (writer[</span><span class="s4">'FeatureTag'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">self.__class__.__name__)</span>
+		<span class="s1">BaseTable.compile(self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">, </span><span class="s1">font)</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs=</span><span class="s3">None, </span><span class="s1">name=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s1">BaseTable.toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">name=self.__class__.__name__)</span>
+
+<span class="s3">class </span><span class="s1">FeatureParamsSize(FeatureParams):</span>
+	<span class="s3">pass</span>
+
+<span class="s3">class </span><span class="s1">FeatureParamsStylisticSet(FeatureParams):</span>
+	<span class="s3">pass</span>
+
+<span class="s3">class </span><span class="s1">FeatureParamsCharacterVariants(FeatureParams):</span>
+	<span class="s3">pass</span>
+
+<span class="s3">class </span><span class="s1">Coverage(FormatSwitchingBaseTable):</span>
+
+	<span class="s0"># manual implementation to get rid of glyphID dependencies</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'glyphs'</span><span class="s1">):</span>
+			<span class="s1">self.glyphs = []</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">self.glyphs = rawTable[</span><span class="s4">&quot;GlyphArray&quot;</span><span class="s1">]</span>
+		<span class="s3">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s1">glyphs = self.glyphs = []</span>
+			<span class="s1">ranges = rawTable[</span><span class="s4">&quot;RangeRecord&quot;</span><span class="s1">]</span>
+			<span class="s0"># Some SIL fonts have coverage entries that don't have sorted</span>
+			<span class="s0"># StartCoverageIndex.  If it is so, fixup and warn.  We undo</span>
+			<span class="s0"># this when writing font out.</span>
+			<span class="s1">sorted_ranges = sorted(ranges</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">a: a.StartCoverageIndex)</span>
+			<span class="s3">if </span><span class="s1">ranges != sorted_ranges:</span>
+				<span class="s1">log.warning(</span><span class="s4">&quot;GSUB/GPOS Coverage is not sorted by glyph ids.&quot;</span><span class="s1">)</span>
+				<span class="s1">ranges = sorted_ranges</span>
+			<span class="s3">del </span><span class="s1">sorted_ranges</span>
+			<span class="s3">for </span><span class="s1">r </span><span class="s3">in </span><span class="s1">ranges:</span>
+				<span class="s1">start = r.Start</span>
+				<span class="s1">end = r.End</span>
+				<span class="s1">startID = font.getGlyphID(start)</span>
+				<span class="s1">endID = font.getGlyphID(end) + </span><span class="s5">1</span>
+				<span class="s1">glyphs.extend(font.getGlyphNameMany(range(startID</span><span class="s3">, </span><span class="s1">endID)))</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">self.glyphs = []</span>
+			<span class="s1">log.warning(</span><span class="s4">&quot;Unknown Coverage format: %s&quot;</span><span class="s3">, </span><span class="s1">self.Format)</span>
+		<span class="s3">del </span><span class="s1">self.Format </span><span class="s0"># Don't need this anymore</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">glyphs = getattr(self</span><span class="s3">, </span><span class="s4">&quot;glyphs&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">glyphs </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">glyphs = self.glyphs = []</span>
+		<span class="s1">format = </span><span class="s5">1</span>
+		<span class="s1">rawTable = {</span><span class="s4">&quot;GlyphArray&quot;</span><span class="s1">: glyphs}</span>
+		<span class="s3">if </span><span class="s1">glyphs:</span>
+			<span class="s0"># find out whether Format 2 is more compact or not</span>
+			<span class="s1">glyphIDs = font.getGlyphIDMany(glyphs)</span>
+			<span class="s1">brokenOrder = sorted(glyphIDs) != glyphIDs</span>
+
+			<span class="s1">last = glyphIDs[</span><span class="s5">0</span><span class="s1">]</span>
+			<span class="s1">ranges = [[last]]</span>
+			<span class="s3">for </span><span class="s1">glyphID </span><span class="s3">in </span><span class="s1">glyphIDs[</span><span class="s5">1</span><span class="s1">:]:</span>
+				<span class="s3">if </span><span class="s1">glyphID != last + </span><span class="s5">1</span><span class="s1">:</span>
+					<span class="s1">ranges[-</span><span class="s5">1</span><span class="s1">].append(last)</span>
+					<span class="s1">ranges.append([glyphID])</span>
+				<span class="s1">last = glyphID</span>
+			<span class="s1">ranges[-</span><span class="s5">1</span><span class="s1">].append(last)</span>
+
+			<span class="s3">if </span><span class="s1">brokenOrder </span><span class="s3">or </span><span class="s1">len(ranges) * </span><span class="s5">3 </span><span class="s1">&lt; len(glyphs):  </span><span class="s0"># 3 words vs. 1 word</span>
+				<span class="s0"># Format 2 is more compact</span>
+				<span class="s1">index = </span><span class="s5">0</span>
+				<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(len(ranges)):</span>
+					<span class="s1">start</span><span class="s3">, </span><span class="s1">end = ranges[i]</span>
+					<span class="s1">r = RangeRecord()</span>
+					<span class="s1">r.StartID = start</span>
+					<span class="s1">r.Start = font.getGlyphName(start)</span>
+					<span class="s1">r.End = font.getGlyphName(end)</span>
+					<span class="s1">r.StartCoverageIndex = index</span>
+					<span class="s1">ranges[i] = r</span>
+					<span class="s1">index = index + end - start + </span><span class="s5">1</span>
+				<span class="s3">if </span><span class="s1">brokenOrder:</span>
+					<span class="s1">log.warning(</span><span class="s4">&quot;GSUB/GPOS Coverage is not sorted by glyph ids.&quot;</span><span class="s1">)</span>
+					<span class="s1">ranges.sort(key=</span><span class="s3">lambda </span><span class="s1">a: a.StartID)</span>
+				<span class="s3">for </span><span class="s1">r </span><span class="s3">in </span><span class="s1">ranges:</span>
+					<span class="s3">del </span><span class="s1">r.StartID</span>
+				<span class="s1">format = </span><span class="s5">2</span>
+				<span class="s1">rawTable = {</span><span class="s4">&quot;RangeRecord&quot;</span><span class="s1">: ranges}</span>
+			<span class="s0">#else:</span>
+			<span class="s0">#   fallthrough; Format 1 is more compact</span>
+		<span class="s1">self.Format = format</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">for </span><span class="s1">glyphName </span><span class="s3">in </span><span class="s1">getattr(self</span><span class="s3">, </span><span class="s4">&quot;glyphs&quot;</span><span class="s3">, </span><span class="s1">[]):</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Glyph&quot;</span><span class="s3">, </span><span class="s1">value=glyphName)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">glyphs = getattr(self</span><span class="s3">, </span><span class="s4">&quot;glyphs&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">glyphs </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">glyphs = []</span>
+			<span class="s1">self.glyphs = glyphs</span>
+		<span class="s1">glyphs.append(attrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+
+
+<span class="s0"># The special 0xFFFFFFFF delta-set index is used to indicate that there</span>
+<span class="s0"># is no variation data in the ItemVariationStore for a given variable field</span>
+<span class="s1">NO_VARIATION_INDEX = </span><span class="s5">0xFFFFFFFF</span>
+
+
+<span class="s3">class </span><span class="s1">DeltaSetIndexMap(getFormatSwitchingBaseTableClass(</span><span class="s4">&quot;uint8&quot;</span><span class="s1">)):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'mapping'</span><span class="s1">):</span>
+			<span class="s1">self.mapping = []</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">assert </span><span class="s1">(rawTable[</span><span class="s4">'EntryFormat'</span><span class="s1">] &amp; </span><span class="s5">0xFFC0</span><span class="s1">) == </span><span class="s5">0</span>
+		<span class="s1">self.mapping = rawTable[</span><span class="s4">'mapping'</span><span class="s1">]</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s3">def </span><span class="s1">getEntryFormat(mapping):</span>
+		<span class="s1">ored = </span><span class="s5">0</span>
+		<span class="s3">for </span><span class="s1">idx </span><span class="s3">in </span><span class="s1">mapping:</span>
+			<span class="s1">ored |= idx</span>
+
+		<span class="s1">inner = ored &amp; </span><span class="s5">0xFFFF</span>
+		<span class="s1">innerBits = </span><span class="s5">0</span>
+		<span class="s3">while </span><span class="s1">inner:</span>
+			<span class="s1">innerBits += </span><span class="s5">1</span>
+			<span class="s1">inner &gt;&gt;= </span><span class="s5">1</span>
+		<span class="s1">innerBits = max(innerBits</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+		<span class="s3">assert </span><span class="s1">innerBits &lt;= </span><span class="s5">16</span>
+
+		<span class="s1">ored = (ored &gt;&gt; (</span><span class="s5">16</span><span class="s1">-innerBits)) | (ored &amp; ((</span><span class="s5">1</span><span class="s1">&lt;&lt;innerBits)-</span><span class="s5">1</span><span class="s1">))</span>
+		<span class="s3">if   </span><span class="s1">ored &lt;= </span><span class="s5">0x000000FF</span><span class="s1">:</span>
+			<span class="s1">entrySize = </span><span class="s5">1</span>
+		<span class="s3">elif </span><span class="s1">ored &lt;= </span><span class="s5">0x0000FFFF</span><span class="s1">:</span>
+			<span class="s1">entrySize = </span><span class="s5">2</span>
+		<span class="s3">elif </span><span class="s1">ored &lt;= </span><span class="s5">0x00FFFFFF</span><span class="s1">:</span>
+			<span class="s1">entrySize = </span><span class="s5">3</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">entrySize = </span><span class="s5">4</span>
+
+		<span class="s3">return </span><span class="s1">((entrySize - </span><span class="s5">1</span><span class="s1">) &lt;&lt; </span><span class="s5">4</span><span class="s1">) | (innerBits - </span><span class="s5">1</span><span class="s1">)</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = self.mapping = []</span>
+		<span class="s1">self.Format = </span><span class="s5">1 </span><span class="s3">if </span><span class="s1">len(mapping) &gt; </span><span class="s5">0xFFFF </span><span class="s3">else </span><span class="s5">0</span>
+		<span class="s1">rawTable = self.__dict__.copy()</span>
+		<span class="s1">rawTable[</span><span class="s4">'MappingCount'</span><span class="s1">] = len(mapping)</span>
+		<span class="s1">rawTable[</span><span class="s4">'EntryFormat'</span><span class="s1">] = self.getEntryFormat(mapping)</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s0"># Make xml dump less verbose, by omitting no-op entries like:</span>
+		<span class="s0">#   &lt;Map index=&quot;...&quot; outer=&quot;65535&quot; inner=&quot;65535&quot;/&gt;</span>
+		<span class="s1">xmlWriter.comment(</span>
+			<span class="s4">&quot;Omitted values default to 0xFFFF/0xFFFF (no variations)&quot;</span>
+		<span class="s1">)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">enumerate(getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, </span><span class="s1">[])):</span>
+			<span class="s1">attrs = [(</span><span class="s4">'index'</span><span class="s3">, </span><span class="s1">i)]</span>
+			<span class="s3">if </span><span class="s1">value != NO_VARIATION_INDEX:</span>
+				<span class="s1">attrs.extend([</span>
+					<span class="s1">(</span><span class="s4">'outer'</span><span class="s3">, </span><span class="s1">value &gt;&gt; </span><span class="s5">16</span><span class="s1">)</span><span class="s3">,</span>
+					<span class="s1">(</span><span class="s4">'inner'</span><span class="s3">, </span><span class="s1">value &amp; </span><span class="s5">0xFFFF</span><span class="s1">)</span><span class="s3">,</span>
+				<span class="s1">])</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Map&quot;</span><span class="s3">, </span><span class="s1">attrs)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">self.mapping = mapping = []</span>
+		<span class="s1">index = safeEval(attrs[</span><span class="s4">'index'</span><span class="s1">])</span>
+		<span class="s1">outer = safeEval(attrs.get(</span><span class="s4">'outer'</span><span class="s3">, </span><span class="s4">'0xFFFF'</span><span class="s1">))</span>
+		<span class="s1">inner = safeEval(attrs.get(</span><span class="s4">'inner'</span><span class="s3">, </span><span class="s4">'0xFFFF'</span><span class="s1">))</span>
+		<span class="s3">assert </span><span class="s1">inner &lt;= </span><span class="s5">0xFFFF</span>
+		<span class="s1">mapping.insert(index</span><span class="s3">, </span><span class="s1">(outer &lt;&lt; </span><span class="s5">16</span><span class="s1">) | inner)</span>
+
+
+<span class="s3">class </span><span class="s1">VarIdxMap(BaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'mapping'</span><span class="s1">):</span>
+			<span class="s1">self.mapping = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">assert </span><span class="s1">(rawTable[</span><span class="s4">'EntryFormat'</span><span class="s1">] &amp; </span><span class="s5">0xFFC0</span><span class="s1">) == </span><span class="s5">0</span>
+		<span class="s1">glyphOrder = font.getGlyphOrder()</span>
+		<span class="s1">mapList = rawTable[</span><span class="s4">'mapping'</span><span class="s1">]</span>
+		<span class="s1">mapList.extend([mapList[-</span><span class="s5">1</span><span class="s1">]] * (len(glyphOrder) - len(mapList)))</span>
+		<span class="s1">self.mapping = dict(zip(glyphOrder</span><span class="s3">, </span><span class="s1">mapList))</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = self.mapping = {}</span>
+
+		<span class="s1">glyphOrder = font.getGlyphOrder()</span>
+		<span class="s1">mapping = [mapping[g] </span><span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">glyphOrder]</span>
+		<span class="s3">while </span><span class="s1">len(mapping) &gt; </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">mapping[-</span><span class="s5">2</span><span class="s1">] == mapping[-</span><span class="s5">1</span><span class="s1">]:</span>
+			<span class="s3">del </span><span class="s1">mapping[-</span><span class="s5">1</span><span class="s1">]</span>
+
+		<span class="s1">rawTable = {</span><span class="s4">'mapping'</span><span class="s1">: mapping}</span>
+		<span class="s1">rawTable[</span><span class="s4">'MappingCount'</span><span class="s1">] = len(mapping)</span>
+		<span class="s1">rawTable[</span><span class="s4">'EntryFormat'</span><span class="s1">] = DeltaSetIndexMap.getEntryFormat(mapping)</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">for </span><span class="s1">glyph</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">sorted(getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, </span><span class="s1">{}).items()):</span>
+			<span class="s1">attrs = (</span>
+				<span class="s1">(</span><span class="s4">'glyph'</span><span class="s3">, </span><span class="s1">glyph)</span><span class="s3">,</span>
+				<span class="s1">(</span><span class="s4">'outer'</span><span class="s3">, </span><span class="s1">value &gt;&gt; </span><span class="s5">16</span><span class="s1">)</span><span class="s3">,</span>
+				<span class="s1">(</span><span class="s4">'inner'</span><span class="s3">, </span><span class="s1">value &amp; </span><span class="s5">0xFFFF</span><span class="s1">)</span><span class="s3">,</span>
+			<span class="s1">)</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Map&quot;</span><span class="s3">, </span><span class="s1">attrs)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = {}</span>
+			<span class="s1">self.mapping = mapping</span>
+		<span class="s3">try</span><span class="s1">:</span>
+			<span class="s1">glyph = attrs[</span><span class="s4">'glyph'</span><span class="s1">]</span>
+		<span class="s3">except</span><span class="s1">: </span><span class="s0"># https://github.com/fonttools/fonttools/commit/21cbab8ce9ded3356fef3745122da64dcaf314e9#commitcomment-27649836</span>
+			<span class="s1">glyph = font.getGlyphOrder()[attrs[</span><span class="s4">'index'</span><span class="s1">]]</span>
+		<span class="s1">outer = safeEval(attrs[</span><span class="s4">'outer'</span><span class="s1">])</span>
+		<span class="s1">inner = safeEval(attrs[</span><span class="s4">'inner'</span><span class="s1">])</span>
+		<span class="s3">assert </span><span class="s1">inner &lt;= </span><span class="s5">0xFFFF</span>
+		<span class="s1">mapping[glyph] = (outer &lt;&lt; </span><span class="s5">16</span><span class="s1">) | inner</span>
+
+
+<span class="s3">class </span><span class="s1">VarRegionList(BaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s0"># The OT spec says VarStore.VarRegionList.RegionAxisCount should always</span>
+		<span class="s0"># be equal to the fvar.axisCount, and OTS &lt; v8.0.0 enforces this rule</span>
+		<span class="s0"># even when the VarRegionList is empty. We can't treat RegionAxisCount</span>
+		<span class="s0"># like a normal propagated count (== len(Region[i].VarRegionAxis)),</span>
+		<span class="s0"># otherwise it would default to 0 if VarRegionList is empty.</span>
+		<span class="s0"># Thus, we force it to always be equal to fvar.axisCount.</span>
+		<span class="s0"># https://github.com/khaledhosny/ots/pull/192</span>
+		<span class="s1">fvarTable = font.get(</span><span class="s4">&quot;fvar&quot;</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">fvarTable:</span>
+			<span class="s1">self.RegionAxisCount = len(fvarTable.axes)</span>
+		<span class="s3">return </span><span class="s1">{</span>
+			<span class="s1">**self.__dict__</span><span class="s3">,</span>
+			<span class="s4">&quot;RegionAxisCount&quot;</span><span class="s1">: CountReference(self.__dict__</span><span class="s3">, </span><span class="s4">&quot;RegionAxisCount&quot;</span><span class="s1">)</span>
+		<span class="s1">}</span>
+
+
+<span class="s3">class </span><span class="s1">SingleSubst(FormatSwitchingBaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'mapping'</span><span class="s1">):</span>
+			<span class="s1">self.mapping = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = {}</span>
+		<span class="s1">input = _getGlyphsFromCoverageTable(rawTable[</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">])</span>
+		<span class="s3">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">delta = rawTable[</span><span class="s4">&quot;DeltaGlyphID&quot;</span><span class="s1">]</span>
+			<span class="s1">inputGIDS = font.getGlyphIDMany(input)</span>
+			<span class="s1">outGIDS = [ (glyphID + delta) % </span><span class="s5">65536 </span><span class="s3">for </span><span class="s1">glyphID </span><span class="s3">in </span><span class="s1">inputGIDS ]</span>
+			<span class="s1">outNames = font.getGlyphNameMany(outGIDS)</span>
+			<span class="s3">for </span><span class="s1">inp</span><span class="s3">, </span><span class="s1">out </span><span class="s3">in </span><span class="s1">zip(input</span><span class="s3">, </span><span class="s1">outNames):</span>
+				<span class="s1">mapping[inp] = out</span>
+		<span class="s3">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s3">assert </span><span class="s1">len(input) == rawTable[</span><span class="s4">&quot;GlyphCount&quot;</span><span class="s1">]</span><span class="s3">, </span><span class="s1">\</span>
+					<span class="s4">&quot;invalid SingleSubstFormat2 table&quot;</span>
+			<span class="s1">subst = rawTable[</span><span class="s4">&quot;Substitute&quot;</span><span class="s1">]</span>
+			<span class="s3">for </span><span class="s1">inp</span><span class="s3">, </span><span class="s1">sub </span><span class="s3">in </span><span class="s1">zip(input</span><span class="s3">, </span><span class="s1">subst):</span>
+				<span class="s1">mapping[inp] = sub</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s3">assert </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;unknown format: %s&quot; </span><span class="s1">% self.Format</span>
+		<span class="s1">self.mapping = mapping</span>
+		<span class="s3">del </span><span class="s1">self.Format </span><span class="s0"># Don't need this anymore</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = self.mapping = {}</span>
+		<span class="s1">items = list(mapping.items())</span>
+		<span class="s1">getGlyphID = font.getGlyphID</span>
+		<span class="s1">gidItems = [(getGlyphID(a)</span><span class="s3">, </span><span class="s1">getGlyphID(b)) </span><span class="s3">for </span><span class="s1">a</span><span class="s3">,</span><span class="s1">b </span><span class="s3">in </span><span class="s1">items]</span>
+		<span class="s1">sortableItems = sorted(zip(gidItems</span><span class="s3">, </span><span class="s1">items))</span>
+
+		<span class="s0"># figure out format</span>
+		<span class="s1">format = </span><span class="s5">2</span>
+		<span class="s1">delta = </span><span class="s3">None</span>
+		<span class="s3">for </span><span class="s1">inID</span><span class="s3">, </span><span class="s1">outID </span><span class="s3">in </span><span class="s1">gidItems:</span>
+			<span class="s3">if </span><span class="s1">delta </span><span class="s3">is None</span><span class="s1">:</span>
+				<span class="s1">delta = (outID - inID) % </span><span class="s5">65536</span>
+
+			<span class="s3">if </span><span class="s1">(inID + delta) % </span><span class="s5">65536 </span><span class="s1">!= outID:</span>
+					<span class="s3">break</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s3">if </span><span class="s1">delta </span><span class="s3">is None</span><span class="s1">:</span>
+				<span class="s0"># the mapping is empty, better use format 2</span>
+				<span class="s1">format = </span><span class="s5">2</span>
+			<span class="s3">else</span><span class="s1">:</span>
+				<span class="s1">format = </span><span class="s5">1</span>
+
+		<span class="s1">rawTable = {}</span>
+		<span class="s1">self.Format = format</span>
+		<span class="s1">cov = Coverage()</span>
+		<span class="s1">input =  [ item [</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">sortableItems]</span>
+		<span class="s1">subst =  [ item [</span><span class="s5">1</span><span class="s1">][</span><span class="s5">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">sortableItems]</span>
+		<span class="s1">cov.glyphs = input</span>
+		<span class="s1">rawTable[</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">] = cov</span>
+		<span class="s3">if </span><span class="s1">format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s3">assert </span><span class="s1">delta </span><span class="s3">is not None</span>
+			<span class="s1">rawTable[</span><span class="s4">&quot;DeltaGlyphID&quot;</span><span class="s1">] = delta</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">rawTable[</span><span class="s4">&quot;Substitute&quot;</span><span class="s1">] = subst</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">items = sorted(self.mapping.items())</span>
+		<span class="s3">for </span><span class="s1">inGlyph</span><span class="s3">, </span><span class="s1">outGlyph </span><span class="s3">in </span><span class="s1">items:</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Substitution&quot;</span><span class="s3">,</span>
+					<span class="s1">[(</span><span class="s4">&quot;in&quot;</span><span class="s3">, </span><span class="s1">inGlyph)</span><span class="s3">, </span><span class="s1">(</span><span class="s4">&quot;out&quot;</span><span class="s3">, </span><span class="s1">outGlyph)])</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = {}</span>
+			<span class="s1">self.mapping = mapping</span>
+		<span class="s1">mapping[attrs[</span><span class="s4">&quot;in&quot;</span><span class="s1">]] = attrs[</span><span class="s4">&quot;out&quot;</span><span class="s1">]</span>
+
+
+<span class="s3">class </span><span class="s1">MultipleSubst(FormatSwitchingBaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'mapping'</span><span class="s1">):</span>
+			<span class="s1">self.mapping = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = {}</span>
+		<span class="s3">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">glyphs = _getGlyphsFromCoverageTable(rawTable[</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">])</span>
+			<span class="s1">subst = [s.Substitute </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">rawTable[</span><span class="s4">&quot;Sequence&quot;</span><span class="s1">]]</span>
+			<span class="s1">mapping = dict(zip(glyphs</span><span class="s3">, </span><span class="s1">subst))</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s3">assert </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;unknown format: %s&quot; </span><span class="s1">% self.Format</span>
+		<span class="s1">self.mapping = mapping</span>
+		<span class="s3">del </span><span class="s1">self.Format </span><span class="s0"># Don't need this anymore</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = self.mapping = {}</span>
+		<span class="s1">cov = Coverage()</span>
+		<span class="s1">cov.glyphs = sorted(list(mapping.keys())</span><span class="s3">, </span><span class="s1">key=font.getGlyphID)</span>
+		<span class="s1">self.Format = </span><span class="s5">1</span>
+		<span class="s1">rawTable = {</span>
+                        <span class="s4">&quot;Coverage&quot;</span><span class="s1">: cov</span><span class="s3">,</span>
+                        <span class="s4">&quot;Sequence&quot;</span><span class="s1">: [self.makeSequence_(mapping[glyph])</span>
+                                     <span class="s3">for </span><span class="s1">glyph </span><span class="s3">in </span><span class="s1">cov.glyphs]</span><span class="s3">,</span>
+                <span class="s1">}</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">items = sorted(self.mapping.items())</span>
+		<span class="s3">for </span><span class="s1">inGlyph</span><span class="s3">, </span><span class="s1">outGlyphs </span><span class="s3">in </span><span class="s1">items:</span>
+			<span class="s1">out = </span><span class="s4">&quot;,&quot;</span><span class="s1">.join(outGlyphs)</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Substitution&quot;</span><span class="s3">,</span>
+					<span class="s1">[(</span><span class="s4">&quot;in&quot;</span><span class="s3">, </span><span class="s1">inGlyph)</span><span class="s3">, </span><span class="s1">(</span><span class="s4">&quot;out&quot;</span><span class="s3">, </span><span class="s1">out)])</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">mapping = getattr(self</span><span class="s3">, </span><span class="s4">&quot;mapping&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">mapping </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">mapping = {}</span>
+			<span class="s1">self.mapping = mapping</span>
+
+		<span class="s0"># TTX v3.0 and earlier.</span>
+		<span class="s3">if </span><span class="s1">name == </span><span class="s4">&quot;Coverage&quot;</span><span class="s1">:</span>
+			<span class="s1">self.old_coverage_ = []</span>
+			<span class="s3">for </span><span class="s1">element </span><span class="s3">in </span><span class="s1">content:</span>
+				<span class="s3">if not </span><span class="s1">isinstance(element</span><span class="s3">, </span><span class="s1">tuple):</span>
+					<span class="s3">continue</span>
+				<span class="s1">element_name</span><span class="s3">, </span><span class="s1">element_attrs</span><span class="s3">, </span><span class="s1">_ = element</span>
+				<span class="s3">if </span><span class="s1">element_name == </span><span class="s4">&quot;Glyph&quot;</span><span class="s1">:</span>
+					<span class="s1">self.old_coverage_.append(element_attrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">return</span>
+		<span class="s3">if </span><span class="s1">name == </span><span class="s4">&quot;Sequence&quot;</span><span class="s1">:</span>
+			<span class="s1">index = int(attrs.get(</span><span class="s4">&quot;index&quot;</span><span class="s3">, </span><span class="s1">len(mapping)))</span>
+			<span class="s1">glyph = self.old_coverage_[index]</span>
+			<span class="s1">glyph_mapping = mapping[glyph] = []</span>
+			<span class="s3">for </span><span class="s1">element </span><span class="s3">in </span><span class="s1">content:</span>
+				<span class="s3">if not </span><span class="s1">isinstance(element</span><span class="s3">, </span><span class="s1">tuple):</span>
+					<span class="s3">continue</span>
+				<span class="s1">element_name</span><span class="s3">, </span><span class="s1">element_attrs</span><span class="s3">, </span><span class="s1">_ = element</span>
+				<span class="s3">if </span><span class="s1">element_name == </span><span class="s4">&quot;Substitute&quot;</span><span class="s1">:</span>
+					<span class="s1">glyph_mapping.append(element_attrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">return</span>
+
+                <span class="s0"># TTX v3.1 and later.</span>
+		<span class="s1">outGlyphs = attrs[</span><span class="s4">&quot;out&quot;</span><span class="s1">].split(</span><span class="s4">&quot;,&quot;</span><span class="s1">) </span><span class="s3">if </span><span class="s1">attrs[</span><span class="s4">&quot;out&quot;</span><span class="s1">] </span><span class="s3">else </span><span class="s1">[]</span>
+		<span class="s1">mapping[attrs[</span><span class="s4">&quot;in&quot;</span><span class="s1">]] = [g.strip() </span><span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">outGlyphs]</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s3">def </span><span class="s1">makeSequence_(g):</span>
+		<span class="s1">seq = Sequence()</span>
+		<span class="s1">seq.Substitute = g</span>
+		<span class="s3">return </span><span class="s1">seq</span>
+
+
+<span class="s3">class </span><span class="s1">ClassDef(FormatSwitchingBaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'classDefs'</span><span class="s1">):</span>
+			<span class="s1">self.classDefs = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">classDefs = {}</span>
+
+		<span class="s3">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">start = rawTable[</span><span class="s4">&quot;StartGlyph&quot;</span><span class="s1">]</span>
+			<span class="s1">classList = rawTable[</span><span class="s4">&quot;ClassValueArray&quot;</span><span class="s1">]</span>
+			<span class="s1">startID = font.getGlyphID(start)</span>
+			<span class="s1">endID = startID + len(classList)</span>
+			<span class="s1">glyphNames = font.getGlyphNameMany(range(startID</span><span class="s3">, </span><span class="s1">endID))</span>
+			<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">cls </span><span class="s3">in </span><span class="s1">zip(glyphNames</span><span class="s3">, </span><span class="s1">classList):</span>
+				<span class="s3">if </span><span class="s1">cls:</span>
+					<span class="s1">classDefs[glyphName] = cls</span>
+
+		<span class="s3">elif </span><span class="s1">self.Format == </span><span class="s5">2</span><span class="s1">:</span>
+			<span class="s1">records = rawTable[</span><span class="s4">&quot;ClassRangeRecord&quot;</span><span class="s1">]</span>
+			<span class="s3">for </span><span class="s1">rec </span><span class="s3">in </span><span class="s1">records:</span>
+				<span class="s1">cls = rec.Class</span>
+				<span class="s3">if not </span><span class="s1">cls:</span>
+					<span class="s3">continue</span>
+				<span class="s1">start = rec.Start</span>
+				<span class="s1">end = rec.End</span>
+				<span class="s1">startID = font.getGlyphID(start)</span>
+				<span class="s1">endID = font.getGlyphID(end) + </span><span class="s5">1</span>
+				<span class="s1">glyphNames = font.getGlyphNameMany(range(startID</span><span class="s3">, </span><span class="s1">endID))</span>
+				<span class="s3">for </span><span class="s1">glyphName </span><span class="s3">in </span><span class="s1">glyphNames:</span>
+					<span class="s1">classDefs[glyphName] = cls</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">log.warning(</span><span class="s4">&quot;Unknown ClassDef format: %s&quot;</span><span class="s3">, </span><span class="s1">self.Format)</span>
+		<span class="s1">self.classDefs = classDefs</span>
+		<span class="s3">del </span><span class="s1">self.Format </span><span class="s0"># Don't need this anymore</span>
+
+	<span class="s3">def </span><span class="s1">_getClassRanges(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">classDefs = getattr(self</span><span class="s3">, </span><span class="s4">&quot;classDefs&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">classDefs </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">self.classDefs = {}</span>
+			<span class="s3">return</span>
+		<span class="s1">getGlyphID = font.getGlyphID</span>
+		<span class="s1">items = []</span>
+		<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">cls </span><span class="s3">in </span><span class="s1">classDefs.items():</span>
+			<span class="s3">if not </span><span class="s1">cls:</span>
+				<span class="s3">continue</span>
+			<span class="s1">items.append((getGlyphID(glyphName)</span><span class="s3">, </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">cls))</span>
+		<span class="s3">if </span><span class="s1">items:</span>
+			<span class="s1">items.sort()</span>
+			<span class="s1">last</span><span class="s3">, </span><span class="s1">lastName</span><span class="s3">, </span><span class="s1">lastCls = items[</span><span class="s5">0</span><span class="s1">]</span>
+			<span class="s1">ranges = [[lastCls</span><span class="s3">, </span><span class="s1">last</span><span class="s3">, </span><span class="s1">lastName]]</span>
+			<span class="s3">for </span><span class="s1">glyphID</span><span class="s3">, </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">cls </span><span class="s3">in </span><span class="s1">items[</span><span class="s5">1</span><span class="s1">:]:</span>
+				<span class="s3">if </span><span class="s1">glyphID != last + </span><span class="s5">1 </span><span class="s3">or </span><span class="s1">cls != lastCls:</span>
+					<span class="s1">ranges[-</span><span class="s5">1</span><span class="s1">].extend([last</span><span class="s3">, </span><span class="s1">lastName])</span>
+					<span class="s1">ranges.append([cls</span><span class="s3">, </span><span class="s1">glyphID</span><span class="s3">, </span><span class="s1">glyphName])</span>
+				<span class="s1">last = glyphID</span>
+				<span class="s1">lastName = glyphName</span>
+				<span class="s1">lastCls = cls</span>
+			<span class="s1">ranges[-</span><span class="s5">1</span><span class="s1">].extend([last</span><span class="s3">, </span><span class="s1">lastName])</span>
+			<span class="s3">return </span><span class="s1">ranges</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">format = </span><span class="s5">2</span>
+		<span class="s1">rawTable = {</span><span class="s4">&quot;ClassRangeRecord&quot;</span><span class="s1">: []}</span>
+		<span class="s1">ranges = self._getClassRanges(font)</span>
+		<span class="s3">if </span><span class="s1">ranges:</span>
+			<span class="s1">startGlyph = ranges[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span>
+			<span class="s1">endGlyph = ranges[-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">3</span><span class="s1">]</span>
+			<span class="s1">glyphCount = endGlyph - startGlyph + </span><span class="s5">1</span>
+			<span class="s3">if </span><span class="s1">len(ranges) * </span><span class="s5">3 </span><span class="s1">&lt; glyphCount + </span><span class="s5">1</span><span class="s1">:</span>
+				<span class="s0"># Format 2 is more compact</span>
+				<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(len(ranges)):</span>
+					<span class="s1">cls</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">startName</span><span class="s3">, </span><span class="s1">end</span><span class="s3">, </span><span class="s1">endName = ranges[i]</span>
+					<span class="s1">rec = ClassRangeRecord()</span>
+					<span class="s1">rec.Start = startName</span>
+					<span class="s1">rec.End = endName</span>
+					<span class="s1">rec.Class = cls</span>
+					<span class="s1">ranges[i] = rec</span>
+				<span class="s1">format = </span><span class="s5">2</span>
+				<span class="s1">rawTable = {</span><span class="s4">&quot;ClassRangeRecord&quot;</span><span class="s1">: ranges}</span>
+			<span class="s3">else</span><span class="s1">:</span>
+				<span class="s0"># Format 1 is more compact</span>
+				<span class="s1">startGlyphName = ranges[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">2</span><span class="s1">]</span>
+				<span class="s1">classes = [</span><span class="s5">0</span><span class="s1">] * glyphCount</span>
+				<span class="s3">for </span><span class="s1">cls</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">startName</span><span class="s3">, </span><span class="s1">end</span><span class="s3">, </span><span class="s1">endName </span><span class="s3">in </span><span class="s1">ranges:</span>
+					<span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">range(start - startGlyph</span><span class="s3">, </span><span class="s1">end - startGlyph + </span><span class="s5">1</span><span class="s1">):</span>
+						<span class="s1">classes[g] = cls</span>
+				<span class="s1">format = </span><span class="s5">1</span>
+				<span class="s1">rawTable = {</span><span class="s4">&quot;StartGlyph&quot;</span><span class="s1">: startGlyphName</span><span class="s3">, </span><span class="s4">&quot;ClassValueArray&quot;</span><span class="s1">: classes}</span>
+		<span class="s1">self.Format = format</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">items = sorted(self.classDefs.items())</span>
+		<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">cls </span><span class="s3">in </span><span class="s1">items:</span>
+			<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;ClassDef&quot;</span><span class="s3">, </span><span class="s1">[(</span><span class="s4">&quot;glyph&quot;</span><span class="s3">, </span><span class="s1">glyphName)</span><span class="s3">, </span><span class="s1">(</span><span class="s4">&quot;class&quot;</span><span class="s3">, </span><span class="s1">cls)])</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">classDefs = getattr(self</span><span class="s3">, </span><span class="s4">&quot;classDefs&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">classDefs </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">classDefs = {}</span>
+			<span class="s1">self.classDefs = classDefs</span>
+		<span class="s1">classDefs[attrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">]] = int(attrs[</span><span class="s4">&quot;class&quot;</span><span class="s1">])</span>
+
+
+<span class="s3">class </span><span class="s1">AlternateSubst(FormatSwitchingBaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'alternates'</span><span class="s1">):</span>
+			<span class="s1">self.alternates = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">alternates = {}</span>
+		<span class="s3">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">input = _getGlyphsFromCoverageTable(rawTable[</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">])</span>
+			<span class="s1">alts = rawTable[</span><span class="s4">&quot;AlternateSet&quot;</span><span class="s1">]</span>
+			<span class="s3">assert </span><span class="s1">len(input) == len(alts)</span>
+			<span class="s3">for </span><span class="s1">inp</span><span class="s3">,</span><span class="s1">alt </span><span class="s3">in </span><span class="s1">zip(input</span><span class="s3">,</span><span class="s1">alts):</span>
+				<span class="s1">alternates[inp] = alt.Alternate</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s3">assert </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;unknown format: %s&quot; </span><span class="s1">% self.Format</span>
+		<span class="s1">self.alternates = alternates</span>
+		<span class="s3">del </span><span class="s1">self.Format </span><span class="s0"># Don't need this anymore</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.Format = </span><span class="s5">1</span>
+		<span class="s1">alternates = getattr(self</span><span class="s3">, </span><span class="s4">&quot;alternates&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">alternates </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">alternates = self.alternates = {}</span>
+		<span class="s1">items = list(alternates.items())</span>
+		<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(len(items)):</span>
+			<span class="s1">glyphName</span><span class="s3">, </span><span class="s1">set = items[i]</span>
+			<span class="s1">items[i] = font.getGlyphID(glyphName)</span><span class="s3">, </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">set</span>
+		<span class="s1">items.sort()</span>
+		<span class="s1">cov = Coverage()</span>
+		<span class="s1">cov.glyphs = [ item[</span><span class="s5">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">items]</span>
+		<span class="s1">alternates = []</span>
+		<span class="s1">setList = [ item[-</span><span class="s5">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">items]</span>
+		<span class="s3">for </span><span class="s1">set </span><span class="s3">in </span><span class="s1">setList:</span>
+			<span class="s1">alts = AlternateSet()</span>
+			<span class="s1">alts.Alternate = set</span>
+			<span class="s1">alternates.append(alts)</span>
+		<span class="s0"># a special case to deal with the fact that several hundred Adobe Japan1-5</span>
+		<span class="s0"># CJK fonts will overflow an offset if the coverage table isn't pushed to the end.</span>
+		<span class="s0"># Also useful in that when splitting a sub-table because of an offset overflow</span>
+		<span class="s0"># I don't need to calculate the change in the subtable offset due to the change in the coverage table size.</span>
+		<span class="s0"># Allows packing more rules in subtable.</span>
+		<span class="s1">self.sortCoverageLast = </span><span class="s5">1</span>
+		<span class="s3">return </span><span class="s1">{</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">: cov</span><span class="s3">, </span><span class="s4">&quot;AlternateSet&quot;</span><span class="s1">: alternates}</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">items = sorted(self.alternates.items())</span>
+		<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">alternates </span><span class="s3">in </span><span class="s1">items:</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s4">&quot;AlternateSet&quot;</span><span class="s3">, </span><span class="s1">glyph=glyphName)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s3">for </span><span class="s1">alt </span><span class="s3">in </span><span class="s1">alternates:</span>
+				<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Alternate&quot;</span><span class="s3">, </span><span class="s1">glyph=alt)</span>
+				<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s4">&quot;AlternateSet&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">alternates = getattr(self</span><span class="s3">, </span><span class="s4">&quot;alternates&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">alternates </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">alternates = {}</span>
+			<span class="s1">self.alternates = alternates</span>
+		<span class="s1">glyphName = attrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">]</span>
+		<span class="s1">set = []</span>
+		<span class="s1">alternates[glyphName] = set</span>
+		<span class="s3">for </span><span class="s1">element </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if not </span><span class="s1">isinstance(element</span><span class="s3">, </span><span class="s1">tuple):</span>
+				<span class="s3">continue</span>
+			<span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content = element</span>
+			<span class="s1">set.append(attrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">])</span>
+
+
+<span class="s3">class </span><span class="s1">LigatureSubst(FormatSwitchingBaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'ligatures'</span><span class="s1">):</span>
+			<span class="s1">self.ligatures = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">ligatures = {}</span>
+		<span class="s3">if </span><span class="s1">self.Format == </span><span class="s5">1</span><span class="s1">:</span>
+			<span class="s1">input = _getGlyphsFromCoverageTable(rawTable[</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">])</span>
+			<span class="s1">ligSets = rawTable[</span><span class="s4">&quot;LigatureSet&quot;</span><span class="s1">]</span>
+			<span class="s3">assert </span><span class="s1">len(input) == len(ligSets)</span>
+			<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(len(input)):</span>
+				<span class="s1">ligatures[input[i]] = ligSets[i].Ligature</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s3">assert </span><span class="s5">0</span><span class="s3">, </span><span class="s4">&quot;unknown format: %s&quot; </span><span class="s1">% self.Format</span>
+		<span class="s1">self.ligatures = ligatures</span>
+		<span class="s3">del </span><span class="s1">self.Format </span><span class="s0"># Don't need this anymore</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.Format = </span><span class="s5">1</span>
+		<span class="s1">ligatures = getattr(self</span><span class="s3">, </span><span class="s4">&quot;ligatures&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">ligatures </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">ligatures = self.ligatures = {}</span>
+
+		<span class="s3">if </span><span class="s1">ligatures </span><span class="s3">and </span><span class="s1">isinstance(next(iter(ligatures))</span><span class="s3">, </span><span class="s1">tuple):</span>
+			<span class="s0"># New high-level API in v3.1 and later.  Note that we just support compiling this</span>
+			<span class="s0"># for now.  We don't load to this API, and don't do XML with it.</span>
+
+			<span class="s0"># ligatures is map from components-sequence to lig-glyph</span>
+			<span class="s1">newLigatures = dict()</span>
+			<span class="s3">for </span><span class="s1">comps</span><span class="s3">,</span><span class="s1">lig </span><span class="s3">in </span><span class="s1">sorted(ligatures.items()</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">item: (-len(item[</span><span class="s5">0</span><span class="s1">])</span><span class="s3">, </span><span class="s1">item[</span><span class="s5">0</span><span class="s1">])):</span>
+				<span class="s1">ligature = Ligature()</span>
+				<span class="s1">ligature.Component = comps[</span><span class="s5">1</span><span class="s1">:]</span>
+				<span class="s1">ligature.CompCount = len(comps)</span>
+				<span class="s1">ligature.LigGlyph = lig</span>
+				<span class="s1">newLigatures.setdefault(comps[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">[]).append(ligature)</span>
+			<span class="s1">ligatures = newLigatures</span>
+
+		<span class="s1">items = list(ligatures.items())</span>
+		<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(len(items)):</span>
+			<span class="s1">glyphName</span><span class="s3">, </span><span class="s1">set = items[i]</span>
+			<span class="s1">items[i] = font.getGlyphID(glyphName)</span><span class="s3">, </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">set</span>
+		<span class="s1">items.sort()</span>
+		<span class="s1">cov = Coverage()</span>
+		<span class="s1">cov.glyphs = [ item[</span><span class="s5">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">items]</span>
+
+		<span class="s1">ligSets = []</span>
+		<span class="s1">setList = [ item[-</span><span class="s5">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">items ]</span>
+		<span class="s3">for </span><span class="s1">set </span><span class="s3">in </span><span class="s1">setList:</span>
+			<span class="s1">ligSet = LigatureSet()</span>
+			<span class="s1">ligs = ligSet.Ligature = []</span>
+			<span class="s3">for </span><span class="s1">lig </span><span class="s3">in </span><span class="s1">set:</span>
+				<span class="s1">ligs.append(lig)</span>
+			<span class="s1">ligSets.append(ligSet)</span>
+		<span class="s0"># Useful in that when splitting a sub-table because of an offset overflow</span>
+		<span class="s0"># I don't need to calculate the change in subtabl offset due to the coverage table size.</span>
+		<span class="s0"># Allows packing more rules in subtable.</span>
+		<span class="s1">self.sortCoverageLast = </span><span class="s5">1</span>
+		<span class="s3">return </span><span class="s1">{</span><span class="s4">&quot;Coverage&quot;</span><span class="s1">: cov</span><span class="s3">, </span><span class="s4">&quot;LigatureSet&quot;</span><span class="s1">: ligSets}</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">items = sorted(self.ligatures.items())</span>
+		<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">ligSets </span><span class="s3">in </span><span class="s1">items:</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s4">&quot;LigatureSet&quot;</span><span class="s3">, </span><span class="s1">glyph=glyphName)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s3">for </span><span class="s1">lig </span><span class="s3">in </span><span class="s1">ligSets:</span>
+				<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Ligature&quot;</span><span class="s3">, </span><span class="s1">glyph=lig.LigGlyph</span><span class="s3">,</span>
+					<span class="s1">components=</span><span class="s4">&quot;,&quot;</span><span class="s1">.join(lig.Component))</span>
+				<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s4">&quot;LigatureSet&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">ligatures = getattr(self</span><span class="s3">, </span><span class="s4">&quot;ligatures&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">ligatures </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">ligatures = {}</span>
+			<span class="s1">self.ligatures = ligatures</span>
+		<span class="s1">glyphName = attrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">]</span>
+		<span class="s1">ligs = []</span>
+		<span class="s1">ligatures[glyphName] = ligs</span>
+		<span class="s3">for </span><span class="s1">element </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if not </span><span class="s1">isinstance(element</span><span class="s3">, </span><span class="s1">tuple):</span>
+				<span class="s3">continue</span>
+			<span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content = element</span>
+			<span class="s1">lig = Ligature()</span>
+			<span class="s1">lig.LigGlyph = attrs[</span><span class="s4">&quot;glyph&quot;</span><span class="s1">]</span>
+			<span class="s1">components = attrs[</span><span class="s4">&quot;components&quot;</span><span class="s1">]</span>
+			<span class="s1">lig.Component = components.split(</span><span class="s4">&quot;,&quot;</span><span class="s1">) </span><span class="s3">if </span><span class="s1">components </span><span class="s3">else </span><span class="s1">[]</span>
+			<span class="s1">lig.CompCount = len(lig.Component)</span>
+			<span class="s1">ligs.append(lig)</span>
+
+
+<span class="s3">class </span><span class="s1">COLR(BaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">decompile(self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s0"># COLRv0 is exceptional in that LayerRecordCount appears *after* the</span>
+		<span class="s0"># LayerRecordArray it counts, but the parser logic expects Count fields</span>
+		<span class="s0"># to always precede the arrays. Here we work around this by parsing the</span>
+		<span class="s0"># LayerRecordCount before the rest of the table, and storing it in</span>
+		<span class="s0"># the reader's local state.</span>
+		<span class="s1">subReader = reader.getSubReader(offset=</span><span class="s5">0</span><span class="s1">)</span>
+		<span class="s3">for </span><span class="s1">conv </span><span class="s3">in </span><span class="s1">self.getConverters():</span>
+			<span class="s3">if </span><span class="s1">conv.name != </span><span class="s4">&quot;LayerRecordCount&quot;</span><span class="s1">:</span>
+				<span class="s1">subReader.advance(conv.staticSize)</span>
+				<span class="s3">continue</span>
+			<span class="s1">reader[conv.name] = conv.read(subReader</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">tableDict={})</span>
+			<span class="s3">break</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s3">raise </span><span class="s1">AssertionError(</span><span class="s4">&quot;LayerRecordCount converter not found&quot;</span><span class="s1">)</span>
+		<span class="s3">return </span><span class="s1">BaseTable.decompile(self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">, </span><span class="s1">font)</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s0"># The writer similarly assumes Count values precede the things counted,</span>
+		<span class="s0"># thus here we pre-initialize a CountReference; the actual count value</span>
+		<span class="s0"># will be set to the lenght of the array by the time this is assembled.</span>
+		<span class="s1">self.LayerRecordCount = </span><span class="s3">None</span>
+		<span class="s3">return </span><span class="s1">{</span>
+			<span class="s1">**self.__dict__</span><span class="s3">,</span>
+			<span class="s4">&quot;LayerRecordCount&quot;</span><span class="s1">: CountReference(self.__dict__</span><span class="s3">, </span><span class="s4">&quot;LayerRecordCount&quot;</span><span class="s1">)</span>
+		<span class="s1">}</span>
+
+
+<span class="s3">class </span><span class="s1">LookupList(BaseTable):</span>
+	<span class="s1">@property</span>
+	<span class="s3">def </span><span class="s1">table(self):</span>
+		<span class="s3">for </span><span class="s1">l </span><span class="s3">in </span><span class="s1">self.Lookup:</span>
+			<span class="s3">for </span><span class="s1">st </span><span class="s3">in </span><span class="s1">l.SubTable:</span>
+				<span class="s3">if </span><span class="s1">type(st).__name__.endswith(</span><span class="s4">&quot;Subst&quot;</span><span class="s1">):</span>
+					<span class="s3">return </span><span class="s4">&quot;GSUB&quot;</span>
+				<span class="s3">if </span><span class="s1">type(st).__name__.endswith(</span><span class="s4">&quot;Pos&quot;</span><span class="s1">):</span>
+					<span class="s3">return </span><span class="s4">&quot;GPOS&quot;</span>
+		<span class="s3">raise </span><span class="s1">ValueError</span>
+
+	<span class="s3">def </span><span class="s1">toXML2(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">if not </span><span class="s1">font </span><span class="s3">or </span><span class="s4">&quot;Debg&quot; </span><span class="s3">not in </span><span class="s1">font </span><span class="s3">or </span><span class="s1">LOOKUP_DEBUG_INFO_KEY </span><span class="s3">not in </span><span class="s1">font[</span><span class="s4">&quot;Debg&quot;</span><span class="s1">].data:</span>
+			<span class="s3">return </span><span class="s1">super().toXML2(xmlWriter</span><span class="s3">, </span><span class="s1">font)</span>
+		<span class="s1">debugData = font[</span><span class="s4">&quot;Debg&quot;</span><span class="s1">].data[LOOKUP_DEBUG_INFO_KEY][self.table]</span>
+		<span class="s3">for </span><span class="s1">conv </span><span class="s3">in </span><span class="s1">self.getConverters():</span>
+			<span class="s3">if </span><span class="s1">conv.repeat:</span>
+				<span class="s1">value = getattr(self</span><span class="s3">, </span><span class="s1">conv.name</span><span class="s3">, </span><span class="s1">[])</span>
+				<span class="s3">for </span><span class="s1">lookupIndex</span><span class="s3">, </span><span class="s1">item </span><span class="s3">in </span><span class="s1">enumerate(value):</span>
+					<span class="s3">if </span><span class="s1">str(lookupIndex) </span><span class="s3">in </span><span class="s1">debugData:</span>
+						<span class="s1">info = LookupDebugInfo(*debugData[str(lookupIndex)])</span>
+						<span class="s1">tag = info.location</span>
+						<span class="s3">if </span><span class="s1">info.name:</span>
+							<span class="s1">tag = </span><span class="s4">f'</span><span class="s3">{</span><span class="s1">info.name</span><span class="s3">}</span><span class="s4">: </span><span class="s3">{</span><span class="s1">tag</span><span class="s3">}</span><span class="s4">'</span>
+						<span class="s3">if </span><span class="s1">info.feature:</span>
+							<span class="s1">script</span><span class="s3">,</span><span class="s1">language</span><span class="s3">,</span><span class="s1">feature = info.feature</span>
+							<span class="s1">tag = </span><span class="s4">f'</span><span class="s3">{</span><span class="s1">tag</span><span class="s3">} </span><span class="s4">in </span><span class="s3">{</span><span class="s1">feature</span><span class="s3">} </span><span class="s4">(</span><span class="s3">{</span><span class="s1">script</span><span class="s3">}</span><span class="s4">/</span><span class="s3">{</span><span class="s1">language</span><span class="s3">}</span><span class="s4">)'</span>
+						<span class="s1">xmlWriter.comment(tag)</span>
+						<span class="s1">xmlWriter.newline()</span>
+
+					<span class="s1">conv.xmlWrite(xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">item</span><span class="s3">, </span><span class="s1">conv.name</span><span class="s3">,</span>
+							<span class="s1">[(</span><span class="s4">&quot;index&quot;</span><span class="s3">, </span><span class="s1">lookupIndex)])</span>
+			<span class="s3">else</span><span class="s1">:</span>
+				<span class="s3">if </span><span class="s1">conv.aux </span><span class="s3">and not </span><span class="s1">eval(conv.aux</span><span class="s3">, None, </span><span class="s1">vars(self)):</span>
+					<span class="s3">continue</span>
+				<span class="s1">value = getattr(self</span><span class="s3">, </span><span class="s1">conv.name</span><span class="s3">, None</span><span class="s1">) </span><span class="s0"># TODO Handle defaults instead of defaulting to None!</span>
+				<span class="s1">conv.xmlWrite(xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">conv.name</span><span class="s3">, </span><span class="s1">[])</span>
+
+<span class="s3">class </span><span class="s1">BaseGlyphRecordArray(BaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.BaseGlyphRecord = sorted(</span>
+			<span class="s1">self.BaseGlyphRecord</span><span class="s3">,</span>
+			<span class="s1">key=</span><span class="s3">lambda </span><span class="s1">rec: font.getGlyphID(rec.BaseGlyph)</span>
+		<span class="s1">)</span>
+		<span class="s3">return </span><span class="s1">self.__dict__.copy()</span>
+
+
+<span class="s3">class </span><span class="s1">BaseGlyphList(BaseTable):</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">self.BaseGlyphPaintRecord = sorted(</span>
+			<span class="s1">self.BaseGlyphPaintRecord</span><span class="s3">,</span>
+			<span class="s1">key=</span><span class="s3">lambda </span><span class="s1">rec: font.getGlyphID(rec.BaseGlyph)</span>
+		<span class="s1">)</span>
+		<span class="s3">return </span><span class="s1">self.__dict__.copy()</span>
+
+
+<span class="s3">class </span><span class="s1">ClipBoxFormat(IntEnum):</span>
+	<span class="s1">Static = </span><span class="s5">1</span>
+	<span class="s1">Variable = </span><span class="s5">2</span>
+
+	<span class="s3">def </span><span class="s1">is_variable(self):</span>
+		<span class="s3">return </span><span class="s1">self </span><span class="s3">is </span><span class="s1">self.Variable</span>
+
+	<span class="s3">def </span><span class="s1">as_variable(self):</span>
+		<span class="s3">return </span><span class="s1">self.Variable</span>
+
+
+<span class="s3">class </span><span class="s1">ClipBox(getFormatSwitchingBaseTableClass(</span><span class="s4">&quot;uint8&quot;</span><span class="s1">)):</span>
+	<span class="s1">formatEnum = ClipBoxFormat</span>
+
+	<span class="s3">def </span><span class="s1">as_tuple(self):</span>
+		<span class="s3">return </span><span class="s1">tuple(getattr(self</span><span class="s3">, </span><span class="s1">conv.name) </span><span class="s3">for </span><span class="s1">conv </span><span class="s3">in </span><span class="s1">self.getConverters())</span>
+
+	<span class="s3">def </span><span class="s1">__repr__(self):</span>
+		<span class="s3">return </span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">self.__class__.__name__</span><span class="s3">}{</span><span class="s1">self.as_tuple()</span><span class="s3">}</span><span class="s4">&quot;</span>
+
+
+<span class="s3">class </span><span class="s1">ClipList(getFormatSwitchingBaseTableClass(</span><span class="s4">&quot;uint8&quot;</span><span class="s1">)):</span>
+
+	<span class="s3">def </span><span class="s1">populateDefaults(self</span><span class="s3">, </span><span class="s1">propagator=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">&quot;clips&quot;</span><span class="s1">):</span>
+			<span class="s1">self.clips = {}</span>
+
+	<span class="s3">def </span><span class="s1">postRead(self</span><span class="s3">, </span><span class="s1">rawTable</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">clips = {}</span>
+		<span class="s1">glyphOrder = font.getGlyphOrder()</span>
+		<span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">rec </span><span class="s3">in </span><span class="s1">enumerate(rawTable[</span><span class="s4">&quot;ClipRecord&quot;</span><span class="s1">]):</span>
+			<span class="s3">if </span><span class="s1">rec.StartGlyphID &gt; rec.EndGlyphID:</span>
+				<span class="s1">log.warning(</span>
+					<span class="s4">&quot;invalid ClipRecord[%i].StartGlyphID (%i) &gt; &quot;</span>
+					<span class="s4">&quot;EndGlyphID (%i); skipped&quot;</span><span class="s3">,</span>
+					<span class="s1">i</span><span class="s3">,</span>
+					<span class="s1">rec.StartGlyphID</span><span class="s3">,</span>
+					<span class="s1">rec.EndGlyphID</span><span class="s3">,</span>
+				<span class="s1">)</span>
+				<span class="s3">continue</span>
+			<span class="s1">redefinedGlyphs = []</span>
+			<span class="s1">missingGlyphs = []</span>
+			<span class="s3">for </span><span class="s1">glyphID </span><span class="s3">in </span><span class="s1">range(rec.StartGlyphID</span><span class="s3">, </span><span class="s1">rec.EndGlyphID + </span><span class="s5">1</span><span class="s1">):</span>
+				<span class="s3">try</span><span class="s1">:</span>
+					<span class="s1">glyph = glyphOrder[glyphID]</span>
+				<span class="s3">except </span><span class="s1">IndexError:</span>
+					<span class="s1">missingGlyphs.append(glyphID)</span>
+					<span class="s3">continue</span>
+				<span class="s3">if </span><span class="s1">glyph </span><span class="s3">not in </span><span class="s1">clips:</span>
+					<span class="s1">clips[glyph] = copy.copy(rec.ClipBox)</span>
+				<span class="s3">else</span><span class="s1">:</span>
+					<span class="s1">redefinedGlyphs.append(glyphID)</span>
+			<span class="s3">if </span><span class="s1">redefinedGlyphs:</span>
+				<span class="s1">log.warning(</span>
+					<span class="s4">&quot;ClipRecord[%i] overlaps previous records; &quot;</span>
+					<span class="s4">&quot;ignoring redefined clip boxes for the &quot;</span>
+					<span class="s4">&quot;following glyph ID range: [%i-%i]&quot;</span><span class="s3">,</span>
+					<span class="s1">i</span><span class="s3">,</span>
+					<span class="s1">min(redefinedGlyphs)</span><span class="s3">,</span>
+					<span class="s1">max(redefinedGlyphs)</span><span class="s3">,</span>
+				<span class="s1">)</span>
+			<span class="s3">if </span><span class="s1">missingGlyphs:</span>
+				<span class="s1">log.warning(</span>
+					<span class="s4">&quot;ClipRecord[%i] range references missing &quot;</span>
+					<span class="s4">&quot;glyph IDs: [%i-%i]&quot;</span><span class="s3">,</span>
+					<span class="s1">i</span><span class="s3">,</span>
+					<span class="s1">min(missingGlyphs)</span><span class="s3">,</span>
+					<span class="s1">max(missingGlyphs)</span><span class="s3">,</span>
+				<span class="s1">)</span>
+		<span class="s1">self.clips = clips</span>
+
+	<span class="s3">def </span><span class="s1">groups(self):</span>
+		<span class="s1">glyphsByClip = defaultdict(list)</span>
+		<span class="s1">uniqueClips = {}</span>
+		<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">clipBox </span><span class="s3">in </span><span class="s1">self.clips.items():</span>
+			<span class="s1">key = clipBox.as_tuple()</span>
+			<span class="s1">glyphsByClip[key].append(glyphName)</span>
+			<span class="s3">if </span><span class="s1">key </span><span class="s3">not in </span><span class="s1">uniqueClips:</span>
+				<span class="s1">uniqueClips[key] = clipBox</span>
+		<span class="s3">return </span><span class="s1">{</span>
+			<span class="s1">frozenset(glyphs): uniqueClips[key]</span>
+			<span class="s3">for </span><span class="s1">key</span><span class="s3">, </span><span class="s1">glyphs </span><span class="s3">in </span><span class="s1">glyphsByClip.items()</span>
+		<span class="s1">}</span>
+
+	<span class="s3">def </span><span class="s1">preWrite(self</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">&quot;clips&quot;</span><span class="s1">):</span>
+			<span class="s1">self.clips = {}</span>
+		<span class="s1">clipBoxRanges = {}</span>
+		<span class="s1">glyphMap = font.getReverseGlyphMap()</span>
+		<span class="s3">for </span><span class="s1">glyphs</span><span class="s3">, </span><span class="s1">clipBox </span><span class="s3">in </span><span class="s1">self.groups().items():</span>
+			<span class="s1">glyphIDs = sorted(</span>
+				<span class="s1">glyphMap[glyphName] </span><span class="s3">for </span><span class="s1">glyphName </span><span class="s3">in </span><span class="s1">glyphs</span>
+				<span class="s3">if </span><span class="s1">glyphName </span><span class="s3">in </span><span class="s1">glyphMap</span>
+			<span class="s1">)</span>
+			<span class="s3">if not </span><span class="s1">glyphIDs:</span>
+				<span class="s3">continue</span>
+			<span class="s1">last = glyphIDs[</span><span class="s5">0</span><span class="s1">]</span>
+			<span class="s1">ranges = [[last]]</span>
+			<span class="s3">for </span><span class="s1">glyphID </span><span class="s3">in </span><span class="s1">glyphIDs[</span><span class="s5">1</span><span class="s1">:]:</span>
+				<span class="s3">if </span><span class="s1">glyphID != last + </span><span class="s5">1</span><span class="s1">:</span>
+					<span class="s1">ranges[-</span><span class="s5">1</span><span class="s1">].append(last)</span>
+					<span class="s1">ranges.append([glyphID])</span>
+				<span class="s1">last = glyphID</span>
+			<span class="s1">ranges[-</span><span class="s5">1</span><span class="s1">].append(last)</span>
+			<span class="s3">for </span><span class="s1">start</span><span class="s3">, </span><span class="s1">end </span><span class="s3">in </span><span class="s1">ranges:</span>
+				<span class="s3">assert </span><span class="s1">(start</span><span class="s3">, </span><span class="s1">end) </span><span class="s3">not in </span><span class="s1">clipBoxRanges</span>
+				<span class="s1">clipBoxRanges[(start</span><span class="s3">, </span><span class="s1">end)] = clipBox</span>
+
+		<span class="s1">clipRecords = []</span>
+		<span class="s3">for </span><span class="s1">(start</span><span class="s3">, </span><span class="s1">end)</span><span class="s3">, </span><span class="s1">clipBox </span><span class="s3">in </span><span class="s1">sorted(clipBoxRanges.items()):</span>
+			<span class="s1">record = ClipRecord()</span>
+			<span class="s1">record.StartGlyphID = start</span>
+			<span class="s1">record.EndGlyphID = end</span>
+			<span class="s1">record.ClipBox = clipBox</span>
+			<span class="s1">clipRecords.append(record)</span>
+		<span class="s1">rawTable = {</span>
+			<span class="s4">&quot;ClipCount&quot;</span><span class="s1">: len(clipRecords)</span><span class="s3">,</span>
+			<span class="s4">&quot;ClipRecord&quot;</span><span class="s1">: clipRecords</span><span class="s3">,</span>
+		<span class="s1">}</span>
+		<span class="s3">return </span><span class="s1">rawTable</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs=</span><span class="s3">None, </span><span class="s1">name=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s1">tableName = name </span><span class="s3">if </span><span class="s1">name </span><span class="s3">else </span><span class="s1">self.__class__.__name__</span>
+		<span class="s3">if </span><span class="s1">attrs </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">attrs = []</span>
+		<span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">&quot;Format&quot;</span><span class="s1">):</span>
+			<span class="s1">attrs.append((</span><span class="s4">&quot;Format&quot;</span><span class="s3">, </span><span class="s1">self.Format))</span>
+		<span class="s1">xmlWriter.begintag(tableName</span><span class="s3">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s0"># sort clips alphabetically to ensure deterministic XML dump</span>
+		<span class="s3">for </span><span class="s1">glyphs</span><span class="s3">, </span><span class="s1">clipBox </span><span class="s3">in </span><span class="s1">sorted(</span>
+			<span class="s1">self.groups().items()</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">item: min(item[</span><span class="s5">0</span><span class="s1">])</span>
+		<span class="s1">):</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s4">&quot;Clip&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s3">for </span><span class="s1">glyphName </span><span class="s3">in </span><span class="s1">sorted(glyphs):</span>
+				<span class="s1">xmlWriter.simpletag(</span><span class="s4">&quot;Glyph&quot;</span><span class="s3">, </span><span class="s1">value=glyphName)</span>
+				<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">xmlWriter.begintag(</span><span class="s4">&quot;ClipBox&quot;</span><span class="s3">, </span><span class="s1">[(</span><span class="s4">&quot;Format&quot;</span><span class="s3">, </span><span class="s1">clipBox.Format)])</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">clipBox.toXML2(xmlWriter</span><span class="s3">, </span><span class="s1">font)</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s4">&quot;ClipBox&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s1">xmlWriter.endtag(</span><span class="s4">&quot;Clip&quot;</span><span class="s1">)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">xmlWriter.endtag(tableName)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">fromXML(self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font):</span>
+		<span class="s1">clips = getattr(self</span><span class="s3">, </span><span class="s4">&quot;clips&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+		<span class="s3">if </span><span class="s1">clips </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">self.clips = clips = {}</span>
+		<span class="s3">assert </span><span class="s1">name == </span><span class="s4">&quot;Clip&quot;</span>
+		<span class="s1">glyphs = []</span>
+		<span class="s1">clipBox = </span><span class="s3">None</span>
+		<span class="s3">for </span><span class="s1">elem </span><span class="s3">in </span><span class="s1">content:</span>
+			<span class="s3">if not </span><span class="s1">isinstance(elem</span><span class="s3">, </span><span class="s1">tuple):</span>
+				<span class="s3">continue</span>
+			<span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content = elem</span>
+			<span class="s3">if </span><span class="s1">name == </span><span class="s4">&quot;Glyph&quot;</span><span class="s1">:</span>
+				<span class="s1">glyphs.append(attrs[</span><span class="s4">&quot;value&quot;</span><span class="s1">])</span>
+			<span class="s3">elif </span><span class="s1">name == </span><span class="s4">&quot;ClipBox&quot;</span><span class="s1">:</span>
+				<span class="s1">clipBox = ClipBox()</span>
+				<span class="s1">clipBox.Format = safeEval(attrs[</span><span class="s4">&quot;Format&quot;</span><span class="s1">])</span>
+				<span class="s3">for </span><span class="s1">elem </span><span class="s3">in </span><span class="s1">content:</span>
+					<span class="s3">if not </span><span class="s1">isinstance(elem</span><span class="s3">, </span><span class="s1">tuple):</span>
+						<span class="s3">continue</span>
+					<span class="s1">name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content = elem</span>
+					<span class="s1">clipBox.fromXML(name</span><span class="s3">, </span><span class="s1">attrs</span><span class="s3">, </span><span class="s1">content</span><span class="s3">, </span><span class="s1">font)</span>
+		<span class="s3">if </span><span class="s1">clipBox:</span>
+			<span class="s3">for </span><span class="s1">glyphName </span><span class="s3">in </span><span class="s1">glyphs:</span>
+				<span class="s1">clips[glyphName] = clipBox</span>
+
+
+<span class="s3">class </span><span class="s1">ExtendMode(IntEnum):</span>
+	<span class="s1">PAD = </span><span class="s5">0</span>
+	<span class="s1">REPEAT = </span><span class="s5">1</span>
+	<span class="s1">REFLECT = </span><span class="s5">2</span>
+
+
+<span class="s0"># Porter-Duff modes for COLRv1 PaintComposite:</span>
+<span class="s0"># https://github.com/googlefonts/colr-gradients-spec/tree/off_sub_1#compositemode-enumeration</span>
+<span class="s3">class </span><span class="s1">CompositeMode(IntEnum):</span>
+	<span class="s1">CLEAR = </span><span class="s5">0</span>
+	<span class="s1">SRC = </span><span class="s5">1</span>
+	<span class="s1">DEST = </span><span class="s5">2</span>
+	<span class="s1">SRC_OVER = </span><span class="s5">3</span>
+	<span class="s1">DEST_OVER = </span><span class="s5">4</span>
+	<span class="s1">SRC_IN = </span><span class="s5">5</span>
+	<span class="s1">DEST_IN = </span><span class="s5">6</span>
+	<span class="s1">SRC_OUT = </span><span class="s5">7</span>
+	<span class="s1">DEST_OUT = </span><span class="s5">8</span>
+	<span class="s1">SRC_ATOP = </span><span class="s5">9</span>
+	<span class="s1">DEST_ATOP = </span><span class="s5">10</span>
+	<span class="s1">XOR = </span><span class="s5">11</span>
+	<span class="s1">PLUS = </span><span class="s5">12</span>
+	<span class="s1">SCREEN = </span><span class="s5">13</span>
+	<span class="s1">OVERLAY = </span><span class="s5">14</span>
+	<span class="s1">DARKEN = </span><span class="s5">15</span>
+	<span class="s1">LIGHTEN = </span><span class="s5">16</span>
+	<span class="s1">COLOR_DODGE = </span><span class="s5">17</span>
+	<span class="s1">COLOR_BURN = </span><span class="s5">18</span>
+	<span class="s1">HARD_LIGHT = </span><span class="s5">19</span>
+	<span class="s1">SOFT_LIGHT = </span><span class="s5">20</span>
+	<span class="s1">DIFFERENCE = </span><span class="s5">21</span>
+	<span class="s1">EXCLUSION = </span><span class="s5">22</span>
+	<span class="s1">MULTIPLY = </span><span class="s5">23</span>
+	<span class="s1">HSL_HUE = </span><span class="s5">24</span>
+	<span class="s1">HSL_SATURATION = </span><span class="s5">25</span>
+	<span class="s1">HSL_COLOR = </span><span class="s5">26</span>
+	<span class="s1">HSL_LUMINOSITY = </span><span class="s5">27</span>
+
+
+<span class="s3">class </span><span class="s1">PaintFormat(IntEnum):</span>
+	<span class="s1">PaintColrLayers = </span><span class="s5">1</span>
+	<span class="s1">PaintSolid = </span><span class="s5">2</span>
+	<span class="s1">PaintVarSolid = </span><span class="s5">3</span><span class="s3">,</span>
+	<span class="s1">PaintLinearGradient = </span><span class="s5">4</span>
+	<span class="s1">PaintVarLinearGradient = </span><span class="s5">5</span>
+	<span class="s1">PaintRadialGradient = </span><span class="s5">6</span>
+	<span class="s1">PaintVarRadialGradient = </span><span class="s5">7</span>
+	<span class="s1">PaintSweepGradient = </span><span class="s5">8</span>
+	<span class="s1">PaintVarSweepGradient = </span><span class="s5">9</span>
+	<span class="s1">PaintGlyph = </span><span class="s5">10</span>
+	<span class="s1">PaintColrGlyph = </span><span class="s5">11</span>
+	<span class="s1">PaintTransform = </span><span class="s5">12</span>
+	<span class="s1">PaintVarTransform = </span><span class="s5">13</span>
+	<span class="s1">PaintTranslate = </span><span class="s5">14</span>
+	<span class="s1">PaintVarTranslate = </span><span class="s5">15</span>
+	<span class="s1">PaintScale = </span><span class="s5">16</span>
+	<span class="s1">PaintVarScale = </span><span class="s5">17</span>
+	<span class="s1">PaintScaleAroundCenter = </span><span class="s5">18</span>
+	<span class="s1">PaintVarScaleAroundCenter = </span><span class="s5">19</span>
+	<span class="s1">PaintScaleUniform = </span><span class="s5">20</span>
+	<span class="s1">PaintVarScaleUniform = </span><span class="s5">21</span>
+	<span class="s1">PaintScaleUniformAroundCenter = </span><span class="s5">22</span>
+	<span class="s1">PaintVarScaleUniformAroundCenter = </span><span class="s5">23</span>
+	<span class="s1">PaintRotate = </span><span class="s5">24</span>
+	<span class="s1">PaintVarRotate = </span><span class="s5">25</span>
+	<span class="s1">PaintRotateAroundCenter = </span><span class="s5">26</span>
+	<span class="s1">PaintVarRotateAroundCenter = </span><span class="s5">27</span>
+	<span class="s1">PaintSkew = </span><span class="s5">28</span>
+	<span class="s1">PaintVarSkew = </span><span class="s5">29</span>
+	<span class="s1">PaintSkewAroundCenter = </span><span class="s5">30</span>
+	<span class="s1">PaintVarSkewAroundCenter = </span><span class="s5">31</span>
+	<span class="s1">PaintComposite = </span><span class="s5">32</span>
+
+	<span class="s3">def </span><span class="s1">is_variable(self):</span>
+		<span class="s3">return </span><span class="s1">self.name.startswith(</span><span class="s4">&quot;PaintVar&quot;</span><span class="s1">)</span>
+
+	<span class="s3">def </span><span class="s1">as_variable(self):</span>
+		<span class="s3">if </span><span class="s1">self.is_variable():</span>
+			<span class="s3">return </span><span class="s1">self</span>
+		<span class="s3">try</span><span class="s1">:</span>
+			<span class="s3">return </span><span class="s1">PaintFormat.__members__[</span><span class="s4">f&quot;PaintVar</span><span class="s3">{</span><span class="s1">self.name[</span><span class="s5">5</span><span class="s1">:]</span><span class="s3">}</span><span class="s4">&quot;</span><span class="s1">]</span>
+		<span class="s3">except </span><span class="s1">KeyError:</span>
+			<span class="s3">return None</span>
+
+
+<span class="s3">class </span><span class="s1">Paint(getFormatSwitchingBaseTableClass(</span><span class="s4">&quot;uint8&quot;</span><span class="s1">)):</span>
+	<span class="s1">formatEnum = PaintFormat</span>
+
+	<span class="s3">def </span><span class="s1">getFormatName(self):</span>
+		<span class="s3">try</span><span class="s1">:</span>
+			<span class="s3">return </span><span class="s1">self.formatEnum(self.Format).name</span>
+		<span class="s3">except </span><span class="s1">ValueError:</span>
+			<span class="s3">raise </span><span class="s1">NotImplementedError(</span><span class="s4">f&quot;Unknown Paint format: </span><span class="s3">{</span><span class="s1">self.Format</span><span class="s3">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+
+	<span class="s3">def </span><span class="s1">toXML(self</span><span class="s3">, </span><span class="s1">xmlWriter</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">attrs=</span><span class="s3">None, </span><span class="s1">name=</span><span class="s3">None</span><span class="s1">):</span>
+		<span class="s1">tableName = name </span><span class="s3">if </span><span class="s1">name </span><span class="s3">else </span><span class="s1">self.__class__.__name__</span>
+		<span class="s3">if </span><span class="s1">attrs </span><span class="s3">is None</span><span class="s1">:</span>
+			<span class="s1">attrs = []</span>
+		<span class="s1">attrs.append((</span><span class="s4">&quot;Format&quot;</span><span class="s3">, </span><span class="s1">self.Format))</span>
+		<span class="s1">xmlWriter.begintag(tableName</span><span class="s3">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.comment(self.getFormatName())</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self.toXML2(xmlWriter</span><span class="s3">, </span><span class="s1">font)</span>
+		<span class="s1">xmlWriter.endtag(tableName)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s3">def </span><span class="s1">getChildren(self</span><span class="s3">, </span><span class="s1">colr):</span>
+		<span class="s3">if </span><span class="s1">self.Format == PaintFormat.PaintColrLayers:</span>
+			<span class="s0"># https://github.com/fonttools/fonttools/issues/2438: don't die when no LayerList exists</span>
+			<span class="s1">layers = []</span>
+			<span class="s3">if </span><span class="s1">colr.LayerList </span><span class="s3">is not None</span><span class="s1">:</span>
+				<span class="s1">layers = colr.LayerList.Paint</span>
+			<span class="s3">return </span><span class="s1">layers[</span>
+				<span class="s1">self.FirstLayerIndex : self.FirstLayerIndex + self.NumLayers</span>
+			<span class="s1">]</span>
+
+		<span class="s3">if </span><span class="s1">self.Format == PaintFormat.PaintColrGlyph:</span>
+			<span class="s3">for </span><span class="s1">record </span><span class="s3">in </span><span class="s1">colr.BaseGlyphList.BaseGlyphPaintRecord:</span>
+				<span class="s3">if </span><span class="s1">record.BaseGlyph == self.Glyph:</span>
+					<span class="s3">return </span><span class="s1">[record.Paint]</span>
+			<span class="s3">else</span><span class="s1">:</span>
+				<span class="s3">raise </span><span class="s1">KeyError(</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">self.Glyph</span><span class="s3">!r} </span><span class="s4">not in colr.BaseGlyphList&quot;</span><span class="s1">)</span>
+
+		<span class="s1">children = []</span>
+		<span class="s3">for </span><span class="s1">conv </span><span class="s3">in </span><span class="s1">self.getConverters():</span>
+			<span class="s3">if </span><span class="s1">conv.tableClass </span><span class="s3">is not None and </span><span class="s1">issubclass(conv.tableClass</span><span class="s3">, </span><span class="s1">type(self)):</span>
+				<span class="s1">children.append(getattr(self</span><span class="s3">, </span><span class="s1">conv.name))</span>
+
+		<span class="s3">return </span><span class="s1">children</span>
+
+	<span class="s3">def </span><span class="s1">traverse(self</span><span class="s3">, </span><span class="s1">colr: COLR</span><span class="s3">, </span><span class="s1">callback):</span>
+		<span class="s2">&quot;&quot;&quot;Depth-first traversal of graph rooted at self, callback on each node.&quot;&quot;&quot;</span>
+		<span class="s3">if not </span><span class="s1">callable(callback):</span>
+			<span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;callback must be callable&quot;</span><span class="s1">)</span>
+		<span class="s1">stack = [self]</span>
+		<span class="s1">visited = set()</span>
+		<span class="s3">while </span><span class="s1">stack:</span>
+			<span class="s1">current = stack.pop()</span>
+			<span class="s3">if </span><span class="s1">id(current) </span><span class="s3">in </span><span class="s1">visited:</span>
+				<span class="s3">continue</span>
+			<span class="s1">callback(current)</span>
+			<span class="s1">visited.add(id(current))</span>
+			<span class="s1">stack.extend(reversed(current.getChildren(colr)))</span>
+
+
+<span class="s0"># For each subtable format there is a class. However, we don't really distinguish</span>
+<span class="s0"># between &quot;field name&quot; and &quot;format name&quot;: often these are the same. Yet there's</span>
+<span class="s0"># a whole bunch of fields with different names. The following dict is a mapping</span>
+<span class="s0"># from &quot;format name&quot; to &quot;field name&quot;. _buildClasses() uses this to create a</span>
+<span class="s0"># subclass for each alternate field name.</span>
+<span class="s0">#</span>
+<span class="s1">_equivalents = {</span>
+	<span class="s4">'MarkArray'</span><span class="s1">: (</span><span class="s4">&quot;Mark1Array&quot;</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'LangSys'</span><span class="s1">: (</span><span class="s4">'DefaultLangSys'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'Coverage'</span><span class="s1">: (</span><span class="s4">'MarkCoverage'</span><span class="s3">, </span><span class="s4">'BaseCoverage'</span><span class="s3">, </span><span class="s4">'LigatureCoverage'</span><span class="s3">, </span><span class="s4">'Mark1Coverage'</span><span class="s3">,</span>
+			<span class="s4">'Mark2Coverage'</span><span class="s3">, </span><span class="s4">'BacktrackCoverage'</span><span class="s3">, </span><span class="s4">'InputCoverage'</span><span class="s3">,</span>
+			<span class="s4">'LookAheadCoverage'</span><span class="s3">, </span><span class="s4">'VertGlyphCoverage'</span><span class="s3">, </span><span class="s4">'HorizGlyphCoverage'</span><span class="s3">,</span>
+			<span class="s4">'TopAccentCoverage'</span><span class="s3">, </span><span class="s4">'ExtendedShapeCoverage'</span><span class="s3">, </span><span class="s4">'MathKernCoverage'</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'ClassDef'</span><span class="s1">: (</span><span class="s4">'ClassDef1'</span><span class="s3">, </span><span class="s4">'ClassDef2'</span><span class="s3">, </span><span class="s4">'BacktrackClassDef'</span><span class="s3">, </span><span class="s4">'InputClassDef'</span><span class="s3">,</span>
+			<span class="s4">'LookAheadClassDef'</span><span class="s3">, </span><span class="s4">'GlyphClassDef'</span><span class="s3">, </span><span class="s4">'MarkAttachClassDef'</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'Anchor'</span><span class="s1">: (</span><span class="s4">'EntryAnchor'</span><span class="s3">, </span><span class="s4">'ExitAnchor'</span><span class="s3">, </span><span class="s4">'BaseAnchor'</span><span class="s3">, </span><span class="s4">'LigatureAnchor'</span><span class="s3">,</span>
+			<span class="s4">'Mark2Anchor'</span><span class="s3">, </span><span class="s4">'MarkAnchor'</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'Device'</span><span class="s1">: (</span><span class="s4">'XPlaDevice'</span><span class="s3">, </span><span class="s4">'YPlaDevice'</span><span class="s3">, </span><span class="s4">'XAdvDevice'</span><span class="s3">, </span><span class="s4">'YAdvDevice'</span><span class="s3">,</span>
+			<span class="s4">'XDeviceTable'</span><span class="s3">, </span><span class="s4">'YDeviceTable'</span><span class="s3">, </span><span class="s4">'DeviceTable'</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'Axis'</span><span class="s1">: (</span><span class="s4">'HorizAxis'</span><span class="s3">, </span><span class="s4">'VertAxis'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'MinMax'</span><span class="s1">: (</span><span class="s4">'DefaultMinMax'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'BaseCoord'</span><span class="s1">: (</span><span class="s4">'MinCoord'</span><span class="s3">, </span><span class="s4">'MaxCoord'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'JstfLangSys'</span><span class="s1">: (</span><span class="s4">'DefJstfLangSys'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'JstfGSUBModList'</span><span class="s1">: (</span><span class="s4">'ShrinkageEnableGSUB'</span><span class="s3">, </span><span class="s4">'ShrinkageDisableGSUB'</span><span class="s3">, </span><span class="s4">'ExtensionEnableGSUB'</span><span class="s3">,</span>
+			<span class="s4">'ExtensionDisableGSUB'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'JstfGPOSModList'</span><span class="s1">: (</span><span class="s4">'ShrinkageEnableGPOS'</span><span class="s3">, </span><span class="s4">'ShrinkageDisableGPOS'</span><span class="s3">, </span><span class="s4">'ExtensionEnableGPOS'</span><span class="s3">,</span>
+			<span class="s4">'ExtensionDisableGPOS'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'JstfMax'</span><span class="s1">: (</span><span class="s4">'ShrinkageJstfMax'</span><span class="s3">, </span><span class="s4">'ExtensionJstfMax'</span><span class="s3">,</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'MathKern'</span><span class="s1">: (</span><span class="s4">'TopRightMathKern'</span><span class="s3">, </span><span class="s4">'TopLeftMathKern'</span><span class="s3">, </span><span class="s4">'BottomRightMathKern'</span><span class="s3">,</span>
+			<span class="s4">'BottomLeftMathKern'</span><span class="s1">)</span><span class="s3">,</span>
+	<span class="s4">'MathGlyphConstruction'</span><span class="s1">: (</span><span class="s4">'VertGlyphConstruction'</span><span class="s3">, </span><span class="s4">'HorizGlyphConstruction'</span><span class="s1">)</span><span class="s3">,</span>
+<span class="s1">}</span>
+
+<span class="s0">#</span>
+<span class="s0"># OverFlow logic, to automatically create ExtensionLookups</span>
+<span class="s0"># XXX This should probably move to otBase.py</span>
+<span class="s0">#</span>
+
+<span class="s3">def </span><span class="s1">fixLookupOverFlows(ttf</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s2">&quot;&quot;&quot; Either the offset from the LookupList to a lookup overflowed, or 
+    an offset from a lookup to a subtable overflowed. 
+    The table layout is: 
+    GPSO/GUSB 
+        Script List 
+        Feature List 
+        LookUpList 
+            Lookup[0] and contents 
+                SubTable offset list 
+                    SubTable[0] and contents 
+                    ... 
+                    SubTable[n] and contents 
+            ... 
+            Lookup[n] and contents 
+                SubTable offset list 
+                    SubTable[0] and contents 
+                    ... 
+                    SubTable[n] and contents 
+    If the offset to a lookup overflowed (SubTableIndex is None) 
+        we must promote the *previous*  lookup to an Extension type. 
+    If the offset from a lookup to subtable overflowed, then we must promote it 
+        to an Extension Lookup type. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">ok = </span><span class="s5">0</span>
+	<span class="s1">lookupIndex = overflowRecord.LookupListIndex</span>
+	<span class="s3">if </span><span class="s1">(overflowRecord.SubTableIndex </span><span class="s3">is None</span><span class="s1">):</span>
+		<span class="s1">lookupIndex = lookupIndex - </span><span class="s5">1</span>
+	<span class="s3">if </span><span class="s1">lookupIndex &lt; </span><span class="s5">0</span><span class="s1">:</span>
+		<span class="s3">return </span><span class="s1">ok</span>
+	<span class="s3">if </span><span class="s1">overflowRecord.tableType == </span><span class="s4">'GSUB'</span><span class="s1">:</span>
+		<span class="s1">extType = </span><span class="s5">7</span>
+	<span class="s3">elif </span><span class="s1">overflowRecord.tableType == </span><span class="s4">'GPOS'</span><span class="s1">:</span>
+		<span class="s1">extType = </span><span class="s5">9</span>
+
+	<span class="s1">lookups = ttf[overflowRecord.tableType].table.LookupList.Lookup</span>
+	<span class="s1">lookup = lookups[lookupIndex]</span>
+	<span class="s0"># If the previous lookup is an extType, look further back. Very unlikely, but possible.</span>
+	<span class="s3">while </span><span class="s1">lookup.SubTable[</span><span class="s5">0</span><span class="s1">].__class__.LookupType == extType:</span>
+		<span class="s1">lookupIndex = lookupIndex -</span><span class="s5">1</span>
+		<span class="s3">if </span><span class="s1">lookupIndex &lt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s3">return </span><span class="s1">ok</span>
+		<span class="s1">lookup = lookups[lookupIndex]</span>
+
+	<span class="s3">for </span><span class="s1">lookupIndex </span><span class="s3">in </span><span class="s1">range(lookupIndex</span><span class="s3">, </span><span class="s1">len(lookups)):</span>
+		<span class="s1">lookup = lookups[lookupIndex]</span>
+		<span class="s3">if </span><span class="s1">lookup.LookupType != extType:</span>
+			<span class="s1">lookup.LookupType = extType</span>
+			<span class="s3">for </span><span class="s1">si </span><span class="s3">in </span><span class="s1">range(len(lookup.SubTable)):</span>
+				<span class="s1">subTable = lookup.SubTable[si]</span>
+				<span class="s1">extSubTableClass = lookupTypes[overflowRecord.tableType][extType]</span>
+				<span class="s1">extSubTable = extSubTableClass()</span>
+				<span class="s1">extSubTable.Format = </span><span class="s5">1</span>
+				<span class="s1">extSubTable.ExtSubTable = subTable</span>
+				<span class="s1">lookup.SubTable[si] = extSubTable</span>
+	<span class="s1">ok = </span><span class="s5">1</span>
+	<span class="s3">return </span><span class="s1">ok</span>
+
+<span class="s3">def </span><span class="s1">splitMultipleSubst(oldSubTable</span><span class="s3">, </span><span class="s1">newSubTable</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s1">ok = </span><span class="s5">1</span>
+	<span class="s1">oldMapping = sorted(oldSubTable.mapping.items())</span>
+	<span class="s1">oldLen = len(oldMapping)</span>
+
+	<span class="s3">if </span><span class="s1">overflowRecord.itemName </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'Coverage'</span><span class="s3">, </span><span class="s4">'RangeRecord'</span><span class="s1">]:</span>
+		<span class="s0"># Coverage table is written last. Overflow is to or within the</span>
+		<span class="s0"># the coverage table. We will just cut the subtable in half.</span>
+		<span class="s1">newLen = oldLen // </span><span class="s5">2</span>
+
+	<span class="s3">elif </span><span class="s1">overflowRecord.itemName == </span><span class="s4">'Sequence'</span><span class="s1">:</span>
+		<span class="s0"># We just need to back up by two items from the overflowed</span>
+		<span class="s0"># Sequence index to make sure the offset to the Coverage table</span>
+		<span class="s0"># doesn't overflow.</span>
+		<span class="s1">newLen = overflowRecord.itemIndex - </span><span class="s5">1</span>
+
+	<span class="s1">newSubTable.mapping = {}</span>
+	<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(newLen</span><span class="s3">, </span><span class="s1">oldLen):</span>
+		<span class="s1">item = oldMapping[i]</span>
+		<span class="s1">key = item[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">newSubTable.mapping[key] = item[</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s3">del </span><span class="s1">oldSubTable.mapping[key]</span>
+
+	<span class="s3">return </span><span class="s1">ok</span>
+
+<span class="s3">def </span><span class="s1">splitAlternateSubst(oldSubTable</span><span class="s3">, </span><span class="s1">newSubTable</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s1">ok = </span><span class="s5">1</span>
+	<span class="s3">if </span><span class="s1">hasattr(oldSubTable</span><span class="s3">, </span><span class="s4">'sortCoverageLast'</span><span class="s1">):</span>
+		<span class="s1">newSubTable.sortCoverageLast = oldSubTable.sortCoverageLast</span>
+
+	<span class="s1">oldAlts = sorted(oldSubTable.alternates.items())</span>
+	<span class="s1">oldLen = len(oldAlts)</span>
+
+	<span class="s3">if </span><span class="s1">overflowRecord.itemName </span><span class="s3">in </span><span class="s1">[ </span><span class="s4">'Coverage'</span><span class="s3">, </span><span class="s4">'RangeRecord'</span><span class="s1">]:</span>
+		<span class="s0"># Coverage table is written last. overflow is to or within the</span>
+		<span class="s0"># the coverage table. We will just cut the subtable in half.</span>
+		<span class="s1">newLen = oldLen//</span><span class="s5">2</span>
+
+	<span class="s3">elif </span><span class="s1">overflowRecord.itemName == </span><span class="s4">'AlternateSet'</span><span class="s1">:</span>
+		<span class="s0"># We just need to back up by two items</span>
+		<span class="s0"># from the overflowed AlternateSet index to make sure the offset</span>
+		<span class="s0"># to the Coverage table doesn't overflow.</span>
+		<span class="s1">newLen = overflowRecord.itemIndex - </span><span class="s5">1</span>
+
+	<span class="s1">newSubTable.alternates = {}</span>
+	<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(newLen</span><span class="s3">, </span><span class="s1">oldLen):</span>
+		<span class="s1">item = oldAlts[i]</span>
+		<span class="s1">key = item[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">newSubTable.alternates[key] = item[</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s3">del </span><span class="s1">oldSubTable.alternates[key]</span>
+
+	<span class="s3">return </span><span class="s1">ok</span>
+
+
+<span class="s3">def </span><span class="s1">splitLigatureSubst(oldSubTable</span><span class="s3">, </span><span class="s1">newSubTable</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s1">ok = </span><span class="s5">1</span>
+	<span class="s1">oldLigs = sorted(oldSubTable.ligatures.items())</span>
+	<span class="s1">oldLen = len(oldLigs)</span>
+
+	<span class="s3">if </span><span class="s1">overflowRecord.itemName </span><span class="s3">in </span><span class="s1">[ </span><span class="s4">'Coverage'</span><span class="s3">, </span><span class="s4">'RangeRecord'</span><span class="s1">]:</span>
+		<span class="s0"># Coverage table is written last. overflow is to or within the</span>
+		<span class="s0"># the coverage table. We will just cut the subtable in half.</span>
+		<span class="s1">newLen = oldLen//</span><span class="s5">2</span>
+
+	<span class="s3">elif </span><span class="s1">overflowRecord.itemName == </span><span class="s4">'LigatureSet'</span><span class="s1">:</span>
+		<span class="s0"># We just need to back up by two items</span>
+		<span class="s0"># from the overflowed AlternateSet index to make sure the offset</span>
+		<span class="s0"># to the Coverage table doesn't overflow.</span>
+		<span class="s1">newLen = overflowRecord.itemIndex - </span><span class="s5">1</span>
+
+	<span class="s1">newSubTable.ligatures = {}</span>
+	<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(newLen</span><span class="s3">, </span><span class="s1">oldLen):</span>
+		<span class="s1">item = oldLigs[i]</span>
+		<span class="s1">key = item[</span><span class="s5">0</span><span class="s1">]</span>
+		<span class="s1">newSubTable.ligatures[key] = item[</span><span class="s5">1</span><span class="s1">]</span>
+		<span class="s3">del </span><span class="s1">oldSubTable.ligatures[key]</span>
+
+	<span class="s3">return </span><span class="s1">ok</span>
+
+
+<span class="s3">def </span><span class="s1">splitPairPos(oldSubTable</span><span class="s3">, </span><span class="s1">newSubTable</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s1">st = oldSubTable</span>
+	<span class="s1">ok = </span><span class="s3">False</span>
+	<span class="s1">newSubTable.Format = oldSubTable.Format</span>
+	<span class="s3">if </span><span class="s1">oldSubTable.Format == </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">len(oldSubTable.PairSet) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s4">'ValueFormat1'</span><span class="s3">, </span><span class="s4">'ValueFormat2'</span><span class="s1">:</span>
+			<span class="s1">setattr(newSubTable</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">getattr(oldSubTable</span><span class="s3">, </span><span class="s1">name))</span>
+
+		<span class="s0"># Move top half of coverage to new subtable</span>
+
+		<span class="s1">newSubTable.Coverage = oldSubTable.Coverage.__class__()</span>
+
+		<span class="s1">coverage = oldSubTable.Coverage.glyphs</span>
+		<span class="s1">records = oldSubTable.PairSet</span>
+
+		<span class="s1">oldCount = len(oldSubTable.PairSet) // </span><span class="s5">2</span>
+
+		<span class="s1">oldSubTable.Coverage.glyphs = coverage[:oldCount]</span>
+		<span class="s1">oldSubTable.PairSet = records[:oldCount]</span>
+
+		<span class="s1">newSubTable.Coverage.glyphs = coverage[oldCount:]</span>
+		<span class="s1">newSubTable.PairSet = records[oldCount:]</span>
+
+		<span class="s1">oldSubTable.PairSetCount = len(oldSubTable.PairSet)</span>
+		<span class="s1">newSubTable.PairSetCount = len(newSubTable.PairSet)</span>
+
+		<span class="s1">ok = </span><span class="s3">True</span>
+
+	<span class="s3">elif </span><span class="s1">oldSubTable.Format == </span><span class="s5">2 </span><span class="s3">and </span><span class="s1">len(oldSubTable.Class1Record) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+		<span class="s3">if not </span><span class="s1">hasattr(oldSubTable</span><span class="s3">, </span><span class="s4">'Class2Count'</span><span class="s1">):</span>
+			<span class="s1">oldSubTable.Class2Count = len(oldSubTable.Class1Record[</span><span class="s5">0</span><span class="s1">].Class2Record)</span>
+		<span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s4">'Class2Count'</span><span class="s3">, </span><span class="s4">'ClassDef2'</span><span class="s3">, </span><span class="s4">'ValueFormat1'</span><span class="s3">, </span><span class="s4">'ValueFormat2'</span><span class="s1">:</span>
+			<span class="s1">setattr(newSubTable</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">getattr(oldSubTable</span><span class="s3">, </span><span class="s1">name))</span>
+
+		<span class="s0"># The two subtables will still have the same ClassDef2 and the table</span>
+		<span class="s0"># sharing will still cause the sharing to overflow.  As such, disable</span>
+		<span class="s0"># sharing on the one that is serialized second (that's oldSubTable).</span>
+		<span class="s1">oldSubTable.DontShare = </span><span class="s3">True</span>
+
+		<span class="s0"># Move top half of class numbers to new subtable</span>
+
+		<span class="s1">newSubTable.Coverage = oldSubTable.Coverage.__class__()</span>
+		<span class="s1">newSubTable.ClassDef1 = oldSubTable.ClassDef1.__class__()</span>
+
+		<span class="s1">coverage = oldSubTable.Coverage.glyphs</span>
+		<span class="s1">classDefs = oldSubTable.ClassDef1.classDefs</span>
+		<span class="s1">records = oldSubTable.Class1Record</span>
+
+		<span class="s1">oldCount = len(oldSubTable.Class1Record) // </span><span class="s5">2</span>
+		<span class="s1">newGlyphs = set(k </span><span class="s3">for </span><span class="s1">k</span><span class="s3">,</span><span class="s1">v </span><span class="s3">in </span><span class="s1">classDefs.items() </span><span class="s3">if </span><span class="s1">v &gt;= oldCount)</span>
+
+		<span class="s1">oldSubTable.Coverage.glyphs = [g </span><span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">coverage </span><span class="s3">if </span><span class="s1">g </span><span class="s3">not in </span><span class="s1">newGlyphs]</span>
+		<span class="s1">oldSubTable.ClassDef1.classDefs = {k:v </span><span class="s3">for </span><span class="s1">k</span><span class="s3">,</span><span class="s1">v </span><span class="s3">in </span><span class="s1">classDefs.items() </span><span class="s3">if </span><span class="s1">v &lt; oldCount}</span>
+		<span class="s1">oldSubTable.Class1Record = records[:oldCount]</span>
+
+		<span class="s1">newSubTable.Coverage.glyphs = [g </span><span class="s3">for </span><span class="s1">g </span><span class="s3">in </span><span class="s1">coverage </span><span class="s3">if </span><span class="s1">g </span><span class="s3">in </span><span class="s1">newGlyphs]</span>
+		<span class="s1">newSubTable.ClassDef1.classDefs = {k:(v-oldCount) </span><span class="s3">for </span><span class="s1">k</span><span class="s3">,</span><span class="s1">v </span><span class="s3">in </span><span class="s1">classDefs.items() </span><span class="s3">if </span><span class="s1">v &gt; oldCount}</span>
+		<span class="s1">newSubTable.Class1Record = records[oldCount:]</span>
+
+		<span class="s1">oldSubTable.Class1Count = len(oldSubTable.Class1Record)</span>
+		<span class="s1">newSubTable.Class1Count = len(newSubTable.Class1Record)</span>
+
+		<span class="s1">ok = </span><span class="s3">True</span>
+
+	<span class="s3">return </span><span class="s1">ok</span>
+
+
+<span class="s3">def </span><span class="s1">splitMarkBasePos(oldSubTable</span><span class="s3">, </span><span class="s1">newSubTable</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s0"># split half of the mark classes to the new subtable</span>
+	<span class="s1">classCount = oldSubTable.ClassCount</span>
+	<span class="s3">if </span><span class="s1">classCount &lt; </span><span class="s5">2</span><span class="s1">:</span>
+		<span class="s0"># oh well, not much left to split...</span>
+		<span class="s3">return False</span>
+
+	<span class="s1">oldClassCount = classCount // </span><span class="s5">2</span>
+	<span class="s1">newClassCount = classCount - oldClassCount</span>
+
+	<span class="s1">oldMarkCoverage</span><span class="s3">, </span><span class="s1">oldMarkRecords = []</span><span class="s3">, </span><span class="s1">[]</span>
+	<span class="s1">newMarkCoverage</span><span class="s3">, </span><span class="s1">newMarkRecords = []</span><span class="s3">, </span><span class="s1">[]</span>
+	<span class="s3">for </span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">markRecord </span><span class="s3">in </span><span class="s1">zip(</span>
+		<span class="s1">oldSubTable.MarkCoverage.glyphs</span><span class="s3">,</span>
+		<span class="s1">oldSubTable.MarkArray.MarkRecord</span>
+	<span class="s1">):</span>
+		<span class="s3">if </span><span class="s1">markRecord.Class &lt; oldClassCount:</span>
+			<span class="s1">oldMarkCoverage.append(glyphName)</span>
+			<span class="s1">oldMarkRecords.append(markRecord)</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">markRecord.Class -= oldClassCount</span>
+			<span class="s1">newMarkCoverage.append(glyphName)</span>
+			<span class="s1">newMarkRecords.append(markRecord)</span>
+
+	<span class="s1">oldBaseRecords</span><span class="s3">, </span><span class="s1">newBaseRecords = []</span><span class="s3">, </span><span class="s1">[]</span>
+	<span class="s3">for </span><span class="s1">rec </span><span class="s3">in </span><span class="s1">oldSubTable.BaseArray.BaseRecord:</span>
+		<span class="s1">oldBaseRecord</span><span class="s3">, </span><span class="s1">newBaseRecord = rec.__class__()</span><span class="s3">, </span><span class="s1">rec.__class__()</span>
+		<span class="s1">oldBaseRecord.BaseAnchor = rec.BaseAnchor[:oldClassCount]</span>
+		<span class="s1">newBaseRecord.BaseAnchor = rec.BaseAnchor[oldClassCount:]</span>
+		<span class="s1">oldBaseRecords.append(oldBaseRecord)</span>
+		<span class="s1">newBaseRecords.append(newBaseRecord)</span>
+
+	<span class="s1">newSubTable.Format = oldSubTable.Format</span>
+
+	<span class="s1">oldSubTable.MarkCoverage.glyphs = oldMarkCoverage</span>
+	<span class="s1">newSubTable.MarkCoverage = oldSubTable.MarkCoverage.__class__()</span>
+	<span class="s1">newSubTable.MarkCoverage.glyphs = newMarkCoverage</span>
+
+	<span class="s0"># share the same BaseCoverage in both halves</span>
+	<span class="s1">newSubTable.BaseCoverage = oldSubTable.BaseCoverage</span>
+
+	<span class="s1">oldSubTable.ClassCount = oldClassCount</span>
+	<span class="s1">newSubTable.ClassCount = newClassCount</span>
+
+	<span class="s1">oldSubTable.MarkArray.MarkRecord = oldMarkRecords</span>
+	<span class="s1">newSubTable.MarkArray = oldSubTable.MarkArray.__class__()</span>
+	<span class="s1">newSubTable.MarkArray.MarkRecord = newMarkRecords</span>
+
+	<span class="s1">oldSubTable.MarkArray.MarkCount = len(oldMarkRecords)</span>
+	<span class="s1">newSubTable.MarkArray.MarkCount = len(newMarkRecords)</span>
+
+	<span class="s1">oldSubTable.BaseArray.BaseRecord = oldBaseRecords</span>
+	<span class="s1">newSubTable.BaseArray = oldSubTable.BaseArray.__class__()</span>
+	<span class="s1">newSubTable.BaseArray.BaseRecord = newBaseRecords</span>
+
+	<span class="s1">oldSubTable.BaseArray.BaseCount = len(oldBaseRecords)</span>
+	<span class="s1">newSubTable.BaseArray.BaseCount = len(newBaseRecords)</span>
+
+	<span class="s3">return True</span>
+
+
+<span class="s1">splitTable = {	</span><span class="s4">'GSUB'</span><span class="s1">: {</span>
+<span class="s0">#                   1: splitSingleSubst,</span>
+					<span class="s5">2</span><span class="s1">: splitMultipleSubst</span><span class="s3">,</span>
+					<span class="s5">3</span><span class="s1">: splitAlternateSubst</span><span class="s3">,</span>
+					<span class="s5">4</span><span class="s1">: splitLigatureSubst</span><span class="s3">,</span>
+<span class="s0">#                   5: splitContextSubst,</span>
+<span class="s0">#                   6: splitChainContextSubst,</span>
+<span class="s0">#                   7: splitExtensionSubst,</span>
+<span class="s0">#                   8: splitReverseChainSingleSubst,</span>
+					<span class="s1">}</span><span class="s3">,</span>
+				<span class="s4">'GPOS'</span><span class="s1">: {</span>
+<span class="s0">#                   1: splitSinglePos,</span>
+					<span class="s5">2</span><span class="s1">: splitPairPos</span><span class="s3">,</span>
+<span class="s0">#                   3: splitCursivePos,</span>
+					<span class="s5">4</span><span class="s1">: splitMarkBasePos</span><span class="s3">,</span>
+<span class="s0">#                   5: splitMarkLigPos,</span>
+<span class="s0">#                   6: splitMarkMarkPos,</span>
+<span class="s0">#                   7: splitContextPos,</span>
+<span class="s0">#                   8: splitChainContextPos,</span>
+<span class="s0">#                   9: splitExtensionPos,</span>
+					<span class="s1">}</span>
+
+			<span class="s1">}</span>
+
+<span class="s3">def </span><span class="s1">fixSubTableOverFlows(ttf</span><span class="s3">, </span><span class="s1">overflowRecord):</span>
+	<span class="s2">&quot;&quot;&quot; 
+    An offset has overflowed within a sub-table. We need to divide this subtable into smaller parts. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">table = ttf[overflowRecord.tableType].table</span>
+	<span class="s1">lookup = table.LookupList.Lookup[overflowRecord.LookupListIndex]</span>
+	<span class="s1">subIndex = overflowRecord.SubTableIndex</span>
+	<span class="s1">subtable = lookup.SubTable[subIndex]</span>
+
+	<span class="s0"># First, try not sharing anything for this subtable...</span>
+	<span class="s3">if not </span><span class="s1">hasattr(subtable</span><span class="s3">, </span><span class="s4">&quot;DontShare&quot;</span><span class="s1">):</span>
+		<span class="s1">subtable.DontShare = </span><span class="s3">True</span>
+		<span class="s3">return True</span>
+
+	<span class="s3">if </span><span class="s1">hasattr(subtable</span><span class="s3">, </span><span class="s4">'ExtSubTable'</span><span class="s1">):</span>
+		<span class="s0"># We split the subtable of the Extension table, and add a new Extension table</span>
+		<span class="s0"># to contain the new subtable.</span>
+
+		<span class="s1">subTableType = subtable.ExtSubTable.__class__.LookupType</span>
+		<span class="s1">extSubTable = subtable</span>
+		<span class="s1">subtable = extSubTable.ExtSubTable</span>
+		<span class="s1">newExtSubTableClass = lookupTypes[overflowRecord.tableType][extSubTable.__class__.LookupType]</span>
+		<span class="s1">newExtSubTable = newExtSubTableClass()</span>
+		<span class="s1">newExtSubTable.Format = extSubTable.Format</span>
+		<span class="s1">toInsert = newExtSubTable</span>
+
+		<span class="s1">newSubTableClass = lookupTypes[overflowRecord.tableType][subTableType]</span>
+		<span class="s1">newSubTable = newSubTableClass()</span>
+		<span class="s1">newExtSubTable.ExtSubTable = newSubTable</span>
+	<span class="s3">else</span><span class="s1">:</span>
+		<span class="s1">subTableType = subtable.__class__.LookupType</span>
+		<span class="s1">newSubTableClass = lookupTypes[overflowRecord.tableType][subTableType]</span>
+		<span class="s1">newSubTable = newSubTableClass()</span>
+		<span class="s1">toInsert = newSubTable</span>
+
+	<span class="s3">if </span><span class="s1">hasattr(lookup</span><span class="s3">, </span><span class="s4">'SubTableCount'</span><span class="s1">): </span><span class="s0"># may not be defined yet.</span>
+		<span class="s1">lookup.SubTableCount = lookup.SubTableCount + </span><span class="s5">1</span>
+
+	<span class="s3">try</span><span class="s1">:</span>
+		<span class="s1">splitFunc = splitTable[overflowRecord.tableType][subTableType]</span>
+	<span class="s3">except </span><span class="s1">KeyError:</span>
+		<span class="s1">log.error(</span>
+			<span class="s4">&quot;Don't know how to split %s lookup type %s&quot;</span><span class="s3">,</span>
+			<span class="s1">overflowRecord.tableType</span><span class="s3">,</span>
+			<span class="s1">subTableType</span><span class="s3">,</span>
+		<span class="s1">)</span>
+		<span class="s3">return False</span>
+
+	<span class="s1">ok = splitFunc(subtable</span><span class="s3">, </span><span class="s1">newSubTable</span><span class="s3">, </span><span class="s1">overflowRecord)</span>
+	<span class="s3">if </span><span class="s1">ok:</span>
+		<span class="s1">lookup.SubTable.insert(subIndex + </span><span class="s5">1</span><span class="s3">, </span><span class="s1">toInsert)</span>
+	<span class="s3">return </span><span class="s1">ok</span>
+
+<span class="s0"># End of OverFlow logic</span>
+
+
+<span class="s3">def </span><span class="s1">_buildClasses():</span>
+	<span class="s3">import </span><span class="s1">re</span>
+	<span class="s3">from </span><span class="s1">.otData </span><span class="s3">import </span><span class="s1">otData</span>
+
+	<span class="s1">formatPat = re.compile(</span><span class="s4">r&quot;([A-Za-z0-9]+)Format(\d+)$&quot;</span><span class="s1">)</span>
+	<span class="s1">namespace = globals()</span>
+
+	<span class="s0"># populate module with classes</span>
+	<span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">table </span><span class="s3">in </span><span class="s1">otData:</span>
+		<span class="s1">baseClass = BaseTable</span>
+		<span class="s1">m = formatPat.match(name)</span>
+		<span class="s3">if </span><span class="s1">m:</span>
+			<span class="s0"># XxxFormatN subtable, we only add the &quot;base&quot; table</span>
+			<span class="s1">name = m.group(</span><span class="s5">1</span><span class="s1">)</span>
+			<span class="s0"># the first row of a format-switching otData table describes the Format;</span>
+			<span class="s0"># the first column defines the type of the Format field.</span>
+			<span class="s0"># Currently this can be either 'uint16' or 'uint8'.</span>
+			<span class="s1">formatType = table[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+			<span class="s1">baseClass = getFormatSwitchingBaseTableClass(formatType)</span>
+		<span class="s3">if </span><span class="s1">name </span><span class="s3">not in </span><span class="s1">namespace:</span>
+			<span class="s0"># the class doesn't exist yet, so the base implementation is used.</span>
+			<span class="s1">cls = type(name</span><span class="s3">, </span><span class="s1">(baseClass</span><span class="s3">,</span><span class="s1">)</span><span class="s3">, </span><span class="s1">{})</span>
+			<span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'GSUB'</span><span class="s3">, </span><span class="s4">'GPOS'</span><span class="s1">):</span>
+				<span class="s1">cls.DontShare = </span><span class="s3">True</span>
+			<span class="s1">namespace[name] = cls</span>
+
+	<span class="s0"># link Var{Table} &lt;-&gt; {Table} (e.g. ColorStop &lt;-&gt; VarColorStop, etc.)</span>
+	<span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">otData:</span>
+		<span class="s3">if </span><span class="s1">name.startswith(</span><span class="s4">&quot;Var&quot;</span><span class="s1">) </span><span class="s3">and </span><span class="s1">len(name) &gt; </span><span class="s5">3 </span><span class="s3">and </span><span class="s1">name[</span><span class="s5">3</span><span class="s1">:] </span><span class="s3">in </span><span class="s1">namespace:</span>
+			<span class="s1">varType = namespace[name]</span>
+			<span class="s1">noVarType = namespace[name[</span><span class="s5">3</span><span class="s1">:]]</span>
+			<span class="s1">varType.NoVarType = noVarType</span>
+			<span class="s1">noVarType.VarType = varType</span>
+
+	<span class="s3">for </span><span class="s1">base</span><span class="s3">, </span><span class="s1">alts </span><span class="s3">in </span><span class="s1">_equivalents.items():</span>
+		<span class="s1">base = namespace[base]</span>
+		<span class="s3">for </span><span class="s1">alt </span><span class="s3">in </span><span class="s1">alts:</span>
+			<span class="s1">namespace[alt] = base</span>
+
+	<span class="s3">global </span><span class="s1">lookupTypes</span>
+	<span class="s1">lookupTypes = {</span>
+		<span class="s4">'GSUB'</span><span class="s1">: {</span>
+			<span class="s5">1</span><span class="s1">: SingleSubst</span><span class="s3">,</span>
+			<span class="s5">2</span><span class="s1">: MultipleSubst</span><span class="s3">,</span>
+			<span class="s5">3</span><span class="s1">: AlternateSubst</span><span class="s3">,</span>
+			<span class="s5">4</span><span class="s1">: LigatureSubst</span><span class="s3">,</span>
+			<span class="s5">5</span><span class="s1">: ContextSubst</span><span class="s3">,</span>
+			<span class="s5">6</span><span class="s1">: ChainContextSubst</span><span class="s3">,</span>
+			<span class="s5">7</span><span class="s1">: ExtensionSubst</span><span class="s3">,</span>
+			<span class="s5">8</span><span class="s1">: ReverseChainSingleSubst</span><span class="s3">,</span>
+		<span class="s1">}</span><span class="s3">,</span>
+		<span class="s4">'GPOS'</span><span class="s1">: {</span>
+			<span class="s5">1</span><span class="s1">: SinglePos</span><span class="s3">,</span>
+			<span class="s5">2</span><span class="s1">: PairPos</span><span class="s3">,</span>
+			<span class="s5">3</span><span class="s1">: CursivePos</span><span class="s3">,</span>
+			<span class="s5">4</span><span class="s1">: MarkBasePos</span><span class="s3">,</span>
+			<span class="s5">5</span><span class="s1">: MarkLigPos</span><span class="s3">,</span>
+			<span class="s5">6</span><span class="s1">: MarkMarkPos</span><span class="s3">,</span>
+			<span class="s5">7</span><span class="s1">: ContextPos</span><span class="s3">,</span>
+			<span class="s5">8</span><span class="s1">: ChainContextPos</span><span class="s3">,</span>
+			<span class="s5">9</span><span class="s1">: ExtensionPos</span><span class="s3">,</span>
+		<span class="s1">}</span><span class="s3">,</span>
+		<span class="s4">'mort'</span><span class="s1">: {</span>
+			<span class="s5">4</span><span class="s1">: NoncontextualMorph</span><span class="s3">,</span>
+		<span class="s1">}</span><span class="s3">,</span>
+		<span class="s4">'morx'</span><span class="s1">: {</span>
+			<span class="s5">0</span><span class="s1">: RearrangementMorph</span><span class="s3">,</span>
+			<span class="s5">1</span><span class="s1">: ContextualMorph</span><span class="s3">,</span>
+			<span class="s5">2</span><span class="s1">: LigatureMorph</span><span class="s3">,</span>
+			<span class="s0"># 3: Reserved,</span>
+			<span class="s5">4</span><span class="s1">: NoncontextualMorph</span><span class="s3">,</span>
+			<span class="s5">5</span><span class="s1">: InsertionMorph</span><span class="s3">,</span>
+		<span class="s1">}</span><span class="s3">,</span>
+	<span class="s1">}</span>
+	<span class="s1">lookupTypes[</span><span class="s4">'JSTF'</span><span class="s1">] = lookupTypes[</span><span class="s4">'GPOS'</span><span class="s1">]  </span><span class="s0"># JSTF contains GPOS</span>
+	<span class="s3">for </span><span class="s1">lookupEnum </span><span class="s3">in </span><span class="s1">lookupTypes.values():</span>
+		<span class="s3">for </span><span class="s1">enum</span><span class="s3">, </span><span class="s1">cls </span><span class="s3">in </span><span class="s1">lookupEnum.items():</span>
+			<span class="s1">cls.LookupType = enum</span>
+
+	<span class="s3">global </span><span class="s1">featureParamTypes</span>
+	<span class="s1">featureParamTypes = {</span>
+		<span class="s4">'size'</span><span class="s1">: FeatureParamsSize</span><span class="s3">,</span>
+	<span class="s1">}</span>
+	<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">20</span><span class="s1">+</span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s1">featureParamTypes[</span><span class="s4">'ss%02d' </span><span class="s1">% i] = FeatureParamsStylisticSet</span>
+	<span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">99</span><span class="s1">+</span><span class="s5">1</span><span class="s1">):</span>
+		<span class="s1">featureParamTypes[</span><span class="s4">'cv%02d' </span><span class="s1">% i] = FeatureParamsCharacterVariants</span>
+
+	<span class="s0"># add converters to classes</span>
+	<span class="s3">from </span><span class="s1">.otConverters </span><span class="s3">import </span><span class="s1">buildConverters</span>
+	<span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">table </span><span class="s3">in </span><span class="s1">otData:</span>
+		<span class="s1">m = formatPat.match(name)</span>
+		<span class="s3">if </span><span class="s1">m:</span>
+			<span class="s0"># XxxFormatN subtable, add converter to &quot;base&quot; table</span>
+			<span class="s1">name</span><span class="s3">, </span><span class="s1">format = m.groups()</span>
+			<span class="s1">format = int(format)</span>
+			<span class="s1">cls = namespace[name]</span>
+			<span class="s3">if not </span><span class="s1">hasattr(cls</span><span class="s3">, </span><span class="s4">&quot;converters&quot;</span><span class="s1">):</span>
+				<span class="s1">cls.converters = {}</span>
+				<span class="s1">cls.convertersByName = {}</span>
+			<span class="s1">converters</span><span class="s3">, </span><span class="s1">convertersByName = buildConverters(table[</span><span class="s5">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">namespace)</span>
+			<span class="s1">cls.converters[format] = converters</span>
+			<span class="s1">cls.convertersByName[format] = convertersByName</span>
+			<span class="s0"># XXX Add staticSize?</span>
+		<span class="s3">else</span><span class="s1">:</span>
+			<span class="s1">cls = namespace[name]</span>
+			<span class="s1">cls.converters</span><span class="s3">, </span><span class="s1">cls.convertersByName = buildConverters(table</span><span class="s3">, </span><span class="s1">namespace)</span>
+			<span class="s0"># XXX Add staticSize?</span>
+
+
+<span class="s1">_buildClasses()</span>
+
+
+<span class="s3">def </span><span class="s1">_getGlyphsFromCoverageTable(coverage):</span>
+	<span class="s3">if </span><span class="s1">coverage </span><span class="s3">is None</span><span class="s1">:</span>
+		<span class="s0"># empty coverage table</span>
+		<span class="s3">return </span><span class="s1">[]</span>
+	<span class="s3">else</span><span class="s1">:</span>
+		<span class="s3">return </span><span class="s1">coverage.glyphs</span>
+</pre>
+</body>
+</html>

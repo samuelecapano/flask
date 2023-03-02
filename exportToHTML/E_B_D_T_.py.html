@@ -1,0 +1,788 @@
+<html>
+<head>
+<title>E_B_D_T_.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+E_B_D_T_.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">sstruct</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">bytechr</span><span class="s0">, </span><span class="s1">byteord</span><span class="s0">, </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">strjoin</span><span class="s0">, </span><span class="s1">safeEval</span><span class="s0">, </span><span class="s1">readHex</span><span class="s0">, </span><span class="s1">hexStr</span><span class="s0">, </span><span class="s1">deHexStr</span>
+<span class="s0">from </span><span class="s1">.BitmapGlyphMetrics </span><span class="s0">import </span><span class="s1">BigGlyphMetrics</span><span class="s0">, </span><span class="s1">bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">SmallGlyphMetrics</span><span class="s0">, </span><span class="s1">smallGlyphMetricsFormat</span>
+<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s1">ebdtTableVersionFormat = </span><span class="s2">&quot;&quot;&quot; 
+    &gt; # big endian 
+    version: 16.16F 
+&quot;&quot;&quot;</span>
+
+<span class="s1">ebdtComponentFormat = </span><span class="s2">&quot;&quot;&quot; 
+    &gt; # big endian 
+    glyphCode: H 
+    xOffset:   b 
+    yOffset:   b 
+&quot;&quot;&quot;</span>
+
+<span class="s0">class </span><span class="s1">table_E_B_D_T_(DefaultTable.DefaultTable):</span>
+
+	<span class="s3"># Keep a reference to the name of the data locator table.</span>
+	<span class="s1">locatorName = </span><span class="s2">'EBLC'</span>
+
+	<span class="s3"># This method can be overridden in subclasses to support new formats</span>
+	<span class="s3"># without changing the other implementation. Also can be used as a</span>
+	<span class="s3"># convenience method for coverting a font file to an alternative format.</span>
+	<span class="s0">def </span><span class="s1">getImageFormatClass(self</span><span class="s0">, </span><span class="s1">imageFormat):</span>
+		<span class="s0">return </span><span class="s1">ebdt_bitmap_classes[imageFormat]</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s3"># Get the version but don't advance the slice.</span>
+		<span class="s3"># Most of the lookup for this table is done relative</span>
+		<span class="s3"># to the begining so slice by the offsets provided</span>
+		<span class="s3"># in the EBLC table.</span>
+		<span class="s1">sstruct.unpack2(ebdtTableVersionFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">self)</span>
+
+		<span class="s3"># Keep a dict of glyphs that have been seen so they aren't remade.</span>
+		<span class="s3"># This dict maps intervals of data to the BitmapGlyph.</span>
+		<span class="s1">glyphDict = {}</span>
+
+		<span class="s3"># Pull out the EBLC table and loop through glyphs.</span>
+		<span class="s3"># A strike is a concept that spans both tables.</span>
+		<span class="s3"># The actual bitmap data is stored in the EBDT.</span>
+		<span class="s1">locator = ttFont[self.__class__.locatorName]</span>
+		<span class="s1">self.strikeData = []</span>
+		<span class="s0">for </span><span class="s1">curStrike </span><span class="s0">in </span><span class="s1">locator.strikes:</span>
+			<span class="s1">bitmapGlyphDict = {}</span>
+			<span class="s1">self.strikeData.append(bitmapGlyphDict)</span>
+			<span class="s0">for </span><span class="s1">indexSubTable </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables:</span>
+				<span class="s1">dataIter = zip(indexSubTable.names</span><span class="s0">, </span><span class="s1">indexSubTable.locations)</span>
+				<span class="s0">for </span><span class="s1">curName</span><span class="s0">, </span><span class="s1">curLoc </span><span class="s0">in </span><span class="s1">dataIter:</span>
+					<span class="s3"># Don't create duplicate data entries for the same glyphs.</span>
+					<span class="s3"># Instead just use the structures that already exist if they exist.</span>
+					<span class="s0">if </span><span class="s1">curLoc </span><span class="s0">in </span><span class="s1">glyphDict:</span>
+						<span class="s1">curGlyph = glyphDict[curLoc]</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s1">curGlyphData = data[slice(*curLoc)]</span>
+						<span class="s1">imageFormatClass = self.getImageFormatClass(indexSubTable.imageFormat)</span>
+						<span class="s1">curGlyph = imageFormatClass(curGlyphData</span><span class="s0">, </span><span class="s1">ttFont)</span>
+						<span class="s1">glyphDict[curLoc] = curGlyph</span>
+					<span class="s1">bitmapGlyphDict[curName] = curGlyph</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+
+		<span class="s1">dataList = []</span>
+		<span class="s1">dataList.append(sstruct.pack(ebdtTableVersionFormat</span><span class="s0">, </span><span class="s1">self))</span>
+		<span class="s1">dataSize = len(dataList[</span><span class="s4">0</span><span class="s1">])</span>
+
+		<span class="s3"># Keep a dict of glyphs that have been seen so they aren't remade.</span>
+		<span class="s3"># This dict maps the id of the BitmapGlyph to the interval</span>
+		<span class="s3"># in the data.</span>
+		<span class="s1">glyphDict = {}</span>
+
+		<span class="s3"># Go through the bitmap glyph data. Just in case the data for a glyph</span>
+		<span class="s3"># changed the size metrics should be recalculated. There are a variety</span>
+		<span class="s3"># of formats and they get stored in the EBLC table. That is why</span>
+		<span class="s3"># recalculation is defered to the EblcIndexSubTable class and just</span>
+		<span class="s3"># pass what is known about bitmap glyphs from this particular table.</span>
+		<span class="s1">locator = ttFont[self.__class__.locatorName]</span>
+		<span class="s0">for </span><span class="s1">curStrike</span><span class="s0">, </span><span class="s1">curGlyphDict </span><span class="s0">in </span><span class="s1">zip(locator.strikes</span><span class="s0">, </span><span class="s1">self.strikeData):</span>
+			<span class="s0">for </span><span class="s1">curIndexSubTable </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables:</span>
+				<span class="s1">dataLocations = []</span>
+				<span class="s0">for </span><span class="s1">curName </span><span class="s0">in </span><span class="s1">curIndexSubTable.names:</span>
+					<span class="s3"># Handle the data placement based on seeing the glyph or not.</span>
+					<span class="s3"># Just save a reference to the location if the glyph has already</span>
+					<span class="s3"># been saved in compile. This code assumes that glyphs will only</span>
+					<span class="s3"># be referenced multiple times from indexFormat5. By luck the</span>
+					<span class="s3"># code may still work when referencing poorly ordered fonts with</span>
+					<span class="s3"># duplicate references. If there is a font that is unlucky the</span>
+					<span class="s3"># respective compile methods for the indexSubTables will fail</span>
+					<span class="s3"># their assertions. All fonts seem to follow this assumption.</span>
+					<span class="s3"># More complicated packing may be needed if a counter-font exists.</span>
+					<span class="s1">glyph = curGlyphDict[curName]</span>
+					<span class="s1">objectId = id(glyph)</span>
+					<span class="s0">if </span><span class="s1">objectId </span><span class="s0">not in </span><span class="s1">glyphDict:</span>
+						<span class="s1">data = glyph.compile(ttFont)</span>
+						<span class="s1">data = curIndexSubTable.padBitmapData(data)</span>
+						<span class="s1">startByte = dataSize</span>
+						<span class="s1">dataSize += len(data)</span>
+						<span class="s1">endByte = dataSize</span>
+						<span class="s1">dataList.append(data)</span>
+						<span class="s1">dataLoc = (startByte</span><span class="s0">, </span><span class="s1">endByte)</span>
+						<span class="s1">glyphDict[objectId] = dataLoc</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s1">dataLoc = glyphDict[objectId]</span>
+					<span class="s1">dataLocations.append(dataLoc)</span>
+				<span class="s3"># Just use the new data locations in the indexSubTable.</span>
+				<span class="s3"># The respective compile implementations will take care</span>
+				<span class="s3"># of any of the problems in the convertion that may arise.</span>
+				<span class="s1">curIndexSubTable.locations = dataLocations</span>
+
+		<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s3"># When exporting to XML if one of the data export formats</span>
+		<span class="s3"># requires metrics then those metrics may be in the locator.</span>
+		<span class="s3"># In this case populate the bitmaps with &quot;export metrics&quot;.</span>
+		<span class="s0">if </span><span class="s1">ttFont.bitmapGlyphDataFormat </span><span class="s0">in </span><span class="s1">(</span><span class="s2">'row'</span><span class="s0">, </span><span class="s2">'bitwise'</span><span class="s1">):</span>
+			<span class="s1">locator = ttFont[self.__class__.locatorName]</span>
+			<span class="s0">for </span><span class="s1">curStrike</span><span class="s0">, </span><span class="s1">curGlyphDict </span><span class="s0">in </span><span class="s1">zip(locator.strikes</span><span class="s0">, </span><span class="s1">self.strikeData):</span>
+				<span class="s0">for </span><span class="s1">curIndexSubTable </span><span class="s0">in </span><span class="s1">curStrike.indexSubTables:</span>
+					<span class="s0">for </span><span class="s1">curName </span><span class="s0">in </span><span class="s1">curIndexSubTable.names:</span>
+						<span class="s1">glyph = curGlyphDict[curName]</span>
+						<span class="s3"># I'm not sure which metrics have priority here.</span>
+						<span class="s3"># For now if both metrics exist go with glyph metrics.</span>
+						<span class="s0">if </span><span class="s1">hasattr(glyph</span><span class="s0">, </span><span class="s2">'metrics'</span><span class="s1">):</span>
+							<span class="s1">glyph.exportMetrics = glyph.metrics</span>
+						<span class="s0">else</span><span class="s1">:</span>
+							<span class="s1">glyph.exportMetrics = curIndexSubTable.metrics</span>
+						<span class="s1">glyph.exportBitDepth = curStrike.bitmapSizeTable.bitDepth</span>
+
+		<span class="s1">writer.simpletag(</span><span class="s2">&quot;header&quot;</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'version'</span><span class="s0">, </span><span class="s1">self.version)])</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">locator = ttFont[self.__class__.locatorName]</span>
+		<span class="s0">for </span><span class="s1">strikeIndex</span><span class="s0">, </span><span class="s1">bitmapGlyphDict </span><span class="s0">in </span><span class="s1">enumerate(self.strikeData):</span>
+			<span class="s1">writer.begintag(</span><span class="s2">'strikedata'</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'index'</span><span class="s0">, </span><span class="s1">strikeIndex)])</span>
+			<span class="s1">writer.newline()</span>
+			<span class="s0">for </span><span class="s1">curName</span><span class="s0">, </span><span class="s1">curBitmap </span><span class="s0">in </span><span class="s1">bitmapGlyphDict.items():</span>
+				<span class="s1">curBitmap.toXML(strikeIndex</span><span class="s0">, </span><span class="s1">curName</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+			<span class="s1">writer.endtag(</span><span class="s2">'strikedata'</span><span class="s1">)</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s2">'header'</span><span class="s1">:</span>
+			<span class="s1">self.version = safeEval(attrs[</span><span class="s2">'version'</span><span class="s1">])</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s2">'strikedata'</span><span class="s1">:</span>
+			<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s2">'strikeData'</span><span class="s1">):</span>
+				<span class="s1">self.strikeData = []</span>
+			<span class="s1">strikeIndex = safeEval(attrs[</span><span class="s2">'index'</span><span class="s1">])</span>
+
+			<span class="s1">bitmapGlyphDict = {}</span>
+			<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+				<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+					<span class="s0">continue</span>
+				<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+				<span class="s0">if </span><span class="s1">name[</span><span class="s4">4</span><span class="s1">:].startswith(_bitmapGlyphSubclassPrefix[</span><span class="s4">4</span><span class="s1">:]):</span>
+					<span class="s1">imageFormat = safeEval(name[len(_bitmapGlyphSubclassPrefix):])</span>
+					<span class="s1">glyphName = attrs[</span><span class="s2">'name'</span><span class="s1">]</span>
+					<span class="s1">imageFormatClass = self.getImageFormatClass(imageFormat)</span>
+					<span class="s1">curGlyph = imageFormatClass(</span><span class="s0">None, None</span><span class="s1">)</span>
+					<span class="s1">curGlyph.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+					<span class="s0">assert </span><span class="s1">glyphName </span><span class="s0">not in </span><span class="s1">bitmapGlyphDict</span><span class="s0">, </span><span class="s2">&quot;Duplicate glyphs with the same name '%s' in the same strike.&quot; </span><span class="s1">% glyphName</span>
+					<span class="s1">bitmapGlyphDict[glyphName] = curGlyph</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">log.warning(</span><span class="s2">&quot;%s being ignored by %s&quot;</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">self.__class__.__name__)</span>
+
+			<span class="s3"># Grow the strike data array to the appropriate size. The XML</span>
+			<span class="s3"># format allows the strike index value to be out of order.</span>
+			<span class="s0">if </span><span class="s1">strikeIndex &gt;= len(self.strikeData):</span>
+				<span class="s1">self.strikeData += [</span><span class="s0">None</span><span class="s1">] * (strikeIndex + </span><span class="s4">1 </span><span class="s1">- len(self.strikeData))</span>
+			<span class="s0">assert </span><span class="s1">self.strikeData[strikeIndex] </span><span class="s0">is None, </span><span class="s2">&quot;Duplicate strike EBDT indices.&quot;</span>
+			<span class="s1">self.strikeData[strikeIndex] = bitmapGlyphDict</span>
+
+<span class="s0">class </span><span class="s1">EbdtComponent(object):</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(</span><span class="s2">'ebdtComponent'</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'name'</span><span class="s0">, </span><span class="s1">self.name)])</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">componentName </span><span class="s0">in </span><span class="s1">sstruct.getformat(ebdtComponentFormat)[</span><span class="s4">1</span><span class="s1">][</span><span class="s4">1</span><span class="s1">:]:</span>
+			<span class="s1">writer.simpletag(componentName</span><span class="s0">, </span><span class="s1">value=getattr(self</span><span class="s0">, </span><span class="s1">componentName))</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">writer.endtag(</span><span class="s2">'ebdtComponent'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.name = attrs[</span><span class="s2">'name'</span><span class="s1">]</span>
+		<span class="s1">componentNames = set(sstruct.getformat(ebdtComponentFormat)[</span><span class="s4">1</span><span class="s1">][</span><span class="s4">1</span><span class="s1">:])</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name </span><span class="s0">in </span><span class="s1">componentNames:</span>
+				<span class="s1">vars(self)[name] = safeEval(attrs[</span><span class="s2">'value'</span><span class="s1">])</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">log.warning(</span><span class="s2">&quot;unknown name '%s' being ignored by EbdtComponent.&quot;</span><span class="s0">, </span><span class="s1">name)</span>
+
+<span class="s3"># Helper functions for dealing with binary.</span>
+
+<span class="s0">def </span><span class="s1">_data2binary(data</span><span class="s0">, </span><span class="s1">numBits):</span>
+	<span class="s1">binaryList = []</span>
+	<span class="s0">for </span><span class="s1">curByte </span><span class="s0">in </span><span class="s1">data:</span>
+		<span class="s1">value = byteord(curByte)</span>
+		<span class="s1">numBitsCut = min(</span><span class="s4">8</span><span class="s0">, </span><span class="s1">numBits)</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numBitsCut):</span>
+			<span class="s0">if </span><span class="s1">value &amp; </span><span class="s4">0x1</span><span class="s1">:</span>
+				<span class="s1">binaryList.append(</span><span class="s2">'1'</span><span class="s1">)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">binaryList.append(</span><span class="s2">'0'</span><span class="s1">)</span>
+			<span class="s1">value = value &gt;&gt; </span><span class="s4">1</span>
+		<span class="s1">numBits -= numBitsCut</span>
+	<span class="s0">return </span><span class="s1">strjoin(binaryList)</span>
+
+<span class="s0">def </span><span class="s1">_binary2data(binary):</span>
+	<span class="s1">byteList = []</span>
+	<span class="s0">for </span><span class="s1">bitLoc </span><span class="s0">in </span><span class="s1">range(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">len(binary)</span><span class="s0">, </span><span class="s4">8</span><span class="s1">):</span>
+		<span class="s1">byteString = binary[bitLoc:bitLoc+</span><span class="s4">8</span><span class="s1">]</span>
+		<span class="s1">curByte = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">curBit </span><span class="s0">in </span><span class="s1">reversed(byteString):</span>
+			<span class="s1">curByte = curByte &lt;&lt; </span><span class="s4">1</span>
+			<span class="s0">if </span><span class="s1">curBit == </span><span class="s2">'1'</span><span class="s1">:</span>
+				<span class="s1">curByte |= </span><span class="s4">1</span>
+		<span class="s1">byteList.append(bytechr(curByte))</span>
+	<span class="s0">return </span><span class="s1">bytesjoin(byteList)</span>
+
+<span class="s0">def </span><span class="s1">_memoize(f):</span>
+	<span class="s0">class </span><span class="s1">memodict(dict):</span>
+		<span class="s0">def </span><span class="s1">__missing__(self</span><span class="s0">, </span><span class="s1">key):</span>
+			<span class="s1">ret = f(key)</span>
+			<span class="s0">if </span><span class="s1">len(key) == </span><span class="s4">1</span><span class="s1">:</span>
+				<span class="s1">self[key] = ret</span>
+			<span class="s0">return </span><span class="s1">ret</span>
+	<span class="s0">return </span><span class="s1">memodict().__getitem__</span>
+
+<span class="s3"># 00100111 -&gt; 11100100 per byte, not to be confused with little/big endian.</span>
+<span class="s3"># Bitmap data per byte is in the order that binary is written on the page</span>
+<span class="s3"># with the least significant bit as far right as possible. This is the</span>
+<span class="s3"># opposite of what makes sense algorithmically and hence this function.</span>
+<span class="s1">@_memoize</span>
+<span class="s0">def </span><span class="s1">_reverseBytes(data):</span>
+	<span class="s0">if </span><span class="s1">len(data) != </span><span class="s4">1</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">bytesjoin(map(_reverseBytes</span><span class="s0">, </span><span class="s1">data))</span>
+	<span class="s1">byte = byteord(data)</span>
+	<span class="s1">result = </span><span class="s4">0</span>
+	<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s4">8</span><span class="s1">):</span>
+		<span class="s1">result = result &lt;&lt; </span><span class="s4">1</span>
+		<span class="s1">result |= byte &amp; </span><span class="s4">1</span>
+		<span class="s1">byte = byte &gt;&gt; </span><span class="s4">1</span>
+	<span class="s0">return </span><span class="s1">bytechr(result)</span>
+
+<span class="s3"># This section of code is for reading and writing image data to/from XML.</span>
+
+<span class="s0">def </span><span class="s1">_writeRawImageData(strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">bitmapObject</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">writer.begintag(</span><span class="s2">'rawimagedata'</span><span class="s1">)</span>
+	<span class="s1">writer.newline()</span>
+	<span class="s1">writer.dumphex(bitmapObject.imageData)</span>
+	<span class="s1">writer.endtag(</span><span class="s2">'rawimagedata'</span><span class="s1">)</span>
+	<span class="s1">writer.newline()</span>
+
+<span class="s0">def </span><span class="s1">_readRawImageData(bitmapObject</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">bitmapObject.imageData = readHex(content)</span>
+
+<span class="s0">def </span><span class="s1">_writeRowImageData(strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">bitmapObject</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">metrics = bitmapObject.exportMetrics</span>
+	<span class="s0">del </span><span class="s1">bitmapObject.exportMetrics</span>
+	<span class="s1">bitDepth = bitmapObject.exportBitDepth</span>
+	<span class="s0">del </span><span class="s1">bitmapObject.exportBitDepth</span>
+
+	<span class="s1">writer.begintag(</span><span class="s2">'rowimagedata'</span><span class="s0">, </span><span class="s1">bitDepth=bitDepth</span><span class="s0">, </span><span class="s1">width=metrics.width</span><span class="s0">, </span><span class="s1">height=metrics.height)</span>
+	<span class="s1">writer.newline()</span>
+	<span class="s0">for </span><span class="s1">curRow </span><span class="s0">in </span><span class="s1">range(metrics.height):</span>
+		<span class="s1">rowData = bitmapObject.getRow(curRow</span><span class="s0">, </span><span class="s1">bitDepth=bitDepth</span><span class="s0">, </span><span class="s1">metrics=metrics)</span>
+		<span class="s1">writer.simpletag(</span><span class="s2">'row'</span><span class="s0">, </span><span class="s1">value=hexStr(rowData))</span>
+		<span class="s1">writer.newline()</span>
+	<span class="s1">writer.endtag(</span><span class="s2">'rowimagedata'</span><span class="s1">)</span>
+	<span class="s1">writer.newline()</span>
+
+<span class="s0">def </span><span class="s1">_readRowImageData(bitmapObject</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">bitDepth = safeEval(attrs[</span><span class="s2">'bitDepth'</span><span class="s1">])</span>
+	<span class="s1">metrics = SmallGlyphMetrics()</span>
+	<span class="s1">metrics.width = safeEval(attrs[</span><span class="s2">'width'</span><span class="s1">])</span>
+	<span class="s1">metrics.height = safeEval(attrs[</span><span class="s2">'height'</span><span class="s1">])</span>
+
+	<span class="s1">dataRows = []</span>
+	<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+		<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+			<span class="s0">continue</span>
+		<span class="s1">name</span><span class="s0">, </span><span class="s1">attr</span><span class="s0">, </span><span class="s1">content = element</span>
+		<span class="s3"># Chop off 'imagedata' from the tag to get just the option.</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s2">'row'</span><span class="s1">:</span>
+			<span class="s1">dataRows.append(deHexStr(attr[</span><span class="s2">'value'</span><span class="s1">]))</span>
+	<span class="s1">bitmapObject.setRows(dataRows</span><span class="s0">, </span><span class="s1">bitDepth=bitDepth</span><span class="s0">, </span><span class="s1">metrics=metrics)</span>
+
+<span class="s0">def </span><span class="s1">_writeBitwiseImageData(strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">bitmapObject</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">metrics = bitmapObject.exportMetrics</span>
+	<span class="s0">del </span><span class="s1">bitmapObject.exportMetrics</span>
+	<span class="s1">bitDepth = bitmapObject.exportBitDepth</span>
+	<span class="s0">del </span><span class="s1">bitmapObject.exportBitDepth</span>
+
+	<span class="s3"># A dict for mapping binary to more readable/artistic ASCII characters.</span>
+	<span class="s1">binaryConv = {</span><span class="s2">'0'</span><span class="s1">:</span><span class="s2">'.'</span><span class="s0">, </span><span class="s2">'1'</span><span class="s1">:</span><span class="s2">'@'</span><span class="s1">}</span>
+
+	<span class="s1">writer.begintag(</span><span class="s2">'bitwiseimagedata'</span><span class="s0">, </span><span class="s1">bitDepth=bitDepth</span><span class="s0">, </span><span class="s1">width=metrics.width</span><span class="s0">, </span><span class="s1">height=metrics.height)</span>
+	<span class="s1">writer.newline()</span>
+	<span class="s0">for </span><span class="s1">curRow </span><span class="s0">in </span><span class="s1">range(metrics.height):</span>
+		<span class="s1">rowData = bitmapObject.getRow(curRow</span><span class="s0">, </span><span class="s1">bitDepth=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">metrics=metrics</span><span class="s0">, </span><span class="s1">reverseBytes=</span><span class="s0">True</span><span class="s1">)</span>
+		<span class="s1">rowData = _data2binary(rowData</span><span class="s0">, </span><span class="s1">metrics.width)</span>
+		<span class="s3"># Make the output a readable ASCII art form.</span>
+		<span class="s1">rowData = strjoin(map(binaryConv.get</span><span class="s0">, </span><span class="s1">rowData))</span>
+		<span class="s1">writer.simpletag(</span><span class="s2">'row'</span><span class="s0">, </span><span class="s1">value=rowData)</span>
+		<span class="s1">writer.newline()</span>
+	<span class="s1">writer.endtag(</span><span class="s2">'bitwiseimagedata'</span><span class="s1">)</span>
+	<span class="s1">writer.newline()</span>
+
+<span class="s0">def </span><span class="s1">_readBitwiseImageData(bitmapObject</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">bitDepth = safeEval(attrs[</span><span class="s2">'bitDepth'</span><span class="s1">])</span>
+	<span class="s1">metrics = SmallGlyphMetrics()</span>
+	<span class="s1">metrics.width = safeEval(attrs[</span><span class="s2">'width'</span><span class="s1">])</span>
+	<span class="s1">metrics.height = safeEval(attrs[</span><span class="s2">'height'</span><span class="s1">])</span>
+
+	<span class="s3"># A dict for mapping from ASCII to binary. All characters are considered</span>
+	<span class="s3"># a '1' except space, period and '0' which maps to '0'.</span>
+	<span class="s1">binaryConv = {</span><span class="s2">' '</span><span class="s1">:</span><span class="s2">'0'</span><span class="s0">, </span><span class="s2">'.'</span><span class="s1">:</span><span class="s2">'0'</span><span class="s0">, </span><span class="s2">'0'</span><span class="s1">:</span><span class="s2">'0'</span><span class="s1">}</span>
+
+	<span class="s1">dataRows = []</span>
+	<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+		<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+			<span class="s0">continue</span>
+		<span class="s1">name</span><span class="s0">, </span><span class="s1">attr</span><span class="s0">, </span><span class="s1">content = element</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s2">'row'</span><span class="s1">:</span>
+			<span class="s1">mapParams = zip(attr[</span><span class="s2">'value'</span><span class="s1">]</span><span class="s0">, </span><span class="s1">itertools.repeat(</span><span class="s2">'1'</span><span class="s1">))</span>
+			<span class="s1">rowData = strjoin(itertools.starmap(binaryConv.get</span><span class="s0">, </span><span class="s1">mapParams))</span>
+			<span class="s1">dataRows.append(_binary2data(rowData))</span>
+
+	<span class="s1">bitmapObject.setRows(dataRows</span><span class="s0">, </span><span class="s1">bitDepth=bitDepth</span><span class="s0">, </span><span class="s1">metrics=metrics</span><span class="s0">, </span><span class="s1">reverseBytes=</span><span class="s0">True</span><span class="s1">)</span>
+
+<span class="s0">def </span><span class="s1">_writeExtFileImageData(strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">bitmapObject</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s0">try</span><span class="s1">:</span>
+		<span class="s1">folder = os.path.dirname(writer.file.name)</span>
+	<span class="s0">except </span><span class="s1">AttributeError:</span>
+		<span class="s3"># fall back to current directory if output file's directory isn't found</span>
+		<span class="s1">folder = </span><span class="s2">'.'</span>
+	<span class="s1">folder = os.path.join(folder</span><span class="s0">, </span><span class="s2">'bitmaps'</span><span class="s1">)</span>
+	<span class="s1">filename = glyphName + bitmapObject.fileExtension</span>
+	<span class="s0">if not </span><span class="s1">os.path.isdir(folder):</span>
+		<span class="s1">os.makedirs(folder)</span>
+	<span class="s1">folder = os.path.join(folder</span><span class="s0">, </span><span class="s2">'strike%d' </span><span class="s1">% strikeIndex)</span>
+	<span class="s0">if not </span><span class="s1">os.path.isdir(folder):</span>
+		<span class="s1">os.makedirs(folder)</span>
+
+	<span class="s1">fullPath = os.path.join(folder</span><span class="s0">, </span><span class="s1">filename)</span>
+	<span class="s1">writer.simpletag(</span><span class="s2">'extfileimagedata'</span><span class="s0">, </span><span class="s1">value=fullPath)</span>
+	<span class="s1">writer.newline()</span>
+
+	<span class="s0">with </span><span class="s1">open(fullPath</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">file:</span>
+		<span class="s1">file.write(bitmapObject.imageData)</span>
+
+<span class="s0">def </span><span class="s1">_readExtFileImageData(bitmapObject</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+	<span class="s1">fullPath = attrs[</span><span class="s2">'value'</span><span class="s1">]</span>
+	<span class="s0">with </span><span class="s1">open(fullPath</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">file:</span>
+		<span class="s1">bitmapObject.imageData = file.read()</span>
+
+<span class="s3"># End of XML writing code.</span>
+
+<span class="s3"># Important information about the naming scheme. Used for identifying formats</span>
+<span class="s3"># in XML.</span>
+<span class="s1">_bitmapGlyphSubclassPrefix = </span><span class="s2">'ebdt_bitmap_format_'</span>
+
+<span class="s0">class </span><span class="s1">BitmapGlyph(object):</span>
+
+	<span class="s3"># For the external file format. This can be changed in subclasses. This way</span>
+	<span class="s3"># when the extfile option is turned on files have the form: glyphName.ext</span>
+	<span class="s3"># The default is just a flat binary file with no meaning.</span>
+	<span class="s1">fileExtension = </span><span class="s2">'.bin'</span>
+
+	<span class="s3"># Keep track of reading and writing of various forms.</span>
+	<span class="s1">xmlDataFunctions = {</span>
+		<span class="s2">'raw'</span><span class="s1">:		(_writeRawImageData</span><span class="s0">, </span><span class="s1">_readRawImageData)</span><span class="s0">,</span>
+		<span class="s2">'row'</span><span class="s1">:		(_writeRowImageData</span><span class="s0">, </span><span class="s1">_readRowImageData)</span><span class="s0">,</span>
+		<span class="s2">'bitwise'</span><span class="s1">:	(_writeBitwiseImageData</span><span class="s0">, </span><span class="s1">_readBitwiseImageData)</span><span class="s0">,</span>
+		<span class="s2">'extfile'</span><span class="s1">:	(_writeExtFileImageData</span><span class="s0">, </span><span class="s1">_readExtFileImageData)</span><span class="s0">,</span>
+		<span class="s1">}</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.data = data</span>
+		<span class="s1">self.ttFont = ttFont</span>
+		<span class="s3"># TODO Currently non-lazy decompilation is untested here...</span>
+		<span class="s3">#if not ttFont.lazy:</span>
+		<span class="s3">#   self.decompile()</span>
+		<span class="s3">#   del self.data</span>
+
+	<span class="s0">def </span><span class="s1">__getattr__(self</span><span class="s0">, </span><span class="s1">attr):</span>
+		<span class="s3"># Allow lazy decompile.</span>
+		<span class="s0">if </span><span class="s1">attr[:</span><span class="s4">2</span><span class="s1">] == </span><span class="s2">'__'</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">AttributeError(attr)</span>
+		<span class="s0">if </span><span class="s1">attr == </span><span class="s2">&quot;data&quot;</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">AttributeError(attr)</span>
+		<span class="s1">self.decompile()</span>
+		<span class="s0">del </span><span class="s1">self.data</span>
+		<span class="s0">return </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">attr)</span>
+
+	<span class="s0">def </span><span class="s1">ensureDecompiled(self</span><span class="s0">, </span><span class="s1">recurse=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s2">&quot;data&quot;</span><span class="s1">):</span>
+			<span class="s1">self.decompile()</span>
+			<span class="s0">del </span><span class="s1">self.data</span>
+
+	<span class="s3"># Not a fan of this but it is needed for safer safety checking.</span>
+	<span class="s0">def </span><span class="s1">getFormat(self):</span>
+		<span class="s0">return </span><span class="s1">safeEval(self.__class__.__name__[len(_bitmapGlyphSubclassPrefix):])</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(self.__class__.__name__</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'name'</span><span class="s0">, </span><span class="s1">glyphName)])</span>
+		<span class="s1">writer.newline()</span>
+
+		<span class="s1">self.writeMetrics(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s3"># Use the internal write method to write using the correct output format.</span>
+		<span class="s1">self.writeData(strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+		<span class="s1">writer.endtag(self.__class__.__name__)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.readMetrics(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attr</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if not </span><span class="s1">name.endswith(</span><span class="s2">'imagedata'</span><span class="s1">):</span>
+				<span class="s0">continue</span>
+			<span class="s3"># Chop off 'imagedata' from the tag to get just the option.</span>
+			<span class="s1">option = name[:-len(</span><span class="s2">'imagedata'</span><span class="s1">)]</span>
+			<span class="s0">assert </span><span class="s1">option </span><span class="s0">in </span><span class="s1">self.__class__.xmlDataFunctions</span>
+			<span class="s1">self.readData(name</span><span class="s0">, </span><span class="s1">attr</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+	<span class="s3"># Some of the glyphs have the metrics. This allows for metrics to be</span>
+	<span class="s3"># added if the glyph format has them. Default behavior is to do nothing.</span>
+	<span class="s0">def </span><span class="s1">writeMetrics(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">pass</span>
+
+	<span class="s3"># The opposite of write metrics.</span>
+	<span class="s0">def </span><span class="s1">readMetrics(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">pass</span>
+
+	<span class="s0">def </span><span class="s1">writeData(self</span><span class="s0">, </span><span class="s1">strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">writeFunc</span><span class="s0">, </span><span class="s1">readFunc = self.__class__.xmlDataFunctions[ttFont.bitmapGlyphDataFormat]</span>
+		<span class="s0">except </span><span class="s1">KeyError:</span>
+			<span class="s1">writeFunc = _writeRawImageData</span>
+		<span class="s1">writeFunc(strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+	<span class="s0">def </span><span class="s1">readData(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s3"># Chop off 'imagedata' from the tag to get just the option.</span>
+		<span class="s1">option = name[:-len(</span><span class="s2">'imagedata'</span><span class="s1">)]</span>
+		<span class="s1">writeFunc</span><span class="s0">, </span><span class="s1">readFunc = self.__class__.xmlDataFunctions[option]</span>
+		<span class="s1">readFunc(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+
+<span class="s3"># A closure for creating a mixin for the two types of metrics handling.</span>
+<span class="s3"># Most of the code is very similar so its easier to deal with here.</span>
+<span class="s3"># Everything works just by passing the class that the mixin is for.</span>
+<span class="s0">def </span><span class="s1">_createBitmapPlusMetricsMixin(metricsClass):</span>
+	<span class="s3"># Both metrics names are listed here to make meaningful error messages.</span>
+	<span class="s1">metricStrings = [BigGlyphMetrics.__name__</span><span class="s0">, </span><span class="s1">SmallGlyphMetrics.__name__]</span>
+	<span class="s1">curMetricsName = metricsClass.__name__</span>
+	<span class="s3"># Find which metrics this is for and determine the opposite name.</span>
+	<span class="s1">metricsId = metricStrings.index(curMetricsName)</span>
+	<span class="s1">oppositeMetricsName = metricStrings[</span><span class="s4">1</span><span class="s1">-metricsId]</span>
+
+	<span class="s0">class </span><span class="s1">BitmapPlusMetricsMixin(object):</span>
+
+		<span class="s0">def </span><span class="s1">writeMetrics(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+			<span class="s1">self.metrics.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+		<span class="s0">def </span><span class="s1">readMetrics(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+			<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+				<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+					<span class="s0">continue</span>
+				<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+				<span class="s0">if </span><span class="s1">name == curMetricsName:</span>
+					<span class="s1">self.metrics = metricsClass()</span>
+					<span class="s1">self.metrics.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+				<span class="s0">elif </span><span class="s1">name == oppositeMetricsName:</span>
+					<span class="s1">log.warning(</span><span class="s2">&quot;Warning: %s being ignored in format %d.&quot;</span><span class="s0">, </span><span class="s1">oppositeMetricsName</span><span class="s0">, </span><span class="s1">self.getFormat())</span>
+
+	<span class="s0">return </span><span class="s1">BitmapPlusMetricsMixin</span>
+
+<span class="s3"># Since there are only two types of mixin's just create them here.</span>
+<span class="s1">BitmapPlusBigMetricsMixin = _createBitmapPlusMetricsMixin(BigGlyphMetrics)</span>
+<span class="s1">BitmapPlusSmallMetricsMixin = _createBitmapPlusMetricsMixin(SmallGlyphMetrics)</span>
+
+<span class="s3"># Data that is bit aligned can be tricky to deal with. These classes implement</span>
+<span class="s3"># helper functionality for dealing with the data and getting a particular row</span>
+<span class="s3"># of bitwise data. Also helps implement fancy data export/import in XML.</span>
+<span class="s0">class </span><span class="s1">BitAlignedBitmapMixin(object):</span>
+
+	<span class="s0">def </span><span class="s1">_getBitRange(self</span><span class="s0">, </span><span class="s1">row</span><span class="s0">, </span><span class="s1">bitDepth</span><span class="s0">, </span><span class="s1">metrics):</span>
+		<span class="s1">rowBits = (bitDepth * metrics.width)</span>
+		<span class="s1">bitOffset = row * rowBits</span>
+		<span class="s0">return </span><span class="s1">(bitOffset</span><span class="s0">, </span><span class="s1">bitOffset+rowBits)</span>
+
+	<span class="s0">def </span><span class="s1">getRow(self</span><span class="s0">, </span><span class="s1">row</span><span class="s0">, </span><span class="s1">bitDepth=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">metrics=</span><span class="s0">None, </span><span class="s1">reverseBytes=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">metrics </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">metrics = self.metrics</span>
+		<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= row </span><span class="s0">and </span><span class="s1">row &lt; metrics.height</span><span class="s0">, </span><span class="s2">&quot;Illegal row access in bitmap&quot;</span>
+
+		<span class="s3"># Loop through each byte. This can cover two bytes in the original data or</span>
+		<span class="s3"># a single byte if things happen to be aligned. The very last entry might</span>
+		<span class="s3"># not be aligned so take care to trim the binary data to size and pad with</span>
+		<span class="s3"># zeros in the row data. Bit aligned data is somewhat tricky.</span>
+		<span class="s3">#</span>
+		<span class="s3"># Example of data cut. Data cut represented in x's.</span>
+		<span class="s3"># '|' represents byte boundary.</span>
+		<span class="s3"># data = ...0XX|XXXXXX00|000... =&gt; XXXXXXXX</span>
+		<span class="s3">#       or</span>
+		<span class="s3"># data = ...0XX|XXXX0000|000... =&gt; XXXXXX00</span>
+		<span class="s3">#   or</span>
+		<span class="s3"># data = ...000|XXXXXXXX|000... =&gt; XXXXXXXX</span>
+		<span class="s3">#   or</span>
+		<span class="s3"># data = ...000|00XXXX00|000... =&gt; XXXX0000</span>
+		<span class="s3">#</span>
+		<span class="s1">dataList = []</span>
+		<span class="s1">bitRange = self._getBitRange(row</span><span class="s0">, </span><span class="s1">bitDepth</span><span class="s0">, </span><span class="s1">metrics)</span>
+		<span class="s1">stepRange = bitRange + (</span><span class="s4">8</span><span class="s0">,</span><span class="s1">)</span>
+		<span class="s0">for </span><span class="s1">curBit </span><span class="s0">in </span><span class="s1">range(*stepRange):</span>
+			<span class="s1">endBit = min(curBit+</span><span class="s4">8</span><span class="s0">, </span><span class="s1">bitRange[</span><span class="s4">1</span><span class="s1">])</span>
+			<span class="s1">numBits = endBit - curBit</span>
+			<span class="s1">cutPoint = curBit % </span><span class="s4">8</span>
+			<span class="s1">firstByteLoc = curBit // </span><span class="s4">8</span>
+			<span class="s1">secondByteLoc = endBit // </span><span class="s4">8</span>
+			<span class="s0">if </span><span class="s1">firstByteLoc &lt; secondByteLoc:</span>
+				<span class="s1">numBitsCut = </span><span class="s4">8 </span><span class="s1">- cutPoint</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">numBitsCut = endBit - curBit</span>
+			<span class="s1">curByte = _reverseBytes(self.imageData[firstByteLoc])</span>
+			<span class="s1">firstHalf = byteord(curByte) &gt;&gt; cutPoint</span>
+			<span class="s1">firstHalf = ((</span><span class="s4">1</span><span class="s1">&lt;&lt;numBitsCut)-</span><span class="s4">1</span><span class="s1">) &amp; firstHalf</span>
+			<span class="s1">newByte = firstHalf</span>
+			<span class="s0">if </span><span class="s1">firstByteLoc &lt; secondByteLoc </span><span class="s0">and </span><span class="s1">secondByteLoc &lt; len(self.imageData):</span>
+				<span class="s1">curByte = _reverseBytes(self.imageData[secondByteLoc])</span>
+				<span class="s1">secondHalf = byteord(curByte) &lt;&lt; numBitsCut</span>
+				<span class="s1">newByte = (firstHalf | secondHalf) &amp; ((</span><span class="s4">1</span><span class="s1">&lt;&lt;numBits)-</span><span class="s4">1</span><span class="s1">)</span>
+			<span class="s1">dataList.append(bytechr(newByte))</span>
+
+		<span class="s3"># The way the data is kept is opposite the algorithm used.</span>
+		<span class="s1">data = bytesjoin(dataList)</span>
+		<span class="s0">if not </span><span class="s1">reverseBytes:</span>
+			<span class="s1">data = _reverseBytes(data)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">setRows(self</span><span class="s0">, </span><span class="s1">dataRows</span><span class="s0">, </span><span class="s1">bitDepth=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">metrics=</span><span class="s0">None, </span><span class="s1">reverseBytes=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">metrics </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">metrics = self.metrics</span>
+		<span class="s0">if not </span><span class="s1">reverseBytes:</span>
+			<span class="s1">dataRows = list(map(_reverseBytes</span><span class="s0">, </span><span class="s1">dataRows))</span>
+
+		<span class="s3"># Keep track of a list of ordinal values as they are easier to modify</span>
+		<span class="s3"># than a list of strings. Map to actual strings later.</span>
+		<span class="s1">numBytes = (self._getBitRange(len(dataRows)</span><span class="s0">, </span><span class="s1">bitDepth</span><span class="s0">, </span><span class="s1">metrics)[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">7</span><span class="s1">) // </span><span class="s4">8</span>
+		<span class="s1">ordDataList = [</span><span class="s4">0</span><span class="s1">] * numBytes</span>
+		<span class="s0">for </span><span class="s1">row</span><span class="s0">, </span><span class="s1">data </span><span class="s0">in </span><span class="s1">enumerate(dataRows):</span>
+			<span class="s1">bitRange = self._getBitRange(row</span><span class="s0">, </span><span class="s1">bitDepth</span><span class="s0">, </span><span class="s1">metrics)</span>
+			<span class="s1">stepRange = bitRange + (</span><span class="s4">8</span><span class="s0">,</span><span class="s1">)</span>
+			<span class="s0">for </span><span class="s1">curBit</span><span class="s0">, </span><span class="s1">curByte </span><span class="s0">in </span><span class="s1">zip(range(*stepRange)</span><span class="s0">, </span><span class="s1">data):</span>
+				<span class="s1">endBit = min(curBit+</span><span class="s4">8</span><span class="s0">, </span><span class="s1">bitRange[</span><span class="s4">1</span><span class="s1">])</span>
+				<span class="s1">cutPoint = curBit % </span><span class="s4">8</span>
+				<span class="s1">firstByteLoc = curBit // </span><span class="s4">8</span>
+				<span class="s1">secondByteLoc = endBit // </span><span class="s4">8</span>
+				<span class="s0">if </span><span class="s1">firstByteLoc &lt; secondByteLoc:</span>
+					<span class="s1">numBitsCut = </span><span class="s4">8 </span><span class="s1">- cutPoint</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">numBitsCut = endBit - curBit</span>
+				<span class="s1">curByte = byteord(curByte)</span>
+				<span class="s1">firstByte = curByte &amp; ((</span><span class="s4">1</span><span class="s1">&lt;&lt;numBitsCut)-</span><span class="s4">1</span><span class="s1">)</span>
+				<span class="s1">ordDataList[firstByteLoc] |= (firstByte &lt;&lt; cutPoint)</span>
+				<span class="s0">if </span><span class="s1">firstByteLoc &lt; secondByteLoc </span><span class="s0">and </span><span class="s1">secondByteLoc &lt; numBytes:</span>
+					<span class="s1">secondByte = (curByte &gt;&gt; numBitsCut) &amp; ((</span><span class="s4">1</span><span class="s1">&lt;&lt;</span><span class="s4">8</span><span class="s1">-numBitsCut)-</span><span class="s4">1</span><span class="s1">)</span>
+					<span class="s1">ordDataList[secondByteLoc] |= secondByte</span>
+
+		<span class="s3"># Save the image data with the bits going the correct way.</span>
+		<span class="s1">self.imageData = _reverseBytes(bytesjoin(map(bytechr</span><span class="s0">, </span><span class="s1">ordDataList)))</span>
+
+<span class="s0">class </span><span class="s1">ByteAlignedBitmapMixin(object):</span>
+
+	<span class="s0">def </span><span class="s1">_getByteRange(self</span><span class="s0">, </span><span class="s1">row</span><span class="s0">, </span><span class="s1">bitDepth</span><span class="s0">, </span><span class="s1">metrics):</span>
+		<span class="s1">rowBytes = (bitDepth * metrics.width + </span><span class="s4">7</span><span class="s1">) // </span><span class="s4">8</span>
+		<span class="s1">byteOffset = row * rowBytes</span>
+		<span class="s0">return </span><span class="s1">(byteOffset</span><span class="s0">, </span><span class="s1">byteOffset+rowBytes)</span>
+
+	<span class="s0">def </span><span class="s1">getRow(self</span><span class="s0">, </span><span class="s1">row</span><span class="s0">, </span><span class="s1">bitDepth=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">metrics=</span><span class="s0">None, </span><span class="s1">reverseBytes=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">metrics </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">metrics = self.metrics</span>
+		<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= row </span><span class="s0">and </span><span class="s1">row &lt; metrics.height</span><span class="s0">, </span><span class="s2">&quot;Illegal row access in bitmap&quot;</span>
+		<span class="s1">byteRange = self._getByteRange(row</span><span class="s0">, </span><span class="s1">bitDepth</span><span class="s0">, </span><span class="s1">metrics)</span>
+		<span class="s1">data = self.imageData[slice(*byteRange)]</span>
+		<span class="s0">if </span><span class="s1">reverseBytes:</span>
+			<span class="s1">data = _reverseBytes(data)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">setRows(self</span><span class="s0">, </span><span class="s1">dataRows</span><span class="s0">, </span><span class="s1">bitDepth=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">metrics=</span><span class="s0">None, </span><span class="s1">reverseBytes=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">metrics </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">metrics = self.metrics</span>
+		<span class="s0">if </span><span class="s1">reverseBytes:</span>
+			<span class="s1">dataRows = map(_reverseBytes</span><span class="s0">, </span><span class="s1">dataRows)</span>
+		<span class="s1">self.imageData = bytesjoin(dataRows)</span>
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_1(ByteAlignedBitmapMixin</span><span class="s0">, </span><span class="s1">BitmapPlusSmallMetricsMixin</span><span class="s0">, </span><span class="s1">BitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.metrics = SmallGlyphMetrics()</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(smallGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">self.imageData = data</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">data = sstruct.pack(smallGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s0">return </span><span class="s1">data + self.imageData</span>
+
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_2(BitAlignedBitmapMixin</span><span class="s0">, </span><span class="s1">BitmapPlusSmallMetricsMixin</span><span class="s0">, </span><span class="s1">BitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.metrics = SmallGlyphMetrics()</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(smallGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">self.imageData = data</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">data = sstruct.pack(smallGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s0">return </span><span class="s1">data + self.imageData</span>
+
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_5(BitAlignedBitmapMixin</span><span class="s0">, </span><span class="s1">BitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.imageData = self.data</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">return </span><span class="s1">self.imageData</span>
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_6(ByteAlignedBitmapMixin</span><span class="s0">, </span><span class="s1">BitmapPlusBigMetricsMixin</span><span class="s0">, </span><span class="s1">BitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.metrics = BigGlyphMetrics()</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">self.imageData = data</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">data = sstruct.pack(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s0">return </span><span class="s1">data + self.imageData</span>
+
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_7(BitAlignedBitmapMixin</span><span class="s0">, </span><span class="s1">BitmapPlusBigMetricsMixin</span><span class="s0">, </span><span class="s1">BitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.metrics = BigGlyphMetrics()</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">self.imageData = data</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">data = sstruct.pack(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s0">return </span><span class="s1">data + self.imageData</span>
+
+
+<span class="s0">class </span><span class="s1">ComponentBitmapGlyph(BitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">strikeIndex</span><span class="s0">, </span><span class="s1">glyphName</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.begintag(self.__class__.__name__</span><span class="s0">, </span><span class="s1">[(</span><span class="s2">'name'</span><span class="s0">, </span><span class="s1">glyphName)])</span>
+		<span class="s1">writer.newline()</span>
+
+		<span class="s1">self.writeMetrics(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+		<span class="s1">writer.begintag(</span><span class="s2">'components'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">curComponent </span><span class="s0">in </span><span class="s1">self.componentArray:</span>
+			<span class="s1">curComponent.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s1">writer.endtag(</span><span class="s2">'components'</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+		<span class="s1">writer.endtag(self.__class__.__name__)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.readMetrics(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attr</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s0">if </span><span class="s1">name == </span><span class="s2">'components'</span><span class="s1">:</span>
+				<span class="s1">self.componentArray = []</span>
+				<span class="s0">for </span><span class="s1">compElement </span><span class="s0">in </span><span class="s1">content:</span>
+					<span class="s0">if not </span><span class="s1">isinstance(compElement</span><span class="s0">, </span><span class="s1">tuple):</span>
+						<span class="s0">continue</span>
+					<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = compElement</span>
+					<span class="s0">if </span><span class="s1">name == </span><span class="s2">'ebdtComponent'</span><span class="s1">:</span>
+						<span class="s1">curComponent = EbdtComponent()</span>
+						<span class="s1">curComponent.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+						<span class="s1">self.componentArray.append(curComponent)</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s1">log.warning(</span><span class="s2">&quot;'%s' being ignored in component array.&quot;</span><span class="s0">, </span><span class="s1">name)</span>
+
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_8(BitmapPlusSmallMetricsMixin</span><span class="s0">, </span><span class="s1">ComponentBitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.metrics = SmallGlyphMetrics()</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(smallGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">data = data[</span><span class="s4">1</span><span class="s1">:]</span>
+
+		<span class="s1">(numComponents</span><span class="s0">,</span><span class="s1">) = struct.unpack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s4">2</span><span class="s1">])</span>
+		<span class="s1">data = data[</span><span class="s4">2</span><span class="s1">:]</span>
+		<span class="s1">self.componentArray = []</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numComponents):</span>
+			<span class="s1">curComponent = EbdtComponent()</span>
+			<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(ebdtComponentFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">curComponent)</span>
+			<span class="s1">curComponent.name = self.ttFont.getGlyphName(curComponent.glyphCode)</span>
+			<span class="s1">self.componentArray.append(curComponent)</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">dataList = []</span>
+		<span class="s1">dataList.append(sstruct.pack(smallGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics))</span>
+		<span class="s1">dataList.append(</span><span class="s5">b'</span><span class="s0">\0</span><span class="s5">'</span><span class="s1">)</span>
+		<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">len(self.componentArray)))</span>
+		<span class="s0">for </span><span class="s1">curComponent </span><span class="s0">in </span><span class="s1">self.componentArray:</span>
+			<span class="s1">curComponent.glyphCode = ttFont.getGlyphID(curComponent.name)</span>
+			<span class="s1">dataList.append(sstruct.pack(ebdtComponentFormat</span><span class="s0">, </span><span class="s1">curComponent))</span>
+		<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+
+<span class="s0">class </span><span class="s1">ebdt_bitmap_format_9(BitmapPlusBigMetricsMixin</span><span class="s0">, </span><span class="s1">ComponentBitmapGlyph):</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self):</span>
+		<span class="s1">self.metrics = BigGlyphMetrics()</span>
+		<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.data</span><span class="s0">, </span><span class="s1">self.metrics)</span>
+		<span class="s1">(numComponents</span><span class="s0">,</span><span class="s1">) = struct.unpack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">data[:</span><span class="s4">2</span><span class="s1">])</span>
+		<span class="s1">data = data[</span><span class="s4">2</span><span class="s1">:]</span>
+		<span class="s1">self.componentArray = []</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numComponents):</span>
+			<span class="s1">curComponent = EbdtComponent()</span>
+			<span class="s1">dummy</span><span class="s0">, </span><span class="s1">data = sstruct.unpack2(ebdtComponentFormat</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">curComponent)</span>
+			<span class="s1">curComponent.name = self.ttFont.getGlyphName(curComponent.glyphCode)</span>
+			<span class="s1">self.componentArray.append(curComponent)</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">dataList = []</span>
+		<span class="s1">dataList.append(sstruct.pack(bigGlyphMetricsFormat</span><span class="s0">, </span><span class="s1">self.metrics))</span>
+		<span class="s1">dataList.append(struct.pack(</span><span class="s2">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">len(self.componentArray)))</span>
+		<span class="s0">for </span><span class="s1">curComponent </span><span class="s0">in </span><span class="s1">self.componentArray:</span>
+			<span class="s1">curComponent.glyphCode = ttFont.getGlyphID(curComponent.name)</span>
+			<span class="s1">dataList.append(sstruct.pack(ebdtComponentFormat</span><span class="s0">, </span><span class="s1">curComponent))</span>
+		<span class="s0">return </span><span class="s1">bytesjoin(dataList)</span>
+
+
+<span class="s3"># Dictionary of bitmap formats to the class representing that format</span>
+<span class="s3"># currently only the ones listed in this map are the ones supported.</span>
+<span class="s1">ebdt_bitmap_classes = {</span>
+		<span class="s4">1</span><span class="s1">: ebdt_bitmap_format_1</span><span class="s0">,</span>
+		<span class="s4">2</span><span class="s1">: ebdt_bitmap_format_2</span><span class="s0">,</span>
+		<span class="s4">5</span><span class="s1">: ebdt_bitmap_format_5</span><span class="s0">,</span>
+		<span class="s4">6</span><span class="s1">: ebdt_bitmap_format_6</span><span class="s0">,</span>
+		<span class="s4">7</span><span class="s1">: ebdt_bitmap_format_7</span><span class="s0">,</span>
+		<span class="s4">8</span><span class="s1">: ebdt_bitmap_format_8</span><span class="s0">,</span>
+		<span class="s4">9</span><span class="s1">: ebdt_bitmap_format_9</span><span class="s0">,</span>
+	<span class="s1">}</span>
+</pre>
+</body>
+</html>

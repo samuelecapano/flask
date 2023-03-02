@@ -1,0 +1,1805 @@
+<html>
+<head>
+<title>contour.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+contour.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Classes to support contour plotting and labelling for the Axes class. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Integral</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy </span><span class="s2">import </span><span class="s1">ma</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">_docstring</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">MouseButton</span>
+<span class="s2">from </span><span class="s1">matplotlib.text </span><span class="s2">import </span><span class="s1">Text</span>
+<span class="s2">import </span><span class="s1">matplotlib.path </span><span class="s2">as </span><span class="s1">mpath</span>
+<span class="s2">import </span><span class="s1">matplotlib.ticker </span><span class="s2">as </span><span class="s1">ticker</span>
+<span class="s2">import </span><span class="s1">matplotlib.cm </span><span class="s2">as </span><span class="s1">cm</span>
+<span class="s2">import </span><span class="s1">matplotlib.colors </span><span class="s2">as </span><span class="s1">mcolors</span>
+<span class="s2">import </span><span class="s1">matplotlib.collections </span><span class="s2">as </span><span class="s1">mcoll</span>
+<span class="s2">import </span><span class="s1">matplotlib.font_manager </span><span class="s2">as </span><span class="s1">font_manager</span>
+<span class="s2">import </span><span class="s1">matplotlib.cbook </span><span class="s2">as </span><span class="s1">cbook</span>
+<span class="s2">import </span><span class="s1">matplotlib.patches </span><span class="s2">as </span><span class="s1">mpatches</span>
+<span class="s2">import </span><span class="s1">matplotlib.transforms </span><span class="s2">as </span><span class="s1">mtransforms</span>
+
+
+<span class="s3"># We can't use a single line collection for contour because a line</span>
+<span class="s3"># collection can have only a single line style, and we want to be able to have</span>
+<span class="s3"># dashed negative contours, for example, and solid positive contours.</span>
+<span class="s3"># We could use a single polygon collection for filled contours, but it</span>
+<span class="s3"># seems better to keep line and filled contours similar, with one collection</span>
+<span class="s3"># per level.</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s4">&quot;Text.set_transform_rotates_text&quot;</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">ClabelText(Text):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Unlike the ordinary text, the get_rotation returns an updated 
+    angle in the pixel coordinate assuming that the input rotation is 
+    an angle in data coordinate (or whatever transform set). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_rotation(self):</span>
+        <span class="s1">new_angle</span><span class="s2">, </span><span class="s1">= self.get_transform().transform_angles(</span>
+            <span class="s1">[super().get_rotation()]</span><span class="s2">, </span><span class="s1">[self.get_position()])</span>
+        <span class="s2">return </span><span class="s1">new_angle</span>
+
+
+<span class="s2">def </span><span class="s1">_contour_labeler_event_handler(cs</span><span class="s2">, </span><span class="s1">inline</span><span class="s2">, </span><span class="s1">inline_spacing</span><span class="s2">, </span><span class="s1">event):</span>
+    <span class="s1">canvas = cs.axes.figure.canvas</span>
+    <span class="s1">is_button = event.name == </span><span class="s4">&quot;button_press_event&quot;</span>
+    <span class="s1">is_key = event.name == </span><span class="s4">&quot;key_press_event&quot;</span>
+    <span class="s3"># Quit (even if not in infinite mode; this is consistent with</span>
+    <span class="s3"># MATLAB and sometimes quite useful, but will require the user to</span>
+    <span class="s3"># test how many points were actually returned before using data).</span>
+    <span class="s2">if </span><span class="s1">(is_button </span><span class="s2">and </span><span class="s1">event.button == MouseButton.MIDDLE</span>
+            <span class="s2">or </span><span class="s1">is_key </span><span class="s2">and </span><span class="s1">event.key </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;escape&quot;</span><span class="s2">, </span><span class="s4">&quot;enter&quot;</span><span class="s1">]):</span>
+        <span class="s1">canvas.stop_event_loop()</span>
+    <span class="s3"># Pop last click.</span>
+    <span class="s2">elif </span><span class="s1">(is_button </span><span class="s2">and </span><span class="s1">event.button == MouseButton.RIGHT</span>
+          <span class="s2">or </span><span class="s1">is_key </span><span class="s2">and </span><span class="s1">event.key </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;backspace&quot;</span><span class="s2">, </span><span class="s4">&quot;delete&quot;</span><span class="s1">]):</span>
+        <span class="s3"># Unfortunately, if one is doing inline labels, then there is currently</span>
+        <span class="s3"># no way to fix the broken contour - once humpty-dumpty is broken, he</span>
+        <span class="s3"># can't be put back together.  In inline mode, this does nothing.</span>
+        <span class="s2">if not </span><span class="s1">inline:</span>
+            <span class="s1">cs.pop_label()</span>
+            <span class="s1">canvas.draw()</span>
+    <span class="s3"># Add new click.</span>
+    <span class="s2">elif </span><span class="s1">(is_button </span><span class="s2">and </span><span class="s1">event.button == MouseButton.LEFT</span>
+          <span class="s3"># On macOS/gtk, some keys return None.</span>
+          <span class="s2">or </span><span class="s1">is_key </span><span class="s2">and </span><span class="s1">event.key </span><span class="s2">is not None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">event.inaxes == cs.axes:</span>
+            <span class="s1">cs.add_label_near(event.x</span><span class="s2">, </span><span class="s1">event.y</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">False,</span>
+                              <span class="s1">inline=inline</span><span class="s2">, </span><span class="s1">inline_spacing=inline_spacing)</span>
+            <span class="s1">canvas.draw()</span>
+
+
+<span class="s2">class </span><span class="s1">ContourLabeler:</span>
+    <span class="s0">&quot;&quot;&quot;Mixin to provide labelling capability to `.ContourSet`.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">clabel(self</span><span class="s2">, </span><span class="s1">levels=</span><span class="s2">None, </span><span class="s1">*</span><span class="s2">,</span>
+               <span class="s1">fontsize=</span><span class="s2">None, </span><span class="s1">inline=</span><span class="s2">True, </span><span class="s1">inline_spacing=</span><span class="s5">5</span><span class="s2">, </span><span class="s1">fmt=</span><span class="s2">None,</span>
+               <span class="s1">colors=</span><span class="s2">None, </span><span class="s1">use_clabeltext=</span><span class="s2">False, </span><span class="s1">manual=</span><span class="s2">False,</span>
+               <span class="s1">rightside_up=</span><span class="s2">True, </span><span class="s1">zorder=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Label a contour plot. 
+ 
+        Adds labels to line contours in this `.ContourSet` (which inherits from 
+        this mixin class). 
+ 
+        Parameters 
+        ---------- 
+        levels : array-like, optional 
+            A list of level values, that should be labeled. The list must be 
+            a subset of ``cs.levels``. If not given, all levels are labeled. 
+ 
+        fontsize : str or float, default: :rc:`font.size` 
+            Size in points or relative size e.g., 'smaller', 'x-large'. 
+            See `.Text.set_size` for accepted string values. 
+ 
+        colors : color or colors or None, default: None 
+            The label colors: 
+ 
+            - If *None*, the color of each label matches the color of 
+              the corresponding contour. 
+ 
+            - If one string color, e.g., *colors* = 'r' or *colors* = 
+              'red', all labels will be plotted in this color. 
+ 
+            - If a tuple of colors (string, float, rgb, etc), different labels 
+              will be plotted in different colors in the order specified. 
+ 
+        inline : bool, default: True 
+            If ``True`` the underlying contour is removed where the label is 
+            placed. 
+ 
+        inline_spacing : float, default: 5 
+            Space in pixels to leave on each side of label when placing inline. 
+ 
+            This spacing will be exact for labels at locations where the 
+            contour is straight, less so for labels on curved contours. 
+ 
+        fmt : `.Formatter` or str or callable or dict, optional 
+            How the levels are formatted: 
+ 
+            - If a `.Formatter`, it is used to format all levels at once, using 
+              its `.Formatter.format_ticks` method. 
+            - If a str, it is interpreted as a %-style format string. 
+            - If a callable, it is called with one level at a time and should 
+              return the corresponding label. 
+            - If a dict, it should directly map levels to labels. 
+ 
+            The default is to use a standard `.ScalarFormatter`. 
+ 
+        manual : bool or iterable, default: False 
+            If ``True``, contour labels will be placed manually using 
+            mouse clicks. Click the first button near a contour to 
+            add a label, click the second button (or potentially both 
+            mouse buttons at once) to finish adding labels. The third 
+            button can be used to remove the last label added, but 
+            only if labels are not inline. Alternatively, the keyboard 
+            can be used to select label locations (enter to end label 
+            placement, delete or backspace act like the third mouse button, 
+            and any other key will select a label location). 
+ 
+            *manual* can also be an iterable object of (x, y) tuples. 
+            Contour labels will be created as if mouse is clicked at each 
+            (x, y) position. 
+ 
+        rightside_up : bool, default: True 
+            If ``True``, label rotations will always be plus 
+            or minus 90 degrees from level. 
+ 
+        use_clabeltext : bool, default: False 
+            If ``True``, use `.Text.set_transform_rotates_text` to ensure that 
+            label rotation is updated whenever the axes aspect changes. 
+ 
+        zorder : float or None, default: ``(2 + contour.get_zorder())`` 
+            zorder of the contour labels. 
+ 
+        Returns 
+        ------- 
+        labels 
+            A list of `.Text` instances for the labels. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3"># clabel basically takes the input arguments and uses them to</span>
+        <span class="s3"># add a list of &quot;label specific&quot; attributes to the ContourSet</span>
+        <span class="s3"># object.  These attributes are all of the form label* and names</span>
+        <span class="s3"># should be fairly self explanatory.</span>
+        <span class="s3">#</span>
+        <span class="s3"># Once these attributes are set, clabel passes control to the</span>
+        <span class="s3"># labels method (case of automatic label placement) or</span>
+        <span class="s3"># `BlockingContourLabeler` (case of manual label placement).</span>
+
+        <span class="s2">if </span><span class="s1">fmt </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">fmt = ticker.ScalarFormatter(useOffset=</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">fmt.create_dummy_axis()</span>
+        <span class="s1">self.labelFmt = fmt</span>
+        <span class="s1">self._use_clabeltext = use_clabeltext</span>
+        <span class="s3"># Detect if manual selection is desired and remove from argument list.</span>
+        <span class="s1">self.labelManual = manual</span>
+        <span class="s1">self.rightside_up = rightside_up</span>
+        <span class="s2">if </span><span class="s1">zorder </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._clabel_zorder = </span><span class="s5">2</span><span class="s1">+self._contour_zorder</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._clabel_zorder = zorder</span>
+
+        <span class="s2">if </span><span class="s1">levels </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">levels = self.levels</span>
+            <span class="s1">indices = list(range(len(self.cvalues)))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">levlabs = list(levels)</span>
+            <span class="s1">indices</span><span class="s2">, </span><span class="s1">levels = []</span><span class="s2">, </span><span class="s1">[]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">lev </span><span class="s2">in </span><span class="s1">enumerate(self.levels):</span>
+                <span class="s2">if </span><span class="s1">lev </span><span class="s2">in </span><span class="s1">levlabs:</span>
+                    <span class="s1">indices.append(i)</span>
+                    <span class="s1">levels.append(lev)</span>
+            <span class="s2">if </span><span class="s1">len(levels) &lt; len(levlabs):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;Specified levels </span><span class="s2">{</span><span class="s1">levlabs</span><span class="s2">} </span><span class="s4">don't match &quot;</span>
+                                 <span class="s4">f&quot;available levels </span><span class="s2">{</span><span class="s1">self.levels</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s1">self.labelLevelList = levels</span>
+        <span class="s1">self.labelIndiceList = indices</span>
+
+        <span class="s1">self._label_font_props = font_manager.FontProperties(size=fontsize)</span>
+
+        <span class="s2">if </span><span class="s1">colors </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.labelMappable = self</span>
+            <span class="s1">self.labelCValueList = np.take(self.cvalues</span><span class="s2">, </span><span class="s1">self.labelIndiceList)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">cmap = mcolors.ListedColormap(colors</span><span class="s2">, </span><span class="s1">N=len(self.labelLevelList))</span>
+            <span class="s1">self.labelCValueList = list(range(len(self.labelLevelList)))</span>
+            <span class="s1">self.labelMappable = cm.ScalarMappable(cmap=cmap</span><span class="s2">,</span>
+                                                   <span class="s1">norm=mcolors.NoNorm())</span>
+
+        <span class="s1">self.labelXYs = []</span>
+
+        <span class="s2">if </span><span class="s1">np.iterable(manual):</span>
+            <span class="s2">for </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s2">in </span><span class="s1">manual:</span>
+                <span class="s1">self.add_label_near(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">inline</span><span class="s2">, </span><span class="s1">inline_spacing)</span>
+        <span class="s2">elif </span><span class="s1">manual:</span>
+            <span class="s1">print(</span><span class="s4">'Select label locations manually using first mouse button.'</span><span class="s1">)</span>
+            <span class="s1">print(</span><span class="s4">'End manual selection with second mouse button.'</span><span class="s1">)</span>
+            <span class="s2">if not </span><span class="s1">inline:</span>
+                <span class="s1">print(</span><span class="s4">'Remove last label by clicking third mouse button.'</span><span class="s1">)</span>
+            <span class="s1">mpl._blocking_input.blocking_input_loop(</span>
+                <span class="s1">self.axes.figure</span><span class="s2">, </span><span class="s1">[</span><span class="s4">&quot;button_press_event&quot;</span><span class="s2">, </span><span class="s4">&quot;key_press_event&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">timeout=-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">handler=functools.partial(</span>
+                    <span class="s1">_contour_labeler_event_handler</span><span class="s2">,</span>
+                    <span class="s1">self</span><span class="s2">, </span><span class="s1">inline</span><span class="s2">, </span><span class="s1">inline_spacing))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.labels(inline</span><span class="s2">, </span><span class="s1">inline_spacing)</span>
+
+        <span class="s2">return </span><span class="s1">cbook.silent_list(</span><span class="s4">'text.Text'</span><span class="s2">, </span><span class="s1">self.labelTexts)</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s4">&quot;cs.labelTexts[0].get_font()&quot;</span><span class="s1">)</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">labelFontProps(self):</span>
+        <span class="s2">return </span><span class="s1">self._label_font_props</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">alternative=(</span>
+        <span class="s4">&quot;[cs.labelTexts[0].get_font().get_size()] * len(cs.labelLevelList)&quot;</span><span class="s1">))</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">labelFontSizeList(self):</span>
+        <span class="s2">return </span><span class="s1">[self._label_font_props.get_size()] * len(self.labelLevelList)</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s4">&quot;cs.labelTexts&quot;</span><span class="s1">)</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">labelTextsList(self):</span>
+        <span class="s2">return </span><span class="s1">cbook.silent_list(</span><span class="s4">'text.Text'</span><span class="s2">, </span><span class="s1">self.labelTexts)</span>
+
+    <span class="s2">def </span><span class="s1">print_label(self</span><span class="s2">, </span><span class="s1">linecontour</span><span class="s2">, </span><span class="s1">labelwidth):</span>
+        <span class="s0">&quot;&quot;&quot;Return whether a contour is long enough to hold a label.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">(len(linecontour) &gt; </span><span class="s5">10 </span><span class="s1">* labelwidth</span>
+                <span class="s2">or </span><span class="s1">(np.ptp(linecontour</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">) &gt; </span><span class="s5">1.2 </span><span class="s1">* labelwidth).any())</span>
+
+    <span class="s2">def </span><span class="s1">too_close(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">lw):</span>
+        <span class="s0">&quot;&quot;&quot;Return whether a label is already near this location.&quot;&quot;&quot;</span>
+        <span class="s1">thresh = (</span><span class="s5">1.2 </span><span class="s1">* lw) ** </span><span class="s5">2</span>
+        <span class="s2">return </span><span class="s1">any((x - loc[</span><span class="s5">0</span><span class="s1">]) ** </span><span class="s5">2 </span><span class="s1">+ (y - loc[</span><span class="s5">1</span><span class="s1">]) ** </span><span class="s5">2 </span><span class="s1">&lt; thresh</span>
+                   <span class="s2">for </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">self.labelXYs)</span>
+
+    <span class="s2">def </span><span class="s1">_get_nth_label_width(self</span><span class="s2">, </span><span class="s1">nth):</span>
+        <span class="s0">&quot;&quot;&quot;Return the width of the *nth* label, in pixels.&quot;&quot;&quot;</span>
+        <span class="s1">fig = self.axes.figure</span>
+        <span class="s1">renderer = fig._get_renderer()</span>
+        <span class="s2">return </span><span class="s1">(Text(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">,</span>
+                     <span class="s1">self.get_text(self.labelLevelList[nth]</span><span class="s2">, </span><span class="s1">self.labelFmt)</span><span class="s2">,</span>
+                     <span class="s1">figure=fig</span><span class="s2">, </span><span class="s1">fontproperties=self._label_font_props)</span>
+                <span class="s1">.get_window_extent(renderer).width)</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s4">&quot;Artist.set&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">set_label_props(self</span><span class="s2">, </span><span class="s1">label</span><span class="s2">, </span><span class="s1">text</span><span class="s2">, </span><span class="s1">color):</span>
+        <span class="s0">&quot;&quot;&quot;Set the label properties - color, fontsize, text.&quot;&quot;&quot;</span>
+        <span class="s1">label.set_text(text)</span>
+        <span class="s1">label.set_color(color)</span>
+        <span class="s1">label.set_fontproperties(self._label_font_props)</span>
+        <span class="s1">label.set_clip_box(self.axes.bbox)</span>
+
+    <span class="s2">def </span><span class="s1">get_text(self</span><span class="s2">, </span><span class="s1">lev</span><span class="s2">, </span><span class="s1">fmt):</span>
+        <span class="s0">&quot;&quot;&quot;Get the text of the label.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance(lev</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">return </span><span class="s1">lev</span>
+        <span class="s2">elif </span><span class="s1">isinstance(fmt</span><span class="s2">, </span><span class="s1">dict):</span>
+            <span class="s2">return </span><span class="s1">fmt.get(lev</span><span class="s2">, </span><span class="s4">'%1.3f'</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">callable(getattr(fmt</span><span class="s2">, </span><span class="s4">&quot;format_ticks&quot;</span><span class="s2">, None</span><span class="s1">)):</span>
+            <span class="s2">return </span><span class="s1">fmt.format_ticks([*self.labelLevelList</span><span class="s2">, </span><span class="s1">lev])[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">elif </span><span class="s1">callable(fmt):</span>
+            <span class="s2">return </span><span class="s1">fmt(lev)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">fmt % lev</span>
+
+    <span class="s2">def </span><span class="s1">locate_label(self</span><span class="s2">, </span><span class="s1">linecontour</span><span class="s2">, </span><span class="s1">labelwidth):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find good place to draw a label (relatively flat part of the contour). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ctr_size = len(linecontour)</span>
+        <span class="s1">n_blocks = int(np.ceil(ctr_size / labelwidth)) </span><span class="s2">if </span><span class="s1">labelwidth &gt; </span><span class="s5">1 </span><span class="s2">else </span><span class="s5">1</span>
+        <span class="s1">block_size = ctr_size </span><span class="s2">if </span><span class="s1">n_blocks == </span><span class="s5">1 </span><span class="s2">else </span><span class="s1">int(labelwidth)</span>
+        <span class="s3"># Split contour into blocks of length ``block_size``, filling the last</span>
+        <span class="s3"># block by cycling the contour start (per `np.resize` semantics).  (Due</span>
+        <span class="s3"># to cycling, the index returned is taken modulo ctr_size.)</span>
+        <span class="s1">xx = np.resize(linecontour[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">(n_blocks</span><span class="s2">, </span><span class="s1">block_size))</span>
+        <span class="s1">yy = np.resize(linecontour[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">(n_blocks</span><span class="s2">, </span><span class="s1">block_size))</span>
+        <span class="s1">yfirst = yy[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">ylast = yy[:</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s1">xfirst = xx[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">xlast = xx[:</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s1">s = (yfirst - yy) * (xlast - xfirst) - (xfirst - xx) * (ylast - yfirst)</span>
+        <span class="s1">l = np.hypot(xlast - xfirst</span><span class="s2">, </span><span class="s1">ylast - yfirst)</span>
+        <span class="s3"># Ignore warning that divide by zero throws, as this is a valid option</span>
+        <span class="s2">with </span><span class="s1">np.errstate(divide=</span><span class="s4">'ignore'</span><span class="s2">, </span><span class="s1">invalid=</span><span class="s4">'ignore'</span><span class="s1">):</span>
+            <span class="s1">distances = (abs(s) / l).sum(axis=-</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s3"># Labels are drawn in the middle of the block (``hbsize``) where the</span>
+        <span class="s3"># contour is the closest (per ``distances``) to a straight line, but</span>
+        <span class="s3"># not `too_close()` to a preexisting label.</span>
+        <span class="s1">hbsize = block_size // </span><span class="s5">2</span>
+        <span class="s1">adist = np.argsort(distances)</span>
+        <span class="s3"># If all candidates are `too_close()`, go back to the straightest part</span>
+        <span class="s3"># (``adist[0]``).</span>
+        <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">np.append(adist</span><span class="s2">, </span><span class="s1">adist[</span><span class="s5">0</span><span class="s1">]):</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = xx[idx</span><span class="s2">, </span><span class="s1">hbsize]</span><span class="s2">, </span><span class="s1">yy[idx</span><span class="s2">, </span><span class="s1">hbsize]</span>
+            <span class="s2">if not </span><span class="s1">self.too_close(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">labelwidth):</span>
+                <span class="s2">break</span>
+        <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">(idx * block_size + hbsize) % ctr_size</span>
+
+    <span class="s2">def </span><span class="s1">calc_label_rot_and_inline(self</span><span class="s2">, </span><span class="s1">slc</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">lw</span><span class="s2">, </span><span class="s1">lc=</span><span class="s2">None, </span><span class="s1">spacing=</span><span class="s5">5</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Calculate the appropriate label rotation given the linecontour 
+        coordinates in screen units, the index of the label location and the 
+        label width. 
+ 
+        If *lc* is not None or empty, also break contours and compute 
+        inlining. 
+ 
+        *spacing* is the empty space to leave around the label, in pixels. 
+ 
+        Both tasks are done together to avoid calculating path lengths 
+        multiple times, which is relatively costly. 
+ 
+        The method used here involves computing the path length along the 
+        contour in pixel coordinates and then looking approximately (label 
+        width / 2) away from central point to determine rotation and then to 
+        break contour if desired. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">lc </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">lc = []</span>
+        <span class="s3"># Half the label width</span>
+        <span class="s1">hlw = lw / </span><span class="s5">2.0</span>
+
+        <span class="s3"># Check if closed and, if so, rotate contour so label is at edge</span>
+        <span class="s1">closed = _is_closed_polygon(slc)</span>
+        <span class="s2">if </span><span class="s1">closed:</span>
+            <span class="s1">slc = np.concatenate([slc[ind:-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">slc[:ind + </span><span class="s5">1</span><span class="s1">]])</span>
+            <span class="s2">if </span><span class="s1">len(lc):  </span><span class="s3"># Rotate lc also if not empty</span>
+                <span class="s1">lc = np.concatenate([lc[ind:-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">lc[:ind + </span><span class="s5">1</span><span class="s1">]])</span>
+            <span class="s1">ind = </span><span class="s5">0</span>
+
+        <span class="s3"># Calculate path lengths</span>
+        <span class="s1">pl = np.zeros(slc.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">dx = np.diff(slc</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">pl[</span><span class="s5">1</span><span class="s1">:] = np.cumsum(np.hypot(dx[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dx[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]))</span>
+        <span class="s1">pl = pl - pl[ind]</span>
+
+        <span class="s3"># Use linear interpolation to get points around label</span>
+        <span class="s1">xi = np.array([-hlw</span><span class="s2">, </span><span class="s1">hlw])</span>
+        <span class="s2">if </span><span class="s1">closed:  </span><span class="s3"># Look at end also for closed contours</span>
+            <span class="s1">dp = np.array([pl[-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">dp = np.zeros_like(xi)</span>
+
+        <span class="s3"># Get angle of vector between the two ends of the label - must be</span>
+        <span class="s3"># calculated in pixel space for text rotation to work correctly.</span>
+        <span class="s1">(dx</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(dy</span><span class="s2">,</span><span class="s1">) = (np.diff(np.interp(dp + xi</span><span class="s2">, </span><span class="s1">pl</span><span class="s2">, </span><span class="s1">slc_col))</span>
+                        <span class="s2">for </span><span class="s1">slc_col </span><span class="s2">in </span><span class="s1">slc.T)</span>
+        <span class="s1">rotation = np.rad2deg(np.arctan2(dy</span><span class="s2">, </span><span class="s1">dx))</span>
+
+        <span class="s2">if </span><span class="s1">self.rightside_up:</span>
+            <span class="s3"># Fix angle so text is never upside-down</span>
+            <span class="s1">rotation = (rotation + </span><span class="s5">90</span><span class="s1">) % </span><span class="s5">180 </span><span class="s1">- </span><span class="s5">90</span>
+
+        <span class="s3"># Break contour if desired</span>
+        <span class="s1">nlc = []</span>
+        <span class="s2">if </span><span class="s1">len(lc):</span>
+            <span class="s3"># Expand range by spacing</span>
+            <span class="s1">xi = dp + xi + np.array([-spacing</span><span class="s2">, </span><span class="s1">spacing])</span>
+
+            <span class="s3"># Get (integer) indices near points of interest; use -1 as marker</span>
+            <span class="s3"># for out of bounds.</span>
+            <span class="s1">I = np.interp(xi</span><span class="s2">, </span><span class="s1">pl</span><span class="s2">, </span><span class="s1">np.arange(len(pl))</span><span class="s2">, </span><span class="s1">left=-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">right=-</span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">I = [np.floor(I[</span><span class="s5">0</span><span class="s1">]).astype(int)</span><span class="s2">, </span><span class="s1">np.ceil(I[</span><span class="s5">1</span><span class="s1">]).astype(int)]</span>
+            <span class="s2">if </span><span class="s1">I[</span><span class="s5">0</span><span class="s1">] != -</span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">xy1 = [np.interp(xi[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pl</span><span class="s2">, </span><span class="s1">lc_col) </span><span class="s2">for </span><span class="s1">lc_col </span><span class="s2">in </span><span class="s1">lc.T]</span>
+            <span class="s2">if </span><span class="s1">I[</span><span class="s5">1</span><span class="s1">] != -</span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">xy2 = [np.interp(xi[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pl</span><span class="s2">, </span><span class="s1">lc_col) </span><span class="s2">for </span><span class="s1">lc_col </span><span class="s2">in </span><span class="s1">lc.T]</span>
+
+            <span class="s3"># Actually break contours</span>
+            <span class="s2">if </span><span class="s1">closed:</span>
+                <span class="s3"># This will remove contour if shorter than label</span>
+                <span class="s2">if </span><span class="s1">all(i != -</span><span class="s5">1 </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">I):</span>
+                    <span class="s1">nlc.append(np.row_stack([xy2</span><span class="s2">, </span><span class="s1">lc[I[</span><span class="s5">1</span><span class="s1">]:I[</span><span class="s5">0</span><span class="s1">]+</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">xy1]))</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s3"># These will remove pieces of contour if they have length zero</span>
+                <span class="s2">if </span><span class="s1">I[</span><span class="s5">0</span><span class="s1">] != -</span><span class="s5">1</span><span class="s1">:</span>
+                    <span class="s1">nlc.append(np.row_stack([lc[:I[</span><span class="s5">0</span><span class="s1">]+</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">xy1]))</span>
+                <span class="s2">if </span><span class="s1">I[</span><span class="s5">1</span><span class="s1">] != -</span><span class="s5">1</span><span class="s1">:</span>
+                    <span class="s1">nlc.append(np.row_stack([xy2</span><span class="s2">, </span><span class="s1">lc[I[</span><span class="s5">1</span><span class="s1">]:]]))</span>
+
+            <span class="s3"># The current implementation removes contours completely</span>
+            <span class="s3"># covered by labels.  Uncomment line below to keep</span>
+            <span class="s3"># original contour if this is the preferred behavior.</span>
+            <span class="s3"># if not len(nlc): nlc = [ lc ]</span>
+
+        <span class="s2">return </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">nlc</span>
+
+    <span class="s2">def </span><span class="s1">add_label(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">lev</span><span class="s2">, </span><span class="s1">cvalue):</span>
+        <span class="s0">&quot;&quot;&quot;Add contour label without `.Text.set_transform_rotates_text`.&quot;&quot;&quot;</span>
+        <span class="s1">data_x</span><span class="s2">, </span><span class="s1">data_y = self.axes.transData.inverted().transform((x</span><span class="s2">, </span><span class="s1">y))</span>
+        <span class="s1">t = Text(</span>
+            <span class="s1">data_x</span><span class="s2">, </span><span class="s1">data_y</span><span class="s2">,</span>
+            <span class="s1">text=self.get_text(lev</span><span class="s2">, </span><span class="s1">self.labelFmt)</span><span class="s2">,</span>
+            <span class="s1">rotation=rotation</span><span class="s2">,</span>
+            <span class="s1">horizontalalignment=</span><span class="s4">'center'</span><span class="s2">, </span><span class="s1">verticalalignment=</span><span class="s4">'center'</span><span class="s2">,</span>
+            <span class="s1">zorder=self._clabel_zorder</span><span class="s2">,</span>
+            <span class="s1">color=self.labelMappable.to_rgba(cvalue</span><span class="s2">, </span><span class="s1">alpha=self.alpha)</span><span class="s2">,</span>
+            <span class="s1">fontproperties=self._label_font_props</span><span class="s2">,</span>
+            <span class="s1">clip_box=self.axes.bbox)</span>
+        <span class="s1">self.labelTexts.append(t)</span>
+        <span class="s1">self.labelCValues.append(cvalue)</span>
+        <span class="s1">self.labelXYs.append((x</span><span class="s2">, </span><span class="s1">y))</span>
+        <span class="s3"># Add label to plot here - useful for manual mode label selection</span>
+        <span class="s1">self.axes.add_artist(t)</span>
+
+    <span class="s2">def </span><span class="s1">add_label_clabeltext(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">lev</span><span class="s2">, </span><span class="s1">cvalue):</span>
+        <span class="s0">&quot;&quot;&quot;Add contour label with `.Text.set_transform_rotates_text`.&quot;&quot;&quot;</span>
+        <span class="s1">self.add_label(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">lev</span><span class="s2">, </span><span class="s1">cvalue)</span>
+        <span class="s3"># Grab the last added text, and reconfigure its rotation.</span>
+        <span class="s1">t = self.labelTexts[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">data_rotation</span><span class="s2">, </span><span class="s1">= self.axes.transData.inverted().transform_angles(</span>
+            <span class="s1">[rotation]</span><span class="s2">, </span><span class="s1">[[x</span><span class="s2">, </span><span class="s1">y]])</span>
+        <span class="s1">t.set(rotation=data_rotation</span><span class="s2">, </span><span class="s1">transform_rotates_text=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">add_label_near(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">inline=</span><span class="s2">True, </span><span class="s1">inline_spacing=</span><span class="s5">5</span><span class="s2">,</span>
+                       <span class="s1">transform=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Add a label near the point ``(x, y)``. 
+ 
+        Parameters 
+        ---------- 
+        x, y : float 
+            The approximate location of the label. 
+        inline : bool, default: True 
+            If *True* remove the segment of the contour beneath the label. 
+        inline_spacing : int, default: 5 
+            Space in pixels to leave on each side of label when placing 
+            inline. This spacing will be exact for labels at locations where 
+            the contour is straight, less so for labels on curved contours. 
+        transform : `.Transform` or `False`, default: ``self.axes.transData`` 
+            A transform applied to ``(x, y)`` before labeling.  The default 
+            causes ``(x, y)`` to be interpreted as data coordinates.  `False` 
+            is a synonym for `.IdentityTransform`; i.e. ``(x, y)`` should be 
+            interpreted as display coordinates. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">transform = self.axes.transData</span>
+        <span class="s2">if </span><span class="s1">transform:</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = transform.transform((x</span><span class="s2">, </span><span class="s1">y))</span>
+
+        <span class="s3"># find the nearest contour _in screen units_</span>
+        <span class="s1">conmin</span><span class="s2">, </span><span class="s1">segmin</span><span class="s2">, </span><span class="s1">imin</span><span class="s2">, </span><span class="s1">xmin</span><span class="s2">, </span><span class="s1">ymin = self.find_nearest_contour(</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">self.labelIndiceList)[:</span><span class="s5">5</span><span class="s1">]</span>
+
+        <span class="s3"># calc_label_rot_and_inline() requires that (xmin, ymin)</span>
+        <span class="s3"># be a vertex in the path. So, if it isn't, add a vertex here</span>
+        <span class="s1">paths = self.collections[conmin].get_paths()  </span><span class="s3"># paths of correct coll.</span>
+        <span class="s1">lc = paths[segmin].vertices  </span><span class="s3"># vertices of correct segment</span>
+        <span class="s3"># Where should the new vertex be added in data-units?</span>
+        <span class="s1">xcmin = self.axes.transData.inverted().transform([xmin</span><span class="s2">, </span><span class="s1">ymin])</span>
+        <span class="s2">if not </span><span class="s1">np.allclose(xcmin</span><span class="s2">, </span><span class="s1">lc[imin]):</span>
+            <span class="s3"># No vertex is close enough, so add a new point in the vertices and</span>
+            <span class="s3"># replace the path by the new one.</span>
+            <span class="s1">lc = np.insert(lc</span><span class="s2">, </span><span class="s1">imin</span><span class="s2">, </span><span class="s1">xcmin</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+            <span class="s1">paths[segmin] = mpath.Path(lc)</span>
+
+        <span class="s3"># Get index of nearest level in subset of levels used for labeling</span>
+        <span class="s1">lmin = self.labelIndiceList.index(conmin)</span>
+
+        <span class="s3"># Get label width for rotating labels and breaking contours</span>
+        <span class="s1">lw = self._get_nth_label_width(lmin)</span>
+
+        <span class="s3"># Figure out label rotation.</span>
+        <span class="s1">rotation</span><span class="s2">, </span><span class="s1">nlc = self.calc_label_rot_and_inline(</span>
+            <span class="s1">self.axes.transData.transform(lc)</span><span class="s2">,  </span><span class="s3"># to pixel space.</span>
+            <span class="s1">imin</span><span class="s2">, </span><span class="s1">lw</span><span class="s2">, </span><span class="s1">lc </span><span class="s2">if </span><span class="s1">inline </span><span class="s2">else None, </span><span class="s1">inline_spacing)</span>
+
+        <span class="s1">self.add_label(xmin</span><span class="s2">, </span><span class="s1">ymin</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">self.labelLevelList[lmin]</span><span class="s2">,</span>
+                       <span class="s1">self.labelCValueList[lmin])</span>
+
+        <span class="s2">if </span><span class="s1">inline:</span>
+            <span class="s3"># Remove old, not looping over paths so we can do this up front</span>
+            <span class="s1">paths.pop(segmin)</span>
+
+            <span class="s3"># Add paths if not empty or single point</span>
+            <span class="s1">paths.extend([mpath.Path(n) </span><span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">nlc </span><span class="s2">if </span><span class="s1">len(n) &gt; </span><span class="s5">1</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">pop_label(self</span><span class="s2">, </span><span class="s1">index=-</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Defaults to removing last label, but any index can be supplied&quot;&quot;&quot;</span>
+        <span class="s1">self.labelCValues.pop(index)</span>
+        <span class="s1">t = self.labelTexts.pop(index)</span>
+        <span class="s1">t.remove()</span>
+
+    <span class="s2">def </span><span class="s1">labels(self</span><span class="s2">, </span><span class="s1">inline</span><span class="s2">, </span><span class="s1">inline_spacing):</span>
+
+        <span class="s2">if </span><span class="s1">self._use_clabeltext:</span>
+            <span class="s1">add_label = self.add_label_clabeltext</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">add_label = self.add_label</span>
+
+        <span class="s2">for </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">(icon</span><span class="s2">, </span><span class="s1">lev</span><span class="s2">, </span><span class="s1">cvalue) </span><span class="s2">in </span><span class="s1">enumerate(zip(</span>
+                <span class="s1">self.labelIndiceList</span><span class="s2">,</span>
+                <span class="s1">self.labelLevelList</span><span class="s2">,</span>
+                <span class="s1">self.labelCValueList</span><span class="s2">,</span>
+        <span class="s1">)):</span>
+
+            <span class="s1">con = self.collections[icon]</span>
+            <span class="s1">trans = con.get_transform()</span>
+            <span class="s1">lw = self._get_nth_label_width(idx)</span>
+            <span class="s1">additions = []</span>
+            <span class="s1">paths = con.get_paths()</span>
+            <span class="s2">for </span><span class="s1">segNum</span><span class="s2">, </span><span class="s1">linepath </span><span class="s2">in </span><span class="s1">enumerate(paths):</span>
+                <span class="s1">lc = linepath.vertices  </span><span class="s3"># Line contour</span>
+                <span class="s1">slc = trans.transform(lc)  </span><span class="s3"># Line contour in screen coords</span>
+
+                <span class="s3"># Check if long enough for a label</span>
+                <span class="s2">if </span><span class="s1">self.print_label(slc</span><span class="s2">, </span><span class="s1">lw):</span>
+                    <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">ind = self.locate_label(slc</span><span class="s2">, </span><span class="s1">lw)</span>
+
+                    <span class="s1">rotation</span><span class="s2">, </span><span class="s1">new = self.calc_label_rot_and_inline(</span>
+                        <span class="s1">slc</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">lw</span><span class="s2">, </span><span class="s1">lc </span><span class="s2">if </span><span class="s1">inline </span><span class="s2">else None, </span><span class="s1">inline_spacing)</span>
+
+                    <span class="s3"># Actually add the label</span>
+                    <span class="s1">add_label(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">, </span><span class="s1">lev</span><span class="s2">, </span><span class="s1">cvalue)</span>
+
+                    <span class="s3"># If inline, add new contours</span>
+                    <span class="s2">if </span><span class="s1">inline:</span>
+                        <span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">new:</span>
+                            <span class="s3"># Add path if not empty or single point</span>
+                            <span class="s2">if </span><span class="s1">len(n) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                                <span class="s1">additions.append(mpath.Path(n))</span>
+                <span class="s2">else</span><span class="s1">:  </span><span class="s3"># If not adding label, keep old path</span>
+                    <span class="s1">additions.append(linepath)</span>
+
+            <span class="s3"># After looping over all segments on a contour, replace old paths</span>
+            <span class="s3"># by new ones if inlining.</span>
+            <span class="s2">if </span><span class="s1">inline:</span>
+                <span class="s1">paths[:] = additions</span>
+
+    <span class="s2">def </span><span class="s1">remove(self):</span>
+        <span class="s2">for </span><span class="s1">text </span><span class="s2">in </span><span class="s1">self.labelTexts:</span>
+            <span class="s1">text.remove()</span>
+
+
+<span class="s2">def </span><span class="s1">_is_closed_polygon(X):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return whether first and last object in a sequence are the same. These are 
+    presumably coordinates on a polygonal curve, in which case this function 
+    tests if that curve is closed. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">np.allclose(X[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">X[-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-10</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-13</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_find_closest_point_on_path(xys</span><span class="s2">, </span><span class="s1">p):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parameters 
+    ---------- 
+    xys : (N, 2) array-like 
+        Coordinates of vertices. 
+    p : (float, float) 
+        Coordinates of point. 
+ 
+    Returns 
+    ------- 
+    d2min : float 
+        Minimum square distance of *p* to *xys*. 
+    proj : (float, float) 
+        Projection of *p* onto *xys*. 
+    imin : (int, int) 
+        Consecutive indices of vertices of segment in *xys* where *proj* is. 
+        Segments are considered as including their end-points; i.e. if the 
+        closest point on the path is a node in *xys* with index *i*, this 
+        returns ``(i-1, i)``.  For the special case where *xys* is a single 
+        point, this returns ``(0, 0)``. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">len(xys) == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">(((p - xys[</span><span class="s5">0</span><span class="s1">]) ** </span><span class="s5">2</span><span class="s1">).sum()</span><span class="s2">, </span><span class="s1">xys[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))</span>
+    <span class="s1">dxys = xys[</span><span class="s5">1</span><span class="s1">:] - xys[:-</span><span class="s5">1</span><span class="s1">]  </span><span class="s3"># Individual segment vectors.</span>
+    <span class="s1">norms = (dxys ** </span><span class="s5">2</span><span class="s1">).sum(axis=</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">norms[norms == </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1  </span><span class="s3"># For zero-length segment, replace 0/0 by 0/1.</span>
+    <span class="s1">rel_projs = np.clip(  </span><span class="s3"># Project onto each segment in relative 0-1 coords.</span>
+        <span class="s1">((p - xys[:-</span><span class="s5">1</span><span class="s1">]) * dxys).sum(axis=</span><span class="s5">1</span><span class="s1">) / norms</span><span class="s2">,</span>
+        <span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)[:</span><span class="s2">, None</span><span class="s1">]</span>
+    <span class="s1">projs = xys[:-</span><span class="s5">1</span><span class="s1">] + rel_projs * dxys  </span><span class="s3"># Projs. onto each segment, in (x, y).</span>
+    <span class="s1">d2s = ((projs - p) ** </span><span class="s5">2</span><span class="s1">).sum(axis=</span><span class="s5">1</span><span class="s1">)  </span><span class="s3"># Squared distances.</span>
+    <span class="s1">imin = np.argmin(d2s)</span>
+    <span class="s2">return </span><span class="s1">(d2s[imin]</span><span class="s2">, </span><span class="s1">projs[imin]</span><span class="s2">, </span><span class="s1">(imin</span><span class="s2">, </span><span class="s1">imin+</span><span class="s5">1</span><span class="s1">))</span>
+
+
+<span class="s1">_docstring.interpd.update(contour_set_attributes=</span><span class="s4">r&quot;&quot;&quot; 
+Attributes 
+---------- 
+ax : `~matplotlib.axes.Axes` 
+    The Axes object in which the contours are drawn. 
+ 
+collections : `.silent_list` of `.PathCollection`\s 
+    The `.Artist`\s representing the contour. This is a list of 
+    `.PathCollection`\s for both line and filled contours. 
+ 
+levels : array 
+    The values of the contour levels. 
+ 
+layers : array 
+    Same as levels for line contours; half-way between 
+    levels for filled contours.  See ``ContourSet._process_colors``. 
+&quot;&quot;&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">@_docstring.dedent_interpd</span>
+<span class="s2">class </span><span class="s1">ContourSet(cm.ScalarMappable</span><span class="s2">, </span><span class="s1">ContourLabeler):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Store a set of contour lines or filled regions. 
+ 
+    User-callable method: `~.Axes.clabel` 
+ 
+    Parameters 
+    ---------- 
+    ax : `~.axes.Axes` 
+ 
+    levels : [level0, level1, ..., leveln] 
+        A list of floating point numbers indicating the contour levels. 
+ 
+    allsegs : [level0segs, level1segs, ...] 
+        List of all the polygon segments for all the *levels*. 
+        For contour lines ``len(allsegs) == len(levels)``, and for 
+        filled contour regions ``len(allsegs) = len(levels)-1``. The lists 
+        should look like :: 
+ 
+            level0segs = [polygon0, polygon1, ...] 
+            polygon0 = [[x0, y0], [x1, y1], ...] 
+ 
+    allkinds : ``None`` or [level0kinds, level1kinds, ...] 
+        Optional list of all the polygon vertex kinds (code types), as 
+        described and used in Path. This is used to allow multiply- 
+        connected paths such as holes within filled polygons. 
+        If not ``None``, ``len(allkinds) == len(allsegs)``. The lists 
+        should look like :: 
+ 
+            level0kinds = [polygon0kinds, ...] 
+            polygon0kinds = [vertexcode0, vertexcode1, ...] 
+ 
+        If *allkinds* is not ``None``, usually all polygons for a 
+        particular contour level are grouped together so that 
+        ``level0segs = [polygon0]`` and ``level0kinds = [polygon0kinds]``. 
+ 
+    **kwargs 
+        Keyword arguments are as described in the docstring of 
+        `~.Axes.contour`. 
+ 
+    %(contour_set_attributes)s 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">ax</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                 <span class="s1">levels=</span><span class="s2">None, </span><span class="s1">filled=</span><span class="s2">False, </span><span class="s1">linewidths=</span><span class="s2">None, </span><span class="s1">linestyles=</span><span class="s2">None,</span>
+                 <span class="s1">hatches=(</span><span class="s2">None,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s2">None, </span><span class="s1">origin=</span><span class="s2">None, </span><span class="s1">extent=</span><span class="s2">None,</span>
+                 <span class="s1">cmap=</span><span class="s2">None, </span><span class="s1">colors=</span><span class="s2">None, </span><span class="s1">norm=</span><span class="s2">None, </span><span class="s1">vmin=</span><span class="s2">None, </span><span class="s1">vmax=</span><span class="s2">None,</span>
+                 <span class="s1">extend=</span><span class="s4">'neither'</span><span class="s2">, </span><span class="s1">antialiased=</span><span class="s2">None, </span><span class="s1">nchunk=</span><span class="s5">0</span><span class="s2">, </span><span class="s1">locator=</span><span class="s2">None,</span>
+                 <span class="s1">transform=</span><span class="s2">None, </span><span class="s1">negative_linestyles=</span><span class="s2">None,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Draw contour lines or filled regions, depending on 
+        whether keyword arg *filled* is ``False`` (default) or ``True``. 
+ 
+        Call signature:: 
+ 
+            ContourSet(ax, levels, allsegs, [allkinds], **kwargs) 
+ 
+        Parameters 
+        ---------- 
+        ax : `~.axes.Axes` 
+            The `~.axes.Axes` object to draw on. 
+ 
+        levels : [level0, level1, ..., leveln] 
+            A list of floating point numbers indicating the contour 
+            levels. 
+ 
+        allsegs : [level0segs, level1segs, ...] 
+            List of all the polygon segments for all the *levels*. 
+            For contour lines ``len(allsegs) == len(levels)``, and for 
+            filled contour regions ``len(allsegs) = len(levels)-1``. The lists 
+            should look like :: 
+ 
+                level0segs = [polygon0, polygon1, ...] 
+                polygon0 = [[x0, y0], [x1, y1], ...] 
+ 
+        allkinds : [level0kinds, level1kinds, ...], optional 
+            Optional list of all the polygon vertex kinds (code types), as 
+            described and used in Path. This is used to allow multiply- 
+            connected paths such as holes within filled polygons. 
+            If not ``None``, ``len(allkinds) == len(allsegs)``. The lists 
+            should look like :: 
+ 
+                level0kinds = [polygon0kinds, ...] 
+                polygon0kinds = [vertexcode0, vertexcode1, ...] 
+ 
+            If *allkinds* is not ``None``, usually all polygons for a 
+            particular contour level are grouped together so that 
+            ``level0segs = [polygon0]`` and ``level0kinds = [polygon0kinds]``. 
+ 
+        **kwargs 
+            Keyword arguments are as described in the docstring of 
+            `~.Axes.contour`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.axes = ax</span>
+        <span class="s1">self.levels = levels</span>
+        <span class="s1">self.filled = filled</span>
+        <span class="s1">self.linewidths = linewidths</span>
+        <span class="s1">self.linestyles = linestyles</span>
+        <span class="s1">self.hatches = hatches</span>
+        <span class="s1">self.alpha = alpha</span>
+        <span class="s1">self.origin = origin</span>
+        <span class="s1">self.extent = extent</span>
+        <span class="s1">self.colors = colors</span>
+        <span class="s1">self.extend = extend</span>
+        <span class="s1">self.antialiased = antialiased</span>
+        <span class="s2">if </span><span class="s1">self.antialiased </span><span class="s2">is None and </span><span class="s1">self.filled:</span>
+            <span class="s3"># Eliminate artifacts; we are not stroking the boundaries.</span>
+            <span class="s1">self.antialiased = </span><span class="s2">False</span>
+            <span class="s3"># The default for line contours will be taken from the</span>
+            <span class="s3"># LineCollection default, which uses :rc:`lines.antialiased`.</span>
+
+        <span class="s1">self.nchunk = nchunk</span>
+        <span class="s1">self.locator = locator</span>
+        <span class="s2">if </span><span class="s1">(isinstance(norm</span><span class="s2">, </span><span class="s1">mcolors.LogNorm)</span>
+                <span class="s2">or </span><span class="s1">isinstance(self.locator</span><span class="s2">, </span><span class="s1">ticker.LogLocator)):</span>
+            <span class="s1">self.logscale = </span><span class="s2">True</span>
+            <span class="s2">if </span><span class="s1">norm </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">norm = mcolors.LogNorm()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.logscale = </span><span class="s2">False</span>
+
+        <span class="s1">_api.check_in_list([</span><span class="s2">None, </span><span class="s4">'lower'</span><span class="s2">, </span><span class="s4">'upper'</span><span class="s2">, </span><span class="s4">'image'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">origin=origin)</span>
+        <span class="s2">if </span><span class="s1">self.extent </span><span class="s2">is not None and </span><span class="s1">len(self.extent) != </span><span class="s5">4</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">&quot;If given, 'extent' must be None or (x0, x1, y0, y1)&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.colors </span><span class="s2">is not None and </span><span class="s1">cmap </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Either colors or cmap must be None'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.origin == </span><span class="s4">'image'</span><span class="s1">:</span>
+            <span class="s1">self.origin = mpl.rcParams[</span><span class="s4">'image.origin'</span><span class="s1">]</span>
+
+        <span class="s1">self._transform = transform</span>
+
+        <span class="s1">self.negative_linestyles = negative_linestyles</span>
+        <span class="s3"># If negative_linestyles was not defined as a keyword argument, define</span>
+        <span class="s3"># negative_linestyles with rcParams</span>
+        <span class="s2">if </span><span class="s1">self.negative_linestyles </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.negative_linestyles = \</span>
+                <span class="s1">mpl.rcParams[</span><span class="s4">'contour.negative_linestyle'</span><span class="s1">]</span>
+
+        <span class="s1">kwargs = self._process_args(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self._process_levels()</span>
+
+        <span class="s1">self._extend_min = self.extend </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'min'</span><span class="s2">, </span><span class="s4">'both'</span><span class="s1">]</span>
+        <span class="s1">self._extend_max = self.extend </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'max'</span><span class="s2">, </span><span class="s4">'both'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.colors </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">ncolors = len(self.levels)</span>
+            <span class="s2">if </span><span class="s1">self.filled:</span>
+                <span class="s1">ncolors -= </span><span class="s5">1</span>
+            <span class="s1">i0 = </span><span class="s5">0</span>
+
+            <span class="s3"># Handle the case where colors are given for the extended</span>
+            <span class="s3"># parts of the contour.</span>
+
+            <span class="s1">use_set_under_over = </span><span class="s2">False</span>
+            <span class="s3"># if we are extending the lower end, and we've been given enough</span>
+            <span class="s3"># colors then skip the first color in the resulting cmap. For the</span>
+            <span class="s3"># extend_max case we don't need to worry about passing more colors</span>
+            <span class="s3"># than ncolors as ListedColormap will clip.</span>
+            <span class="s1">total_levels = (ncolors +</span>
+                            <span class="s1">int(self._extend_min) +</span>
+                            <span class="s1">int(self._extend_max))</span>
+            <span class="s2">if </span><span class="s1">(len(self.colors) == total_levels </span><span class="s2">and</span>
+                    <span class="s1">(self._extend_min </span><span class="s2">or </span><span class="s1">self._extend_max)):</span>
+                <span class="s1">use_set_under_over = </span><span class="s2">True</span>
+                <span class="s2">if </span><span class="s1">self._extend_min:</span>
+                    <span class="s1">i0 = </span><span class="s5">1</span>
+
+            <span class="s1">cmap = mcolors.ListedColormap(self.colors[i0:</span><span class="s2">None</span><span class="s1">]</span><span class="s2">, </span><span class="s1">N=ncolors)</span>
+
+            <span class="s2">if </span><span class="s1">use_set_under_over:</span>
+                <span class="s2">if </span><span class="s1">self._extend_min:</span>
+                    <span class="s1">cmap.set_under(self.colors[</span><span class="s5">0</span><span class="s1">])</span>
+                <span class="s2">if </span><span class="s1">self._extend_max:</span>
+                    <span class="s1">cmap.set_over(self.colors[-</span><span class="s5">1</span><span class="s1">])</span>
+
+        <span class="s1">self.collections = cbook.silent_list(</span><span class="s2">None</span><span class="s1">)</span>
+
+        <span class="s3"># label lists must be initialized here</span>
+        <span class="s1">self.labelTexts = []</span>
+        <span class="s1">self.labelCValues = []</span>
+
+        <span class="s1">kw = {</span><span class="s4">'cmap'</span><span class="s1">: cmap}</span>
+        <span class="s2">if </span><span class="s1">norm </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">kw[</span><span class="s4">'norm'</span><span class="s1">] = norm</span>
+        <span class="s3"># sets self.cmap, norm if needed;</span>
+        <span class="s1">cm.ScalarMappable.__init__(self</span><span class="s2">, </span><span class="s1">**kw)</span>
+        <span class="s2">if </span><span class="s1">vmin </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.norm.vmin = vmin</span>
+        <span class="s2">if </span><span class="s1">vmax </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.norm.vmax = vmax</span>
+        <span class="s1">self._process_colors()</span>
+
+        <span class="s2">if </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s4">'allsegs'</span><span class="s2">, None</span><span class="s1">) </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.allsegs</span><span class="s2">, </span><span class="s1">self.allkinds = self._get_allsegs_and_allkinds()</span>
+        <span class="s2">elif </span><span class="s1">self.allkinds </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s3"># allsegs specified in constructor may or may not have allkinds as</span>
+            <span class="s3"># well.  Must ensure allkinds can be zipped below.</span>
+            <span class="s1">self.allkinds = [</span><span class="s2">None</span><span class="s1">] * len(self.allsegs)</span>
+
+        <span class="s2">if </span><span class="s1">self.filled:</span>
+            <span class="s2">if </span><span class="s1">self.linewidths </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">_api.warn_external(</span><span class="s4">'linewidths is ignored by contourf'</span><span class="s1">)</span>
+            <span class="s3"># Lower and upper contour levels.</span>
+            <span class="s1">lowers</span><span class="s2">, </span><span class="s1">uppers = self._get_lowers_and_uppers()</span>
+            <span class="s3"># Default zorder taken from Collection</span>
+            <span class="s1">self._contour_zorder = kwargs.pop(</span><span class="s4">'zorder'</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+            <span class="s1">self.collections[:] = [</span>
+                <span class="s1">mcoll.PathCollection(</span>
+                    <span class="s1">self._make_paths(segs</span><span class="s2">, </span><span class="s1">kinds)</span><span class="s2">,</span>
+                    <span class="s1">antialiaseds=(self.antialiased</span><span class="s2">,</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">edgecolors=</span><span class="s4">'none'</span><span class="s2">,</span>
+                    <span class="s1">alpha=self.alpha</span><span class="s2">,</span>
+                    <span class="s1">transform=self.get_transform()</span><span class="s2">,</span>
+                    <span class="s1">zorder=self._contour_zorder)</span>
+                <span class="s2">for </span><span class="s1">level</span><span class="s2">, </span><span class="s1">level_upper</span><span class="s2">, </span><span class="s1">segs</span><span class="s2">, </span><span class="s1">kinds</span>
+                <span class="s2">in </span><span class="s1">zip(lowers</span><span class="s2">, </span><span class="s1">uppers</span><span class="s2">, </span><span class="s1">self.allsegs</span><span class="s2">, </span><span class="s1">self.allkinds)]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.tlinewidths = tlinewidths = self._process_linewidths()</span>
+            <span class="s1">tlinestyles = self._process_linestyles()</span>
+            <span class="s1">aa = self.antialiased</span>
+            <span class="s2">if </span><span class="s1">aa </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">aa = (self.antialiased</span><span class="s2">,</span><span class="s1">)</span>
+            <span class="s3"># Default zorder taken from LineCollection, which is higher than</span>
+            <span class="s3"># for filled contours so that lines are displayed on top.</span>
+            <span class="s1">self._contour_zorder = kwargs.pop(</span><span class="s4">'zorder'</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span>
+
+            <span class="s1">self.collections[:] = [</span>
+                <span class="s1">mcoll.PathCollection(</span>
+                    <span class="s1">self._make_paths(segs</span><span class="s2">, </span><span class="s1">kinds)</span><span class="s2">,</span>
+                    <span class="s1">facecolors=</span><span class="s4">&quot;none&quot;</span><span class="s2">,</span>
+                    <span class="s1">antialiaseds=aa</span><span class="s2">,</span>
+                    <span class="s1">linewidths=width</span><span class="s2">,</span>
+                    <span class="s1">linestyles=[lstyle]</span><span class="s2">,</span>
+                    <span class="s1">alpha=self.alpha</span><span class="s2">,</span>
+                    <span class="s1">transform=self.get_transform()</span><span class="s2">,</span>
+                    <span class="s1">zorder=self._contour_zorder</span><span class="s2">,</span>
+                    <span class="s1">label=</span><span class="s4">'_nolegend_'</span><span class="s1">)</span>
+                <span class="s2">for </span><span class="s1">level</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">lstyle</span><span class="s2">, </span><span class="s1">segs</span><span class="s2">, </span><span class="s1">kinds</span>
+                <span class="s2">in </span><span class="s1">zip(self.levels</span><span class="s2">, </span><span class="s1">tlinewidths</span><span class="s2">, </span><span class="s1">tlinestyles</span><span class="s2">, </span><span class="s1">self.allsegs</span><span class="s2">,</span>
+                       <span class="s1">self.allkinds)]</span>
+
+        <span class="s2">for </span><span class="s1">col </span><span class="s2">in </span><span class="s1">self.collections:</span>
+            <span class="s1">self.axes.add_collection(col</span><span class="s2">, </span><span class="s1">autolim=</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">col.sticky_edges.x[:] = [self._mins[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self._maxs[</span><span class="s5">0</span><span class="s1">]]</span>
+            <span class="s1">col.sticky_edges.y[:] = [self._mins[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self._maxs[</span><span class="s5">1</span><span class="s1">]]</span>
+        <span class="s1">self.axes.update_datalim([self._mins</span><span class="s2">, </span><span class="s1">self._maxs])</span>
+        <span class="s1">self.axes.autoscale_view(tight=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s1">self.changed()  </span><span class="s3"># set the colors</span>
+
+        <span class="s2">if </span><span class="s1">kwargs:</span>
+            <span class="s1">_api.warn_external(</span>
+                <span class="s4">'The following kwargs were not used by contour: ' </span><span class="s1">+</span>
+                <span class="s4">&quot;, &quot;</span><span class="s1">.join(map(repr</span><span class="s2">, </span><span class="s1">kwargs))</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_transform(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the `.Transform` instance used by this ContourSet.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._transform </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._transform = self.axes.transData</span>
+        <span class="s2">elif </span><span class="s1">(</span><span class="s2">not </span><span class="s1">isinstance(self._transform</span><span class="s2">, </span><span class="s1">mtransforms.Transform)</span>
+              <span class="s2">and </span><span class="s1">hasattr(self._transform</span><span class="s2">, </span><span class="s4">'_as_mpl_transform'</span><span class="s1">)):</span>
+            <span class="s1">self._transform = self._transform._as_mpl_transform(self.axes)</span>
+        <span class="s2">return </span><span class="s1">self._transform</span>
+
+    <span class="s2">def </span><span class="s1">__getstate__(self):</span>
+        <span class="s1">state = self.__dict__.copy()</span>
+        <span class="s3"># the C object _contour_generator cannot currently be pickled. This</span>
+        <span class="s3"># isn't a big issue as it is not actually used once the contour has</span>
+        <span class="s3"># been calculated.</span>
+        <span class="s1">state[</span><span class="s4">'_contour_generator'</span><span class="s1">] = </span><span class="s2">None</span>
+        <span class="s2">return </span><span class="s1">state</span>
+
+    <span class="s2">def </span><span class="s1">legend_elements(self</span><span class="s2">, </span><span class="s1">variable_name=</span><span class="s4">'x'</span><span class="s2">, </span><span class="s1">str_format=str):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a list of artists and labels suitable for passing through 
+        to `~.Axes.legend` which represent this ContourSet. 
+ 
+        The labels have the form &quot;0 &lt; x &lt;= 1&quot; stating the data ranges which 
+        the artists represent. 
+ 
+        Parameters 
+        ---------- 
+        variable_name : str 
+            The string used inside the inequality used on the labels. 
+        str_format : function: float -&gt; str 
+            Function used to format the numbers in the labels. 
+ 
+        Returns 
+        ------- 
+        artists : list[`.Artist`] 
+            A list of the artists. 
+        labels : list[str] 
+            A list of the labels. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">artists = []</span>
+        <span class="s1">labels = []</span>
+
+        <span class="s2">if </span><span class="s1">self.filled:</span>
+            <span class="s1">lowers</span><span class="s2">, </span><span class="s1">uppers = self._get_lowers_and_uppers()</span>
+            <span class="s1">n_levels = len(self.collections)</span>
+
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(collection</span><span class="s2">, </span><span class="s1">lower</span><span class="s2">, </span><span class="s1">upper) </span><span class="s2">in </span><span class="s1">enumerate(</span>
+                    <span class="s1">zip(self.collections</span><span class="s2">, </span><span class="s1">lowers</span><span class="s2">, </span><span class="s1">uppers)):</span>
+                <span class="s1">patch = mpatches.Rectangle(</span>
+                    <span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s2">,</span>
+                    <span class="s1">facecolor=collection.get_facecolor()[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                    <span class="s1">hatch=collection.get_hatch()</span><span class="s2">,</span>
+                    <span class="s1">alpha=collection.get_alpha())</span>
+                <span class="s1">artists.append(patch)</span>
+
+                <span class="s1">lower = str_format(lower)</span>
+                <span class="s1">upper = str_format(upper)</span>
+
+                <span class="s2">if </span><span class="s1">i == </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'min'</span><span class="s2">, </span><span class="s4">'both'</span><span class="s1">):</span>
+                    <span class="s1">labels.append(</span><span class="s4">fr'$</span><span class="s2">{</span><span class="s1">variable_name</span><span class="s2">} </span><span class="s4">\leq </span><span class="s2">{</span><span class="s1">lower</span><span class="s2">}</span><span class="s4">s$'</span><span class="s1">)</span>
+                <span class="s2">elif </span><span class="s1">i == n_levels - </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'max'</span><span class="s2">, </span><span class="s4">'both'</span><span class="s1">):</span>
+                    <span class="s1">labels.append(</span><span class="s4">fr'$</span><span class="s2">{</span><span class="s1">variable_name</span><span class="s2">} </span><span class="s4">&gt; </span><span class="s2">{</span><span class="s1">upper</span><span class="s2">}</span><span class="s4">s$'</span><span class="s1">)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">labels.append(</span><span class="s4">fr'$</span><span class="s2">{</span><span class="s1">lower</span><span class="s2">} </span><span class="s4">&lt; </span><span class="s2">{</span><span class="s1">variable_name</span><span class="s2">} </span><span class="s4">\leq </span><span class="s2">{</span><span class="s1">upper</span><span class="s2">}</span><span class="s4">$'</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">collection</span><span class="s2">, </span><span class="s1">level </span><span class="s2">in </span><span class="s1">zip(self.collections</span><span class="s2">, </span><span class="s1">self.levels):</span>
+
+                <span class="s1">patch = mcoll.LineCollection(</span><span class="s2">None</span><span class="s1">)</span>
+                <span class="s1">patch.update_from(collection)</span>
+
+                <span class="s1">artists.append(patch)</span>
+                <span class="s3"># format the level for insertion into the labels</span>
+                <span class="s1">level = str_format(level)</span>
+                <span class="s1">labels.append(</span><span class="s4">fr'$</span><span class="s2">{</span><span class="s1">variable_name</span><span class="s2">} </span><span class="s4">= </span><span class="s2">{</span><span class="s1">level</span><span class="s2">}</span><span class="s4">$'</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">artists</span><span class="s2">, </span><span class="s1">labels</span>
+
+    <span class="s2">def </span><span class="s1">_process_args(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Process *args* and *kwargs*; override in derived classes. 
+ 
+        Must set self.levels, self.zmin and self.zmax, and update axes limits. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.levels = args[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">self.allsegs = args[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">self.allkinds = args[</span><span class="s5">2</span><span class="s1">] </span><span class="s2">if </span><span class="s1">len(args) &gt; </span><span class="s5">2 </span><span class="s2">else None</span>
+        <span class="s1">self.zmax = np.max(self.levels)</span>
+        <span class="s1">self.zmin = np.min(self.levels)</span>
+
+        <span class="s3"># Check lengths of levels and allsegs.</span>
+        <span class="s2">if </span><span class="s1">self.filled:</span>
+            <span class="s2">if </span><span class="s1">len(self.allsegs) != len(self.levels) - </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'must be one less number of segments as '</span>
+                                 <span class="s4">'levels'</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(self.allsegs) != len(self.levels):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'must be same number of segments as levels'</span><span class="s1">)</span>
+
+        <span class="s3"># Check length of allkinds.</span>
+        <span class="s2">if </span><span class="s1">(self.allkinds </span><span class="s2">is not None and</span>
+                <span class="s1">len(self.allkinds) != len(self.allsegs)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'allkinds has different length to allsegs'</span><span class="s1">)</span>
+
+        <span class="s3"># Determine x, y bounds and update axes data limits.</span>
+        <span class="s1">flatseglist = [s </span><span class="s2">for </span><span class="s1">seg </span><span class="s2">in </span><span class="s1">self.allsegs </span><span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">seg]</span>
+        <span class="s1">points = np.concatenate(flatseglist</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">self._mins = points.min(axis=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">self._maxs = points.max(axis=</span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">kwargs</span>
+
+    <span class="s2">def </span><span class="s1">_get_allsegs_and_allkinds(self):</span>
+        <span class="s0">&quot;&quot;&quot;Compute ``allsegs`` and ``allkinds`` using C extension.&quot;&quot;&quot;</span>
+        <span class="s1">allsegs = []</span>
+        <span class="s1">allkinds = []</span>
+        <span class="s2">if </span><span class="s1">self.filled:</span>
+            <span class="s1">lowers</span><span class="s2">, </span><span class="s1">uppers = self._get_lowers_and_uppers()</span>
+            <span class="s2">for </span><span class="s1">level</span><span class="s2">, </span><span class="s1">level_upper </span><span class="s2">in </span><span class="s1">zip(lowers</span><span class="s2">, </span><span class="s1">uppers):</span>
+                <span class="s1">vertices</span><span class="s2">, </span><span class="s1">kinds = \</span>
+                    <span class="s1">self._contour_generator.create_filled_contour(</span>
+                        <span class="s1">level</span><span class="s2">, </span><span class="s1">level_upper)</span>
+                <span class="s1">allsegs.append(vertices)</span>
+                <span class="s1">allkinds.append(kinds)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">level </span><span class="s2">in </span><span class="s1">self.levels:</span>
+                <span class="s1">vertices</span><span class="s2">, </span><span class="s1">kinds = self._contour_generator.create_contour(level)</span>
+                <span class="s1">allsegs.append(vertices)</span>
+                <span class="s1">allkinds.append(kinds)</span>
+        <span class="s2">return </span><span class="s1">allsegs</span><span class="s2">, </span><span class="s1">allkinds</span>
+
+    <span class="s2">def </span><span class="s1">_get_lowers_and_uppers(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return ``(lowers, uppers)`` for filled contours. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lowers = self._levels[:-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.zmin == lowers[</span><span class="s5">0</span><span class="s1">]:</span>
+            <span class="s3"># Include minimum values in lowest interval</span>
+            <span class="s1">lowers = lowers.copy()  </span><span class="s3"># so we don't change self._levels</span>
+            <span class="s2">if </span><span class="s1">self.logscale:</span>
+                <span class="s1">lowers[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">0.99 </span><span class="s1">* self.zmin</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">lowers[</span><span class="s5">0</span><span class="s1">] -= </span><span class="s5">1</span>
+        <span class="s1">uppers = self._levels[</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s2">return </span><span class="s1">(lowers</span><span class="s2">, </span><span class="s1">uppers)</span>
+
+    <span class="s2">def </span><span class="s1">_make_paths(self</span><span class="s2">, </span><span class="s1">segs</span><span class="s2">, </span><span class="s1">kinds):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create and return Path objects for the specified segments and optional 
+        kind codes.  *segs* is a list of numpy arrays, each array is either a 
+        closed line loop or open line strip of 2D points with a shape of 
+        (npoints, 2).  *kinds* is either None or a list (with the same length 
+        as *segs*) of numpy arrays, each array is of shape (npoints,) and 
+        contains the kind codes for the corresponding line in *segs*.  If 
+        *kinds* is None then the Path constructor creates the kind codes 
+        assuming that the line is an open strip. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">kinds </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">[mpath.Path(seg) </span><span class="s2">for </span><span class="s1">seg </span><span class="s2">in </span><span class="s1">segs]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">[mpath.Path(seg</span><span class="s2">, </span><span class="s1">codes=kind) </span><span class="s2">for </span><span class="s1">seg</span><span class="s2">, </span><span class="s1">kind</span>
+                    <span class="s2">in </span><span class="s1">zip(segs</span><span class="s2">, </span><span class="s1">kinds)]</span>
+
+    <span class="s2">def </span><span class="s1">changed(self):</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;cvalues&quot;</span><span class="s1">):</span>
+            <span class="s3"># Just return after calling the super() changed function</span>
+            <span class="s1">cm.ScalarMappable.changed(self)</span>
+            <span class="s2">return</span>
+        <span class="s3"># Force an autoscale immediately because self.to_rgba() calls</span>
+        <span class="s3"># autoscale_None() internally with the data passed to it,</span>
+        <span class="s3"># so if vmin/vmax are not set yet, this would override them with</span>
+        <span class="s3"># content from *cvalues* rather than levels like we want</span>
+        <span class="s1">self.norm.autoscale_None(self.levels)</span>
+        <span class="s1">tcolors = [(tuple(rgba)</span><span class="s2">,</span><span class="s1">)</span>
+                   <span class="s2">for </span><span class="s1">rgba </span><span class="s2">in </span><span class="s1">self.to_rgba(self.cvalues</span><span class="s2">, </span><span class="s1">alpha=self.alpha)]</span>
+        <span class="s1">self.tcolors = tcolors</span>
+        <span class="s1">hatches = self.hatches * len(tcolors)</span>
+        <span class="s2">for </span><span class="s1">color</span><span class="s2">, </span><span class="s1">hatch</span><span class="s2">, </span><span class="s1">collection </span><span class="s2">in </span><span class="s1">zip(tcolors</span><span class="s2">, </span><span class="s1">hatches</span><span class="s2">,</span>
+                                            <span class="s1">self.collections):</span>
+            <span class="s2">if </span><span class="s1">self.filled:</span>
+                <span class="s1">collection.set_facecolor(color)</span>
+                <span class="s3"># update the collection's hatch (may be None)</span>
+                <span class="s1">collection.set_hatch(hatch)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">collection.set_edgecolor(color)</span>
+        <span class="s2">for </span><span class="s1">label</span><span class="s2">, </span><span class="s1">cv </span><span class="s2">in </span><span class="s1">zip(self.labelTexts</span><span class="s2">, </span><span class="s1">self.labelCValues):</span>
+            <span class="s1">label.set_alpha(self.alpha)</span>
+            <span class="s1">label.set_color(self.labelMappable.to_rgba(cv))</span>
+        <span class="s3"># add label colors</span>
+        <span class="s1">cm.ScalarMappable.changed(self)</span>
+
+    <span class="s2">def </span><span class="s1">_autolev(self</span><span class="s2">, </span><span class="s1">N):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Select contour levels to span the data. 
+ 
+        The target number of levels, *N*, is used only when the 
+        scale is not log and default locator is used. 
+ 
+        We need two more levels for filled contours than for 
+        line contours, because for the latter we need to specify 
+        the lower and upper boundary of each range. For example, 
+        a single contour boundary, say at z = 0, requires only 
+        one contour line, but two filled regions, and therefore 
+        three levels to provide boundaries for both regions. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.locator </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">self.logscale:</span>
+                <span class="s1">self.locator = ticker.LogLocator()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self.locator = ticker.MaxNLocator(N + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">min_n_ticks=</span><span class="s5">1</span><span class="s1">)</span>
+
+        <span class="s1">lev = self.locator.tick_values(self.zmin</span><span class="s2">, </span><span class="s1">self.zmax)</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">self.locator._symmetric:</span>
+                <span class="s2">return </span><span class="s1">lev</span>
+        <span class="s2">except </span><span class="s1">AttributeError:</span>
+            <span class="s2">pass</span>
+
+        <span class="s3"># Trim excess levels the locator may have supplied.</span>
+        <span class="s1">under = np.nonzero(lev &lt; self.zmin)[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">i0 = under[-</span><span class="s5">1</span><span class="s1">] </span><span class="s2">if </span><span class="s1">len(under) </span><span class="s2">else </span><span class="s5">0</span>
+        <span class="s1">over = np.nonzero(lev &gt; self.zmax)[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">i1 = over[</span><span class="s5">0</span><span class="s1">] + </span><span class="s5">1 </span><span class="s2">if </span><span class="s1">len(over) </span><span class="s2">else </span><span class="s1">len(lev)</span>
+        <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'min'</span><span class="s2">, </span><span class="s4">'both'</span><span class="s1">):</span>
+            <span class="s1">i0 += </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'max'</span><span class="s2">, </span><span class="s4">'both'</span><span class="s1">):</span>
+            <span class="s1">i1 -= </span><span class="s5">1</span>
+
+        <span class="s2">if </span><span class="s1">i1 - i0 &lt; </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s1">i0</span><span class="s2">, </span><span class="s1">i1 = </span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(lev)</span>
+
+        <span class="s2">return </span><span class="s1">lev[i0:i1]</span>
+
+    <span class="s2">def </span><span class="s1">_process_contour_level_args(self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">z_dtype):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Determine the contour levels and store in self.levels. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.levels </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">args:</span>
+                <span class="s1">levels_arg = args[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s2">elif </span><span class="s1">np.issubdtype(z_dtype</span><span class="s2">, </span><span class="s1">bool):</span>
+                <span class="s2">if </span><span class="s1">self.filled:</span>
+                    <span class="s1">levels_arg = [</span><span class="s5">0</span><span class="s2">, </span><span class="s5">.5</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">levels_arg = [</span><span class="s5">.5</span><span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">levels_arg = </span><span class="s5">7  </span><span class="s3"># Default, hard-wired.</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">levels_arg = self.levels</span>
+        <span class="s2">if </span><span class="s1">isinstance(levels_arg</span><span class="s2">, </span><span class="s1">Integral):</span>
+            <span class="s1">self.levels = self._autolev(levels_arg)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.levels = np.asarray(levels_arg</span><span class="s2">, </span><span class="s1">np.float64)</span>
+        <span class="s2">if </span><span class="s1">self.filled </span><span class="s2">and </span><span class="s1">len(self.levels) &lt; </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Filled contours require at least 2 levels.&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">len(self.levels) &gt; </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">np.min(np.diff(self.levels)) &lt;= </span><span class="s5">0.0</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Contour levels must be increasing&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_process_levels(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Assign values to :attr:`layers` based on :attr:`levels`, 
+        adding extended layers as needed if contours are filled. 
+ 
+        For line contours, layers simply coincide with levels; 
+        a line is a thin layer.  No extended levels are needed 
+        with line contours. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Make a private _levels to include extended regions; we</span>
+        <span class="s3"># want to leave the original levels attribute unchanged.</span>
+        <span class="s3"># (Colorbar needs this even for line contours.)</span>
+        <span class="s1">self._levels = list(self.levels)</span>
+
+        <span class="s2">if </span><span class="s1">self.logscale:</span>
+            <span class="s1">lower</span><span class="s2">, </span><span class="s1">upper = </span><span class="s5">1e-250</span><span class="s2">, </span><span class="s5">1e250</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">lower</span><span class="s2">, </span><span class="s1">upper = -</span><span class="s5">1e250</span><span class="s2">, </span><span class="s5">1e250</span>
+
+        <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'both'</span><span class="s2">, </span><span class="s4">'min'</span><span class="s1">):</span>
+            <span class="s1">self._levels.insert(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">lower)</span>
+        <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'both'</span><span class="s2">, </span><span class="s4">'max'</span><span class="s1">):</span>
+            <span class="s1">self._levels.append(upper)</span>
+        <span class="s1">self._levels = np.asarray(self._levels)</span>
+
+        <span class="s2">if not </span><span class="s1">self.filled:</span>
+            <span class="s1">self.layers = self.levels</span>
+            <span class="s2">return</span>
+
+        <span class="s3"># Layer values are mid-way between levels in screen space.</span>
+        <span class="s2">if </span><span class="s1">self.logscale:</span>
+            <span class="s3"># Avoid overflow by taking sqrt before multiplying.</span>
+            <span class="s1">self.layers = (np.sqrt(self._levels[:-</span><span class="s5">1</span><span class="s1">])</span>
+                           <span class="s1">* np.sqrt(self._levels[</span><span class="s5">1</span><span class="s1">:]))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.layers = </span><span class="s5">0.5 </span><span class="s1">* (self._levels[:-</span><span class="s5">1</span><span class="s1">] + self._levels[</span><span class="s5">1</span><span class="s1">:])</span>
+
+    <span class="s2">def </span><span class="s1">_process_colors(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Color argument processing for contouring. 
+ 
+        Note that we base the colormapping on the contour levels 
+        and layers, not on the actual range of the Z values.  This 
+        means we don't have to worry about bad values in Z, and we 
+        always have the full dynamic range available for the selected 
+        levels. 
+ 
+        The color is based on the midpoint of the layer, except for 
+        extended end layers.  By default, the norm vmin and vmax 
+        are the extreme values of the non-extended levels.  Hence, 
+        the layer color extremes are not the extreme values of 
+        the colormap itself, but approach those values as the number 
+        of levels increases.  An advantage of this scheme is that 
+        line contours, when added to filled contours, take on 
+        colors that are consistent with those of the filled regions; 
+        for example, a contour line on the boundary between two 
+        regions will have a color intermediate between those 
+        of the regions. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.monochrome = self.cmap.monochrome</span>
+        <span class="s2">if </span><span class="s1">self.colors </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s3"># Generate integers for direct indexing.</span>
+            <span class="s1">i0</span><span class="s2">, </span><span class="s1">i1 = </span><span class="s5">0</span><span class="s2">, </span><span class="s1">len(self.levels)</span>
+            <span class="s2">if </span><span class="s1">self.filled:</span>
+                <span class="s1">i1 -= </span><span class="s5">1</span>
+                <span class="s3"># Out of range indices for over and under:</span>
+                <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'both'</span><span class="s2">, </span><span class="s4">'min'</span><span class="s1">):</span>
+                    <span class="s1">i0 -= </span><span class="s5">1</span>
+                <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'both'</span><span class="s2">, </span><span class="s4">'max'</span><span class="s1">):</span>
+                    <span class="s1">i1 += </span><span class="s5">1</span>
+            <span class="s1">self.cvalues = list(range(i0</span><span class="s2">, </span><span class="s1">i1))</span>
+            <span class="s1">self.set_norm(mcolors.NoNorm())</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.cvalues = self.layers</span>
+        <span class="s1">self.set_array(self.levels)</span>
+        <span class="s1">self.autoscale_None()</span>
+        <span class="s2">if </span><span class="s1">self.extend </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'both'</span><span class="s2">, </span><span class="s4">'max'</span><span class="s2">, </span><span class="s4">'min'</span><span class="s1">):</span>
+            <span class="s1">self.norm.clip = </span><span class="s2">False</span>
+
+        <span class="s3"># self.tcolors are set by the &quot;changed&quot; method</span>
+
+    <span class="s2">def </span><span class="s1">_process_linewidths(self):</span>
+        <span class="s1">linewidths = self.linewidths</span>
+        <span class="s1">Nlev = len(self.levels)</span>
+        <span class="s2">if </span><span class="s1">linewidths </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">default_linewidth = mpl.rcParams[</span><span class="s4">'contour.linewidth'</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s1">default_linewidth </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">default_linewidth = mpl.rcParams[</span><span class="s4">'lines.linewidth'</span><span class="s1">]</span>
+            <span class="s1">tlinewidths = [(default_linewidth</span><span class="s2">,</span><span class="s1">)] * Nlev</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">np.iterable(linewidths):</span>
+                <span class="s1">linewidths = [linewidths] * Nlev</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">linewidths = list(linewidths)</span>
+                <span class="s2">if </span><span class="s1">len(linewidths) &lt; Nlev:</span>
+                    <span class="s1">nreps = int(np.ceil(Nlev / len(linewidths)))</span>
+                    <span class="s1">linewidths = linewidths * nreps</span>
+                <span class="s2">if </span><span class="s1">len(linewidths) &gt; Nlev:</span>
+                    <span class="s1">linewidths = linewidths[:Nlev]</span>
+            <span class="s1">tlinewidths = [(w</span><span class="s2">,</span><span class="s1">) </span><span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">linewidths]</span>
+        <span class="s2">return </span><span class="s1">tlinewidths</span>
+
+    <span class="s2">def </span><span class="s1">_process_linestyles(self):</span>
+        <span class="s1">linestyles = self.linestyles</span>
+        <span class="s1">Nlev = len(self.levels)</span>
+        <span class="s2">if </span><span class="s1">linestyles </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">tlinestyles = [</span><span class="s4">'solid'</span><span class="s1">] * Nlev</span>
+            <span class="s2">if </span><span class="s1">self.monochrome:</span>
+                <span class="s1">eps = - (self.zmax - self.zmin) * </span><span class="s5">1e-15</span>
+                <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">lev </span><span class="s2">in </span><span class="s1">enumerate(self.levels):</span>
+                    <span class="s2">if </span><span class="s1">lev &lt; eps:</span>
+                        <span class="s1">tlinestyles[i] = self.negative_linestyles</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">isinstance(linestyles</span><span class="s2">, </span><span class="s1">str):</span>
+                <span class="s1">tlinestyles = [linestyles] * Nlev</span>
+            <span class="s2">elif </span><span class="s1">np.iterable(linestyles):</span>
+                <span class="s1">tlinestyles = list(linestyles)</span>
+                <span class="s2">if </span><span class="s1">len(tlinestyles) &lt; Nlev:</span>
+                    <span class="s1">nreps = int(np.ceil(Nlev / len(linestyles)))</span>
+                    <span class="s1">tlinestyles = tlinestyles * nreps</span>
+                <span class="s2">if </span><span class="s1">len(tlinestyles) &gt; Nlev:</span>
+                    <span class="s1">tlinestyles = tlinestyles[:Nlev]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unrecognized type for linestyles kwarg&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">tlinestyles</span>
+
+    <span class="s2">def </span><span class="s1">get_alpha(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return alpha to be applied to all ContourSet artists.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.alpha</span>
+
+    <span class="s2">def </span><span class="s1">set_alpha(self</span><span class="s2">, </span><span class="s1">alpha):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the alpha blending value for all ContourSet artists. 
+        *alpha* must be between 0 (transparent) and 1 (opaque). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.alpha = alpha</span>
+        <span class="s1">self.changed()</span>
+
+    <span class="s2">def </span><span class="s1">find_nearest_contour(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">indices=</span><span class="s2">None, </span><span class="s1">pixel=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find the point in the contour plot that is closest to ``(x, y)``. 
+ 
+        This method does not support filled contours. 
+ 
+        Parameters 
+        ---------- 
+        x, y : float 
+            The reference point. 
+        indices : list of int or None, default: None 
+            Indices of contour levels to consider.  If None (the default), all 
+            levels are considered. 
+        pixel : bool, default: True 
+            If *True*, measure distance in pixel (screen) space, which is 
+            useful for manual contour labeling; else, measure distance in axes 
+            space. 
+ 
+        Returns 
+        ------- 
+        contour : `.Collection` 
+            The contour that is closest to ``(x, y)``. 
+        segment : int 
+            The index of the `.Path` in *contour* that is closest to 
+            ``(x, y)``. 
+        index : int 
+            The index of the path segment in *segment* that is closest to 
+            ``(x, y)``. 
+        xmin, ymin : float 
+            The point in the contour plot that is closest to ``(x, y)``. 
+        d2 : float 
+            The squared distance from ``(xmin, ymin)`` to ``(x, y)``. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3"># This function uses a method that is probably quite</span>
+        <span class="s3"># inefficient based on converting each contour segment to</span>
+        <span class="s3"># pixel coordinates and then comparing the given point to</span>
+        <span class="s3"># those coordinates for each contour.  This will probably be</span>
+        <span class="s3"># quite slow for complex contours, but for normal use it works</span>
+        <span class="s3"># sufficiently well that the time is not noticeable.</span>
+        <span class="s3"># Nonetheless, improvements could probably be made.</span>
+
+        <span class="s2">if </span><span class="s1">self.filled:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Method does not support filled contours.&quot;</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">indices </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">indices = range(len(self.collections))</span>
+
+        <span class="s1">d2min = np.inf</span>
+        <span class="s1">conmin = </span><span class="s2">None</span>
+        <span class="s1">segmin = </span><span class="s2">None</span>
+        <span class="s1">imin = </span><span class="s2">None</span>
+        <span class="s1">xmin = </span><span class="s2">None</span>
+        <span class="s1">ymin = </span><span class="s2">None</span>
+
+        <span class="s1">point = np.array([x</span><span class="s2">, </span><span class="s1">y])</span>
+
+        <span class="s2">for </span><span class="s1">icon </span><span class="s2">in </span><span class="s1">indices:</span>
+            <span class="s1">con = self.collections[icon]</span>
+            <span class="s1">trans = con.get_transform()</span>
+            <span class="s1">paths = con.get_paths()</span>
+
+            <span class="s2">for </span><span class="s1">segNum</span><span class="s2">, </span><span class="s1">linepath </span><span class="s2">in </span><span class="s1">enumerate(paths):</span>
+                <span class="s1">lc = linepath.vertices</span>
+                <span class="s3"># transfer all data points to screen coordinates if desired</span>
+                <span class="s2">if </span><span class="s1">pixel:</span>
+                    <span class="s1">lc = trans.transform(lc)</span>
+
+                <span class="s1">d2</span><span class="s2">, </span><span class="s1">xc</span><span class="s2">, </span><span class="s1">leg = _find_closest_point_on_path(lc</span><span class="s2">, </span><span class="s1">point)</span>
+                <span class="s2">if </span><span class="s1">d2 &lt; d2min:</span>
+                    <span class="s1">d2min = d2</span>
+                    <span class="s1">conmin = icon</span>
+                    <span class="s1">segmin = segNum</span>
+                    <span class="s1">imin = leg[</span><span class="s5">1</span><span class="s1">]</span>
+                    <span class="s1">xmin = xc[</span><span class="s5">0</span><span class="s1">]</span>
+                    <span class="s1">ymin = xc[</span><span class="s5">1</span><span class="s1">]</span>
+
+        <span class="s2">return </span><span class="s1">(conmin</span><span class="s2">, </span><span class="s1">segmin</span><span class="s2">, </span><span class="s1">imin</span><span class="s2">, </span><span class="s1">xmin</span><span class="s2">, </span><span class="s1">ymin</span><span class="s2">, </span><span class="s1">d2min)</span>
+
+    <span class="s2">def </span><span class="s1">remove(self):</span>
+        <span class="s1">super().remove()</span>
+        <span class="s2">for </span><span class="s1">coll </span><span class="s2">in </span><span class="s1">self.collections:</span>
+            <span class="s1">coll.remove()</span>
+
+
+<span class="s1">@_docstring.dedent_interpd</span>
+<span class="s2">class </span><span class="s1">QuadContourSet(ContourSet):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Create and store a set of contour lines or filled regions. 
+ 
+    This class is typically not instantiated directly by the user but by 
+    `~.Axes.contour` and `~.Axes.contourf`. 
+ 
+    %(contour_set_attributes)s 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_process_args(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">corner_mask=</span><span class="s2">None, </span><span class="s1">algorithm=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Process args and kwargs. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance(args[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">QuadContourSet):</span>
+            <span class="s2">if </span><span class="s1">self.levels </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">self.levels = args[</span><span class="s5">0</span><span class="s1">].levels</span>
+            <span class="s1">self.zmin = args[</span><span class="s5">0</span><span class="s1">].zmin</span>
+            <span class="s1">self.zmax = args[</span><span class="s5">0</span><span class="s1">].zmax</span>
+            <span class="s1">self._corner_mask = args[</span><span class="s5">0</span><span class="s1">]._corner_mask</span>
+            <span class="s1">contour_generator = args[</span><span class="s5">0</span><span class="s1">]._contour_generator</span>
+            <span class="s1">self._mins = args[</span><span class="s5">0</span><span class="s1">]._mins</span>
+            <span class="s1">self._maxs = args[</span><span class="s5">0</span><span class="s1">]._maxs</span>
+            <span class="s1">self._algorithm = args[</span><span class="s5">0</span><span class="s1">]._algorithm</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">import </span><span class="s1">contourpy</span>
+
+            <span class="s2">if </span><span class="s1">algorithm </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">algorithm = mpl.rcParams[</span><span class="s4">'contour.algorithm'</span><span class="s1">]</span>
+            <span class="s1">mpl.rcParams.validate[</span><span class="s4">&quot;contour.algorithm&quot;</span><span class="s1">](algorithm)</span>
+            <span class="s1">self._algorithm = algorithm</span>
+
+            <span class="s2">if </span><span class="s1">corner_mask </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">self._algorithm == </span><span class="s4">&quot;mpl2005&quot;</span><span class="s1">:</span>
+                    <span class="s3"># mpl2005 does not support corner_mask=True so if not</span>
+                    <span class="s3"># specifically requested then disable it.</span>
+                    <span class="s1">corner_mask = </span><span class="s2">False</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">corner_mask = mpl.rcParams[</span><span class="s4">'contour.corner_mask'</span><span class="s1">]</span>
+            <span class="s1">self._corner_mask = corner_mask</span>
+
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z = self._contour_args(args</span><span class="s2">, </span><span class="s1">kwargs)</span>
+
+            <span class="s1">contour_generator = contourpy.contour_generator(</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">name=self._algorithm</span><span class="s2">, </span><span class="s1">corner_mask=self._corner_mask</span><span class="s2">,</span>
+                <span class="s1">line_type=contourpy.LineType.SeparateCode</span><span class="s2">,</span>
+                <span class="s1">fill_type=contourpy.FillType.OuterCode</span><span class="s2">,</span>
+                <span class="s1">chunk_size=self.nchunk)</span>
+
+            <span class="s1">t = self.get_transform()</span>
+
+            <span class="s3"># if the transform is not trans data, and some part of it</span>
+            <span class="s3"># contains transData, transform the xs and ys to data coordinates</span>
+            <span class="s2">if </span><span class="s1">(t != self.axes.transData </span><span class="s2">and</span>
+                    <span class="s1">any(t.contains_branch_seperately(self.axes.transData))):</span>
+                <span class="s1">trans_to_data = t - self.axes.transData</span>
+                <span class="s1">pts = np.vstack([x.flat</span><span class="s2">, </span><span class="s1">y.flat]).T</span>
+                <span class="s1">transformed_pts = trans_to_data.transform(pts)</span>
+                <span class="s1">x = transformed_pts[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+                <span class="s1">y = transformed_pts[...</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span>
+
+            <span class="s1">self._mins = [ma.min(x)</span><span class="s2">, </span><span class="s1">ma.min(y)]</span>
+            <span class="s1">self._maxs = [ma.max(x)</span><span class="s2">, </span><span class="s1">ma.max(y)]</span>
+
+        <span class="s1">self._contour_generator = contour_generator</span>
+
+        <span class="s2">return </span><span class="s1">kwargs</span>
+
+    <span class="s2">def </span><span class="s1">_contour_args(self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwargs):</span>
+        <span class="s2">if </span><span class="s1">self.filled:</span>
+            <span class="s1">fn = </span><span class="s4">'contourf'</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">fn = </span><span class="s4">'contour'</span>
+        <span class="s1">nargs = len(args)</span>
+        <span class="s2">if </span><span class="s1">nargs &lt;= </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s1">z</span><span class="s2">, </span><span class="s1">*args = args</span>
+            <span class="s1">z = ma.asarray(z)</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = self._initialize_x_y(z)</span>
+        <span class="s2">elif </span><span class="s1">nargs &lt;= </span><span class="s5">4</span><span class="s1">:</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z_orig</span><span class="s2">, </span><span class="s1">*args = args</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z = self._check_xyz(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z_orig</span><span class="s2">, </span><span class="s1">kwargs)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">_api.nargs_error(fn</span><span class="s2">, </span><span class="s1">takes=</span><span class="s4">&quot;from 1 to 4&quot;</span><span class="s2">, </span><span class="s1">given=nargs)</span>
+        <span class="s1">z = ma.masked_invalid(z</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">self.zmax = float(z.max())</span>
+        <span class="s1">self.zmin = float(z.min())</span>
+        <span class="s2">if </span><span class="s1">self.logscale </span><span class="s2">and </span><span class="s1">self.zmin &lt;= </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">z = ma.masked_where(z &lt;= </span><span class="s5">0</span><span class="s2">, </span><span class="s1">z)</span>
+            <span class="s1">_api.warn_external(</span><span class="s4">'Log scale: values of z &lt;= 0 have been masked'</span><span class="s1">)</span>
+            <span class="s1">self.zmin = float(z.min())</span>
+        <span class="s1">self._process_contour_level_args(args</span><span class="s2">, </span><span class="s1">z.dtype)</span>
+        <span class="s2">return </span><span class="s1">(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z)</span>
+
+    <span class="s2">def </span><span class="s1">_check_xyz(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z</span><span class="s2">, </span><span class="s1">kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Check that the shapes of the input arrays match; if x and y are 1D, 
+        convert them to 2D using meshgrid. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y = self.axes._process_unit_info([(</span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s1">x)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s1">y)]</span><span class="s2">, </span><span class="s1">kwargs)</span>
+
+        <span class="s1">x = np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">y = np.asarray(y</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">z = ma.asarray(z)</span>
+
+        <span class="s2">if </span><span class="s1">z.ndim != </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Input z must be 2D, not </span><span class="s2">{</span><span class="s1">z.ndim</span><span class="s2">}</span><span class="s4">D&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">z.shape[</span><span class="s5">0</span><span class="s1">] &lt; </span><span class="s5">2 </span><span class="s2">or </span><span class="s1">z.shape[</span><span class="s5">1</span><span class="s1">] &lt; </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Input z must be at least a (2, 2) shaped array, &quot;</span>
+                            <span class="s4">f&quot;but has shape </span><span class="s2">{</span><span class="s1">z.shape</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s1">Ny</span><span class="s2">, </span><span class="s1">Nx = z.shape</span>
+
+        <span class="s2">if </span><span class="s1">x.ndim != y.ndim:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Number of dimensions of x (</span><span class="s2">{</span><span class="s1">x.ndim</span><span class="s2">}</span><span class="s4">) and y &quot;</span>
+                            <span class="s4">f&quot;(</span><span class="s2">{</span><span class="s1">y.ndim</span><span class="s2">}</span><span class="s4">) do not match&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">x.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">nx</span><span class="s2">, </span><span class="s1">= x.shape</span>
+            <span class="s1">ny</span><span class="s2">, </span><span class="s1">= y.shape</span>
+            <span class="s2">if </span><span class="s1">nx != Nx:</span>
+                <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Length of x (</span><span class="s2">{</span><span class="s1">nx</span><span class="s2">}</span><span class="s4">) must match number of &quot;</span>
+                                <span class="s4">f&quot;columns in z (</span><span class="s2">{</span><span class="s1">Nx</span><span class="s2">}</span><span class="s4">)&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">ny != Ny:</span>
+                <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Length of y (</span><span class="s2">{</span><span class="s1">ny</span><span class="s2">}</span><span class="s4">) must match number of &quot;</span>
+                                <span class="s4">f&quot;rows in z (</span><span class="s2">{</span><span class="s1">Ny</span><span class="s2">}</span><span class="s4">)&quot;</span><span class="s1">)</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y = np.meshgrid(x</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s2">elif </span><span class="s1">x.ndim == </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">x.shape != z.shape:</span>
+                <span class="s2">raise </span><span class="s1">TypeError(</span>
+                    <span class="s4">f&quot;Shapes of x </span><span class="s2">{</span><span class="s1">x.shape</span><span class="s2">} </span><span class="s4">and z </span><span class="s2">{</span><span class="s1">z.shape</span><span class="s2">} </span><span class="s4">do not match&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">y.shape != z.shape:</span>
+                <span class="s2">raise </span><span class="s1">TypeError(</span>
+                    <span class="s4">f&quot;Shapes of y </span><span class="s2">{</span><span class="s1">y.shape</span><span class="s2">} </span><span class="s4">and z </span><span class="s2">{</span><span class="s1">z.shape</span><span class="s2">} </span><span class="s4">do not match&quot;</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Inputs x and y must be 1D or 2D, not </span><span class="s2">{</span><span class="s1">x.ndim</span><span class="s2">}</span><span class="s4">D&quot;</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">z</span>
+
+    <span class="s2">def </span><span class="s1">_initialize_x_y(self</span><span class="s2">, </span><span class="s1">z):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return X, Y arrays such that contour(Z) will match imshow(Z) 
+        if origin is not None. 
+        The center of pixel Z[i, j] depends on origin: 
+        if origin is None, x = j, y = i; 
+        if origin is 'lower', x = j + 0.5, y = i + 0.5; 
+        if origin is 'upper', x = j + 0.5, y = Nrows - i - 0.5 
+        If extent is not None, x and y will be scaled to match, 
+        as in imshow. 
+        If origin is None and extent is not None, then extent 
+        will give the minimum and maximum values of x and y. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">z.ndim != </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Input z must be 2D, not </span><span class="s2">{</span><span class="s1">z.ndim</span><span class="s2">}</span><span class="s4">D&quot;</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">z.shape[</span><span class="s5">0</span><span class="s1">] &lt; </span><span class="s5">2 </span><span class="s2">or </span><span class="s1">z.shape[</span><span class="s5">1</span><span class="s1">] &lt; </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;Input z must be at least a (2, 2) shaped array, &quot;</span>
+                            <span class="s4">f&quot;but has shape </span><span class="s2">{</span><span class="s1">z.shape</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">Ny</span><span class="s2">, </span><span class="s1">Nx = z.shape</span>
+        <span class="s2">if </span><span class="s1">self.origin </span><span class="s2">is None</span><span class="s1">:  </span><span class="s3"># Not for image-matching.</span>
+            <span class="s2">if </span><span class="s1">self.extent </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">np.meshgrid(np.arange(Nx)</span><span class="s2">, </span><span class="s1">np.arange(Ny))</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">x0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">y1 = self.extent</span>
+                <span class="s1">x = np.linspace(x0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">Nx)</span>
+                <span class="s1">y = np.linspace(y0</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">Ny)</span>
+                <span class="s2">return </span><span class="s1">np.meshgrid(x</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s3"># Match image behavior:</span>
+        <span class="s2">if </span><span class="s1">self.extent </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">x0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">y1 = (</span><span class="s5">0</span><span class="s2">, </span><span class="s1">Nx</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">Ny)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">x0</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">y1 = self.extent</span>
+        <span class="s1">dx = (x1 - x0) / Nx</span>
+        <span class="s1">dy = (y1 - y0) / Ny</span>
+        <span class="s1">x = x0 + (np.arange(Nx) + </span><span class="s5">0.5</span><span class="s1">) * dx</span>
+        <span class="s1">y = y0 + (np.arange(Ny) + </span><span class="s5">0.5</span><span class="s1">) * dy</span>
+        <span class="s2">if </span><span class="s1">self.origin == </span><span class="s4">'upper'</span><span class="s1">:</span>
+            <span class="s1">y = y[::-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">np.meshgrid(x</span><span class="s2">, </span><span class="s1">y)</span>
+
+
+<span class="s1">_docstring.interpd.update(contour_doc=</span><span class="s4">&quot;&quot;&quot; 
+`.contour` and `.contourf` draw contour lines and filled contours, 
+respectively.  Except as noted, function signatures and return values 
+are the same for both versions. 
+ 
+Parameters 
+---------- 
+X, Y : array-like, optional 
+    The coordinates of the values in *Z*. 
+ 
+    *X* and *Y* must both be 2D with the same shape as *Z* (e.g. 
+    created via `numpy.meshgrid`), or they must both be 1-D such 
+    that ``len(X) == N`` is the number of columns in *Z* and 
+    ``len(Y) == M`` is the number of rows in *Z*. 
+ 
+    *X* and *Y* must both be ordered monotonically. 
+ 
+    If not given, they are assumed to be integer indices, i.e. 
+    ``X = range(N)``, ``Y = range(M)``. 
+ 
+Z : (M, N) array-like 
+    The height values over which the contour is drawn.  Color-mapping is 
+    controlled by *cmap*, *norm*, *vmin*, and *vmax*. 
+ 
+levels : int or array-like, optional 
+    Determines the number and positions of the contour lines / regions. 
+ 
+    If an int *n*, use `~matplotlib.ticker.MaxNLocator`, which tries 
+    to automatically choose no more than *n+1* &quot;nice&quot; contour levels 
+    between minimum and maximum numeric values of *Z*. 
+ 
+    If array-like, draw contour lines at the specified levels. 
+    The values must be in increasing order. 
+ 
+Returns 
+------- 
+`~.contour.QuadContourSet` 
+ 
+Other Parameters 
+---------------- 
+corner_mask : bool, default: :rc:`contour.corner_mask` 
+    Enable/disable corner masking, which only has an effect if *Z* is 
+    a masked array.  If ``False``, any quad touching a masked point is 
+    masked out.  If ``True``, only the triangular corners of quads 
+    nearest those points are always masked out, other triangular 
+    corners comprising three unmasked points are contoured as usual. 
+ 
+colors : color string or sequence of colors, optional 
+    The colors of the levels, i.e. the lines for `.contour` and the 
+    areas for `.contourf`. 
+ 
+    The sequence is cycled for the levels in ascending order. If the 
+    sequence is shorter than the number of levels, it's repeated. 
+ 
+    As a shortcut, single color strings may be used in place of 
+    one-element lists, i.e. ``'red'`` instead of ``['red']`` to color 
+    all levels with the same color. This shortcut does only work for 
+    color strings, not for other ways of specifying colors. 
+ 
+    By default (value *None*), the colormap specified by *cmap* 
+    will be used. 
+ 
+alpha : float, default: 1 
+    The alpha blending value, between 0 (transparent) and 1 (opaque). 
+ 
+%(cmap_doc)s 
+ 
+    This parameter is ignored if *colors* is set. 
+ 
+%(norm_doc)s 
+ 
+    This parameter is ignored if *colors* is set. 
+ 
+%(vmin_vmax_doc)s 
+ 
+    If *vmin* or *vmax* are not given, the default color scaling is based on 
+    *levels*. 
+ 
+    This parameter is ignored if *colors* is set. 
+ 
+origin : {*None*, 'upper', 'lower', 'image'}, default: None 
+    Determines the orientation and exact position of *Z* by specifying 
+    the position of ``Z[0, 0]``.  This is only relevant, if *X*, *Y* 
+    are not given. 
+ 
+    - *None*: ``Z[0, 0]`` is at X=0, Y=0 in the lower left corner. 
+    - 'lower': ``Z[0, 0]`` is at X=0.5, Y=0.5 in the lower left corner. 
+    - 'upper': ``Z[0, 0]`` is at X=N+0.5, Y=0.5 in the upper left 
+      corner. 
+    - 'image': Use the value from :rc:`image.origin`. 
+ 
+extent : (x0, x1, y0, y1), optional 
+    If *origin* is not *None*, then *extent* is interpreted as in 
+    `.imshow`: it gives the outer pixel boundaries. In this case, the 
+    position of Z[0, 0] is the center of the pixel, not a corner. If 
+    *origin* is *None*, then (*x0*, *y0*) is the position of Z[0, 0], 
+    and (*x1*, *y1*) is the position of Z[-1, -1]. 
+ 
+    This argument is ignored if *X* and *Y* are specified in the call 
+    to contour. 
+ 
+locator : ticker.Locator subclass, optional 
+    The locator is used to determine the contour levels if they 
+    are not given explicitly via *levels*. 
+    Defaults to `~.ticker.MaxNLocator`. 
+ 
+extend : {'neither', 'both', 'min', 'max'}, default: 'neither' 
+    Determines the ``contourf``-coloring of values that are outside the 
+    *levels* range. 
+ 
+    If 'neither', values outside the *levels* range are not colored. 
+    If 'min', 'max' or 'both', color the values below, above or below 
+    and above the *levels* range. 
+ 
+    Values below ``min(levels)`` and above ``max(levels)`` are mapped 
+    to the under/over values of the `.Colormap`. Note that most 
+    colormaps do not have dedicated colors for these by default, so 
+    that the over and under values are the edge values of the colormap. 
+    You may want to set these values explicitly using 
+    `.Colormap.set_under` and `.Colormap.set_over`. 
+ 
+    .. note:: 
+ 
+        An existing `.QuadContourSet` does not get notified if 
+        properties of its colormap are changed. Therefore, an explicit 
+        call `.QuadContourSet.changed()` is needed after modifying the 
+        colormap. The explicit call can be left out, if a colorbar is 
+        assigned to the `.QuadContourSet` because it internally calls 
+        `.QuadContourSet.changed()`. 
+ 
+    Example:: 
+ 
+        x = np.arange(1, 10) 
+        y = x.reshape(-1, 1) 
+        h = x * y 
+ 
+        cs = plt.contourf(h, levels=[10, 30, 50], 
+            colors=['#808080', '#A0A0A0', '#C0C0C0'], extend='both') 
+        cs.cmap.set_over('red') 
+        cs.cmap.set_under('blue') 
+        cs.changed() 
+ 
+xunits, yunits : registered units, optional 
+    Override axis units by specifying an instance of a 
+    :class:`matplotlib.units.ConversionInterface`. 
+ 
+antialiased : bool, optional 
+    Enable antialiasing, overriding the defaults.  For 
+    filled contours, the default is *True*.  For line contours, 
+    it is taken from :rc:`lines.antialiased`. 
+ 
+nchunk : int &gt;= 0, optional 
+    If 0, no subdivision of the domain.  Specify a positive integer to 
+    divide the domain into subdomains of *nchunk* by *nchunk* quads. 
+    Chunking reduces the maximum length of polygons generated by the 
+    contouring algorithm which reduces the rendering workload passed 
+    on to the backend and also requires slightly less RAM.  It can 
+    however introduce rendering artifacts at chunk boundaries depending 
+    on the backend, the *antialiased* flag and value of *alpha*. 
+ 
+linewidths : float or array-like, default: :rc:`contour.linewidth` 
+    *Only applies to* `.contour`. 
+ 
+    The line width of the contour lines. 
+ 
+    If a number, all levels will be plotted with this linewidth. 
+ 
+    If a sequence, the levels in ascending order will be plotted with 
+    the linewidths in the order specified. 
+ 
+    If None, this falls back to :rc:`lines.linewidth`. 
+ 
+linestyles : {*None*, 'solid', 'dashed', 'dashdot', 'dotted'}, optional 
+    *Only applies to* `.contour`. 
+ 
+    If *linestyles* is *None*, the default is 'solid' unless the lines are 
+    monochrome. In that case, negative contours will instead take their 
+    linestyle from the *negative_linestyles* argument. 
+ 
+    *linestyles* can also be an iterable of the above strings specifying a set 
+    of linestyles to be used. If this iterable is shorter than the number of 
+    contour levels it will be repeated as necessary. 
+ 
+negative_linestyles : {*None*, 'solid', 'dashed', 'dashdot', 'dotted'}, </span><span class="s2">\ 
+                       </span><span class="s4">optional 
+    *Only applies to* `.contour`. 
+ 
+    If *linestyles* is *None* and the lines are monochrome, this argument 
+    specifies the line style for negative contours. 
+ 
+    If *negative_linestyles* is *None*, the default is taken from 
+    :rc:`contour.negative_linestyles`. 
+ 
+    *negative_linestyles* can also be an iterable of the above strings 
+    specifying a set of linestyles to be used. If this iterable is shorter than 
+    the number of contour levels it will be repeated as necessary. 
+ 
+hatches : list[str], optional 
+    *Only applies to* `.contourf`. 
+ 
+    A list of cross hatch patterns to use on the filled areas. 
+    If None, no hatching will be added to the contour. 
+    Hatching is supported in the PostScript, PDF, SVG and Agg 
+    backends only. 
+ 
+algorithm : {'mpl2005', 'mpl2014', 'serial', 'threaded'}, optional 
+    Which contouring algorithm to use to calculate the contour lines and 
+    polygons. The algorithms are implemented in 
+    `ContourPy &lt;https://github.com/contourpy/contourpy&gt;`_, consult the 
+    `ContourPy documentation &lt;https://contourpy.readthedocs.io&gt;`_ for 
+    further information. 
+ 
+    The default is taken from :rc:`contour.algorithm`. 
+ 
+data : indexable object, optional 
+    DATA_PARAMETER_PLACEHOLDER 
+ 
+Notes 
+----- 
+1. `.contourf` differs from the MATLAB version in that it does not draw 
+   the polygon edges. To draw edges, add line contours with calls to 
+   `.contour`. 
+ 
+2. `.contourf` fills intervals that are closed at the top; that is, for 
+   boundaries *z1* and *z2*, the filled region is:: 
+ 
+      z1 &lt; Z &lt;= z2 
+ 
+   except for the lowest interval, which is closed on both sides (i.e. 
+   it includes the lowest value). 
+ 
+3. `.contour` and `.contourf` use a `marching squares 
+   &lt;https://en.wikipedia.org/wiki/Marching_squares&gt;`_ algorithm to 
+   compute contour locations.  More information can be found in 
+   `ContourPy documentation &lt;https://contourpy.readthedocs.io&gt;`_. 
+&quot;&quot;&quot; </span><span class="s1">% _docstring.interpd.params)</span>
+</pre>
+</body>
+</html>

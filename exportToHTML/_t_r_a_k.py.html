@@ -1,0 +1,336 @@
+<html>
+<head>
+<title>_t_r_a_k.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_t_r_a_k.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc </span><span class="s0">import </span><span class="s1">sstruct</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.fixedTools </span><span class="s0">import </span><span class="s1">(</span>
+	<span class="s1">fixedToFloat </span><span class="s0">as </span><span class="s1">fi2fl</span><span class="s0">,</span>
+	<span class="s1">floatToFixed </span><span class="s0">as </span><span class="s1">fl2fi</span><span class="s0">,</span>
+	<span class="s1">floatToFixedToStr </span><span class="s0">as </span><span class="s1">fl2str</span><span class="s0">,</span>
+	<span class="s1">strToFixedToFloat </span><span class="s0">as </span><span class="s1">str2fl</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">bytesjoin</span><span class="s0">, </span><span class="s1">safeEval</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib </span><span class="s0">import </span><span class="s1">TTLibError</span>
+<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">MutableMapping</span>
+
+
+<span class="s2"># Apple's documentation of 'trak':</span>
+<span class="s2"># https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6trak.html</span>
+
+<span class="s1">TRAK_HEADER_FORMAT = </span><span class="s3">&quot;&quot;&quot; 
+    &gt; # big endian 
+    version:     16.16F 
+    format:      H 
+    horizOffset: H 
+    vertOffset:  H 
+    reserved:    H 
+&quot;&quot;&quot;</span>
+
+<span class="s1">TRAK_HEADER_FORMAT_SIZE = sstruct.calcsize(TRAK_HEADER_FORMAT)</span>
+
+
+<span class="s1">TRACK_DATA_FORMAT = </span><span class="s3">&quot;&quot;&quot; 
+    &gt; # big endian 
+    nTracks:         H 
+    nSizes:          H 
+    sizeTableOffset: L 
+&quot;&quot;&quot;</span>
+
+<span class="s1">TRACK_DATA_FORMAT_SIZE = sstruct.calcsize(TRACK_DATA_FORMAT)</span>
+
+
+<span class="s1">TRACK_TABLE_ENTRY_FORMAT = </span><span class="s3">&quot;&quot;&quot; 
+    &gt; # big endian 
+    track:      16.16F 
+    nameIndex:       H 
+    offset:          H 
+&quot;&quot;&quot;</span>
+
+<span class="s1">TRACK_TABLE_ENTRY_FORMAT_SIZE = sstruct.calcsize(TRACK_TABLE_ENTRY_FORMAT)</span>
+
+
+<span class="s2"># size values are actually '16.16F' fixed-point values, but here I do the</span>
+<span class="s2"># fixedToFloat conversion manually instead of relying on sstruct</span>
+<span class="s1">SIZE_VALUE_FORMAT = </span><span class="s3">&quot;&gt;l&quot;</span>
+<span class="s1">SIZE_VALUE_FORMAT_SIZE = struct.calcsize(SIZE_VALUE_FORMAT)</span>
+
+<span class="s2"># per-Size values are in 'FUnits', i.e. 16-bit signed integers</span>
+<span class="s1">PER_SIZE_VALUE_FORMAT = </span><span class="s3">&quot;&gt;h&quot;</span>
+<span class="s1">PER_SIZE_VALUE_FORMAT_SIZE = struct.calcsize(PER_SIZE_VALUE_FORMAT)</span>
+
+
+<span class="s0">class </span><span class="s1">table__t_r_a_k(DefaultTable.DefaultTable):</span>
+	<span class="s1">dependencies = [</span><span class="s3">'name'</span><span class="s1">]</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">dataList = []</span>
+		<span class="s1">offset = TRAK_HEADER_FORMAT_SIZE</span>
+		<span class="s0">for </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">(</span><span class="s3">'horiz'</span><span class="s0">, </span><span class="s3">'vert'</span><span class="s1">):</span>
+			<span class="s1">trackData = getattr(self</span><span class="s0">, </span><span class="s1">direction + </span><span class="s3">'Data'</span><span class="s0">, </span><span class="s1">TrackData())</span>
+			<span class="s1">offsetName = direction + </span><span class="s3">'Offset'</span>
+			<span class="s2"># set offset to 0 if None or empty</span>
+			<span class="s0">if not </span><span class="s1">trackData:</span>
+				<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">offsetName</span><span class="s0">, </span><span class="s4">0</span><span class="s1">)</span>
+				<span class="s0">continue</span>
+			<span class="s2"># TrackData table format must be longword aligned</span>
+			<span class="s1">alignedOffset = (offset + </span><span class="s4">3</span><span class="s1">) &amp; ~</span><span class="s4">3</span>
+			<span class="s1">padding</span><span class="s0">, </span><span class="s1">offset = </span><span class="s5">b&quot;</span><span class="s0">\x00</span><span class="s5">&quot;</span><span class="s1">*(alignedOffset - offset)</span><span class="s0">, </span><span class="s1">alignedOffset</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">offsetName</span><span class="s0">, </span><span class="s1">offset)</span>
+
+			<span class="s1">data = trackData.compile(offset)</span>
+			<span class="s1">offset += len(data)</span>
+			<span class="s1">dataList.append(padding + data)</span>
+
+		<span class="s1">self.reserved = </span><span class="s4">0</span>
+		<span class="s1">tableData = bytesjoin([sstruct.pack(TRAK_HEADER_FORMAT</span><span class="s0">, </span><span class="s1">self)] + dataList)</span>
+		<span class="s0">return </span><span class="s1">tableData</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">sstruct.unpack(TRAK_HEADER_FORMAT</span><span class="s0">, </span><span class="s1">data[:TRAK_HEADER_FORMAT_SIZE]</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s0">for </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">(</span><span class="s3">'horiz'</span><span class="s0">, </span><span class="s3">'vert'</span><span class="s1">):</span>
+			<span class="s1">trackData = TrackData()</span>
+			<span class="s1">offset = getattr(self</span><span class="s0">, </span><span class="s1">direction + </span><span class="s3">'Offset'</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">offset != </span><span class="s4">0</span><span class="s1">:</span>
+				<span class="s1">trackData.decompile(data</span><span class="s0">, </span><span class="s1">offset)</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">direction + </span><span class="s3">'Data'</span><span class="s0">, </span><span class="s1">trackData)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">writer.simpletag(</span><span class="s3">'version'</span><span class="s0">, </span><span class="s1">value=self.version)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s1">writer.simpletag(</span><span class="s3">'format'</span><span class="s0">, </span><span class="s1">value=self.format)</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">direction </span><span class="s0">in </span><span class="s1">(</span><span class="s3">'horiz'</span><span class="s0">, </span><span class="s3">'vert'</span><span class="s1">):</span>
+			<span class="s1">dataName = direction + </span><span class="s3">'Data'</span>
+			<span class="s1">writer.begintag(dataName)</span>
+			<span class="s1">writer.newline()</span>
+			<span class="s1">trackData = getattr(self</span><span class="s0">, </span><span class="s1">dataName</span><span class="s0">, </span><span class="s1">TrackData())</span>
+			<span class="s1">trackData.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+			<span class="s1">writer.endtag(dataName)</span>
+			<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s3">'version'</span><span class="s1">:</span>
+			<span class="s1">self.version = safeEval(attrs[</span><span class="s3">'value'</span><span class="s1">])</span>
+		<span class="s0">elif </span><span class="s1">name == </span><span class="s3">'format'</span><span class="s1">:</span>
+			<span class="s1">self.format = safeEval(attrs[</span><span class="s3">'value'</span><span class="s1">])</span>
+		<span class="s0">elif </span><span class="s1">name </span><span class="s0">in </span><span class="s1">(</span><span class="s3">'horizData'</span><span class="s0">, </span><span class="s3">'vertData'</span><span class="s1">):</span>
+			<span class="s1">trackData = TrackData()</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">trackData)</span>
+			<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+				<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+					<span class="s0">continue</span>
+				<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content_ = element</span>
+				<span class="s1">trackData.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content_</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+
+<span class="s0">class </span><span class="s1">TrackData(MutableMapping):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">initialdata={}):</span>
+		<span class="s1">self._map = dict(initialdata)</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">offset):</span>
+		<span class="s1">nTracks = len(self)</span>
+		<span class="s1">sizes = self.sizes()</span>
+		<span class="s1">nSizes = len(sizes)</span>
+
+		<span class="s2"># offset to the start of the size subtable</span>
+		<span class="s1">offset += TRACK_DATA_FORMAT_SIZE + TRACK_TABLE_ENTRY_FORMAT_SIZE*nTracks</span>
+		<span class="s1">trackDataHeader = sstruct.pack(</span>
+			<span class="s1">TRACK_DATA_FORMAT</span><span class="s0">,</span>
+			<span class="s1">{</span><span class="s3">'nTracks'</span><span class="s1">: nTracks</span><span class="s0">, </span><span class="s3">'nSizes'</span><span class="s1">: nSizes</span><span class="s0">, </span><span class="s3">'sizeTableOffset'</span><span class="s1">: offset})</span>
+
+		<span class="s1">entryDataList = []</span>
+		<span class="s1">perSizeDataList = []</span>
+		<span class="s2"># offset to per-size tracking values</span>
+		<span class="s1">offset += SIZE_VALUE_FORMAT_SIZE*nSizes</span>
+		<span class="s2"># sort track table entries by track value</span>
+		<span class="s0">for </span><span class="s1">track</span><span class="s0">, </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">sorted(self.items()):</span>
+			<span class="s0">assert </span><span class="s1">entry.nameIndex </span><span class="s0">is not None</span>
+			<span class="s1">entry.track = track</span>
+			<span class="s1">entry.offset = offset</span>
+			<span class="s1">entryDataList += [sstruct.pack(TRACK_TABLE_ENTRY_FORMAT</span><span class="s0">, </span><span class="s1">entry)]</span>
+			<span class="s2"># sort per-size values by size</span>
+			<span class="s0">for </span><span class="s1">size</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">sorted(entry.items()):</span>
+				<span class="s1">perSizeDataList += [struct.pack(PER_SIZE_VALUE_FORMAT</span><span class="s0">, </span><span class="s1">value)]</span>
+			<span class="s1">offset += PER_SIZE_VALUE_FORMAT_SIZE*nSizes</span>
+		<span class="s2"># sort size values</span>
+		<span class="s1">sizeDataList = [struct.pack(SIZE_VALUE_FORMAT</span><span class="s0">, </span><span class="s1">fl2fi(sv</span><span class="s0">, </span><span class="s4">16</span><span class="s1">)) </span><span class="s0">for </span><span class="s1">sv </span><span class="s0">in </span><span class="s1">sorted(sizes)]</span>
+
+		<span class="s1">data = bytesjoin([trackDataHeader] + entryDataList + sizeDataList + perSizeDataList)</span>
+		<span class="s0">return </span><span class="s1">data</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset):</span>
+		<span class="s2"># initial offset is from the start of trak table to the current TrackData</span>
+		<span class="s1">trackDataHeader = data[offset:offset+TRACK_DATA_FORMAT_SIZE]</span>
+		<span class="s0">if </span><span class="s1">len(trackDataHeader) != TRACK_DATA_FORMAT_SIZE:</span>
+			<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s3">'not enough data to decompile TrackData header'</span><span class="s1">)</span>
+		<span class="s1">sstruct.unpack(TRACK_DATA_FORMAT</span><span class="s0">, </span><span class="s1">trackDataHeader</span><span class="s0">, </span><span class="s1">self)</span>
+		<span class="s1">offset += TRACK_DATA_FORMAT_SIZE</span>
+
+		<span class="s1">nSizes = self.nSizes</span>
+		<span class="s1">sizeTableOffset = self.sizeTableOffset</span>
+		<span class="s1">sizeTable = []</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(nSizes):</span>
+			<span class="s1">sizeValueData = data[sizeTableOffset:sizeTableOffset+SIZE_VALUE_FORMAT_SIZE]</span>
+			<span class="s0">if </span><span class="s1">len(sizeValueData) &lt; SIZE_VALUE_FORMAT_SIZE:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s3">'not enough data to decompile TrackData size subtable'</span><span class="s1">)</span>
+			<span class="s1">sizeValue</span><span class="s0">, </span><span class="s1">= struct.unpack(SIZE_VALUE_FORMAT</span><span class="s0">, </span><span class="s1">sizeValueData)</span>
+			<span class="s1">sizeTable.append(fi2fl(sizeValue</span><span class="s0">, </span><span class="s4">16</span><span class="s1">))</span>
+			<span class="s1">sizeTableOffset += SIZE_VALUE_FORMAT_SIZE</span>
+
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.nTracks):</span>
+			<span class="s1">entry = TrackTableEntry()</span>
+			<span class="s1">entryData = data[offset:offset+TRACK_TABLE_ENTRY_FORMAT_SIZE]</span>
+			<span class="s0">if </span><span class="s1">len(entryData) &lt; TRACK_TABLE_ENTRY_FORMAT_SIZE:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s3">'not enough data to decompile TrackTableEntry record'</span><span class="s1">)</span>
+			<span class="s1">sstruct.unpack(TRACK_TABLE_ENTRY_FORMAT</span><span class="s0">, </span><span class="s1">entryData</span><span class="s0">, </span><span class="s1">entry)</span>
+			<span class="s1">perSizeOffset = entry.offset</span>
+			<span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range(nSizes):</span>
+				<span class="s1">size = sizeTable[j]</span>
+				<span class="s1">perSizeValueData = data[perSizeOffset:perSizeOffset+PER_SIZE_VALUE_FORMAT_SIZE]</span>
+				<span class="s0">if </span><span class="s1">len(perSizeValueData) &lt; PER_SIZE_VALUE_FORMAT_SIZE:</span>
+					<span class="s0">raise </span><span class="s1">TTLibError(</span><span class="s3">'not enough data to decompile per-size track values'</span><span class="s1">)</span>
+				<span class="s1">perSizeValue</span><span class="s0">, </span><span class="s1">= struct.unpack(PER_SIZE_VALUE_FORMAT</span><span class="s0">, </span><span class="s1">perSizeValueData)</span>
+				<span class="s1">entry[size] = perSizeValue</span>
+				<span class="s1">perSizeOffset += PER_SIZE_VALUE_FORMAT_SIZE</span>
+			<span class="s1">self[entry.track] = entry</span>
+			<span class="s1">offset += TRACK_TABLE_ENTRY_FORMAT_SIZE</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">nTracks = len(self)</span>
+		<span class="s1">nSizes = len(self.sizes())</span>
+		<span class="s1">writer.comment(</span><span class="s3">&quot;nTracks=%d, nSizes=%d&quot; </span><span class="s1">% (nTracks</span><span class="s0">, </span><span class="s1">nSizes))</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">track</span><span class="s0">, </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">sorted(self.items()):</span>
+			<span class="s0">assert </span><span class="s1">entry.nameIndex </span><span class="s0">is not None</span>
+			<span class="s1">entry.track = track</span>
+			<span class="s1">entry.toXML(writer</span><span class="s0">, </span><span class="s1">ttFont)</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s0">if </span><span class="s1">name != </span><span class="s3">'trackEntry'</span><span class="s1">:</span>
+			<span class="s0">return</span>
+		<span class="s1">entry = TrackTableEntry()</span>
+		<span class="s1">entry.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont)</span>
+		<span class="s1">self[entry.track] = entry</span>
+
+	<span class="s0">def </span><span class="s1">sizes(self):</span>
+		<span class="s0">if not </span><span class="s1">self:</span>
+			<span class="s0">return </span><span class="s1">frozenset()</span>
+		<span class="s1">tracks = list(self.tracks())</span>
+		<span class="s1">sizes = self[tracks.pop(</span><span class="s4">0</span><span class="s1">)].sizes()</span>
+		<span class="s0">for </span><span class="s1">track </span><span class="s0">in </span><span class="s1">tracks:</span>
+			<span class="s1">entrySizes = self[track].sizes()</span>
+			<span class="s0">if </span><span class="s1">sizes != entrySizes:</span>
+				<span class="s0">raise </span><span class="s1">TTLibError(</span>
+					<span class="s3">&quot;'trak' table entries must specify the same sizes: &quot;</span>
+					<span class="s3">&quot;%s != %s&quot; </span><span class="s1">% (sorted(sizes)</span><span class="s0">, </span><span class="s1">sorted(entrySizes)))</span>
+		<span class="s0">return </span><span class="s1">frozenset(sizes)</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">track):</span>
+		<span class="s0">return </span><span class="s1">self._map[track]</span>
+
+	<span class="s0">def </span><span class="s1">__delitem__(self</span><span class="s0">, </span><span class="s1">track):</span>
+		<span class="s0">del </span><span class="s1">self._map[track]</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">track</span><span class="s0">, </span><span class="s1">entry):</span>
+		<span class="s1">self._map[track] = entry</span>
+
+	<span class="s0">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">return </span><span class="s1">len(self._map)</span>
+
+	<span class="s0">def </span><span class="s1">__iter__(self):</span>
+		<span class="s0">return </span><span class="s1">iter(self._map)</span>
+
+	<span class="s0">def </span><span class="s1">keys(self):</span>
+		<span class="s0">return </span><span class="s1">self._map.keys()</span>
+
+	<span class="s1">tracks = keys</span>
+
+	<span class="s0">def </span><span class="s1">__repr__(self):</span>
+		<span class="s0">return </span><span class="s3">&quot;TrackData({})&quot;</span><span class="s1">.format(self._map </span><span class="s0">if </span><span class="s1">self </span><span class="s0">else </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">TrackTableEntry(MutableMapping):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">values={}</span><span class="s0">, </span><span class="s1">nameIndex=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.nameIndex = nameIndex</span>
+		<span class="s1">self._map = dict(values)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">name = ttFont[</span><span class="s3">&quot;name&quot;</span><span class="s1">].getDebugName(self.nameIndex)</span>
+		<span class="s1">writer.begintag(</span>
+			<span class="s3">&quot;trackEntry&quot;</span><span class="s0">,</span>
+			<span class="s1">((</span><span class="s3">'value'</span><span class="s0">, </span><span class="s1">fl2str(self.track</span><span class="s0">, </span><span class="s4">16</span><span class="s1">))</span><span class="s0">, </span><span class="s1">(</span><span class="s3">'nameIndex'</span><span class="s0">, </span><span class="s1">self.nameIndex)))</span>
+		<span class="s1">writer.newline()</span>
+		<span class="s0">if </span><span class="s1">name:</span>
+			<span class="s1">writer.comment(name)</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s0">for </span><span class="s1">size</span><span class="s0">, </span><span class="s1">perSizeValue </span><span class="s0">in </span><span class="s1">sorted(self.items()):</span>
+			<span class="s1">writer.simpletag(</span><span class="s3">&quot;track&quot;</span><span class="s0">, </span><span class="s1">size=fl2str(size</span><span class="s0">, </span><span class="s4">16</span><span class="s1">)</span><span class="s0">, </span><span class="s1">value=perSizeValue)</span>
+			<span class="s1">writer.newline()</span>
+		<span class="s1">writer.endtag(</span><span class="s3">&quot;trackEntry&quot;</span><span class="s1">)</span>
+		<span class="s1">writer.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">ttFont):</span>
+		<span class="s1">self.track = str2fl(attrs[</span><span class="s3">'value'</span><span class="s1">]</span><span class="s0">, </span><span class="s4">16</span><span class="s1">)</span>
+		<span class="s1">self.nameIndex = safeEval(attrs[</span><span class="s3">'nameIndex'</span><span class="s1">])</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">_ = element</span>
+			<span class="s0">if </span><span class="s1">name != </span><span class="s3">'track'</span><span class="s1">:</span>
+				<span class="s0">continue</span>
+			<span class="s1">size = str2fl(attrs[</span><span class="s3">'size'</span><span class="s1">]</span><span class="s0">, </span><span class="s4">16</span><span class="s1">)</span>
+			<span class="s1">self[size] = safeEval(attrs[</span><span class="s3">'value'</span><span class="s1">])</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">size):</span>
+		<span class="s0">return </span><span class="s1">self._map[size]</span>
+
+	<span class="s0">def </span><span class="s1">__delitem__(self</span><span class="s0">, </span><span class="s1">size):</span>
+		<span class="s0">del </span><span class="s1">self._map[size]</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">size</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">self._map[size] = value</span>
+
+	<span class="s0">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">return </span><span class="s1">len(self._map)</span>
+
+	<span class="s0">def </span><span class="s1">__iter__(self):</span>
+		<span class="s0">return </span><span class="s1">iter(self._map)</span>
+
+	<span class="s0">def </span><span class="s1">keys(self):</span>
+		<span class="s0">return </span><span class="s1">self._map.keys()</span>
+
+	<span class="s1">sizes = keys</span>
+
+	<span class="s0">def </span><span class="s1">__repr__(self):</span>
+		<span class="s0">return </span><span class="s3">&quot;TrackTableEntry({}, nameIndex={})&quot;</span><span class="s1">.format(self._map</span><span class="s0">, </span><span class="s1">self.nameIndex)</span>
+
+	<span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if not </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">self.__class__):</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+		<span class="s0">return </span><span class="s1">self.nameIndex == other.nameIndex </span><span class="s0">and </span><span class="s1">dict(self) == dict(other)</span>
+
+	<span class="s0">def </span><span class="s1">__ne__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s0">return </span><span class="s1">result </span><span class="s0">if </span><span class="s1">result </span><span class="s0">is </span><span class="s1">NotImplemented </span><span class="s0">else not </span><span class="s1">result</span>
+</pre>
+</body>
+</html>

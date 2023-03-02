@@ -1,0 +1,547 @@
+<html>
+<head>
+<title>decorators.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+decorators.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">contextlib</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">from </span><span class="s1">pathlib </span><span class="s0">import </span><span class="s1">Path</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">string</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+
+<span class="s0">from </span><span class="s1">packaging.version </span><span class="s0">import </span><span class="s1">parse </span><span class="s0">as </span><span class="s1">parse_version</span>
+
+<span class="s0">import </span><span class="s1">matplotlib.style</span>
+<span class="s0">import </span><span class="s1">matplotlib.units</span>
+<span class="s0">import </span><span class="s1">matplotlib.testing</span>
+<span class="s0">from </span><span class="s1">matplotlib </span><span class="s0">import </span><span class="s1">(_api</span><span class="s0">, </span><span class="s1">_pylab_helpers</span><span class="s0">, </span><span class="s1">cbook</span><span class="s0">, </span><span class="s1">ft2font</span><span class="s0">, </span><span class="s1">pyplot </span><span class="s0">as </span><span class="s1">plt</span><span class="s0">,</span>
+                        <span class="s1">ticker)</span>
+<span class="s0">from </span><span class="s1">.compare </span><span class="s0">import </span><span class="s1">comparable_formats</span><span class="s0">, </span><span class="s1">compare_images</span><span class="s0">, </span><span class="s1">make_test_filename</span>
+<span class="s0">from </span><span class="s1">.exceptions </span><span class="s0">import </span><span class="s1">ImageComparisonFailure</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">_cleanup_cm():</span>
+    <span class="s1">orig_units_registry = matplotlib.units.registry.copy()</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">with </span><span class="s1">warnings.catch_warnings()</span><span class="s0">, </span><span class="s1">matplotlib.rc_context():</span>
+            <span class="s0">yield</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">matplotlib.units.registry.clear()</span>
+        <span class="s1">matplotlib.units.registry.update(orig_units_registry)</span>
+        <span class="s1">plt.close(</span><span class="s2">&quot;all&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s2">&quot;3.6&quot;</span><span class="s0">, </span><span class="s1">alternative=</span><span class="s2">&quot;a vendored copy of the existing code, &quot;</span>
+                 <span class="s2">&quot;including the private function _cleanup_cm&quot;</span><span class="s1">)</span>
+<span class="s0">class </span><span class="s1">CleanupTestCase(unittest.TestCase):</span>
+    <span class="s3">&quot;&quot;&quot;A wrapper for unittest.TestCase that includes cleanup operations.&quot;&quot;&quot;</span>
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">setUpClass(cls):</span>
+        <span class="s1">cls._cm = _cleanup_cm().__enter__()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">tearDownClass(cls):</span>
+        <span class="s1">cls._cm.__exit__(</span><span class="s0">None, None, None</span><span class="s1">)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s2">&quot;3.6&quot;</span><span class="s0">, </span><span class="s1">alternative=</span><span class="s2">&quot;a vendored copy of the existing code, &quot;</span>
+                 <span class="s2">&quot;including the private function _cleanup_cm&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">cleanup(style=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    A decorator to ensure that any global state is reset before 
+    running a test. 
+ 
+    Parameters 
+    ---------- 
+    style : str, dict, or list, optional 
+        The style(s) to apply.  Defaults to ``[&quot;classic&quot;, 
+        &quot;_classic_test_patch&quot;]``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># If cleanup is used without arguments, *style* will be a callable, and we</span>
+    <span class="s4"># pass it directly to the wrapper generator.  If cleanup if called with an</span>
+    <span class="s4"># argument, it is a string naming a style, and the function will be passed</span>
+    <span class="s4"># as an argument to what we return.  This is a confusing, but somewhat</span>
+    <span class="s4"># standard, pattern for writing a decorator with optional arguments.</span>
+
+    <span class="s0">def </span><span class="s1">make_cleanup(func):</span>
+        <span class="s0">if </span><span class="s1">inspect.isgeneratorfunction(func):</span>
+            <span class="s1">@functools.wraps(func)</span>
+            <span class="s0">def </span><span class="s1">wrapped_callable(*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+                <span class="s0">with </span><span class="s1">_cleanup_cm()</span><span class="s0">, </span><span class="s1">matplotlib.style.context(style):</span>
+                    <span class="s0">yield from </span><span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">@functools.wraps(func)</span>
+            <span class="s0">def </span><span class="s1">wrapped_callable(*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+                <span class="s0">with </span><span class="s1">_cleanup_cm()</span><span class="s0">, </span><span class="s1">matplotlib.style.context(style):</span>
+                    <span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s0">return </span><span class="s1">wrapped_callable</span>
+
+    <span class="s0">if </span><span class="s1">callable(style):</span>
+        <span class="s1">result = make_cleanup(style)</span>
+        <span class="s4"># Default of mpl_test_settings fixture and image_comparison too.</span>
+        <span class="s1">style = [</span><span class="s2">&quot;classic&quot;</span><span class="s0">, </span><span class="s2">&quot;_classic_test_patch&quot;</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">result</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">make_cleanup</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s2">&quot;3.6&quot;</span><span class="s0">, </span><span class="s1">alternative=</span><span class="s2">&quot;a vendored copy of the existing code &quot;</span>
+                 <span class="s2">&quot;of _check_freetype_version&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">check_freetype_version(ver):</span>
+    <span class="s0">return </span><span class="s1">_check_freetype_version(ver)</span>
+
+
+<span class="s0">def </span><span class="s1">_check_freetype_version(ver):</span>
+    <span class="s0">if </span><span class="s1">ver </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">return True</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(ver</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s1">ver = (ver</span><span class="s0">, </span><span class="s1">ver)</span>
+    <span class="s1">ver = [parse_version(x) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">ver]</span>
+    <span class="s1">found = parse_version(ft2font.__freetype_version__)</span>
+
+    <span class="s0">return </span><span class="s1">ver[</span><span class="s5">0</span><span class="s1">] &lt;= found &lt;= ver[</span><span class="s5">1</span><span class="s1">]</span>
+
+
+<span class="s0">def </span><span class="s1">_checked_on_freetype_version(required_freetype_version):</span>
+    <span class="s0">import </span><span class="s1">pytest</span>
+    <span class="s0">return </span><span class="s1">pytest.mark.xfail(</span>
+        <span class="s0">not </span><span class="s1">_check_freetype_version(required_freetype_version)</span><span class="s0">,</span>
+        <span class="s1">reason=</span><span class="s2">f&quot;Mismatched version of freetype. &quot;</span>
+               <span class="s2">f&quot;Test requires '</span><span class="s0">{</span><span class="s1">required_freetype_version</span><span class="s0">}</span><span class="s2">', &quot;</span>
+               <span class="s2">f&quot;you have '</span><span class="s0">{</span><span class="s1">ft2font.__freetype_version__</span><span class="s0">}</span><span class="s2">'&quot;</span><span class="s0">,</span>
+        <span class="s1">raises=ImageComparisonFailure</span><span class="s0">, </span><span class="s1">strict=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">remove_ticks_and_titles(figure):</span>
+    <span class="s1">figure.suptitle(</span><span class="s2">&quot;&quot;</span><span class="s1">)</span>
+    <span class="s1">null_formatter = ticker.NullFormatter()</span>
+    <span class="s0">def </span><span class="s1">remove_ticks(ax):</span>
+        <span class="s3">&quot;&quot;&quot;Remove ticks in *ax* and all its child Axes.&quot;&quot;&quot;</span>
+        <span class="s1">ax.set_title(</span><span class="s2">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">ax.xaxis.set_major_formatter(null_formatter)</span>
+        <span class="s1">ax.xaxis.set_minor_formatter(null_formatter)</span>
+        <span class="s1">ax.yaxis.set_major_formatter(null_formatter)</span>
+        <span class="s1">ax.yaxis.set_minor_formatter(null_formatter)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">ax.zaxis.set_major_formatter(null_formatter)</span>
+            <span class="s1">ax.zaxis.set_minor_formatter(null_formatter)</span>
+        <span class="s0">except </span><span class="s1">AttributeError:</span>
+            <span class="s0">pass</span>
+        <span class="s0">for </span><span class="s1">child </span><span class="s0">in </span><span class="s1">ax.child_axes:</span>
+            <span class="s1">remove_ticks(child)</span>
+    <span class="s0">for </span><span class="s1">ax </span><span class="s0">in </span><span class="s1">figure.get_axes():</span>
+        <span class="s1">remove_ticks(ax)</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">_collect_new_figures():</span>
+    <span class="s3">&quot;&quot;&quot; 
+    After:: 
+ 
+        with _collect_new_figures() as figs: 
+            some_code() 
+ 
+    the list *figs* contains the figures that have been created during the 
+    execution of ``some_code``, sorted by figure number. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">managers = _pylab_helpers.Gcf.figs</span>
+    <span class="s1">preexisting = [manager </span><span class="s0">for </span><span class="s1">manager </span><span class="s0">in </span><span class="s1">managers.values()]</span>
+    <span class="s1">new_figs = []</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">yield </span><span class="s1">new_figs</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">new_managers = sorted([manager </span><span class="s0">for </span><span class="s1">manager </span><span class="s0">in </span><span class="s1">managers.values()</span>
+                               <span class="s0">if </span><span class="s1">manager </span><span class="s0">not in </span><span class="s1">preexisting]</span><span class="s0">,</span>
+                              <span class="s1">key=</span><span class="s0">lambda </span><span class="s1">manager: manager.num)</span>
+        <span class="s1">new_figs[:] = [manager.canvas.figure </span><span class="s0">for </span><span class="s1">manager </span><span class="s0">in </span><span class="s1">new_managers]</span>
+
+
+<span class="s0">def </span><span class="s1">_raise_on_image_difference(expected</span><span class="s0">, </span><span class="s1">actual</span><span class="s0">, </span><span class="s1">tol):</span>
+    <span class="s1">__tracebackhide__ = </span><span class="s0">True</span>
+
+    <span class="s1">err = compare_images(expected</span><span class="s0">, </span><span class="s1">actual</span><span class="s0">, </span><span class="s1">tol</span><span class="s0">, </span><span class="s1">in_decorator=</span><span class="s0">True</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">err:</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;actual&quot;</span><span class="s0">, </span><span class="s2">&quot;expected&quot;</span><span class="s0">, </span><span class="s2">&quot;diff&quot;</span><span class="s1">]:</span>
+            <span class="s1">err[key] = os.path.relpath(err[key])</span>
+        <span class="s0">raise </span><span class="s1">ImageComparisonFailure(</span>
+            <span class="s1">(</span><span class="s2">'images not close (RMS %(rms).3f):'</span>
+                <span class="s2">'</span><span class="s0">\n\t</span><span class="s2">%(actual)s</span><span class="s0">\n\t</span><span class="s2">%(expected)s</span><span class="s0">\n\t</span><span class="s2">%(diff)s'</span><span class="s1">) % err)</span>
+
+
+<span class="s0">class </span><span class="s1">_ImageComparisonBase:</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Image comparison base class 
+ 
+    This class provides *just* the comparison-related functionality and avoids 
+    any code that would be specific to any testing framework. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">func</span><span class="s0">, </span><span class="s1">tol</span><span class="s0">, </span><span class="s1">remove_text</span><span class="s0">, </span><span class="s1">savefig_kwargs):</span>
+        <span class="s1">self.func = func</span>
+        <span class="s1">self.baseline_dir</span><span class="s0">, </span><span class="s1">self.result_dir = _image_directories(func)</span>
+        <span class="s1">self.tol = tol</span>
+        <span class="s1">self.remove_text = remove_text</span>
+        <span class="s1">self.savefig_kwargs = savefig_kwargs</span>
+
+    <span class="s0">def </span><span class="s1">copy_baseline(self</span><span class="s0">, </span><span class="s1">baseline</span><span class="s0">, </span><span class="s1">extension):</span>
+        <span class="s1">baseline_path = self.baseline_dir / baseline</span>
+        <span class="s1">orig_expected_path = baseline_path.with_suffix(</span><span class="s2">f'.</span><span class="s0">{</span><span class="s1">extension</span><span class="s0">}</span><span class="s2">'</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">extension == </span><span class="s2">'eps' </span><span class="s0">and not </span><span class="s1">orig_expected_path.exists():</span>
+            <span class="s1">orig_expected_path = orig_expected_path.with_suffix(</span><span class="s2">'.pdf'</span><span class="s1">)</span>
+        <span class="s1">expected_fname = make_test_filename(</span>
+            <span class="s1">self.result_dir / orig_expected_path.name</span><span class="s0">, </span><span class="s2">'expected'</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s4"># os.symlink errors if the target already exists.</span>
+            <span class="s0">with </span><span class="s1">contextlib.suppress(OSError):</span>
+                <span class="s1">os.remove(expected_fname)</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">os.symlink(orig_expected_path</span><span class="s0">, </span><span class="s1">expected_fname)</span>
+            <span class="s0">except </span><span class="s1">OSError:  </span><span class="s4"># On Windows, symlink *may* be unavailable.</span>
+                <span class="s1">shutil.copyfile(orig_expected_path</span><span class="s0">, </span><span class="s1">expected_fname)</span>
+        <span class="s0">except </span><span class="s1">OSError </span><span class="s0">as </span><span class="s1">err:</span>
+            <span class="s0">raise </span><span class="s1">ImageComparisonFailure(</span>
+                <span class="s2">f&quot;Missing baseline image </span><span class="s0">{</span><span class="s1">expected_fname</span><span class="s0">} </span><span class="s2">because the &quot;</span>
+                <span class="s2">f&quot;following file cannot be accessed: &quot;</span>
+                <span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">orig_expected_path</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">) </span><span class="s0">from </span><span class="s1">err</span>
+        <span class="s0">return </span><span class="s1">expected_fname</span>
+
+    <span class="s0">def </span><span class="s1">compare(self</span><span class="s0">, </span><span class="s1">fig</span><span class="s0">, </span><span class="s1">baseline</span><span class="s0">, </span><span class="s1">extension</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">_lock=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s1">__tracebackhide__ = </span><span class="s0">True</span>
+
+        <span class="s0">if </span><span class="s1">self.remove_text:</span>
+            <span class="s1">remove_ticks_and_titles(fig)</span>
+
+        <span class="s1">actual_path = (self.result_dir / baseline).with_suffix(</span><span class="s2">f'.</span><span class="s0">{</span><span class="s1">extension</span><span class="s0">}</span><span class="s2">'</span><span class="s1">)</span>
+        <span class="s1">kwargs = self.savefig_kwargs.copy()</span>
+        <span class="s0">if </span><span class="s1">extension == </span><span class="s2">'pdf'</span><span class="s1">:</span>
+            <span class="s1">kwargs.setdefault(</span><span class="s2">'metadata'</span><span class="s0">,</span>
+                              <span class="s1">{</span><span class="s2">'Creator'</span><span class="s1">: </span><span class="s0">None, </span><span class="s2">'Producer'</span><span class="s1">: </span><span class="s0">None,</span>
+                               <span class="s2">'CreationDate'</span><span class="s1">: </span><span class="s0">None</span><span class="s1">})</span>
+
+        <span class="s1">lock = (cbook._lock_path(actual_path)</span>
+                <span class="s0">if </span><span class="s1">_lock </span><span class="s0">else </span><span class="s1">contextlib.nullcontext())</span>
+        <span class="s0">with </span><span class="s1">lock:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">fig.savefig(actual_path</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s0">finally</span><span class="s1">:</span>
+                <span class="s4"># Matplotlib has an autouse fixture to close figures, but this</span>
+                <span class="s4"># makes things more convenient for third-party users.</span>
+                <span class="s1">plt.close(fig)</span>
+            <span class="s1">expected_path = self.copy_baseline(baseline</span><span class="s0">, </span><span class="s1">extension)</span>
+            <span class="s1">_raise_on_image_difference(expected_path</span><span class="s0">, </span><span class="s1">actual_path</span><span class="s0">, </span><span class="s1">self.tol)</span>
+
+
+<span class="s0">def </span><span class="s1">_pytest_image_comparison(baseline_images</span><span class="s0">, </span><span class="s1">extensions</span><span class="s0">, </span><span class="s1">tol</span><span class="s0">,</span>
+                             <span class="s1">freetype_version</span><span class="s0">, </span><span class="s1">remove_text</span><span class="s0">, </span><span class="s1">savefig_kwargs</span><span class="s0">,</span>
+                             <span class="s1">style):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Decorate function with image comparison for pytest. 
+ 
+    This function creates a decorator that wraps a figure-generating function 
+    with image comparison code. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">import </span><span class="s1">pytest</span>
+
+    <span class="s1">KEYWORD_ONLY = inspect.Parameter.KEYWORD_ONLY</span>
+
+    <span class="s0">def </span><span class="s1">decorator(func):</span>
+        <span class="s1">old_sig = inspect.signature(func)</span>
+
+        <span class="s1">@functools.wraps(func)</span>
+        <span class="s1">@pytest.mark.parametrize(</span><span class="s2">'extension'</span><span class="s0">, </span><span class="s1">extensions)</span>
+        <span class="s1">@matplotlib.style.context(style)</span>
+        <span class="s1">@_checked_on_freetype_version(freetype_version)</span>
+        <span class="s1">@functools.wraps(func)</span>
+        <span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">extension</span><span class="s0">, </span><span class="s1">request</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+            <span class="s1">__tracebackhide__ = </span><span class="s0">True</span>
+            <span class="s0">if </span><span class="s2">'extension' </span><span class="s0">in </span><span class="s1">old_sig.parameters:</span>
+                <span class="s1">kwargs[</span><span class="s2">'extension'</span><span class="s1">] = extension</span>
+            <span class="s0">if </span><span class="s2">'request' </span><span class="s0">in </span><span class="s1">old_sig.parameters:</span>
+                <span class="s1">kwargs[</span><span class="s2">'request'</span><span class="s1">] = request</span>
+
+            <span class="s0">if </span><span class="s1">extension </span><span class="s0">not in </span><span class="s1">comparable_formats():</span>
+                <span class="s1">reason = {</span>
+                    <span class="s2">'pdf'</span><span class="s1">: </span><span class="s2">'because Ghostscript is not installed'</span><span class="s0">,</span>
+                    <span class="s2">'eps'</span><span class="s1">: </span><span class="s2">'because Ghostscript is not installed'</span><span class="s0">,</span>
+                    <span class="s2">'svg'</span><span class="s1">: </span><span class="s2">'because Inkscape is not installed'</span><span class="s0">,</span>
+                <span class="s1">}.get(extension</span><span class="s0">, </span><span class="s2">'on this system'</span><span class="s1">)</span>
+                <span class="s1">pytest.skip(</span><span class="s2">f&quot;Cannot compare </span><span class="s0">{</span><span class="s1">extension</span><span class="s0">} </span><span class="s2">files </span><span class="s0">{</span><span class="s1">reason</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+            <span class="s1">img = _ImageComparisonBase(func</span><span class="s0">, </span><span class="s1">tol=tol</span><span class="s0">, </span><span class="s1">remove_text=remove_text</span><span class="s0">,</span>
+                                       <span class="s1">savefig_kwargs=savefig_kwargs)</span>
+            <span class="s1">matplotlib.testing.set_font_settings_for_testing()</span>
+
+            <span class="s0">with </span><span class="s1">_collect_new_figures() </span><span class="s0">as </span><span class="s1">figs:</span>
+                <span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+            <span class="s4"># If the test is parametrized in any way other than applied via</span>
+            <span class="s4"># this decorator, then we need to use a lock to prevent two</span>
+            <span class="s4"># processes from touching the same output file.</span>
+            <span class="s1">needs_lock = any(</span>
+                <span class="s1">marker.args[</span><span class="s5">0</span><span class="s1">] != </span><span class="s2">'extension'</span>
+                <span class="s0">for </span><span class="s1">marker </span><span class="s0">in </span><span class="s1">request.node.iter_markers(</span><span class="s2">'parametrize'</span><span class="s1">))</span>
+
+            <span class="s0">if </span><span class="s1">baseline_images </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">our_baseline_images = baseline_images</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s4"># Allow baseline image list to be produced on the fly based on</span>
+                <span class="s4"># current parametrization.</span>
+                <span class="s1">our_baseline_images = request.getfixturevalue(</span>
+                    <span class="s2">'baseline_images'</span><span class="s1">)</span>
+
+            <span class="s0">assert </span><span class="s1">len(figs) == len(our_baseline_images)</span><span class="s0">, </span><span class="s1">(</span>
+                <span class="s2">&quot;Test generated {} images but there are {} baseline images&quot;</span>
+                <span class="s1">.format(len(figs)</span><span class="s0">, </span><span class="s1">len(our_baseline_images)))</span>
+            <span class="s0">for </span><span class="s1">fig</span><span class="s0">, </span><span class="s1">baseline </span><span class="s0">in </span><span class="s1">zip(figs</span><span class="s0">, </span><span class="s1">our_baseline_images):</span>
+                <span class="s1">img.compare(fig</span><span class="s0">, </span><span class="s1">baseline</span><span class="s0">, </span><span class="s1">extension</span><span class="s0">, </span><span class="s1">_lock=needs_lock)</span>
+
+        <span class="s1">parameters = list(old_sig.parameters.values())</span>
+        <span class="s0">if </span><span class="s2">'extension' </span><span class="s0">not in </span><span class="s1">old_sig.parameters:</span>
+            <span class="s1">parameters += [inspect.Parameter(</span><span class="s2">'extension'</span><span class="s0">, </span><span class="s1">KEYWORD_ONLY)]</span>
+        <span class="s0">if </span><span class="s2">'request' </span><span class="s0">not in </span><span class="s1">old_sig.parameters:</span>
+            <span class="s1">parameters += [inspect.Parameter(</span><span class="s2">&quot;request&quot;</span><span class="s0">, </span><span class="s1">KEYWORD_ONLY)]</span>
+        <span class="s1">new_sig = old_sig.replace(parameters=parameters)</span>
+        <span class="s1">wrapper.__signature__ = new_sig</span>
+
+        <span class="s4"># Reach a bit into pytest internals to hoist the marks from our wrapped</span>
+        <span class="s4"># function.</span>
+        <span class="s1">new_marks = getattr(func</span><span class="s0">, </span><span class="s2">'pytestmark'</span><span class="s0">, </span><span class="s1">[]) + wrapper.pytestmark</span>
+        <span class="s1">wrapper.pytestmark = new_marks</span>
+
+        <span class="s0">return </span><span class="s1">wrapper</span>
+
+    <span class="s0">return </span><span class="s1">decorator</span>
+
+
+<span class="s0">def </span><span class="s1">image_comparison(baseline_images</span><span class="s0">, </span><span class="s1">extensions=</span><span class="s0">None, </span><span class="s1">tol=</span><span class="s5">0</span><span class="s0">,</span>
+                     <span class="s1">freetype_version=</span><span class="s0">None, </span><span class="s1">remove_text=</span><span class="s0">False,</span>
+                     <span class="s1">savefig_kwarg=</span><span class="s0">None,</span>
+                     <span class="s4"># Default of mpl_test_settings fixture and cleanup too.</span>
+                     <span class="s1">style=(</span><span class="s2">&quot;classic&quot;</span><span class="s0">, </span><span class="s2">&quot;_classic_test_patch&quot;</span><span class="s1">)):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Compare images generated by the test with those specified in 
+    *baseline_images*, which must correspond, else an `ImageComparisonFailure` 
+    exception will be raised. 
+ 
+    Parameters 
+    ---------- 
+    baseline_images : list or None 
+        A list of strings specifying the names of the images generated by 
+        calls to `.Figure.savefig`. 
+ 
+        If *None*, the test function must use the ``baseline_images`` fixture, 
+        either as a parameter or with `pytest.mark.usefixtures`. This value is 
+        only allowed when using pytest. 
+ 
+    extensions : None or list of str 
+        The list of extensions to test, e.g. ``['png', 'pdf']``. 
+ 
+        If *None*, defaults to all supported extensions: png, pdf, and svg. 
+ 
+        When testing a single extension, it can be directly included in the 
+        names passed to *baseline_images*.  In that case, *extensions* must not 
+        be set. 
+ 
+        In order to keep the size of the test suite from ballooning, we only 
+        include the ``svg`` or ``pdf`` outputs if the test is explicitly 
+        exercising a feature dependent on that backend (see also the 
+        `check_figures_equal` decorator for that purpose). 
+ 
+    tol : float, default: 0 
+        The RMS threshold above which the test is considered failed. 
+ 
+        Due to expected small differences in floating-point calculations, on 
+        32-bit systems an additional 0.06 is added to this threshold. 
+ 
+    freetype_version : str or tuple 
+        The expected freetype version or range of versions for this test to 
+        pass. 
+ 
+    remove_text : bool 
+        Remove the title and tick text from the figure before comparison.  This 
+        is useful to make the baseline images independent of variations in text 
+        rendering between different versions of FreeType. 
+ 
+        This does not remove other, more deliberate, text, such as legends and 
+        annotations. 
+ 
+    savefig_kwarg : dict 
+        Optional arguments that are passed to the savefig method. 
+ 
+    style : str, dict, or list 
+        The optional style(s) to apply to the image test. The test itself 
+        can also apply additional styles if desired. Defaults to ``[&quot;classic&quot;, 
+        &quot;_classic_test_patch&quot;]``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">baseline_images </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s4"># List of non-empty filename extensions.</span>
+        <span class="s1">baseline_exts = [*filter(</span><span class="s0">None, </span><span class="s1">{Path(baseline).suffix[</span><span class="s5">1</span><span class="s1">:]</span>
+                                        <span class="s0">for </span><span class="s1">baseline </span><span class="s0">in </span><span class="s1">baseline_images})]</span>
+        <span class="s0">if </span><span class="s1">baseline_exts:</span>
+            <span class="s0">if </span><span class="s1">extensions </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s2">&quot;When including extensions directly in 'baseline_images', &quot;</span>
+                    <span class="s2">&quot;'extensions' cannot be set as well&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">len(baseline_exts) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s2">&quot;When including extensions directly in 'baseline_images', &quot;</span>
+                    <span class="s2">&quot;all baselines must share the same suffix&quot;</span><span class="s1">)</span>
+            <span class="s1">extensions = baseline_exts</span>
+            <span class="s1">baseline_images = [  </span><span class="s4"># Chop suffix out from baseline_images.</span>
+                <span class="s1">Path(baseline).stem </span><span class="s0">for </span><span class="s1">baseline </span><span class="s0">in </span><span class="s1">baseline_images]</span>
+    <span class="s0">if </span><span class="s1">extensions </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s4"># Default extensions to test, if not set via baseline_images.</span>
+        <span class="s1">extensions = [</span><span class="s2">'png'</span><span class="s0">, </span><span class="s2">'pdf'</span><span class="s0">, </span><span class="s2">'svg'</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">savefig_kwarg </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">savefig_kwarg = dict()  </span><span class="s4"># default no kwargs to savefig</span>
+    <span class="s0">if </span><span class="s1">sys.maxsize &lt;= </span><span class="s5">2</span><span class="s1">**</span><span class="s5">32</span><span class="s1">:</span>
+        <span class="s1">tol += </span><span class="s5">0.06</span>
+    <span class="s0">return </span><span class="s1">_pytest_image_comparison(</span>
+        <span class="s1">baseline_images=baseline_images</span><span class="s0">, </span><span class="s1">extensions=extensions</span><span class="s0">, </span><span class="s1">tol=tol</span><span class="s0">,</span>
+        <span class="s1">freetype_version=freetype_version</span><span class="s0">, </span><span class="s1">remove_text=remove_text</span><span class="s0">,</span>
+        <span class="s1">savefig_kwargs=savefig_kwarg</span><span class="s0">, </span><span class="s1">style=style)</span>
+
+
+<span class="s0">def </span><span class="s1">check_figures_equal(*</span><span class="s0">, </span><span class="s1">extensions=(</span><span class="s2">&quot;png&quot;</span><span class="s0">, </span><span class="s2">&quot;pdf&quot;</span><span class="s0">, </span><span class="s2">&quot;svg&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">tol=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Decorator for test cases that generate and compare two figures. 
+ 
+    The decorated function must take two keyword arguments, *fig_test* 
+    and *fig_ref*, and draw the test and reference images on them. 
+    After the function returns, the figures are saved and compared. 
+ 
+    This decorator should be preferred over `image_comparison` when possible in 
+    order to keep the size of the test suite from ballooning. 
+ 
+    Parameters 
+    ---------- 
+    extensions : list, default: [&quot;png&quot;, &quot;pdf&quot;, &quot;svg&quot;] 
+        The extensions to test. 
+    tol : float 
+        The RMS threshold above which the test is considered failed. 
+ 
+    Raises 
+    ------ 
+    RuntimeError 
+        If any new figures are created (and not subsequently closed) inside 
+        the test function. 
+ 
+    Examples 
+    -------- 
+    Check that calling `.Axes.plot` with a single argument plots it against 
+    ``[0, 1, 2, ...]``:: 
+ 
+        @check_figures_equal() 
+        def test_plot(fig_test, fig_ref): 
+            fig_test.subplots().plot([1, 3, 5]) 
+            fig_ref.subplots().plot([0, 1, 2], [1, 3, 5]) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">ALLOWED_CHARS = set(string.digits + string.ascii_letters + </span><span class="s2">'_-[]()'</span><span class="s1">)</span>
+    <span class="s1">KEYWORD_ONLY = inspect.Parameter.KEYWORD_ONLY</span>
+
+    <span class="s0">def </span><span class="s1">decorator(func):</span>
+        <span class="s0">import </span><span class="s1">pytest</span>
+
+        <span class="s1">_</span><span class="s0">, </span><span class="s1">result_dir = _image_directories(func)</span>
+        <span class="s1">old_sig = inspect.signature(func)</span>
+
+        <span class="s0">if not </span><span class="s1">{</span><span class="s2">&quot;fig_test&quot;</span><span class="s0">, </span><span class="s2">&quot;fig_ref&quot;</span><span class="s1">}.issubset(old_sig.parameters):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;The decorated function must have at least the &quot;</span>
+                             <span class="s2">&quot;parameters 'fig_test' and 'fig_ref', but your &quot;</span>
+                             <span class="s2">f&quot;function has the signature </span><span class="s0">{</span><span class="s1">old_sig</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+        <span class="s1">@pytest.mark.parametrize(</span><span class="s2">&quot;ext&quot;</span><span class="s0">, </span><span class="s1">extensions)</span>
+        <span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">ext</span><span class="s0">, </span><span class="s1">request</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+            <span class="s0">if </span><span class="s2">'ext' </span><span class="s0">in </span><span class="s1">old_sig.parameters:</span>
+                <span class="s1">kwargs[</span><span class="s2">'ext'</span><span class="s1">] = ext</span>
+            <span class="s0">if </span><span class="s2">'request' </span><span class="s0">in </span><span class="s1">old_sig.parameters:</span>
+                <span class="s1">kwargs[</span><span class="s2">'request'</span><span class="s1">] = request</span>
+
+            <span class="s1">file_name = </span><span class="s2">&quot;&quot;</span><span class="s1">.join(c </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">request.node.name</span>
+                                <span class="s0">if </span><span class="s1">c </span><span class="s0">in </span><span class="s1">ALLOWED_CHARS)</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">fig_test = plt.figure(</span><span class="s2">&quot;test&quot;</span><span class="s1">)</span>
+                <span class="s1">fig_ref = plt.figure(</span><span class="s2">&quot;reference&quot;</span><span class="s1">)</span>
+                <span class="s0">with </span><span class="s1">_collect_new_figures() </span><span class="s0">as </span><span class="s1">figs:</span>
+                    <span class="s1">func(*args</span><span class="s0">, </span><span class="s1">fig_test=fig_test</span><span class="s0">, </span><span class="s1">fig_ref=fig_ref</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+                <span class="s0">if </span><span class="s1">figs:</span>
+                    <span class="s0">raise </span><span class="s1">RuntimeError(</span><span class="s2">'Number of open figures changed during '</span>
+                                       <span class="s2">'test. Make sure you are plotting to '</span>
+                                       <span class="s2">'fig_test or fig_ref, or if this is '</span>
+                                       <span class="s2">'deliberate explicitly close the '</span>
+                                       <span class="s2">'new figure(s) inside the test.'</span><span class="s1">)</span>
+                <span class="s1">test_image_path = result_dir / (file_name + </span><span class="s2">&quot;.&quot; </span><span class="s1">+ ext)</span>
+                <span class="s1">ref_image_path = result_dir / (file_name + </span><span class="s2">&quot;-expected.&quot; </span><span class="s1">+ ext)</span>
+                <span class="s1">fig_test.savefig(test_image_path)</span>
+                <span class="s1">fig_ref.savefig(ref_image_path)</span>
+                <span class="s1">_raise_on_image_difference(</span>
+                    <span class="s1">ref_image_path</span><span class="s0">, </span><span class="s1">test_image_path</span><span class="s0">, </span><span class="s1">tol=tol</span>
+                <span class="s1">)</span>
+            <span class="s0">finally</span><span class="s1">:</span>
+                <span class="s1">plt.close(fig_test)</span>
+                <span class="s1">plt.close(fig_ref)</span>
+
+        <span class="s1">parameters = [</span>
+            <span class="s1">param</span>
+            <span class="s0">for </span><span class="s1">param </span><span class="s0">in </span><span class="s1">old_sig.parameters.values()</span>
+            <span class="s0">if </span><span class="s1">param.name </span><span class="s0">not in </span><span class="s1">{</span><span class="s2">&quot;fig_test&quot;</span><span class="s0">, </span><span class="s2">&quot;fig_ref&quot;</span><span class="s1">}</span>
+        <span class="s1">]</span>
+        <span class="s0">if </span><span class="s2">'ext' </span><span class="s0">not in </span><span class="s1">old_sig.parameters:</span>
+            <span class="s1">parameters += [inspect.Parameter(</span><span class="s2">&quot;ext&quot;</span><span class="s0">, </span><span class="s1">KEYWORD_ONLY)]</span>
+        <span class="s0">if </span><span class="s2">'request' </span><span class="s0">not in </span><span class="s1">old_sig.parameters:</span>
+            <span class="s1">parameters += [inspect.Parameter(</span><span class="s2">&quot;request&quot;</span><span class="s0">, </span><span class="s1">KEYWORD_ONLY)]</span>
+        <span class="s1">new_sig = old_sig.replace(parameters=parameters)</span>
+        <span class="s1">wrapper.__signature__ = new_sig</span>
+
+        <span class="s4"># reach a bit into pytest internals to hoist the marks from</span>
+        <span class="s4"># our wrapped function</span>
+        <span class="s1">new_marks = getattr(func</span><span class="s0">, </span><span class="s2">&quot;pytestmark&quot;</span><span class="s0">, </span><span class="s1">[]) + wrapper.pytestmark</span>
+        <span class="s1">wrapper.pytestmark = new_marks</span>
+
+        <span class="s0">return </span><span class="s1">wrapper</span>
+
+    <span class="s0">return </span><span class="s1">decorator</span>
+
+
+<span class="s0">def </span><span class="s1">_image_directories(func):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Compute the baseline and result image directories for testing *func*. 
+ 
+    For test module ``foo.bar.test_baz``, the baseline directory is at 
+    ``foo/bar/baseline_images/test_baz`` and the result directory at 
+    ``$(pwd)/result_images/test_baz``.  The result directory is created if it 
+    doesn't exist. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">module_path = Path(inspect.getfile(func))</span>
+    <span class="s1">baseline_dir = module_path.parent / </span><span class="s2">&quot;baseline_images&quot; </span><span class="s1">/ module_path.stem</span>
+    <span class="s1">result_dir = Path().resolve() / </span><span class="s2">&quot;result_images&quot; </span><span class="s1">/ module_path.stem</span>
+    <span class="s1">result_dir.mkdir(parents=</span><span class="s0">True, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">baseline_dir</span><span class="s0">, </span><span class="s1">result_dir</span>
+</pre>
+</body>
+</html>

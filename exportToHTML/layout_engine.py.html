@@ -1,0 +1,303 @@
+<html>
+<head>
+<title>layout_engine.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+layout_engine.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Classes to layout elements in a `.Figure`. 
+ 
+Figures have a ``layout_engine`` property that holds a subclass of 
+`~.LayoutEngine` defined here (or *None* for no layout).  At draw time 
+``figure.get_layout_engine().execute()`` is called, the goal of which is 
+usually to rearrange Axes on the figure to produce a pleasing layout. This is 
+like a ``draw`` callback but with two differences.  First, when printing we 
+disable the layout engine for the final draw. Second, it is useful to know the 
+layout engine while the figure is being created.  In particular, colorbars are 
+made differently with different layout engines (for historical reasons). 
+ 
+Matplotlib supplies two layout engines, `.TightLayoutEngine` and 
+`.ConstrainedLayoutEngine`.  Third parties can create their own layout engine 
+by subclassing `.LayoutEngine`. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">nullcontext</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+
+<span class="s2">from </span><span class="s1">matplotlib._constrained_layout </span><span class="s2">import </span><span class="s1">do_constrained_layout</span>
+<span class="s2">from </span><span class="s1">matplotlib._tight_layout </span><span class="s2">import </span><span class="s1">(get_subplotspec_list</span><span class="s2">,</span>
+                                      <span class="s1">get_tight_layout_figure)</span>
+
+
+<span class="s2">class </span><span class="s1">LayoutEngine:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Base class for Matplotlib layout engines. 
+ 
+    A layout engine can be passed to a figure at instantiation or at any time 
+    with `~.figure.Figure.set_layout_engine`.  Once attached to a figure, the 
+    layout engine ``execute`` function is called at draw time by 
+    `~.figure.Figure.draw`, providing a special draw-time hook. 
+ 
+    .. note:: 
+ 
+       However, note that layout engines affect the creation of colorbars, so 
+       `~.figure.Figure.set_layout_engine` should be called before any 
+       colorbars are created. 
+ 
+    Currently, there are two properties of `LayoutEngine` classes that are 
+    consulted while manipulating the figure: 
+ 
+    - ``engine.colorbar_gridspec`` tells `.Figure.colorbar` whether to make the 
+       axes using the gridspec method (see `.colorbar.make_axes_gridspec`) or 
+       not (see `.colorbar.make_axes`); 
+    - ``engine.adjust_compatible`` stops `.Figure.subplots_adjust` from being 
+        run if it is not compatible with the layout engine. 
+ 
+    To implement a custom `LayoutEngine`: 
+ 
+    1. override ``_adjust_compatible`` and ``_colorbar_gridspec`` 
+    2. override `LayoutEngine.set` to update *self._params* 
+    3. override `LayoutEngine.execute` with your implementation 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># override these in subclass</span>
+    <span class="s1">_adjust_compatible = </span><span class="s2">None</span>
+    <span class="s1">_colorbar_gridspec = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+        <span class="s1">self._params = {}</span>
+
+    <span class="s2">def </span><span class="s1">set(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">colorbar_gridspec(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a boolean if the layout engine creates colorbars using a 
+        gridspec. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._colorbar_gridspec </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s2">return </span><span class="s1">self._colorbar_gridspec</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">adjust_compatible(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a boolean if the layout engine is compatible with 
+        `~.Figure.subplots_adjust`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._adjust_compatible </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s2">return </span><span class="s1">self._adjust_compatible</span>
+
+    <span class="s2">def </span><span class="s1">get(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return copy of the parameters for the layout engine. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">dict(self._params)</span>
+
+    <span class="s2">def </span><span class="s1">execute(self</span><span class="s2">, </span><span class="s1">fig):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Execute the layout on the figure given by *fig*. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># subclasses must implement this.</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s2">class </span><span class="s1">PlaceHolderLayoutEngine(LayoutEngine):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    This layout engine does not adjust the figure layout at all. 
+ 
+    The purpose of this `.LayoutEngine` is to act as a placeholder when the 
+    user removes a layout engine to ensure an incompatible `.LayoutEngine` can 
+    not be set later. 
+ 
+    Parameters 
+    ---------- 
+    adjust_compatible, colorbar_gridspec : bool 
+        Allow the PlaceHolderLayoutEngine to mirror the behavior of whatever 
+        layout engine it is replacing. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">adjust_compatible</span><span class="s2">, </span><span class="s1">colorbar_gridspec</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._adjust_compatible = adjust_compatible</span>
+        <span class="s1">self._colorbar_gridspec = colorbar_gridspec</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">execute(self</span><span class="s2">, </span><span class="s1">fig):</span>
+        <span class="s2">return</span>
+
+
+<span class="s2">class </span><span class="s1">TightLayoutEngine(LayoutEngine):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implements the ``tight_layout`` geometry management.  See 
+    :doc:`/tutorials/intermediate/tight_layout_guide` for details. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_adjust_compatible = </span><span class="s2">True</span>
+    <span class="s1">_colorbar_gridspec = </span><span class="s2">True</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">pad=</span><span class="s4">1.08</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s2">None, </span><span class="s1">w_pad=</span><span class="s2">None,</span>
+                 <span class="s1">rect=(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize tight_layout engine. 
+ 
+        Parameters 
+        ---------- 
+        pad : float, 1.08 
+            Padding between the figure edge and the edges of subplots, as a 
+            fraction of the font size. 
+        h_pad, w_pad : float 
+            Padding (height/width) between edges of adjacent subplots. 
+            Defaults to *pad*. 
+        rect : tuple (left, bottom, right, top), default: (0, 0, 1, 1). 
+            rectangle in normalized figure coordinates that the subplots 
+            (including labels) will fit into. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+        <span class="s2">for </span><span class="s1">td </span><span class="s2">in </span><span class="s1">[</span><span class="s5">'pad'</span><span class="s2">, </span><span class="s5">'h_pad'</span><span class="s2">, </span><span class="s5">'w_pad'</span><span class="s2">, </span><span class="s5">'rect'</span><span class="s1">]:</span>
+            <span class="s3"># initialize these in case None is passed in above:</span>
+            <span class="s1">self._params[td] = </span><span class="s2">None</span>
+        <span class="s1">self.set(pad=pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">, </span><span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">rect=rect)</span>
+
+    <span class="s2">def </span><span class="s1">execute(self</span><span class="s2">, </span><span class="s1">fig):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Execute tight_layout. 
+ 
+        This decides the subplot parameters given the padding that 
+        will allow the axes labels to not be covered by other labels 
+        and axes. 
+ 
+        Parameters 
+        ---------- 
+        fig : `.Figure` to perform layout on. 
+ 
+        See also: `.figure.Figure.tight_layout` and `.pyplot.tight_layout`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">info = self._params</span>
+        <span class="s1">renderer = fig._get_renderer()</span>
+        <span class="s2">with </span><span class="s1">getattr(renderer</span><span class="s2">, </span><span class="s5">&quot;_draw_disabled&quot;</span><span class="s2">, </span><span class="s1">nullcontext)():</span>
+            <span class="s1">kwargs = get_tight_layout_figure(</span>
+                <span class="s1">fig</span><span class="s2">, </span><span class="s1">fig.axes</span><span class="s2">, </span><span class="s1">get_subplotspec_list(fig.axes)</span><span class="s2">, </span><span class="s1">renderer</span><span class="s2">,</span>
+                <span class="s1">pad=info[</span><span class="s5">'pad'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">h_pad=info[</span><span class="s5">'h_pad'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">w_pad=info[</span><span class="s5">'w_pad'</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">rect=info[</span><span class="s5">'rect'</span><span class="s1">])</span>
+        <span class="s2">if </span><span class="s1">kwargs:</span>
+            <span class="s1">fig.subplots_adjust(**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">set(self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">pad=</span><span class="s2">None, </span><span class="s1">w_pad=</span><span class="s2">None, </span><span class="s1">h_pad=</span><span class="s2">None, </span><span class="s1">rect=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">for </span><span class="s1">td </span><span class="s2">in </span><span class="s1">self.set.__kwdefaults__:</span>
+            <span class="s2">if </span><span class="s1">locals()[td] </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">self._params[td] = locals()[td]</span>
+
+
+<span class="s2">class </span><span class="s1">ConstrainedLayoutEngine(LayoutEngine):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implements the ``constrained_layout`` geometry management.  See 
+    :doc:`/tutorials/intermediate/constrainedlayout_guide` for details. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_adjust_compatible = </span><span class="s2">False</span>
+    <span class="s1">_colorbar_gridspec = </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s2">None, </span><span class="s1">w_pad=</span><span class="s2">None,</span>
+                 <span class="s1">hspace=</span><span class="s2">None, </span><span class="s1">wspace=</span><span class="s2">None, </span><span class="s1">rect=(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">,</span>
+                 <span class="s1">compress=</span><span class="s2">False, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize ``constrained_layout`` settings. 
+ 
+        Parameters 
+        ---------- 
+        h_pad, w_pad : float 
+            Padding around the axes elements in figure-normalized units. 
+            Default to :rc:`figure.constrained_layout.h_pad` and 
+            :rc:`figure.constrained_layout.w_pad`. 
+        hspace, wspace : float 
+            Fraction of the figure to dedicate to space between the 
+            axes.  These are evenly spread between the gaps between the axes. 
+            A value of 0.2 for a three-column layout would have a space 
+            of 0.1 of the figure width between each column. 
+            If h/wspace &lt; h/w_pad, then the pads are used instead. 
+            Default to :rc:`figure.constrained_layout.hspace` and 
+            :rc:`figure.constrained_layout.wspace`. 
+        rect : tuple of 4 floats 
+            Rectangle in figure coordinates to perform constrained layout in 
+            (left, bottom, width, height), each from 0-1. 
+        compress : bool 
+            Whether to shift Axes so that white space in between them is 
+            removed. This is useful for simple grids of fixed-aspect Axes (e.g. 
+            a grid of images).  See :ref:`compressed_layout`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+        <span class="s3"># set the defaults:</span>
+        <span class="s1">self.set(w_pad=mpl.rcParams[</span><span class="s5">'figure.constrained_layout.w_pad'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s1">h_pad=mpl.rcParams[</span><span class="s5">'figure.constrained_layout.h_pad'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s1">wspace=mpl.rcParams[</span><span class="s5">'figure.constrained_layout.wspace'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s1">hspace=mpl.rcParams[</span><span class="s5">'figure.constrained_layout.hspace'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s1">rect=(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span>
+        <span class="s3"># set anything that was passed in (None will be ignored):</span>
+        <span class="s1">self.set(w_pad=w_pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">, </span><span class="s1">wspace=wspace</span><span class="s2">, </span><span class="s1">hspace=hspace</span><span class="s2">,</span>
+                 <span class="s1">rect=rect)</span>
+        <span class="s1">self._compress = compress</span>
+
+    <span class="s2">def </span><span class="s1">execute(self</span><span class="s2">, </span><span class="s1">fig):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Perform constrained_layout and move and resize axes accordingly. 
+ 
+        Parameters 
+        ---------- 
+        fig : `.Figure` to perform layout on. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height = fig.get_size_inches()</span>
+        <span class="s3"># pads are relative to the current state of the figure...</span>
+        <span class="s1">w_pad = self._params[</span><span class="s5">'w_pad'</span><span class="s1">] / width</span>
+        <span class="s1">h_pad = self._params[</span><span class="s5">'h_pad'</span><span class="s1">] / height</span>
+
+        <span class="s2">return </span><span class="s1">do_constrained_layout(fig</span><span class="s2">, </span><span class="s1">w_pad=w_pad</span><span class="s2">, </span><span class="s1">h_pad=h_pad</span><span class="s2">,</span>
+                                     <span class="s1">wspace=self._params[</span><span class="s5">'wspace'</span><span class="s1">]</span><span class="s2">,</span>
+                                     <span class="s1">hspace=self._params[</span><span class="s5">'hspace'</span><span class="s1">]</span><span class="s2">,</span>
+                                     <span class="s1">rect=self._params[</span><span class="s5">'rect'</span><span class="s1">]</span><span class="s2">,</span>
+                                     <span class="s1">compress=self._compress)</span>
+
+    <span class="s2">def </span><span class="s1">set(self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">h_pad=</span><span class="s2">None, </span><span class="s1">w_pad=</span><span class="s2">None,</span>
+            <span class="s1">hspace=</span><span class="s2">None, </span><span class="s1">wspace=</span><span class="s2">None, </span><span class="s1">rect=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the pads for constrained_layout. 
+ 
+        Parameters 
+        ---------- 
+        h_pad, w_pad : float 
+            Padding around the axes elements in figure-normalized units. 
+            Default to :rc:`figure.constrained_layout.h_pad` and 
+            :rc:`figure.constrained_layout.w_pad`. 
+        hspace, wspace : float 
+            Fraction of the figure to dedicate to space between the 
+            axes.  These are evenly spread between the gaps between the axes. 
+            A value of 0.2 for a three-column layout would have a space 
+            of 0.1 of the figure width between each column. 
+            If h/wspace &lt; h/w_pad, then the pads are used instead. 
+            Default to :rc:`figure.constrained_layout.hspace` and 
+            :rc:`figure.constrained_layout.wspace`. 
+        rect : tuple of 4 floats 
+            Rectangle in figure coordinates to perform constrained layout in 
+            (left, bottom, width, height), each from 0-1. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">td </span><span class="s2">in </span><span class="s1">self.set.__kwdefaults__:</span>
+            <span class="s2">if </span><span class="s1">locals()[td] </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">self._params[td] = locals()[td]</span>
+</pre>
+</body>
+</html>

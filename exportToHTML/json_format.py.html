@@ -1,0 +1,935 @@
+<html>
+<head>
+<title>json_format.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+json_format.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Protocol Buffers - Google's data interchange format</span>
+<span class="s0"># Copyright 2008 Google Inc.  All rights reserved.</span>
+<span class="s0"># https://developers.google.com/protocol-buffers/</span>
+<span class="s0">#</span>
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are</span>
+<span class="s0"># met:</span>
+<span class="s0">#</span>
+<span class="s0">#     * Redistributions of source code must retain the above copyright</span>
+<span class="s0"># notice, this list of conditions and the following disclaimer.</span>
+<span class="s0">#     * Redistributions in binary form must reproduce the above</span>
+<span class="s0"># copyright notice, this list of conditions and the following disclaimer</span>
+<span class="s0"># in the documentation and/or other materials provided with the</span>
+<span class="s0"># distribution.</span>
+<span class="s0">#     * Neither the name of Google Inc. nor the names of its</span>
+<span class="s0"># contributors may be used to endorse or promote products derived from</span>
+<span class="s0"># this software without specific prior written permission.</span>
+<span class="s0">#</span>
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</span>
+<span class="s0"># &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</span>
+<span class="s0"># A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</span>
+<span class="s0"># OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</span>
+<span class="s0"># SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</span>
+<span class="s0"># DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</span>
+<span class="s0"># THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</span>
+<span class="s0"># (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</span>
+<span class="s0"># OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</span>
+
+<span class="s2">&quot;&quot;&quot;Contains routines for printing protocol messages in JSON format. 
+ 
+Simple usage example: 
+ 
+  # Create a proto object and serialize it to a json format string. 
+  message = my_proto_pb2.MyMessage(foo='bar') 
+  json_string = json_format.MessageToJson(message) 
+ 
+  # Parse a json format string to proto object. 
+  message = json_format.Parse(json_string, my_proto_pb2.MyMessage()) 
+&quot;&quot;&quot;</span>
+
+<span class="s1">__author__ = </span><span class="s3">'jieluo@google.com (Jie Luo)'</span>
+
+
+<span class="s4">import </span><span class="s1">base64</span>
+<span class="s4">from </span><span class="s1">collections </span><span class="s4">import </span><span class="s1">OrderedDict</span>
+<span class="s4">import </span><span class="s1">json</span>
+<span class="s4">import </span><span class="s1">math</span>
+<span class="s4">from </span><span class="s1">operator </span><span class="s4">import </span><span class="s1">methodcaller</span>
+<span class="s4">import </span><span class="s1">re</span>
+<span class="s4">import </span><span class="s1">sys</span>
+
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">type_checkers</span>
+<span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">descriptor</span>
+<span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">symbol_database</span>
+
+
+<span class="s1">_TIMESTAMPFOMAT = </span><span class="s3">'%Y-%m-%dT%H:%M:%S'</span>
+<span class="s1">_INT_TYPES = frozenset([descriptor.FieldDescriptor.CPPTYPE_INT32</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.CPPTYPE_UINT32</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.CPPTYPE_INT64</span><span class="s4">,</span>
+                        <span class="s1">descriptor.FieldDescriptor.CPPTYPE_UINT64])</span>
+<span class="s1">_INT64_TYPES = frozenset([descriptor.FieldDescriptor.CPPTYPE_INT64</span><span class="s4">,</span>
+                          <span class="s1">descriptor.FieldDescriptor.CPPTYPE_UINT64])</span>
+<span class="s1">_FLOAT_TYPES = frozenset([descriptor.FieldDescriptor.CPPTYPE_FLOAT</span><span class="s4">,</span>
+                          <span class="s1">descriptor.FieldDescriptor.CPPTYPE_DOUBLE])</span>
+<span class="s1">_INFINITY = </span><span class="s3">'Infinity'</span>
+<span class="s1">_NEG_INFINITY = </span><span class="s3">'-Infinity'</span>
+<span class="s1">_NAN = </span><span class="s3">'NaN'</span>
+
+<span class="s1">_UNPAIRED_SURROGATE_PATTERN = re.compile(</span>
+    <span class="s3">u'[</span><span class="s4">\ud800</span><span class="s3">-</span><span class="s4">\udbff</span><span class="s3">](?![</span><span class="s4">\udc00</span><span class="s3">-</span><span class="s4">\udfff</span><span class="s3">])|(?&lt;![</span><span class="s4">\ud800</span><span class="s3">-</span><span class="s4">\udbff</span><span class="s3">])[</span><span class="s4">\udc00</span><span class="s3">-</span><span class="s4">\udfff</span><span class="s3">]'</span><span class="s1">)</span>
+
+<span class="s1">_VALID_EXTENSION_NAME = re.compile(</span><span class="s3">r'\[[a-zA-Z0-9\._]*\]$'</span><span class="s1">)</span>
+
+
+<span class="s4">class </span><span class="s1">Error(Exception):</span>
+  <span class="s2">&quot;&quot;&quot;Top-level module error for json_format.&quot;&quot;&quot;</span>
+
+
+<span class="s4">class </span><span class="s1">SerializeToJsonError(Error):</span>
+  <span class="s2">&quot;&quot;&quot;Thrown if serialization to JSON fails.&quot;&quot;&quot;</span>
+
+
+<span class="s4">class </span><span class="s1">ParseError(Error):</span>
+  <span class="s2">&quot;&quot;&quot;Thrown in case of parsing error.&quot;&quot;&quot;</span>
+
+
+<span class="s4">def </span><span class="s1">MessageToJson(</span>
+    <span class="s1">message</span><span class="s4">,</span>
+    <span class="s1">including_default_value_fields=</span><span class="s4">False,</span>
+    <span class="s1">preserving_proto_field_name=</span><span class="s4">False,</span>
+    <span class="s1">indent=</span><span class="s5">2</span><span class="s4">,</span>
+    <span class="s1">sort_keys=</span><span class="s4">False,</span>
+    <span class="s1">use_integers_for_enums=</span><span class="s4">False,</span>
+    <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+    <span class="s1">float_precision=</span><span class="s4">None,</span>
+    <span class="s1">ensure_ascii=</span><span class="s4">True</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Converts protobuf message to JSON format. 
+ 
+  Args: 
+    message: The protocol buffers message instance to serialize. 
+    including_default_value_fields: If True, singular primitive fields, 
+        repeated fields, and map fields will always be serialized.  If 
+        False, only serialize non-empty fields.  Singular message fields 
+        and oneof fields are not affected by this option. 
+    preserving_proto_field_name: If True, use the original proto field 
+        names as defined in the .proto file. If False, convert the field 
+        names to lowerCamelCase. 
+    indent: The JSON object will be pretty-printed with this indent level. 
+        An indent level of 0 or negative will only insert newlines. 
+    sort_keys: If True, then the output will be sorted by field names. 
+    use_integers_for_enums: If true, print integers instead of enum names. 
+    descriptor_pool: A Descriptor Pool for resolving types. If None use the 
+        default. 
+    float_precision: If set, use this to specify float field valid digits. 
+    ensure_ascii: If True, strings with non-ASCII characters are escaped. 
+        If False, Unicode strings are returned unchanged. 
+ 
+  Returns: 
+    A string containing the JSON formatted protocol buffer message. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">printer = _Printer(</span>
+      <span class="s1">including_default_value_fields</span><span class="s4">,</span>
+      <span class="s1">preserving_proto_field_name</span><span class="s4">,</span>
+      <span class="s1">use_integers_for_enums</span><span class="s4">,</span>
+      <span class="s1">descriptor_pool</span><span class="s4">,</span>
+      <span class="s1">float_precision=float_precision)</span>
+  <span class="s4">return </span><span class="s1">printer.ToJsonString(message</span><span class="s4">, </span><span class="s1">indent</span><span class="s4">, </span><span class="s1">sort_keys</span><span class="s4">, </span><span class="s1">ensure_ascii)</span>
+
+
+<span class="s4">def </span><span class="s1">MessageToDict(</span>
+    <span class="s1">message</span><span class="s4">,</span>
+    <span class="s1">including_default_value_fields=</span><span class="s4">False,</span>
+    <span class="s1">preserving_proto_field_name=</span><span class="s4">False,</span>
+    <span class="s1">use_integers_for_enums=</span><span class="s4">False,</span>
+    <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+    <span class="s1">float_precision=</span><span class="s4">None</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Converts protobuf message to a dictionary. 
+ 
+  When the dictionary is encoded to JSON, it conforms to proto3 JSON spec. 
+ 
+  Args: 
+    message: The protocol buffers message instance to serialize. 
+    including_default_value_fields: If True, singular primitive fields, 
+        repeated fields, and map fields will always be serialized.  If 
+        False, only serialize non-empty fields.  Singular message fields 
+        and oneof fields are not affected by this option. 
+    preserving_proto_field_name: If True, use the original proto field 
+        names as defined in the .proto file. If False, convert the field 
+        names to lowerCamelCase. 
+    use_integers_for_enums: If true, print integers instead of enum names. 
+    descriptor_pool: A Descriptor Pool for resolving types. If None use the 
+        default. 
+    float_precision: If set, use this to specify float field valid digits. 
+ 
+  Returns: 
+    A dict representation of the protocol buffer message. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">printer = _Printer(</span>
+      <span class="s1">including_default_value_fields</span><span class="s4">,</span>
+      <span class="s1">preserving_proto_field_name</span><span class="s4">,</span>
+      <span class="s1">use_integers_for_enums</span><span class="s4">,</span>
+      <span class="s1">descriptor_pool</span><span class="s4">,</span>
+      <span class="s1">float_precision=float_precision)</span>
+  <span class="s0"># pylint: disable=protected-access</span>
+  <span class="s4">return </span><span class="s1">printer._MessageToJsonObject(message)</span>
+
+
+<span class="s4">def </span><span class="s1">_IsMapEntry(field):</span>
+  <span class="s4">return </span><span class="s1">(field.type == descriptor.FieldDescriptor.TYPE_MESSAGE </span><span class="s4">and</span>
+          <span class="s1">field.message_type.has_options </span><span class="s4">and</span>
+          <span class="s1">field.message_type.GetOptions().map_entry)</span>
+
+
+<span class="s4">class </span><span class="s1">_Printer(object):</span>
+  <span class="s2">&quot;&quot;&quot;JSON format printer for protocol message.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(</span>
+      <span class="s1">self</span><span class="s4">,</span>
+      <span class="s1">including_default_value_fields=</span><span class="s4">False,</span>
+      <span class="s1">preserving_proto_field_name=</span><span class="s4">False,</span>
+      <span class="s1">use_integers_for_enums=</span><span class="s4">False,</span>
+      <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+      <span class="s1">float_precision=</span><span class="s4">None</span><span class="s1">):</span>
+    <span class="s1">self.including_default_value_fields = including_default_value_fields</span>
+    <span class="s1">self.preserving_proto_field_name = preserving_proto_field_name</span>
+    <span class="s1">self.use_integers_for_enums = use_integers_for_enums</span>
+    <span class="s1">self.descriptor_pool = descriptor_pool</span>
+    <span class="s4">if </span><span class="s1">float_precision:</span>
+      <span class="s1">self.float_format = </span><span class="s3">'.{}g'</span><span class="s1">.format(float_precision)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self.float_format = </span><span class="s4">None</span>
+
+  <span class="s4">def </span><span class="s1">ToJsonString(self</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">indent</span><span class="s4">, </span><span class="s1">sort_keys</span><span class="s4">, </span><span class="s1">ensure_ascii):</span>
+    <span class="s1">js = self._MessageToJsonObject(message)</span>
+    <span class="s4">return </span><span class="s1">json.dumps(</span>
+        <span class="s1">js</span><span class="s4">, </span><span class="s1">indent=indent</span><span class="s4">, </span><span class="s1">sort_keys=sort_keys</span><span class="s4">, </span><span class="s1">ensure_ascii=ensure_ascii)</span>
+
+  <span class="s4">def </span><span class="s1">_MessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts message to an object according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s1">message_descriptor = message.DESCRIPTOR</span>
+    <span class="s1">full_name = message_descriptor.full_name</span>
+    <span class="s4">if </span><span class="s1">_IsWrapperMessage(message_descriptor):</span>
+      <span class="s4">return </span><span class="s1">self._WrapperMessageToJsonObject(message)</span>
+    <span class="s4">if </span><span class="s1">full_name </span><span class="s4">in </span><span class="s1">_WKTJSONMETHODS:</span>
+      <span class="s4">return </span><span class="s1">methodcaller(_WKTJSONMETHODS[full_name][</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">message)(self)</span>
+    <span class="s1">js = {}</span>
+    <span class="s4">return </span><span class="s1">self._RegularMessageToJsonObject(message</span><span class="s4">, </span><span class="s1">js)</span>
+
+  <span class="s4">def </span><span class="s1">_RegularMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">js):</span>
+    <span class="s2">&quot;&quot;&quot;Converts normal message according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s1">fields = message.ListFields()</span>
+
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s4">for </span><span class="s1">field</span><span class="s4">, </span><span class="s1">value </span><span class="s4">in </span><span class="s1">fields:</span>
+        <span class="s4">if </span><span class="s1">self.preserving_proto_field_name:</span>
+          <span class="s1">name = field.name</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">name = field.json_name</span>
+        <span class="s4">if </span><span class="s1">_IsMapEntry(field):</span>
+          <span class="s0"># Convert a map field.</span>
+          <span class="s1">v_field = field.message_type.fields_by_name[</span><span class="s3">'value'</span><span class="s1">]</span>
+          <span class="s1">js_map = {}</span>
+          <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">value:</span>
+            <span class="s4">if </span><span class="s1">isinstance(key</span><span class="s4">, </span><span class="s1">bool):</span>
+              <span class="s4">if </span><span class="s1">key:</span>
+                <span class="s1">recorded_key = </span><span class="s3">'true'</span>
+              <span class="s4">else</span><span class="s1">:</span>
+                <span class="s1">recorded_key = </span><span class="s3">'false'</span>
+            <span class="s4">else</span><span class="s1">:</span>
+              <span class="s1">recorded_key = str(key)</span>
+            <span class="s1">js_map[recorded_key] = self._FieldToJsonObject(</span>
+                <span class="s1">v_field</span><span class="s4">, </span><span class="s1">value[key])</span>
+          <span class="s1">js[name] = js_map</span>
+        <span class="s4">elif </span><span class="s1">field.label == descriptor.FieldDescriptor.LABEL_REPEATED:</span>
+          <span class="s0"># Convert a repeated field.</span>
+          <span class="s1">js[name] = [self._FieldToJsonObject(field</span><span class="s4">, </span><span class="s1">k)</span>
+                      <span class="s4">for </span><span class="s1">k </span><span class="s4">in </span><span class="s1">value]</span>
+        <span class="s4">elif </span><span class="s1">field.is_extension:</span>
+          <span class="s1">name = </span><span class="s3">'[%s]' </span><span class="s1">% field.full_name</span>
+          <span class="s1">js[name] = self._FieldToJsonObject(field</span><span class="s4">, </span><span class="s1">value)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">js[name] = self._FieldToJsonObject(field</span><span class="s4">, </span><span class="s1">value)</span>
+
+      <span class="s0"># Serialize default value if including_default_value_fields is True.</span>
+      <span class="s4">if </span><span class="s1">self.including_default_value_fields:</span>
+        <span class="s1">message_descriptor = message.DESCRIPTOR</span>
+        <span class="s4">for </span><span class="s1">field </span><span class="s4">in </span><span class="s1">message_descriptor.fields:</span>
+          <span class="s0"># Singular message fields and oneof fields will not be affected.</span>
+          <span class="s4">if </span><span class="s1">((field.label != descriptor.FieldDescriptor.LABEL_REPEATED </span><span class="s4">and</span>
+               <span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE) </span><span class="s4">or</span>
+              <span class="s1">field.containing_oneof):</span>
+            <span class="s4">continue</span>
+          <span class="s4">if </span><span class="s1">self.preserving_proto_field_name:</span>
+            <span class="s1">name = field.name</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">name = field.json_name</span>
+          <span class="s4">if </span><span class="s1">name </span><span class="s4">in </span><span class="s1">js:</span>
+            <span class="s0"># Skip the field which has been serialized already.</span>
+            <span class="s4">continue</span>
+          <span class="s4">if </span><span class="s1">_IsMapEntry(field):</span>
+            <span class="s1">js[name] = {}</span>
+          <span class="s4">elif </span><span class="s1">field.label == descriptor.FieldDescriptor.LABEL_REPEATED:</span>
+            <span class="s1">js[name] = []</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">js[name] = self._FieldToJsonObject(field</span><span class="s4">, </span><span class="s1">field.default_value)</span>
+
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">SerializeToJsonError(</span>
+          <span class="s3">'Failed to serialize {0} field: {1}.'</span><span class="s1">.format(field.name</span><span class="s4">, </span><span class="s1">e))</span>
+
+    <span class="s4">return </span><span class="s1">js</span>
+
+  <span class="s4">def </span><span class="s1">_FieldToJsonObject(self</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Converts field value according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+      <span class="s4">return </span><span class="s1">self._MessageToJsonObject(value)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_ENUM:</span>
+      <span class="s4">if </span><span class="s1">self.use_integers_for_enums:</span>
+        <span class="s4">return </span><span class="s1">value</span>
+      <span class="s4">if </span><span class="s1">field.enum_type.full_name == </span><span class="s3">'google.protobuf.NullValue'</span><span class="s1">:</span>
+        <span class="s4">return None</span>
+      <span class="s1">enum_value = field.enum_type.values_by_number.get(value</span><span class="s4">, None</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">is not None</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">enum_value.name</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">if </span><span class="s1">field.file.syntax == </span><span class="s3">'proto3'</span><span class="s1">:</span>
+          <span class="s4">return </span><span class="s1">value</span>
+        <span class="s4">raise </span><span class="s1">SerializeToJsonError(</span><span class="s3">'Enum field contains an integer value '</span>
+                                   <span class="s3">'which can not mapped to an enum value.'</span><span class="s1">)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_STRING:</span>
+      <span class="s4">if </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_BYTES:</span>
+        <span class="s0"># Use base64 Data encoding for bytes</span>
+        <span class="s4">return </span><span class="s1">base64.b64encode(value).decode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">value</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_BOOL:</span>
+      <span class="s4">return </span><span class="s1">bool(value)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type </span><span class="s4">in </span><span class="s1">_INT64_TYPES:</span>
+      <span class="s4">return </span><span class="s1">str(value)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type </span><span class="s4">in </span><span class="s1">_FLOAT_TYPES:</span>
+      <span class="s4">if </span><span class="s1">math.isinf(value):</span>
+        <span class="s4">if </span><span class="s1">value &lt; </span><span class="s5">0.0</span><span class="s1">:</span>
+          <span class="s4">return </span><span class="s1">_NEG_INFINITY</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">return </span><span class="s1">_INFINITY</span>
+      <span class="s4">if </span><span class="s1">math.isnan(value):</span>
+        <span class="s4">return </span><span class="s1">_NAN</span>
+      <span class="s4">if </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_FLOAT:</span>
+        <span class="s4">if </span><span class="s1">self.float_format:</span>
+          <span class="s4">return </span><span class="s1">float(format(value</span><span class="s4">, </span><span class="s1">self.float_format))</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">return </span><span class="s1">type_checkers.ToShortestFloat(value)</span>
+
+    <span class="s4">return </span><span class="s1">value</span>
+
+  <span class="s4">def </span><span class="s1">_AnyMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts Any message according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s4">if not </span><span class="s1">message.ListFields():</span>
+      <span class="s4">return </span><span class="s1">{}</span>
+    <span class="s0"># Must print @type first, use OrderedDict instead of {}</span>
+    <span class="s1">js = OrderedDict()</span>
+    <span class="s1">type_url = message.type_url</span>
+    <span class="s1">js[</span><span class="s3">'@type'</span><span class="s1">] = type_url</span>
+    <span class="s1">sub_message = _CreateMessageFromTypeUrl(type_url</span><span class="s4">, </span><span class="s1">self.descriptor_pool)</span>
+    <span class="s1">sub_message.ParseFromString(message.value)</span>
+    <span class="s1">message_descriptor = sub_message.DESCRIPTOR</span>
+    <span class="s1">full_name = message_descriptor.full_name</span>
+    <span class="s4">if </span><span class="s1">_IsWrapperMessage(message_descriptor):</span>
+      <span class="s1">js[</span><span class="s3">'value'</span><span class="s1">] = self._WrapperMessageToJsonObject(sub_message)</span>
+      <span class="s4">return </span><span class="s1">js</span>
+    <span class="s4">if </span><span class="s1">full_name </span><span class="s4">in </span><span class="s1">_WKTJSONMETHODS:</span>
+      <span class="s1">js[</span><span class="s3">'value'</span><span class="s1">] = methodcaller(_WKTJSONMETHODS[full_name][</span><span class="s5">0</span><span class="s1">]</span><span class="s4">,</span>
+                                 <span class="s1">sub_message)(self)</span>
+      <span class="s4">return </span><span class="s1">js</span>
+    <span class="s4">return </span><span class="s1">self._RegularMessageToJsonObject(sub_message</span><span class="s4">, </span><span class="s1">js)</span>
+
+  <span class="s4">def </span><span class="s1">_GenericMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts message according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s0"># Duration, Timestamp and FieldMask have ToJsonString method to do the</span>
+    <span class="s0"># convert. Users can also call the method directly.</span>
+    <span class="s4">return </span><span class="s1">message.ToJsonString()</span>
+
+  <span class="s4">def </span><span class="s1">_ValueMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts Value message according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s1">which = message.WhichOneof(</span><span class="s3">'kind'</span><span class="s1">)</span>
+    <span class="s0"># If the Value message is not set treat as null_value when serialize</span>
+    <span class="s0"># to JSON. The parse back result will be different from original message.</span>
+    <span class="s4">if </span><span class="s1">which </span><span class="s4">is None or </span><span class="s1">which == </span><span class="s3">'null_value'</span><span class="s1">:</span>
+      <span class="s4">return None</span>
+    <span class="s4">if </span><span class="s1">which == </span><span class="s3">'list_value'</span><span class="s1">:</span>
+      <span class="s4">return </span><span class="s1">self._ListValueMessageToJsonObject(message.list_value)</span>
+    <span class="s4">if </span><span class="s1">which == </span><span class="s3">'struct_value'</span><span class="s1">:</span>
+      <span class="s1">value = message.struct_value</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">value = getattr(message</span><span class="s4">, </span><span class="s1">which)</span>
+    <span class="s1">oneof_descriptor = message.DESCRIPTOR.fields_by_name[which]</span>
+    <span class="s4">return </span><span class="s1">self._FieldToJsonObject(oneof_descriptor</span><span class="s4">, </span><span class="s1">value)</span>
+
+  <span class="s4">def </span><span class="s1">_ListValueMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts ListValue message according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s4">return </span><span class="s1">[self._ValueMessageToJsonObject(value)</span>
+            <span class="s4">for </span><span class="s1">value </span><span class="s4">in </span><span class="s1">message.values]</span>
+
+  <span class="s4">def </span><span class="s1">_StructMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s2">&quot;&quot;&quot;Converts Struct message according to Proto3 JSON Specification.&quot;&quot;&quot;</span>
+    <span class="s1">fields = message.fields</span>
+    <span class="s1">ret = {}</span>
+    <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">fields:</span>
+      <span class="s1">ret[key] = self._ValueMessageToJsonObject(fields[key])</span>
+    <span class="s4">return </span><span class="s1">ret</span>
+
+  <span class="s4">def </span><span class="s1">_WrapperMessageToJsonObject(self</span><span class="s4">, </span><span class="s1">message):</span>
+    <span class="s4">return </span><span class="s1">self._FieldToJsonObject(</span>
+        <span class="s1">message.DESCRIPTOR.fields_by_name[</span><span class="s3">'value'</span><span class="s1">]</span><span class="s4">, </span><span class="s1">message.value)</span>
+
+
+<span class="s4">def </span><span class="s1">_IsWrapperMessage(message_descriptor):</span>
+  <span class="s4">return </span><span class="s1">message_descriptor.file.name == </span><span class="s3">'google/protobuf/wrappers.proto'</span>
+
+
+<span class="s4">def </span><span class="s1">_DuplicateChecker(js):</span>
+  <span class="s1">result = {}</span>
+  <span class="s4">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">value </span><span class="s4">in </span><span class="s1">js:</span>
+    <span class="s4">if </span><span class="s1">name </span><span class="s4">in </span><span class="s1">result:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Failed to load JSON: duplicate key {0}.'</span><span class="s1">.format(name))</span>
+    <span class="s1">result[name] = value</span>
+  <span class="s4">return </span><span class="s1">result</span>
+
+
+<span class="s4">def </span><span class="s1">_CreateMessageFromTypeUrl(type_url</span><span class="s4">, </span><span class="s1">descriptor_pool):</span>
+  <span class="s2">&quot;&quot;&quot;Creates a message from a type URL.&quot;&quot;&quot;</span>
+  <span class="s1">db = symbol_database.Default()</span>
+  <span class="s1">pool = db.pool </span><span class="s4">if </span><span class="s1">descriptor_pool </span><span class="s4">is None else </span><span class="s1">descriptor_pool</span>
+  <span class="s1">type_name = type_url.split(</span><span class="s3">'/'</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">]</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">message_descriptor = pool.FindMessageTypeByName(type_name)</span>
+  <span class="s4">except </span><span class="s1">KeyError:</span>
+    <span class="s4">raise </span><span class="s1">TypeError(</span>
+        <span class="s3">'Can not find message descriptor by type_url: {0}'</span><span class="s1">.format(type_url))</span>
+  <span class="s1">message_class = db.GetPrototype(message_descriptor)</span>
+  <span class="s4">return </span><span class="s1">message_class()</span>
+
+
+<span class="s4">def </span><span class="s1">Parse(text</span><span class="s4">,</span>
+          <span class="s1">message</span><span class="s4">,</span>
+          <span class="s1">ignore_unknown_fields=</span><span class="s4">False,</span>
+          <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+          <span class="s1">max_recursion_depth=</span><span class="s5">100</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses a JSON representation of a protocol message into a message. 
+ 
+  Args: 
+    text: Message JSON representation. 
+    message: A protocol buffer message to merge into. 
+    ignore_unknown_fields: If True, do not raise errors for unknown fields. 
+    descriptor_pool: A Descriptor Pool for resolving types. If None use the 
+      default. 
+    max_recursion_depth: max recursion depth of JSON message to be 
+      deserialized. JSON messages over this depth will fail to be 
+      deserialized. Default value is 100. 
+ 
+  Returns: 
+    The same message passed as argument. 
+ 
+  Raises:: 
+    ParseError: On JSON parsing problems. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if not </span><span class="s1">isinstance(text</span><span class="s4">, </span><span class="s1">str):</span>
+    <span class="s1">text = text.decode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s1">js = json.loads(text</span><span class="s4">, </span><span class="s1">object_pairs_hook=_DuplicateChecker)</span>
+  <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Failed to load JSON: {0}.'</span><span class="s1">.format(str(e)))</span>
+  <span class="s4">return </span><span class="s1">ParseDict(js</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">ignore_unknown_fields</span><span class="s4">, </span><span class="s1">descriptor_pool</span><span class="s4">,</span>
+                   <span class="s1">max_recursion_depth)</span>
+
+
+<span class="s4">def </span><span class="s1">ParseDict(js_dict</span><span class="s4">,</span>
+              <span class="s1">message</span><span class="s4">,</span>
+              <span class="s1">ignore_unknown_fields=</span><span class="s4">False,</span>
+              <span class="s1">descriptor_pool=</span><span class="s4">None,</span>
+              <span class="s1">max_recursion_depth=</span><span class="s5">100</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Parses a JSON dictionary representation into a message. 
+ 
+  Args: 
+    js_dict: Dict representation of a JSON message. 
+    message: A protocol buffer message to merge into. 
+    ignore_unknown_fields: If True, do not raise errors for unknown fields. 
+    descriptor_pool: A Descriptor Pool for resolving types. If None use the 
+      default. 
+    max_recursion_depth: max recursion depth of JSON message to be 
+      deserialized. JSON messages over this depth will fail to be 
+      deserialized. Default value is 100. 
+ 
+  Returns: 
+    The same message passed as argument. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">parser = _Parser(ignore_unknown_fields</span><span class="s4">, </span><span class="s1">descriptor_pool</span><span class="s4">, </span><span class="s1">max_recursion_depth)</span>
+  <span class="s1">parser.ConvertMessage(js_dict</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s3">''</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">message</span>
+
+
+<span class="s1">_INT_OR_FLOAT = (int</span><span class="s4">, </span><span class="s1">float)</span>
+
+
+<span class="s4">class </span><span class="s1">_Parser(object):</span>
+  <span class="s2">&quot;&quot;&quot;JSON format parser for protocol message.&quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">ignore_unknown_fields</span><span class="s4">, </span><span class="s1">descriptor_pool</span><span class="s4">,</span>
+               <span class="s1">max_recursion_depth):</span>
+    <span class="s1">self.ignore_unknown_fields = ignore_unknown_fields</span>
+    <span class="s1">self.descriptor_pool = descriptor_pool</span>
+    <span class="s1">self.max_recursion_depth = max_recursion_depth</span>
+    <span class="s1">self.recursion_depth = </span><span class="s5">0</span>
+
+  <span class="s4">def </span><span class="s1">ConvertMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON object into a message. 
+ 
+    Args: 
+      value: A JSON object. 
+      message: A WKT or regular protocol message to record the data. 
+      path: parent path to log parse error info. 
+ 
+    Raises: 
+      ParseError: In case of convert problems. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self.recursion_depth += </span><span class="s5">1</span>
+    <span class="s4">if </span><span class="s1">self.recursion_depth &gt; self.max_recursion_depth:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Message too deep. Max recursion depth is {0}'</span><span class="s1">.format(</span>
+          <span class="s1">self.max_recursion_depth))</span>
+    <span class="s1">message_descriptor = message.DESCRIPTOR</span>
+    <span class="s1">full_name = message_descriptor.full_name</span>
+    <span class="s4">if not </span><span class="s1">path:</span>
+      <span class="s1">path = message_descriptor.name</span>
+    <span class="s4">if </span><span class="s1">_IsWrapperMessage(message_descriptor):</span>
+      <span class="s1">self._ConvertWrapperMessage(value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path)</span>
+    <span class="s4">elif </span><span class="s1">full_name </span><span class="s4">in </span><span class="s1">_WKTJSONMETHODS:</span>
+      <span class="s1">methodcaller(_WKTJSONMETHODS[full_name][</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path)(self)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s1">self._ConvertFieldValuePair(value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path)</span>
+    <span class="s1">self.recursion_depth -= </span><span class="s5">1</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertFieldValuePair(self</span><span class="s4">, </span><span class="s1">js</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert field value pairs into regular message. 
+ 
+    Args: 
+      js: A JSON object to convert the field value pairs. 
+      message: A regular protocol message to record the data. 
+      path: parent path to log parse error info. 
+ 
+    Raises: 
+      ParseError: In case of problems converting. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">names = []</span>
+    <span class="s1">message_descriptor = message.DESCRIPTOR</span>
+    <span class="s1">fields_by_json_name = dict((f.json_name</span><span class="s4">, </span><span class="s1">f)</span>
+                               <span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">message_descriptor.fields)</span>
+    <span class="s4">for </span><span class="s1">name </span><span class="s4">in </span><span class="s1">js:</span>
+      <span class="s4">try</span><span class="s1">:</span>
+        <span class="s1">field = fields_by_json_name.get(name</span><span class="s4">, None</span><span class="s1">)</span>
+        <span class="s4">if not </span><span class="s1">field:</span>
+          <span class="s1">field = message_descriptor.fields_by_name.get(name</span><span class="s4">, None</span><span class="s1">)</span>
+        <span class="s4">if not </span><span class="s1">field </span><span class="s4">and </span><span class="s1">_VALID_EXTENSION_NAME.match(name):</span>
+          <span class="s4">if not </span><span class="s1">message_descriptor.is_extendable:</span>
+            <span class="s4">raise </span><span class="s1">ParseError(</span>
+                <span class="s3">'Message type {0} does not have extensions at {1}'</span><span class="s1">.format(</span>
+                    <span class="s1">message_descriptor.full_name</span><span class="s4">, </span><span class="s1">path))</span>
+          <span class="s1">identifier = name[</span><span class="s5">1</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">]  </span><span class="s0"># strip [] brackets</span>
+          <span class="s0"># pylint: disable=protected-access</span>
+          <span class="s1">field = message.Extensions._FindExtensionByName(identifier)</span>
+          <span class="s0"># pylint: enable=protected-access</span>
+          <span class="s4">if not </span><span class="s1">field:</span>
+            <span class="s0"># Try looking for extension by the message type name, dropping the</span>
+            <span class="s0"># field name following the final . separator in full_name.</span>
+            <span class="s1">identifier = </span><span class="s3">'.'</span><span class="s1">.join(identifier.split(</span><span class="s3">'.'</span><span class="s1">)[:-</span><span class="s5">1</span><span class="s1">])</span>
+            <span class="s0"># pylint: disable=protected-access</span>
+            <span class="s1">field = message.Extensions._FindExtensionByName(identifier)</span>
+            <span class="s0"># pylint: enable=protected-access</span>
+        <span class="s4">if not </span><span class="s1">field:</span>
+          <span class="s4">if </span><span class="s1">self.ignore_unknown_fields:</span>
+            <span class="s4">continue</span>
+          <span class="s4">raise </span><span class="s1">ParseError(</span>
+              <span class="s1">(</span><span class="s3">'Message type &quot;{0}&quot; has no field named &quot;{1}&quot; at &quot;{2}&quot;.</span><span class="s4">\n</span><span class="s3">'</span>
+               <span class="s3">' Available Fields(except extensions): &quot;{3}&quot;'</span><span class="s1">).format(</span>
+                   <span class="s1">message_descriptor.full_name</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">path</span><span class="s4">,</span>
+                   <span class="s1">[f.json_name </span><span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">message_descriptor.fields]))</span>
+        <span class="s4">if </span><span class="s1">name </span><span class="s4">in </span><span class="s1">names:</span>
+          <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Message type &quot;{0}&quot; should not have multiple '</span>
+                           <span class="s3">'&quot;{1}&quot; fields at &quot;{2}&quot;.'</span><span class="s1">.format(</span>
+                               <span class="s1">message.DESCRIPTOR.full_name</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">path))</span>
+        <span class="s1">names.append(name)</span>
+        <span class="s1">value = js[name]</span>
+        <span class="s0"># Check no other oneof field is parsed.</span>
+        <span class="s4">if </span><span class="s1">field.containing_oneof </span><span class="s4">is not None and </span><span class="s1">value </span><span class="s4">is not None</span><span class="s1">:</span>
+          <span class="s1">oneof_name = field.containing_oneof.name</span>
+          <span class="s4">if </span><span class="s1">oneof_name </span><span class="s4">in </span><span class="s1">names:</span>
+            <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Message type &quot;{0}&quot; should not have multiple '</span>
+                             <span class="s3">'&quot;{1}&quot; oneof fields at &quot;{2}&quot;.'</span><span class="s1">.format(</span>
+                                 <span class="s1">message.DESCRIPTOR.full_name</span><span class="s4">, </span><span class="s1">oneof_name</span><span class="s4">,</span>
+                                 <span class="s1">path))</span>
+          <span class="s1">names.append(oneof_name)</span>
+
+        <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s4">if </span><span class="s1">(field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE</span>
+              <span class="s4">and </span><span class="s1">field.message_type.full_name == </span><span class="s3">'google.protobuf.Value'</span><span class="s1">):</span>
+            <span class="s1">sub_message = getattr(message</span><span class="s4">, </span><span class="s1">field.name)</span>
+            <span class="s1">sub_message.null_value = </span><span class="s5">0</span>
+          <span class="s4">elif </span><span class="s1">(field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_ENUM</span>
+                <span class="s4">and </span><span class="s1">field.enum_type.full_name == </span><span class="s3">'google.protobuf.NullValue'</span><span class="s1">):</span>
+            <span class="s1">setattr(message</span><span class="s4">, </span><span class="s1">field.name</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">message.ClearField(field.name)</span>
+          <span class="s4">continue</span>
+
+        <span class="s0"># Parse field value.</span>
+        <span class="s4">if </span><span class="s1">_IsMapEntry(field):</span>
+          <span class="s1">message.ClearField(field.name)</span>
+          <span class="s1">self._ConvertMapFieldValue(value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field</span><span class="s4">,</span>
+                                     <span class="s3">'{0}.{1}'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">name))</span>
+        <span class="s4">elif </span><span class="s1">field.label == descriptor.FieldDescriptor.LABEL_REPEATED:</span>
+          <span class="s1">message.ClearField(field.name)</span>
+          <span class="s4">if not </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">list):</span>
+            <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'repeated field {0} must be in [] which is '</span>
+                             <span class="s3">'{1} at {2}'</span><span class="s1">.format(name</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">path))</span>
+          <span class="s4">if </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+            <span class="s0"># Repeated message field.</span>
+            <span class="s4">for </span><span class="s1">index</span><span class="s4">, </span><span class="s1">item </span><span class="s4">in </span><span class="s1">enumerate(value):</span>
+              <span class="s1">sub_message = getattr(message</span><span class="s4">, </span><span class="s1">field.name).add()</span>
+              <span class="s0"># None is a null_value in Value.</span>
+              <span class="s4">if </span><span class="s1">(item </span><span class="s4">is None and</span>
+                  <span class="s1">sub_message.DESCRIPTOR.full_name != </span><span class="s3">'google.protobuf.Value'</span><span class="s1">):</span>
+                <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'null is not allowed to be used as an element'</span>
+                                 <span class="s3">' in a repeated field at {0}.{1}[{2}]'</span><span class="s1">.format(</span>
+                                     <span class="s1">path</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">index))</span>
+              <span class="s1">self.ConvertMessage(item</span><span class="s4">, </span><span class="s1">sub_message</span><span class="s4">,</span>
+                                  <span class="s3">'{0}.{1}[{2}]'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">index))</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s0"># Repeated scalar field.</span>
+            <span class="s4">for </span><span class="s1">index</span><span class="s4">, </span><span class="s1">item </span><span class="s4">in </span><span class="s1">enumerate(value):</span>
+              <span class="s4">if </span><span class="s1">item </span><span class="s4">is None</span><span class="s1">:</span>
+                <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'null is not allowed to be used as an element'</span>
+                                 <span class="s3">' in a repeated field at {0}.{1}[{2}]'</span><span class="s1">.format(</span>
+                                     <span class="s1">path</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">index))</span>
+              <span class="s1">getattr(message</span><span class="s4">, </span><span class="s1">field.name).append(</span>
+                  <span class="s1">_ConvertScalarFieldValue(</span>
+                      <span class="s1">item</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s3">'{0}.{1}[{2}]'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">index)))</span>
+        <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+          <span class="s4">if </span><span class="s1">field.is_extension:</span>
+            <span class="s1">sub_message = message.Extensions[field]</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">sub_message = getattr(message</span><span class="s4">, </span><span class="s1">field.name)</span>
+          <span class="s1">sub_message.SetInParent()</span>
+          <span class="s1">self.ConvertMessage(value</span><span class="s4">, </span><span class="s1">sub_message</span><span class="s4">, </span><span class="s3">'{0}.{1}'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">name))</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">if </span><span class="s1">field.is_extension:</span>
+            <span class="s1">message.Extensions[field] = _ConvertScalarFieldValue(</span>
+                <span class="s1">value</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s3">'{0}.{1}'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">name))</span>
+          <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">setattr(</span>
+                <span class="s1">message</span><span class="s4">, </span><span class="s1">field.name</span><span class="s4">,</span>
+                <span class="s1">_ConvertScalarFieldValue(value</span><span class="s4">, </span><span class="s1">field</span><span class="s4">,</span>
+                                         <span class="s3">'{0}.{1}'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">name)))</span>
+      <span class="s4">except </span><span class="s1">ParseError </span><span class="s4">as </span><span class="s1">e:</span>
+        <span class="s4">if </span><span class="s1">field </span><span class="s4">and </span><span class="s1">field.containing_oneof </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Failed to parse {0} field: {1}.'</span><span class="s1">.format(name</span><span class="s4">, </span><span class="s1">e))</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">raise </span><span class="s1">ParseError(str(e))</span>
+      <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Failed to parse {0} field: {1}.'</span><span class="s1">.format(name</span><span class="s4">, </span><span class="s1">e))</span>
+      <span class="s4">except </span><span class="s1">TypeError </span><span class="s4">as </span><span class="s1">e:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Failed to parse {0} field: {1}.'</span><span class="s1">.format(name</span><span class="s4">, </span><span class="s1">e))</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertAnyMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON representation into Any message.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">dict) </span><span class="s4">and not </span><span class="s1">value:</span>
+      <span class="s4">return</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">type_url = value[</span><span class="s3">'@type'</span><span class="s1">]</span>
+    <span class="s4">except </span><span class="s1">KeyError:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span>
+          <span class="s3">'@type is missing when parsing any message at {0}'</span><span class="s1">.format(path))</span>
+
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">sub_message = _CreateMessageFromTypeUrl(type_url</span><span class="s4">, </span><span class="s1">self.descriptor_pool)</span>
+    <span class="s4">except </span><span class="s1">TypeError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'{0} at {1}'</span><span class="s1">.format(e</span><span class="s4">, </span><span class="s1">path))</span>
+    <span class="s1">message_descriptor = sub_message.DESCRIPTOR</span>
+    <span class="s1">full_name = message_descriptor.full_name</span>
+    <span class="s4">if </span><span class="s1">_IsWrapperMessage(message_descriptor):</span>
+      <span class="s1">self._ConvertWrapperMessage(value[</span><span class="s3">'value'</span><span class="s1">]</span><span class="s4">, </span><span class="s1">sub_message</span><span class="s4">,</span>
+                                  <span class="s3">'{0}.value'</span><span class="s1">.format(path))</span>
+    <span class="s4">elif </span><span class="s1">full_name </span><span class="s4">in </span><span class="s1">_WKTJSONMETHODS:</span>
+      <span class="s1">methodcaller(_WKTJSONMETHODS[full_name][</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, </span><span class="s1">value[</span><span class="s3">'value'</span><span class="s1">]</span><span class="s4">, </span><span class="s1">sub_message</span><span class="s4">,</span>
+                   <span class="s3">'{0}.value'</span><span class="s1">.format(path))(</span>
+                       <span class="s1">self)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">del </span><span class="s1">value[</span><span class="s3">'@type'</span><span class="s1">]</span>
+      <span class="s1">self._ConvertFieldValuePair(value</span><span class="s4">, </span><span class="s1">sub_message</span><span class="s4">, </span><span class="s1">path)</span>
+      <span class="s1">value[</span><span class="s3">'@type'</span><span class="s1">] = type_url</span>
+    <span class="s0"># Sets Any message</span>
+    <span class="s1">message.value = sub_message.SerializeToString()</span>
+    <span class="s1">message.type_url = type_url</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertGenericMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON representation into message with FromJsonString.&quot;&quot;&quot;</span>
+    <span class="s0"># Duration, Timestamp, FieldMask have a FromJsonString method to do the</span>
+    <span class="s0"># conversion. Users can also call the method directly.</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">message.FromJsonString(value)</span>
+    <span class="s4">except </span><span class="s1">ValueError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'{0} at {1}'</span><span class="s1">.format(e</span><span class="s4">, </span><span class="s1">path))</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertValueMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON representation into Value message.&quot;&quot;&quot;</span>
+    <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">dict):</span>
+      <span class="s1">self._ConvertStructMessage(value</span><span class="s4">, </span><span class="s1">message.struct_value</span><span class="s4">, </span><span class="s1">path)</span>
+    <span class="s4">elif </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">list):</span>
+      <span class="s1">self._ConvertListValueMessage(value</span><span class="s4">, </span><span class="s1">message.list_value</span><span class="s4">, </span><span class="s1">path)</span>
+    <span class="s4">elif </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s1">message.null_value = </span><span class="s5">0</span>
+    <span class="s4">elif </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">bool):</span>
+      <span class="s1">message.bool_value = value</span>
+    <span class="s4">elif </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">str):</span>
+      <span class="s1">message.string_value = value</span>
+    <span class="s4">elif </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">_INT_OR_FLOAT):</span>
+      <span class="s1">message.number_value = value</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Value {0} has unexpected type {1} at {2}'</span><span class="s1">.format(</span>
+          <span class="s1">value</span><span class="s4">, </span><span class="s1">type(value)</span><span class="s4">, </span><span class="s1">path))</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertListValueMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON representation into ListValue message.&quot;&quot;&quot;</span>
+    <span class="s4">if not </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">list):</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'ListValue must be in [] which is {0} at {1}'</span><span class="s1">.format(</span>
+          <span class="s1">value</span><span class="s4">, </span><span class="s1">path))</span>
+    <span class="s1">message.ClearField(</span><span class="s3">'values'</span><span class="s1">)</span>
+    <span class="s4">for </span><span class="s1">index</span><span class="s4">, </span><span class="s1">item </span><span class="s4">in </span><span class="s1">enumerate(value):</span>
+      <span class="s1">self._ConvertValueMessage(item</span><span class="s4">, </span><span class="s1">message.values.add()</span><span class="s4">,</span>
+                                <span class="s3">'{0}[{1}]'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">index))</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertStructMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON representation into Struct message.&quot;&quot;&quot;</span>
+    <span class="s4">if not </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">dict):</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Struct must be in a dict which is {0} at {1}'</span><span class="s1">.format(</span>
+          <span class="s1">value</span><span class="s4">, </span><span class="s1">path))</span>
+    <span class="s0"># Clear will mark the struct as modified so it will be created even if</span>
+    <span class="s0"># there are no values.</span>
+    <span class="s1">message.Clear()</span>
+    <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">value:</span>
+      <span class="s1">self._ConvertValueMessage(value[key]</span><span class="s4">, </span><span class="s1">message.fields[key]</span><span class="s4">,</span>
+                                <span class="s3">'{0}.{1}'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">key))</span>
+    <span class="s4">return</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertWrapperMessage(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a JSON representation into Wrapper message.&quot;&quot;&quot;</span>
+    <span class="s1">field = message.DESCRIPTOR.fields_by_name[</span><span class="s3">'value'</span><span class="s1">]</span>
+    <span class="s1">setattr(</span>
+        <span class="s1">message</span><span class="s4">, </span><span class="s3">'value'</span><span class="s4">,</span>
+        <span class="s1">_ConvertScalarFieldValue(value</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">path=</span><span class="s3">'{0}.value'</span><span class="s1">.format(path)))</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertMapFieldValue(self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">path):</span>
+    <span class="s2">&quot;&quot;&quot;Convert map field value for a message map field. 
+ 
+    Args: 
+      value: A JSON object to convert the map field value. 
+      message: A protocol message to record the converted data. 
+      field: The descriptor of the map field to be converted. 
+      path: parent path to log parse error info. 
+ 
+    Raises: 
+      ParseError: In case of convert problems. 
+    &quot;&quot;&quot;</span>
+    <span class="s4">if not </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">dict):</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span>
+          <span class="s3">'Map field {0} must be in a dict which is {1} at {2}'</span><span class="s1">.format(</span>
+              <span class="s1">field.name</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">path))</span>
+    <span class="s1">key_field = field.message_type.fields_by_name[</span><span class="s3">'key'</span><span class="s1">]</span>
+    <span class="s1">value_field = field.message_type.fields_by_name[</span><span class="s3">'value'</span><span class="s1">]</span>
+    <span class="s4">for </span><span class="s1">key </span><span class="s4">in </span><span class="s1">value:</span>
+      <span class="s1">key_value = _ConvertScalarFieldValue(key</span><span class="s4">, </span><span class="s1">key_field</span><span class="s4">,</span>
+                                           <span class="s3">'{0}.key'</span><span class="s1">.format(path)</span><span class="s4">, True</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">value_field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_MESSAGE:</span>
+        <span class="s1">self.ConvertMessage(value[key]</span><span class="s4">,</span>
+                            <span class="s1">getattr(message</span><span class="s4">, </span><span class="s1">field.name)[key_value]</span><span class="s4">,</span>
+                            <span class="s3">'{0}[{1}]'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">key_value))</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">getattr(message</span><span class="s4">, </span><span class="s1">field.name)[key_value] = _ConvertScalarFieldValue(</span>
+            <span class="s1">value[key]</span><span class="s4">, </span><span class="s1">value_field</span><span class="s4">, </span><span class="s1">path=</span><span class="s3">'{0}[{1}]'</span><span class="s1">.format(path</span><span class="s4">, </span><span class="s1">key_value))</span>
+
+
+<span class="s4">def </span><span class="s1">_ConvertScalarFieldValue(value</span><span class="s4">, </span><span class="s1">field</span><span class="s4">, </span><span class="s1">path</span><span class="s4">, </span><span class="s1">require_str=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Convert a single scalar field value. 
+ 
+  Args: 
+    value: A scalar value to convert the scalar field value. 
+    field: The descriptor of the field to convert. 
+    path: parent path to log parse error info. 
+    require_str: If True, the field value must be a str. 
+ 
+  Returns: 
+    The converted scalar field value 
+ 
+  Raises: 
+    ParseError: In case of convert problems. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s4">if </span><span class="s1">field.cpp_type </span><span class="s4">in </span><span class="s1">_INT_TYPES:</span>
+      <span class="s4">return </span><span class="s1">_ConvertInteger(value)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type </span><span class="s4">in </span><span class="s1">_FLOAT_TYPES:</span>
+      <span class="s4">return </span><span class="s1">_ConvertFloat(value</span><span class="s4">, </span><span class="s1">field)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_BOOL:</span>
+      <span class="s4">return </span><span class="s1">_ConvertBool(value</span><span class="s4">, </span><span class="s1">require_str)</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_STRING:</span>
+      <span class="s4">if </span><span class="s1">field.type == descriptor.FieldDescriptor.TYPE_BYTES:</span>
+        <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">str):</span>
+          <span class="s1">encoded = value.encode(</span><span class="s3">'utf-8'</span><span class="s1">)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">encoded = value</span>
+        <span class="s0"># Add extra padding '='</span>
+        <span class="s1">padded_value = encoded + </span><span class="s6">b'=' </span><span class="s1">* (</span><span class="s5">4 </span><span class="s1">- len(encoded) % </span><span class="s5">4</span><span class="s1">)</span>
+        <span class="s4">return </span><span class="s1">base64.urlsafe_b64decode(padded_value)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s0"># Checking for unpaired surrogates appears to be unreliable,</span>
+        <span class="s0"># depending on the specific Python version, so we check manually.</span>
+        <span class="s4">if </span><span class="s1">_UNPAIRED_SURROGATE_PATTERN.search(value):</span>
+          <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Unpaired surrogate'</span><span class="s1">)</span>
+        <span class="s4">return </span><span class="s1">value</span>
+    <span class="s4">elif </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_ENUM:</span>
+      <span class="s0"># Convert an enum value.</span>
+      <span class="s1">enum_value = field.enum_type.values_by_name.get(value</span><span class="s4">, None</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s4">try</span><span class="s1">:</span>
+          <span class="s1">number = int(value)</span>
+          <span class="s1">enum_value = field.enum_type.values_by_number.get(number</span><span class="s4">, None</span><span class="s1">)</span>
+        <span class="s4">except </span><span class="s1">ValueError:</span>
+          <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Invalid enum value {0} for enum type {1}'</span><span class="s1">.format(</span>
+              <span class="s1">value</span><span class="s4">, </span><span class="s1">field.enum_type.full_name))</span>
+        <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s4">if </span><span class="s1">field.file.syntax == </span><span class="s3">'proto3'</span><span class="s1">:</span>
+            <span class="s0"># Proto3 accepts unknown enums.</span>
+            <span class="s4">return </span><span class="s1">number</span>
+          <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Invalid enum value {0} for enum type {1}'</span><span class="s1">.format(</span>
+              <span class="s1">value</span><span class="s4">, </span><span class="s1">field.enum_type.full_name))</span>
+      <span class="s4">return </span><span class="s1">enum_value.number</span>
+  <span class="s4">except </span><span class="s1">ParseError </span><span class="s4">as </span><span class="s1">e:</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'{0} at {1}'</span><span class="s1">.format(e</span><span class="s4">, </span><span class="s1">path))</span>
+
+
+<span class="s4">def </span><span class="s1">_ConvertInteger(value):</span>
+  <span class="s2">&quot;&quot;&quot;Convert an integer. 
+ 
+  Args: 
+    value: A scalar value to convert. 
+ 
+  Returns: 
+    The integer value. 
+ 
+  Raises: 
+    ParseError: If an integer couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">float) </span><span class="s4">and not </span><span class="s1">value.is_integer():</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse integer: {0}'</span><span class="s1">.format(value))</span>
+
+  <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">str) </span><span class="s4">and </span><span class="s1">value.find(</span><span class="s3">' '</span><span class="s1">) != -</span><span class="s5">1</span><span class="s1">:</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse integer: &quot;{0}&quot;'</span><span class="s1">.format(value))</span>
+
+  <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">bool):</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Bool value {0} is not acceptable for '</span>
+                     <span class="s3">'integer field'</span><span class="s1">.format(value))</span>
+
+  <span class="s4">return </span><span class="s1">int(value)</span>
+
+
+<span class="s4">def </span><span class="s1">_ConvertFloat(value</span><span class="s4">, </span><span class="s1">field):</span>
+  <span class="s2">&quot;&quot;&quot;Convert an floating point number.&quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">float):</span>
+    <span class="s4">if </span><span class="s1">math.isnan(value):</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse NaN, use quoted &quot;NaN&quot; instead'</span><span class="s1">)</span>
+    <span class="s4">if </span><span class="s1">math.isinf(value):</span>
+      <span class="s4">if </span><span class="s1">value &gt; </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse Infinity or value too large, '</span>
+                         <span class="s3">'use quoted &quot;Infinity&quot; instead'</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse -Infinity or value too small, '</span>
+                         <span class="s3">'use quoted &quot;-Infinity&quot; instead'</span><span class="s1">)</span>
+    <span class="s4">if </span><span class="s1">field.cpp_type == descriptor.FieldDescriptor.CPPTYPE_FLOAT:</span>
+      <span class="s0"># pylint: disable=protected-access</span>
+      <span class="s4">if </span><span class="s1">value &gt; type_checkers._FLOAT_MAX:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Float value too large'</span><span class="s1">)</span>
+      <span class="s0"># pylint: disable=protected-access</span>
+      <span class="s4">if </span><span class="s1">value &lt; type_checkers._FLOAT_MIN:</span>
+        <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Float value too small'</span><span class="s1">)</span>
+  <span class="s4">if </span><span class="s1">value == </span><span class="s3">'nan'</span><span class="s1">:</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse float &quot;nan&quot;, use &quot;NaN&quot; instead'</span><span class="s1">)</span>
+  <span class="s4">try</span><span class="s1">:</span>
+    <span class="s0"># Assume Python compatible syntax.</span>
+    <span class="s4">return </span><span class="s1">float(value)</span>
+  <span class="s4">except </span><span class="s1">ValueError:</span>
+    <span class="s0"># Check alternative spellings.</span>
+    <span class="s4">if </span><span class="s1">value == _NEG_INFINITY:</span>
+      <span class="s4">return </span><span class="s1">float(</span><span class="s3">'-inf'</span><span class="s1">)</span>
+    <span class="s4">elif </span><span class="s1">value == _INFINITY:</span>
+      <span class="s4">return </span><span class="s1">float(</span><span class="s3">'inf'</span><span class="s1">)</span>
+    <span class="s4">elif </span><span class="s1">value == _NAN:</span>
+      <span class="s4">return </span><span class="s1">float(</span><span class="s3">'nan'</span><span class="s1">)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Couldn</span><span class="s4">\'</span><span class="s3">t parse float: {0}'</span><span class="s1">.format(value))</span>
+
+
+<span class="s4">def </span><span class="s1">_ConvertBool(value</span><span class="s4">, </span><span class="s1">require_str):</span>
+  <span class="s2">&quot;&quot;&quot;Convert a boolean value. 
+ 
+  Args: 
+    value: A scalar value to convert. 
+    require_str: If True, value must be a str. 
+ 
+  Returns: 
+    The bool parsed. 
+ 
+  Raises: 
+    ParseError: If a boolean value couldn't be consumed. 
+  &quot;&quot;&quot;</span>
+  <span class="s4">if </span><span class="s1">require_str:</span>
+    <span class="s4">if </span><span class="s1">value == </span><span class="s3">'true'</span><span class="s1">:</span>
+      <span class="s4">return True</span>
+    <span class="s4">elif </span><span class="s1">value == </span><span class="s3">'false'</span><span class="s1">:</span>
+      <span class="s4">return False</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Expected &quot;true&quot; or &quot;false&quot;, not {0}'</span><span class="s1">.format(value))</span>
+
+  <span class="s4">if not </span><span class="s1">isinstance(value</span><span class="s4">, </span><span class="s1">bool):</span>
+    <span class="s4">raise </span><span class="s1">ParseError(</span><span class="s3">'Expected true or false without quotes'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">value</span>
+
+<span class="s1">_WKTJSONMETHODS = {</span>
+    <span class="s3">'google.protobuf.Any'</span><span class="s1">: [</span><span class="s3">'_AnyMessageToJsonObject'</span><span class="s4">,</span>
+                            <span class="s3">'_ConvertAnyMessage'</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s3">'google.protobuf.Duration'</span><span class="s1">: [</span><span class="s3">'_GenericMessageToJsonObject'</span><span class="s4">,</span>
+                                 <span class="s3">'_ConvertGenericMessage'</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s3">'google.protobuf.FieldMask'</span><span class="s1">: [</span><span class="s3">'_GenericMessageToJsonObject'</span><span class="s4">,</span>
+                                  <span class="s3">'_ConvertGenericMessage'</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s3">'google.protobuf.ListValue'</span><span class="s1">: [</span><span class="s3">'_ListValueMessageToJsonObject'</span><span class="s4">,</span>
+                                  <span class="s3">'_ConvertListValueMessage'</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s3">'google.protobuf.Struct'</span><span class="s1">: [</span><span class="s3">'_StructMessageToJsonObject'</span><span class="s4">,</span>
+                               <span class="s3">'_ConvertStructMessage'</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s3">'google.protobuf.Timestamp'</span><span class="s1">: [</span><span class="s3">'_GenericMessageToJsonObject'</span><span class="s4">,</span>
+                                  <span class="s3">'_ConvertGenericMessage'</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s3">'google.protobuf.Value'</span><span class="s1">: [</span><span class="s3">'_ValueMessageToJsonObject'</span><span class="s4">,</span>
+                              <span class="s3">'_ConvertValueMessage'</span><span class="s1">]</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

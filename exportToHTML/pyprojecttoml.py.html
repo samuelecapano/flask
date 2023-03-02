@@ -1,0 +1,515 @@
+<html>
+<head>
+<title>pyprojecttoml.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+pyprojecttoml.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Load setuptools configuration from ``pyproject.toml`` files. 
+ 
+**PRIVATE MODULE**: API reserved for setuptools internal usage only. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">contextmanager</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">partial</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">TYPE_CHECKING</span><span class="s2">, </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Dict</span><span class="s2">, </span><span class="s1">Optional</span><span class="s2">, </span><span class="s1">Mapping</span><span class="s2">, </span><span class="s1">Union</span>
+
+<span class="s2">from </span><span class="s1">setuptools.errors </span><span class="s2">import </span><span class="s1">FileError</span><span class="s2">, </span><span class="s1">OptionError</span>
+
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">expand </span><span class="s2">as </span><span class="s1">_expand</span>
+<span class="s2">from </span><span class="s1">._apply_pyprojecttoml </span><span class="s2">import </span><span class="s1">apply </span><span class="s2">as </span><span class="s1">_apply</span>
+<span class="s2">from </span><span class="s1">._apply_pyprojecttoml </span><span class="s2">import </span><span class="s1">_PREVIOUSLY_DEFINED</span><span class="s2">, </span><span class="s1">_WouldIgnoreField</span>
+
+<span class="s2">if </span><span class="s1">TYPE_CHECKING:</span>
+    <span class="s2">from </span><span class="s1">setuptools.dist </span><span class="s2">import </span><span class="s1">Distribution  </span><span class="s3"># noqa</span>
+
+<span class="s1">_Path = Union[str</span><span class="s2">, </span><span class="s1">os.PathLike]</span>
+<span class="s1">_logger = logging.getLogger(__name__)</span>
+
+
+<span class="s2">def </span><span class="s1">load_file(filepath: _Path) -&gt; dict:</span>
+    <span class="s2">from </span><span class="s1">setuptools.extern </span><span class="s2">import </span><span class="s1">tomli  </span><span class="s3"># type: ignore</span>
+
+    <span class="s2">with </span><span class="s1">open(filepath</span><span class="s2">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">file:</span>
+        <span class="s2">return </span><span class="s1">tomli.load(file)</span>
+
+
+<span class="s2">def </span><span class="s1">validate(config: dict</span><span class="s2">, </span><span class="s1">filepath: _Path) -&gt; bool:</span>
+    <span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">_validate_pyproject </span><span class="s2">as </span><span class="s1">validator</span>
+
+    <span class="s1">trove_classifier = validator.FORMAT_FUNCTIONS.get(</span><span class="s4">&quot;trove-classifier&quot;</span><span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">hasattr(trove_classifier</span><span class="s2">, </span><span class="s4">&quot;_disable_download&quot;</span><span class="s1">):</span>
+        <span class="s3"># Improve reproducibility by default. See issue 31 for validate-pyproject.</span>
+        <span class="s1">trove_classifier._disable_download()  </span><span class="s3"># type: ignore</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">validator.validate(config)</span>
+    <span class="s2">except </span><span class="s1">validator.ValidationError </span><span class="s2">as </span><span class="s1">ex:</span>
+        <span class="s1">summary = </span><span class="s4">f&quot;configuration error: </span><span class="s2">{</span><span class="s1">ex.summary</span><span class="s2">}</span><span class="s4">&quot;</span>
+        <span class="s2">if </span><span class="s1">ex.name.strip(</span><span class="s4">&quot;`&quot;</span><span class="s1">) != </span><span class="s4">&quot;project&quot;</span><span class="s1">:</span>
+            <span class="s3"># Probably it is just a field missing/misnamed, not worthy the verbosity...</span>
+            <span class="s1">_logger.debug(summary)</span>
+            <span class="s1">_logger.debug(ex.details)</span>
+
+        <span class="s1">error = </span><span class="s4">f&quot;invalid pyproject.toml config: </span><span class="s2">{</span><span class="s1">ex.name</span><span class="s2">}</span><span class="s4">.&quot;</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">error</span><span class="s2">}\n{</span><span class="s1">summary</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">) </span><span class="s2">from None</span>
+
+
+<span class="s2">def </span><span class="s1">apply_configuration(</span>
+    <span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">,</span>
+    <span class="s1">filepath: _Path</span><span class="s2">,</span>
+    <span class="s1">ignore_option_errors=</span><span class="s2">False,</span>
+<span class="s1">) -&gt; </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">:</span>
+    <span class="s0">&quot;&quot;&quot;Apply the configuration from a ``pyproject.toml`` file into an existing 
+    distribution object. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">config = read_configuration(filepath</span><span class="s2">, True, </span><span class="s1">ignore_option_errors</span><span class="s2">, </span><span class="s1">dist)</span>
+    <span class="s2">return </span><span class="s1">_apply(dist</span><span class="s2">, </span><span class="s1">config</span><span class="s2">, </span><span class="s1">filepath)</span>
+
+
+<span class="s2">def </span><span class="s1">read_configuration(</span>
+    <span class="s1">filepath: _Path</span><span class="s2">,</span>
+    <span class="s1">expand=</span><span class="s2">True,</span>
+    <span class="s1">ignore_option_errors=</span><span class="s2">False,</span>
+    <span class="s1">dist: Optional[</span><span class="s4">&quot;Distribution&quot;</span><span class="s1">] = </span><span class="s2">None,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Read given configuration file and returns options from it as a dict. 
+ 
+    :param str|unicode filepath: Path to configuration file in the ``pyproject.toml`` 
+        format. 
+ 
+    :param bool expand: Whether to expand directives and other computed values 
+        (i.e. post-process the given configuration) 
+ 
+    :param bool ignore_option_errors: Whether to silently ignore 
+        options, values of which could not be resolved (e.g. due to exceptions 
+        in directives such as file:, attr:, etc.). 
+        If False exceptions are propagated as expected. 
+ 
+    :param Distribution|None: Distribution object to which the configuration refers. 
+        If not given a dummy object will be created and discarded after the 
+        configuration is read. This is used for auto-discovery of packages in the case 
+        a dynamic configuration (e.g. ``attr`` or ``cmdclass``) is expanded. 
+        When ``expand=False`` this object is simply ignored. 
+ 
+    :rtype: dict 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filepath = os.path.abspath(filepath)</span>
+
+    <span class="s2">if not </span><span class="s1">os.path.isfile(filepath):</span>
+        <span class="s2">raise </span><span class="s1">FileError(</span><span class="s4">f&quot;Configuration file </span><span class="s2">{</span><span class="s1">filepath</span><span class="s2">!r} </span><span class="s4">does not exist.&quot;</span><span class="s1">)</span>
+
+    <span class="s1">asdict = load_file(filepath) </span><span class="s2">or </span><span class="s1">{}</span>
+    <span class="s1">project_table = asdict.get(</span><span class="s4">&quot;project&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+    <span class="s1">tool_table = asdict.get(</span><span class="s4">&quot;tool&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+    <span class="s1">setuptools_table = tool_table.get(</span><span class="s4">&quot;setuptools&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+    <span class="s2">if not </span><span class="s1">asdict </span><span class="s2">or not </span><span class="s1">(project_table </span><span class="s2">or </span><span class="s1">setuptools_table):</span>
+        <span class="s2">return </span><span class="s1">{}  </span><span class="s3"># User is not using pyproject to configure setuptools</span>
+
+    <span class="s2">if </span><span class="s1">setuptools_table:</span>
+        <span class="s3"># TODO: Remove the following once the feature stabilizes:</span>
+        <span class="s1">msg = </span><span class="s4">&quot;Support for `[tool.setuptools]` in `pyproject.toml` is still *beta*.&quot;</span>
+        <span class="s1">warnings.warn(msg</span><span class="s2">, </span><span class="s1">_BetaConfiguration)</span>
+
+    <span class="s3"># There is an overall sense in the community that making include_package_data=True</span>
+    <span class="s3"># the default would be an improvement.</span>
+    <span class="s3"># `ini2toml` backfills include_package_data=False when nothing is explicitly given,</span>
+    <span class="s3"># therefore setting a default here is backwards compatible.</span>
+    <span class="s1">orig_setuptools_table = setuptools_table.copy()</span>
+    <span class="s2">if </span><span class="s1">dist </span><span class="s2">and </span><span class="s1">getattr(dist</span><span class="s2">, </span><span class="s4">&quot;include_package_data&quot;</span><span class="s1">) </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s1">setuptools_table.setdefault(</span><span class="s4">&quot;include-package-data&quot;</span><span class="s2">, </span><span class="s1">dist.include_package_data)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">setuptools_table.setdefault(</span><span class="s4">&quot;include-package-data&quot;</span><span class="s2">, True</span><span class="s1">)</span>
+    <span class="s3"># Persist changes:</span>
+    <span class="s1">asdict[</span><span class="s4">&quot;tool&quot;</span><span class="s1">] = tool_table</span>
+    <span class="s1">tool_table[</span><span class="s4">&quot;setuptools&quot;</span><span class="s1">] = setuptools_table</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s3"># Don't complain about unrelated errors (e.g. tools not using the &quot;tool&quot; table)</span>
+        <span class="s1">subset = {</span><span class="s4">&quot;project&quot;</span><span class="s1">: project_table</span><span class="s2">, </span><span class="s4">&quot;tool&quot;</span><span class="s1">: {</span><span class="s4">&quot;setuptools&quot;</span><span class="s1">: setuptools_table}}</span>
+        <span class="s1">validate(subset</span><span class="s2">, </span><span class="s1">filepath)</span>
+    <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">ex:</span>
+        <span class="s3"># TODO: Remove the following once the feature stabilizes:</span>
+        <span class="s2">if </span><span class="s1">_skip_bad_config(project_table</span><span class="s2">, </span><span class="s1">orig_setuptools_table</span><span class="s2">, </span><span class="s1">dist):</span>
+            <span class="s2">return </span><span class="s1">{}</span>
+        <span class="s3"># TODO: After the previous statement is removed the try/except can be replaced</span>
+        <span class="s3"># by the _ignore_errors context manager.</span>
+        <span class="s2">if </span><span class="s1">ignore_option_errors:</span>
+            <span class="s1">_logger.debug(</span><span class="s4">f&quot;ignored error: </span><span class="s2">{</span><span class="s1">ex.__class__.__name__</span><span class="s2">} </span><span class="s4">- </span><span class="s2">{</span><span class="s1">ex</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise  </span><span class="s3"># re-raise exception</span>
+
+    <span class="s2">if </span><span class="s1">expand:</span>
+        <span class="s1">root_dir = os.path.dirname(filepath)</span>
+        <span class="s2">return </span><span class="s1">expand_configuration(asdict</span><span class="s2">, </span><span class="s1">root_dir</span><span class="s2">, </span><span class="s1">ignore_option_errors</span><span class="s2">, </span><span class="s1">dist)</span>
+
+    <span class="s2">return </span><span class="s1">asdict</span>
+
+
+<span class="s2">def </span><span class="s1">_skip_bad_config(</span>
+    <span class="s1">project_cfg: dict</span><span class="s2">, </span><span class="s1">setuptools_cfg: dict</span><span class="s2">, </span><span class="s1">dist: Optional[</span><span class="s4">&quot;Distribution&quot;</span><span class="s1">]</span>
+<span class="s1">) -&gt; bool:</span>
+    <span class="s0">&quot;&quot;&quot;Be temporarily forgiving with invalid ``pyproject.toml``&quot;&quot;&quot;</span>
+    <span class="s3"># See pypa/setuptools#3199 and pypa/cibuildwheel#1064</span>
+
+    <span class="s2">if </span><span class="s1">dist </span><span class="s2">is None or </span><span class="s1">(</span>
+        <span class="s1">dist.metadata.name </span><span class="s2">is None</span>
+        <span class="s2">and </span><span class="s1">dist.metadata.version </span><span class="s2">is None</span>
+        <span class="s2">and </span><span class="s1">dist.install_requires </span><span class="s2">is None</span>
+    <span class="s1">):</span>
+        <span class="s3"># It seems that the build is not getting any configuration from other places</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">if </span><span class="s1">setuptools_cfg:</span>
+        <span class="s3"># If `[tool.setuptools]` is set, then `pyproject.toml` config is intentional</span>
+        <span class="s2">return False</span>
+
+    <span class="s1">given_config = set(project_cfg.keys())</span>
+    <span class="s1">popular_subset = {</span><span class="s4">&quot;name&quot;</span><span class="s2">, </span><span class="s4">&quot;version&quot;</span><span class="s2">, </span><span class="s4">&quot;python_requires&quot;</span><span class="s2">, </span><span class="s4">&quot;requires-python&quot;</span><span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">given_config &lt;= popular_subset:</span>
+        <span class="s3"># It seems that the docs in cibuildtool has been inadvertently encouraging users</span>
+        <span class="s3"># to create `pyproject.toml` files that are not compliant with the standards.</span>
+        <span class="s3"># Let's be forgiving for the time being.</span>
+        <span class="s1">warnings.warn(_InvalidFile.message()</span><span class="s2">, </span><span class="s1">_InvalidFile</span><span class="s2">, </span><span class="s1">stacklevel=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">return False</span>
+
+
+<span class="s2">def </span><span class="s1">expand_configuration(</span>
+    <span class="s1">config: dict</span><span class="s2">,</span>
+    <span class="s1">root_dir: Optional[_Path] = </span><span class="s2">None,</span>
+    <span class="s1">ignore_option_errors: bool = </span><span class="s2">False,</span>
+    <span class="s1">dist: Optional[</span><span class="s4">&quot;Distribution&quot;</span><span class="s1">] = </span><span class="s2">None,</span>
+<span class="s1">) -&gt; dict:</span>
+    <span class="s0">&quot;&quot;&quot;Given a configuration with unresolved fields (e.g. dynamic, cmdclass, ...) 
+    find their final values. 
+ 
+    :param dict config: Dict containing the configuration for the distribution 
+    :param str root_dir: Top-level directory for the distribution/project 
+        (the same directory where ``pyproject.toml`` is place) 
+    :param bool ignore_option_errors: see :func:`read_configuration` 
+    :param Distribution|None: Distribution object to which the configuration refers. 
+        If not given a dummy object will be created and discarded after the 
+        configuration is read. Used in the case a dynamic configuration 
+        (e.g. ``attr`` or ``cmdclass``). 
+ 
+    :rtype: dict 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">_ConfigExpander(config</span><span class="s2">, </span><span class="s1">root_dir</span><span class="s2">, </span><span class="s1">ignore_option_errors</span><span class="s2">, </span><span class="s1">dist).expand()</span>
+
+
+<span class="s2">class </span><span class="s1">_ConfigExpander:</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">config: dict</span><span class="s2">,</span>
+        <span class="s1">root_dir: Optional[_Path] = </span><span class="s2">None,</span>
+        <span class="s1">ignore_option_errors: bool = </span><span class="s2">False,</span>
+        <span class="s1">dist: Optional[</span><span class="s4">&quot;Distribution&quot;</span><span class="s1">] = </span><span class="s2">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.config = config</span>
+        <span class="s1">self.root_dir = root_dir </span><span class="s2">or </span><span class="s1">os.getcwd()</span>
+        <span class="s1">self.project_cfg = config.get(</span><span class="s4">&quot;project&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+        <span class="s1">self.dynamic = self.project_cfg.get(</span><span class="s4">&quot;dynamic&quot;</span><span class="s2">, </span><span class="s1">[])</span>
+        <span class="s1">self.setuptools_cfg = config.get(</span><span class="s4">&quot;tool&quot;</span><span class="s2">, </span><span class="s1">{}).get(</span><span class="s4">&quot;setuptools&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+        <span class="s1">self.dynamic_cfg = self.setuptools_cfg.get(</span><span class="s4">&quot;dynamic&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+        <span class="s1">self.ignore_option_errors = ignore_option_errors</span>
+        <span class="s1">self._dist = dist</span>
+
+    <span class="s2">def </span><span class="s1">_ensure_dist(self) -&gt; </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">setuptools.dist </span><span class="s2">import </span><span class="s1">Distribution</span>
+
+        <span class="s1">attrs = {</span><span class="s4">&quot;src_root&quot;</span><span class="s1">: self.root_dir</span><span class="s2">, </span><span class="s4">&quot;name&quot;</span><span class="s1">: self.project_cfg.get(</span><span class="s4">&quot;name&quot;</span><span class="s2">, None</span><span class="s1">)}</span>
+        <span class="s2">return </span><span class="s1">self._dist </span><span class="s2">or </span><span class="s1">Distribution(attrs)</span>
+
+    <span class="s2">def </span><span class="s1">_process_field(self</span><span class="s2">, </span><span class="s1">container: dict</span><span class="s2">, </span><span class="s1">field: str</span><span class="s2">, </span><span class="s1">fn: Callable):</span>
+        <span class="s2">if </span><span class="s1">field </span><span class="s2">in </span><span class="s1">container:</span>
+            <span class="s2">with </span><span class="s1">_ignore_errors(self.ignore_option_errors):</span>
+                <span class="s1">container[field] = fn(container[field])</span>
+
+    <span class="s2">def </span><span class="s1">_canonic_package_data(self</span><span class="s2">, </span><span class="s1">field=</span><span class="s4">&quot;package-data&quot;</span><span class="s1">):</span>
+        <span class="s1">package_data = self.setuptools_cfg.get(field</span><span class="s2">, </span><span class="s1">{})</span>
+        <span class="s2">return </span><span class="s1">_expand.canonic_package_data(package_data)</span>
+
+    <span class="s2">def </span><span class="s1">expand(self):</span>
+        <span class="s1">self._expand_packages()</span>
+        <span class="s1">self._canonic_package_data()</span>
+        <span class="s1">self._canonic_package_data(</span><span class="s4">&quot;exclude-package-data&quot;</span><span class="s1">)</span>
+
+        <span class="s3"># A distribution object is required for discovering the correct package_dir</span>
+        <span class="s1">dist = self._ensure_dist()</span>
+        <span class="s1">ctx = _EnsurePackagesDiscovered(dist</span><span class="s2">, </span><span class="s1">self.project_cfg</span><span class="s2">, </span><span class="s1">self.setuptools_cfg)</span>
+        <span class="s2">with </span><span class="s1">ctx </span><span class="s2">as </span><span class="s1">ensure_discovered:</span>
+            <span class="s1">package_dir = ensure_discovered.package_dir</span>
+            <span class="s1">self._expand_data_files()</span>
+            <span class="s1">self._expand_cmdclass(package_dir)</span>
+            <span class="s1">self._expand_all_dynamic(dist</span><span class="s2">, </span><span class="s1">package_dir)</span>
+
+        <span class="s2">return </span><span class="s1">self.config</span>
+
+    <span class="s2">def </span><span class="s1">_expand_packages(self):</span>
+        <span class="s1">packages = self.setuptools_cfg.get(</span><span class="s4">&quot;packages&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">packages </span><span class="s2">is None or </span><span class="s1">isinstance(packages</span><span class="s2">, </span><span class="s1">(list</span><span class="s2">, </span><span class="s1">tuple)):</span>
+            <span class="s2">return</span>
+
+        <span class="s1">find = packages.get(</span><span class="s4">&quot;find&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">isinstance(find</span><span class="s2">, </span><span class="s1">dict):</span>
+            <span class="s1">find[</span><span class="s4">&quot;root_dir&quot;</span><span class="s1">] = self.root_dir</span>
+            <span class="s1">find[</span><span class="s4">&quot;fill_package_dir&quot;</span><span class="s1">] = self.setuptools_cfg.setdefault(</span><span class="s4">&quot;package-dir&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+            <span class="s2">with </span><span class="s1">_ignore_errors(self.ignore_option_errors):</span>
+                <span class="s1">self.setuptools_cfg[</span><span class="s4">&quot;packages&quot;</span><span class="s1">] = _expand.find_packages(**find)</span>
+
+    <span class="s2">def </span><span class="s1">_expand_data_files(self):</span>
+        <span class="s1">data_files = partial(_expand.canonic_data_files</span><span class="s2">, </span><span class="s1">root_dir=self.root_dir)</span>
+        <span class="s1">self._process_field(self.setuptools_cfg</span><span class="s2">, </span><span class="s4">&quot;data-files&quot;</span><span class="s2">, </span><span class="s1">data_files)</span>
+
+    <span class="s2">def </span><span class="s1">_expand_cmdclass(self</span><span class="s2">, </span><span class="s1">package_dir: Mapping[str</span><span class="s2">, </span><span class="s1">str]):</span>
+        <span class="s1">root_dir = self.root_dir</span>
+        <span class="s1">cmdclass = partial(_expand.cmdclass</span><span class="s2">, </span><span class="s1">package_dir=package_dir</span><span class="s2">, </span><span class="s1">root_dir=root_dir)</span>
+        <span class="s1">self._process_field(self.setuptools_cfg</span><span class="s2">, </span><span class="s4">&quot;cmdclass&quot;</span><span class="s2">, </span><span class="s1">cmdclass)</span>
+
+    <span class="s2">def </span><span class="s1">_expand_all_dynamic(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">package_dir: Mapping[str</span><span class="s2">, </span><span class="s1">str]):</span>
+        <span class="s1">special = (  </span><span class="s3"># need special handling</span>
+            <span class="s4">&quot;version&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;readme&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;entry-points&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;scripts&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;gui-scripts&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;classifiers&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;dependencies&quot;</span><span class="s2">,</span>
+            <span class="s4">&quot;optional-dependencies&quot;</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s3"># `_obtain` functions are assumed to raise appropriate exceptions/warnings.</span>
+        <span class="s1">obtained_dynamic = {</span>
+            <span class="s1">field: self._obtain(dist</span><span class="s2">, </span><span class="s1">field</span><span class="s2">, </span><span class="s1">package_dir)</span>
+            <span class="s2">for </span><span class="s1">field </span><span class="s2">in </span><span class="s1">self.dynamic</span>
+            <span class="s2">if </span><span class="s1">field </span><span class="s2">not in </span><span class="s1">special</span>
+        <span class="s1">}</span>
+        <span class="s1">obtained_dynamic.update(</span>
+            <span class="s1">self._obtain_entry_points(dist</span><span class="s2">, </span><span class="s1">package_dir) </span><span class="s2">or </span><span class="s1">{}</span><span class="s2">,</span>
+            <span class="s1">version=self._obtain_version(dist</span><span class="s2">, </span><span class="s1">package_dir)</span><span class="s2">,</span>
+            <span class="s1">readme=self._obtain_readme(dist)</span><span class="s2">,</span>
+            <span class="s1">classifiers=self._obtain_classifiers(dist)</span><span class="s2">,</span>
+            <span class="s1">dependencies=self._obtain_dependencies(dist)</span><span class="s2">,</span>
+            <span class="s1">optional_dependencies=self._obtain_optional_dependencies(dist)</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s3"># `None` indicates there is nothing in `tool.setuptools.dynamic` but the value</span>
+        <span class="s3"># might have already been set by setup.py/extensions, so avoid overwriting.</span>
+        <span class="s1">updates = {k: v </span><span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">obtained_dynamic.items() </span><span class="s2">if </span><span class="s1">v </span><span class="s2">is not None</span><span class="s1">}</span>
+        <span class="s1">self.project_cfg.update(updates)</span>
+
+    <span class="s2">def </span><span class="s1">_ensure_previously_set(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">field: str):</span>
+        <span class="s1">previous = _PREVIOUSLY_DEFINED[field](dist)</span>
+        <span class="s2">if </span><span class="s1">previous </span><span class="s2">is None and not </span><span class="s1">self.ignore_option_errors:</span>
+            <span class="s1">msg = (</span>
+                <span class="s4">f&quot;No configuration found for dynamic </span><span class="s2">{</span><span class="s1">field</span><span class="s2">!r}</span><span class="s4">.</span><span class="s2">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;Some dynamic fields need to be specified via `tool.setuptools.dynamic`&quot;</span>
+                <span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">others must be specified via the equivalent attribute in `setup.py`.&quot;</span>
+            <span class="s1">)</span>
+            <span class="s2">raise </span><span class="s1">OptionError(msg)</span>
+
+    <span class="s2">def </span><span class="s1">_expand_directive(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">specifier: str</span><span class="s2">, </span><span class="s1">directive</span><span class="s2">, </span><span class="s1">package_dir: Mapping[str</span><span class="s2">, </span><span class="s1">str]</span>
+    <span class="s1">):</span>
+        <span class="s2">with </span><span class="s1">_ignore_errors(self.ignore_option_errors):</span>
+            <span class="s1">root_dir = self.root_dir</span>
+            <span class="s2">if </span><span class="s4">&quot;file&quot; </span><span class="s2">in </span><span class="s1">directive:</span>
+                <span class="s2">return </span><span class="s1">_expand.read_files(directive[</span><span class="s4">&quot;file&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">root_dir)</span>
+            <span class="s2">if </span><span class="s4">&quot;attr&quot; </span><span class="s2">in </span><span class="s1">directive:</span>
+                <span class="s2">return </span><span class="s1">_expand.read_attr(directive[</span><span class="s4">&quot;attr&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">package_dir</span><span class="s2">, </span><span class="s1">root_dir)</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;invalid `</span><span class="s2">{</span><span class="s1">specifier</span><span class="s2">}</span><span class="s4">`: </span><span class="s2">{</span><span class="s1">directive</span><span class="s2">!r}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_obtain(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">field: str</span><span class="s2">, </span><span class="s1">package_dir: Mapping[str</span><span class="s2">, </span><span class="s1">str]):</span>
+        <span class="s2">if </span><span class="s1">field </span><span class="s2">in </span><span class="s1">self.dynamic_cfg:</span>
+            <span class="s2">return </span><span class="s1">self._expand_directive(</span>
+                <span class="s4">f&quot;tool.setuptools.dynamic.</span><span class="s2">{</span><span class="s1">field</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s2">,</span>
+                <span class="s1">self.dynamic_cfg[field]</span><span class="s2">,</span>
+                <span class="s1">package_dir</span><span class="s2">,</span>
+            <span class="s1">)</span>
+        <span class="s1">self._ensure_previously_set(dist</span><span class="s2">, </span><span class="s1">field)</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_obtain_version(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">package_dir: Mapping[str</span><span class="s2">, </span><span class="s1">str]):</span>
+        <span class="s3"># Since plugins can set version, let's silently skip if it cannot be obtained</span>
+        <span class="s2">if </span><span class="s4">&quot;version&quot; </span><span class="s2">in </span><span class="s1">self.dynamic </span><span class="s2">and </span><span class="s4">&quot;version&quot; </span><span class="s2">in </span><span class="s1">self.dynamic_cfg:</span>
+            <span class="s2">return </span><span class="s1">_expand.version(self._obtain(dist</span><span class="s2">, </span><span class="s4">&quot;version&quot;</span><span class="s2">, </span><span class="s1">package_dir))</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_obtain_readme(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">) -&gt; Optional[Dict[str</span><span class="s2">, </span><span class="s1">str]]:</span>
+        <span class="s2">if </span><span class="s4">&quot;readme&quot; </span><span class="s2">not in </span><span class="s1">self.dynamic:</span>
+            <span class="s2">return None</span>
+
+        <span class="s1">dynamic_cfg = self.dynamic_cfg</span>
+        <span class="s2">if </span><span class="s4">&quot;readme&quot; </span><span class="s2">in </span><span class="s1">dynamic_cfg:</span>
+            <span class="s2">return </span><span class="s1">{</span>
+                <span class="s4">&quot;text&quot;</span><span class="s1">: self._obtain(dist</span><span class="s2">, </span><span class="s4">&quot;readme&quot;</span><span class="s2">, </span><span class="s1">{})</span><span class="s2">,</span>
+                <span class="s4">&quot;content-type&quot;</span><span class="s1">: dynamic_cfg[</span><span class="s4">&quot;readme&quot;</span><span class="s1">].get(</span><span class="s4">&quot;content-type&quot;</span><span class="s2">, </span><span class="s4">&quot;text/x-rst&quot;</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">}</span>
+
+        <span class="s1">self._ensure_previously_set(dist</span><span class="s2">, </span><span class="s4">&quot;readme&quot;</span><span class="s1">)</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_obtain_entry_points(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">package_dir: Mapping[str</span><span class="s2">, </span><span class="s1">str]</span>
+    <span class="s1">) -&gt; Optional[Dict[str</span><span class="s2">, </span><span class="s1">dict]]:</span>
+        <span class="s1">fields = (</span><span class="s4">&quot;entry-points&quot;</span><span class="s2">, </span><span class="s4">&quot;scripts&quot;</span><span class="s2">, </span><span class="s4">&quot;gui-scripts&quot;</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">any(field </span><span class="s2">in </span><span class="s1">self.dynamic </span><span class="s2">for </span><span class="s1">field </span><span class="s2">in </span><span class="s1">fields):</span>
+            <span class="s2">return None</span>
+
+        <span class="s1">text = self._obtain(dist</span><span class="s2">, </span><span class="s4">&quot;entry-points&quot;</span><span class="s2">, </span><span class="s1">package_dir)</span>
+        <span class="s2">if </span><span class="s1">text </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return None</span>
+
+        <span class="s1">groups = _expand.entry_points(text)</span>
+        <span class="s1">expanded = {</span><span class="s4">&quot;entry-points&quot;</span><span class="s1">: groups}</span>
+
+        <span class="s2">def </span><span class="s1">_set_scripts(field: str</span><span class="s2">, </span><span class="s1">group: str):</span>
+            <span class="s2">if </span><span class="s1">group </span><span class="s2">in </span><span class="s1">groups:</span>
+                <span class="s1">value = groups.pop(group)</span>
+                <span class="s2">if </span><span class="s1">field </span><span class="s2">not in </span><span class="s1">self.dynamic:</span>
+                    <span class="s1">msg = _WouldIgnoreField.message(field</span><span class="s2">, </span><span class="s1">value)</span>
+                    <span class="s1">warnings.warn(msg</span><span class="s2">, </span><span class="s1">_WouldIgnoreField)</span>
+                <span class="s3"># TODO: Don't set field when support for pyproject.toml stabilizes</span>
+                <span class="s3">#       instead raise an error as specified in PEP 621</span>
+                <span class="s1">expanded[field] = value</span>
+
+        <span class="s1">_set_scripts(</span><span class="s4">&quot;scripts&quot;</span><span class="s2">, </span><span class="s4">&quot;console_scripts&quot;</span><span class="s1">)</span>
+        <span class="s1">_set_scripts(</span><span class="s4">&quot;gui-scripts&quot;</span><span class="s2">, </span><span class="s4">&quot;gui_scripts&quot;</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">expanded</span>
+
+    <span class="s2">def </span><span class="s1">_obtain_classifiers(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s4">&quot;classifiers&quot; </span><span class="s2">in </span><span class="s1">self.dynamic:</span>
+            <span class="s1">value = self._obtain(dist</span><span class="s2">, </span><span class="s4">&quot;classifiers&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+            <span class="s2">if </span><span class="s1">value:</span>
+                <span class="s2">return </span><span class="s1">value.splitlines()</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_obtain_dependencies(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s4">&quot;dependencies&quot; </span><span class="s2">in </span><span class="s1">self.dynamic:</span>
+            <span class="s1">value = self._obtain(dist</span><span class="s2">, </span><span class="s4">&quot;dependencies&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+            <span class="s2">if </span><span class="s1">value:</span>
+                <span class="s2">return </span><span class="s1">_parse_requirements_list(value)</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_obtain_optional_dependencies(self</span><span class="s2">, </span><span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s4">&quot;optional-dependencies&quot; </span><span class="s2">not in </span><span class="s1">self.dynamic:</span>
+            <span class="s2">return None</span>
+        <span class="s2">if </span><span class="s4">&quot;optional-dependencies&quot; </span><span class="s2">in </span><span class="s1">self.dynamic_cfg:</span>
+            <span class="s1">optional_dependencies_map = self.dynamic_cfg[</span><span class="s4">&quot;optional-dependencies&quot;</span><span class="s1">]</span>
+            <span class="s2">assert </span><span class="s1">isinstance(optional_dependencies_map</span><span class="s2">, </span><span class="s1">dict)</span>
+            <span class="s2">return </span><span class="s1">{</span>
+                <span class="s1">group: _parse_requirements_list(self._expand_directive(</span>
+                    <span class="s4">f&quot;tool.setuptools.dynamic.optional-dependencies.</span><span class="s2">{</span><span class="s1">group</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s2">,</span>
+                    <span class="s1">directive</span><span class="s2">,</span>
+                    <span class="s1">{}</span><span class="s2">,</span>
+                <span class="s1">))</span>
+                <span class="s2">for </span><span class="s1">group</span><span class="s2">, </span><span class="s1">directive </span><span class="s2">in </span><span class="s1">optional_dependencies_map.items()</span>
+            <span class="s1">}</span>
+        <span class="s1">self._ensure_previously_set(dist</span><span class="s2">, </span><span class="s4">&quot;optional-dependencies&quot;</span><span class="s1">)</span>
+        <span class="s2">return None</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_requirements_list(value):</span>
+    <span class="s2">return </span><span class="s1">[</span>
+        <span class="s1">line</span>
+        <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">value.splitlines()</span>
+        <span class="s2">if </span><span class="s1">line.strip() </span><span class="s2">and not </span><span class="s1">line.strip().startswith(</span><span class="s4">&quot;#&quot;</span><span class="s1">)</span>
+    <span class="s1">]</span>
+
+
+<span class="s1">@contextmanager</span>
+<span class="s2">def </span><span class="s1">_ignore_errors(ignore_option_errors: bool):</span>
+    <span class="s2">if not </span><span class="s1">ignore_option_errors:</span>
+        <span class="s2">yield</span>
+        <span class="s2">return</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">yield</span>
+    <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">ex:</span>
+        <span class="s1">_logger.debug(</span><span class="s4">f&quot;ignored error: </span><span class="s2">{</span><span class="s1">ex.__class__.__name__</span><span class="s2">} </span><span class="s4">- </span><span class="s2">{</span><span class="s1">ex</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">_EnsurePackagesDiscovered(_expand.EnsurePackagesDiscovered):</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">distribution: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">project_cfg: dict</span><span class="s2">, </span><span class="s1">setuptools_cfg: dict</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(distribution)</span>
+        <span class="s1">self._project_cfg = project_cfg</span>
+        <span class="s1">self._setuptools_cfg = setuptools_cfg</span>
+
+    <span class="s2">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">&quot;&quot;&quot;When entering the context, the values of ``packages``, ``py_modules`` and 
+        ``package_dir`` that are missing in ``dist`` are copied from ``setuptools_cfg``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">dist</span><span class="s2">, </span><span class="s1">cfg = self._dist</span><span class="s2">, </span><span class="s1">self._setuptools_cfg</span>
+        <span class="s1">package_dir: Dict[str</span><span class="s2">, </span><span class="s1">str] = cfg.setdefault(</span><span class="s4">&quot;package-dir&quot;</span><span class="s2">, </span><span class="s1">{})</span>
+        <span class="s1">package_dir.update(dist.package_dir </span><span class="s2">or </span><span class="s1">{})</span>
+        <span class="s1">dist.package_dir = package_dir  </span><span class="s3"># needs to be the same object</span>
+
+        <span class="s1">dist.set_defaults._ignore_ext_modules()  </span><span class="s3"># pyproject.toml-specific behaviour</span>
+
+        <span class="s3"># Set `name`, `py_modules` and `packages` in dist to short-circuit</span>
+        <span class="s3"># auto-discovery, but avoid overwriting empty lists purposefully set by users.</span>
+        <span class="s2">if </span><span class="s1">dist.metadata.name </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dist.metadata.name = self._project_cfg.get(</span><span class="s4">&quot;name&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">dist.py_modules </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dist.py_modules = cfg.get(</span><span class="s4">&quot;py-modules&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">dist.packages </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">dist.packages = cfg.get(</span><span class="s4">&quot;packages&quot;</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">super().__enter__()</span>
+
+    <span class="s2">def </span><span class="s1">__exit__(self</span><span class="s2">, </span><span class="s1">exc_type</span><span class="s2">, </span><span class="s1">exc_value</span><span class="s2">, </span><span class="s1">traceback):</span>
+        <span class="s0">&quot;&quot;&quot;When exiting the context, if values of ``packages``, ``py_modules`` and 
+        ``package_dir`` are missing in ``setuptools_cfg``, copy from ``dist``. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># If anything was discovered set them back, so they count in the final config.</span>
+        <span class="s1">self._setuptools_cfg.setdefault(</span><span class="s4">&quot;packages&quot;</span><span class="s2">, </span><span class="s1">self._dist.packages)</span>
+        <span class="s1">self._setuptools_cfg.setdefault(</span><span class="s4">&quot;py-modules&quot;</span><span class="s2">, </span><span class="s1">self._dist.py_modules)</span>
+        <span class="s2">return </span><span class="s1">super().__exit__(exc_type</span><span class="s2">, </span><span class="s1">exc_value</span><span class="s2">, </span><span class="s1">traceback)</span>
+
+
+<span class="s2">class </span><span class="s1">_BetaConfiguration(UserWarning):</span>
+    <span class="s0">&quot;&quot;&quot;Explicitly inform users that some `pyproject.toml` configuration is *beta*&quot;&quot;&quot;</span>
+
+
+<span class="s2">class </span><span class="s1">_InvalidFile(UserWarning):</span>
+    <span class="s0">&quot;&quot;&quot;The given `pyproject.toml` file is invalid and would be ignored. 
+    !!\n\n 
+    ############################ 
+    # Invalid `pyproject.toml` # 
+    ############################ 
+ 
+    Any configurations in `pyproject.toml` will be ignored. 
+    Please note that future releases of setuptools will halt the build process 
+    if an invalid file is given. 
+ 
+    To prevent setuptools from considering `pyproject.toml` please 
+    DO NOT include the `[project]` or `[tool.setuptools]` tables in your file. 
+    \n\n!! 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">message(cls):</span>
+        <span class="s2">from </span><span class="s1">inspect </span><span class="s2">import </span><span class="s1">cleandoc</span>
+        <span class="s2">return </span><span class="s1">cleandoc(cls.__doc__)</span>
+</pre>
+</body>
+</html>

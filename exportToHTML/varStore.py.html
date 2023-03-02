@@ -1,0 +1,644 @@
+<html>
+<head>
+<title>varStore.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6897bb;}
+.s3 { color: #808080;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+varStore.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s0">import </span><span class="s1">noRound</span><span class="s0">, </span><span class="s1">otRound</span>
+<span class="s0">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s0">import </span><span class="s1">otTables </span><span class="s0">as </span><span class="s1">ot</span>
+<span class="s0">from </span><span class="s1">fontTools.varLib.models </span><span class="s0">import </span><span class="s1">supportScalar</span>
+<span class="s0">from </span><span class="s1">fontTools.varLib.builder </span><span class="s0">import </span><span class="s1">(buildVarRegionList</span><span class="s0">, </span><span class="s1">buildVarStore</span><span class="s0">,</span>
+				      <span class="s1">buildVarRegion</span><span class="s0">, </span><span class="s1">buildVarData)</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">partial</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">defaultdict</span>
+
+
+<span class="s1">NO_VARIATION_INDEX = ot.NO_VARIATION_INDEX</span>
+<span class="s1">ot.VarStore.NO_VARIATION_INDEX = NO_VARIATION_INDEX</span>
+
+
+<span class="s0">def </span><span class="s1">_getLocationKey(loc):</span>
+	<span class="s0">return </span><span class="s1">tuple(sorted(loc.items()</span><span class="s0">, </span><span class="s1">key=</span><span class="s0">lambda </span><span class="s1">kv: kv[</span><span class="s2">0</span><span class="s1">]))</span>
+
+
+<span class="s0">class </span><span class="s1">OnlineVarStoreBuilder(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">axisTags):</span>
+		<span class="s1">self._axisTags = axisTags</span>
+		<span class="s1">self._regionMap = {}</span>
+		<span class="s1">self._regionList = buildVarRegionList([]</span><span class="s0">, </span><span class="s1">axisTags)</span>
+		<span class="s1">self._store = buildVarStore(self._regionList</span><span class="s0">, </span><span class="s1">[])</span>
+		<span class="s1">self._data = </span><span class="s0">None</span>
+		<span class="s1">self._model = </span><span class="s0">None</span>
+		<span class="s1">self._supports = </span><span class="s0">None</span>
+		<span class="s1">self._varDataIndices = {}</span>
+		<span class="s1">self._varDataCaches = {}</span>
+		<span class="s1">self._cache = {}</span>
+
+	<span class="s0">def </span><span class="s1">setModel(self</span><span class="s0">, </span><span class="s1">model):</span>
+		<span class="s1">self.setSupports(model.supports)</span>
+		<span class="s1">self._model = model</span>
+
+	<span class="s0">def </span><span class="s1">setSupports(self</span><span class="s0">, </span><span class="s1">supports):</span>
+		<span class="s1">self._model = </span><span class="s0">None</span>
+		<span class="s1">self._supports = list(supports)</span>
+		<span class="s0">if not </span><span class="s1">self._supports[</span><span class="s2">0</span><span class="s1">]:</span>
+			<span class="s0">del </span><span class="s1">self._supports[</span><span class="s2">0</span><span class="s1">] </span><span class="s3"># Drop base master support</span>
+		<span class="s1">self._cache = {}</span>
+		<span class="s1">self._data = </span><span class="s0">None</span>
+
+	<span class="s0">def </span><span class="s1">finish(self</span><span class="s0">, </span><span class="s1">optimize=</span><span class="s0">True</span><span class="s1">):</span>
+		<span class="s1">self._regionList.RegionCount = len(self._regionList.Region)</span>
+		<span class="s1">self._store.VarDataCount = len(self._store.VarData)</span>
+		<span class="s0">for </span><span class="s1">data </span><span class="s0">in </span><span class="s1">self._store.VarData:</span>
+			<span class="s1">data.ItemCount = len(data.Item)</span>
+			<span class="s1">data.calculateNumShorts(optimize=optimize)</span>
+		<span class="s0">return </span><span class="s1">self._store</span>
+
+	<span class="s0">def </span><span class="s1">_add_VarData(self):</span>
+		<span class="s1">regionMap = self._regionMap</span>
+		<span class="s1">regionList = self._regionList</span>
+
+		<span class="s1">regions = self._supports</span>
+		<span class="s1">regionIndices = []</span>
+		<span class="s0">for </span><span class="s1">region </span><span class="s0">in </span><span class="s1">regions:</span>
+			<span class="s1">key = _getLocationKey(region)</span>
+			<span class="s1">idx = regionMap.get(key)</span>
+			<span class="s0">if </span><span class="s1">idx </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s1">varRegion = buildVarRegion(region</span><span class="s0">, </span><span class="s1">self._axisTags)</span>
+				<span class="s1">idx = regionMap[key] = len(regionList.Region)</span>
+				<span class="s1">regionList.Region.append(varRegion)</span>
+			<span class="s1">regionIndices.append(idx)</span>
+
+		<span class="s3"># Check if we have one already...</span>
+		<span class="s1">key = tuple(regionIndices)</span>
+		<span class="s1">varDataIdx = self._varDataIndices.get(key)</span>
+		<span class="s0">if </span><span class="s1">varDataIdx </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">self._outer = varDataIdx</span>
+			<span class="s1">self._data = self._store.VarData[varDataIdx]</span>
+			<span class="s1">self._cache = self._varDataCaches[key]</span>
+			<span class="s0">if </span><span class="s1">len(self._data.Item) == </span><span class="s2">0xFFFF</span><span class="s1">:</span>
+				<span class="s3"># This is full.  Need new one.</span>
+				<span class="s1">varDataIdx = </span><span class="s0">None</span>
+
+		<span class="s0">if </span><span class="s1">varDataIdx </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">self._data = buildVarData(regionIndices</span><span class="s0">, </span><span class="s1">[]</span><span class="s0">, </span><span class="s1">optimize=</span><span class="s0">False</span><span class="s1">)</span>
+			<span class="s1">self._outer = len(self._store.VarData)</span>
+			<span class="s1">self._store.VarData.append(self._data)</span>
+			<span class="s1">self._varDataIndices[key] = self._outer</span>
+			<span class="s0">if </span><span class="s1">key </span><span class="s0">not in </span><span class="s1">self._varDataCaches:</span>
+				<span class="s1">self._varDataCaches[key] = {}</span>
+			<span class="s1">self._cache = self._varDataCaches[key]</span>
+
+
+	<span class="s0">def </span><span class="s1">storeMasters(self</span><span class="s0">, </span><span class="s1">master_values):</span>
+		<span class="s1">deltas = self._model.getDeltas(master_values</span><span class="s0">, </span><span class="s1">round=round)</span>
+		<span class="s1">base = deltas.pop(</span><span class="s2">0</span><span class="s1">)</span>
+		<span class="s0">return </span><span class="s1">base</span><span class="s0">, </span><span class="s1">self.storeDeltas(deltas</span><span class="s0">, </span><span class="s1">round=noRound)</span>
+
+	<span class="s0">def </span><span class="s1">storeDeltas(self</span><span class="s0">, </span><span class="s1">deltas</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">round=round):</span>
+		<span class="s1">deltas = [round(d) </span><span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">deltas]</span>
+		<span class="s0">if </span><span class="s1">len(deltas) == len(self._supports) + </span><span class="s2">1</span><span class="s1">:</span>
+			<span class="s1">deltas = tuple(deltas[</span><span class="s2">1</span><span class="s1">:])</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">assert </span><span class="s1">len(deltas) == len(self._supports)</span>
+			<span class="s1">deltas = tuple(deltas)</span>
+
+		<span class="s1">varIdx = self._cache.get(deltas)</span>
+		<span class="s0">if </span><span class="s1">varIdx </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">varIdx</span>
+
+		<span class="s0">if not </span><span class="s1">self._data:</span>
+			<span class="s1">self._add_VarData()</span>
+		<span class="s1">inner = len(self._data.Item)</span>
+		<span class="s0">if </span><span class="s1">inner == </span><span class="s2">0xFFFF</span><span class="s1">:</span>
+			<span class="s3"># Full array. Start new one.</span>
+			<span class="s1">self._add_VarData()</span>
+			<span class="s0">return </span><span class="s1">self.storeDeltas(deltas)</span>
+		<span class="s1">self._data.addItem(deltas</span><span class="s0">, </span><span class="s1">round=noRound)</span>
+
+		<span class="s1">varIdx = (self._outer &lt;&lt; </span><span class="s2">16</span><span class="s1">) + inner</span>
+		<span class="s1">self._cache[deltas] = varIdx</span>
+		<span class="s0">return </span><span class="s1">varIdx</span>
+
+<span class="s0">def </span><span class="s1">VarData_addItem(self</span><span class="s0">, </span><span class="s1">deltas</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">round=round):</span>
+	<span class="s1">deltas = [round(d) </span><span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">deltas]</span>
+
+	<span class="s1">countUs = self.VarRegionCount</span>
+	<span class="s1">countThem = len(deltas)</span>
+	<span class="s0">if </span><span class="s1">countUs + </span><span class="s2">1 </span><span class="s1">== countThem:</span>
+		<span class="s1">deltas = tuple(deltas[</span><span class="s2">1</span><span class="s1">:])</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">assert </span><span class="s1">countUs == countThem</span><span class="s0">, </span><span class="s1">(countUs</span><span class="s0">, </span><span class="s1">countThem)</span>
+		<span class="s1">deltas = tuple(deltas)</span>
+	<span class="s1">self.Item.append(list(deltas))</span>
+	<span class="s1">self.ItemCount = len(self.Item)</span>
+
+<span class="s1">ot.VarData.addItem = VarData_addItem</span>
+
+<span class="s0">def </span><span class="s1">VarRegion_get_support(self</span><span class="s0">, </span><span class="s1">fvar_axes):</span>
+	<span class="s0">return </span><span class="s1">{</span>
+		<span class="s1">fvar_axes[i].axisTag: (reg.StartCoord</span><span class="s0">,</span><span class="s1">reg.PeakCoord</span><span class="s0">,</span><span class="s1">reg.EndCoord)</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">reg </span><span class="s0">in </span><span class="s1">enumerate(self.VarRegionAxis)</span>
+		<span class="s0">if </span><span class="s1">reg.PeakCoord != </span><span class="s2">0</span>
+	<span class="s1">}</span>
+
+<span class="s1">ot.VarRegion.get_support = VarRegion_get_support</span>
+
+<span class="s0">def </span><span class="s1">VarStore___bool__(self):</span>
+    <span class="s0">return </span><span class="s1">bool(self.VarData)</span>
+
+<span class="s1">ot.VarStore.__bool__ = VarStore___bool__</span>
+
+<span class="s0">class </span><span class="s1">VarStoreInstancer(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">varstore</span><span class="s0">, </span><span class="s1">fvar_axes</span><span class="s0">, </span><span class="s1">location={}):</span>
+		<span class="s1">self.fvar_axes = fvar_axes</span>
+		<span class="s0">assert </span><span class="s1">varstore </span><span class="s0">is None or </span><span class="s1">varstore.Format == </span><span class="s2">1</span>
+		<span class="s1">self._varData = varstore.VarData </span><span class="s0">if </span><span class="s1">varstore </span><span class="s0">else </span><span class="s1">[]</span>
+		<span class="s1">self._regions = varstore.VarRegionList.Region </span><span class="s0">if </span><span class="s1">varstore </span><span class="s0">else </span><span class="s1">[]</span>
+		<span class="s1">self.setLocation(location)</span>
+
+	<span class="s0">def </span><span class="s1">setLocation(self</span><span class="s0">, </span><span class="s1">location):</span>
+		<span class="s1">self.location = dict(location)</span>
+		<span class="s1">self._clearCaches()</span>
+
+	<span class="s0">def </span><span class="s1">_clearCaches(self):</span>
+		<span class="s1">self._scalars = {}</span>
+
+	<span class="s0">def </span><span class="s1">_getScalar(self</span><span class="s0">, </span><span class="s1">regionIdx):</span>
+		<span class="s1">scalar = self._scalars.get(regionIdx)</span>
+		<span class="s0">if </span><span class="s1">scalar </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">support = self._regions[regionIdx].get_support(self.fvar_axes)</span>
+			<span class="s1">scalar = supportScalar(self.location</span><span class="s0">, </span><span class="s1">support)</span>
+			<span class="s1">self._scalars[regionIdx] = scalar</span>
+		<span class="s0">return </span><span class="s1">scalar</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">interpolateFromDeltasAndScalars(deltas</span><span class="s0">, </span><span class="s1">scalars):</span>
+		<span class="s1">delta = </span><span class="s2">0.</span>
+		<span class="s0">for </span><span class="s1">d</span><span class="s0">,</span><span class="s1">s </span><span class="s0">in </span><span class="s1">zip(deltas</span><span class="s0">, </span><span class="s1">scalars):</span>
+			<span class="s0">if not </span><span class="s1">s: </span><span class="s0">continue</span>
+			<span class="s1">delta += d * s</span>
+		<span class="s0">return </span><span class="s1">delta</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">varidx):</span>
+		<span class="s1">major</span><span class="s0">, </span><span class="s1">minor = varidx &gt;&gt; </span><span class="s2">16</span><span class="s0">, </span><span class="s1">varidx &amp; </span><span class="s2">0xFFFF</span>
+		<span class="s0">if </span><span class="s1">varidx == NO_VARIATION_INDEX: </span><span class="s0">return </span><span class="s2">0.</span>
+		<span class="s1">varData = self._varData</span>
+		<span class="s1">scalars = [self._getScalar(ri) </span><span class="s0">for </span><span class="s1">ri </span><span class="s0">in </span><span class="s1">varData[major].VarRegionIndex]</span>
+		<span class="s1">deltas = varData[major].Item[minor]</span>
+		<span class="s0">return </span><span class="s1">self.interpolateFromDeltasAndScalars(deltas</span><span class="s0">, </span><span class="s1">scalars)</span>
+
+	<span class="s0">def </span><span class="s1">interpolateFromDeltas(self</span><span class="s0">, </span><span class="s1">varDataIndex</span><span class="s0">, </span><span class="s1">deltas):</span>
+		<span class="s1">varData = self._varData</span>
+		<span class="s1">scalars = [self._getScalar(ri) </span><span class="s0">for </span><span class="s1">ri </span><span class="s0">in</span>
+					<span class="s1">varData[varDataIndex].VarRegionIndex]</span>
+		<span class="s0">return </span><span class="s1">self.interpolateFromDeltasAndScalars(deltas</span><span class="s0">, </span><span class="s1">scalars)</span>
+
+
+<span class="s3">#</span>
+<span class="s3"># Optimizations</span>
+<span class="s3">#</span>
+<span class="s3"># retainFirstMap - If true, major 0 mappings are retained. Deltas for unused indices are zeroed</span>
+<span class="s3"># advIdxes - Set of major 0 indices for advance deltas to be listed first. Other major 0 indices follow.</span>
+
+<span class="s0">def </span><span class="s1">VarStore_subset_varidxes(self</span><span class="s0">, </span><span class="s1">varIdxes</span><span class="s0">, </span><span class="s1">optimize=</span><span class="s0">True, </span><span class="s1">retainFirstMap=</span><span class="s0">False, </span><span class="s1">advIdxes=set()):</span>
+
+	<span class="s3"># Sort out used varIdxes by major/minor.</span>
+	<span class="s1">used = {}</span>
+	<span class="s0">for </span><span class="s1">varIdx </span><span class="s0">in </span><span class="s1">varIdxes:</span>
+		<span class="s0">if </span><span class="s1">varIdx == NO_VARIATION_INDEX:</span>
+			<span class="s0">continue</span>
+		<span class="s1">major = varIdx &gt;&gt; </span><span class="s2">16</span>
+		<span class="s1">minor = varIdx &amp; </span><span class="s2">0xFFFF</span>
+		<span class="s1">d = used.get(major)</span>
+		<span class="s0">if </span><span class="s1">d </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">d = used[major] = set()</span>
+		<span class="s1">d.add(minor)</span>
+	<span class="s0">del </span><span class="s1">varIdxes</span>
+
+	<span class="s3">#</span>
+	<span class="s3"># Subset VarData</span>
+	<span class="s3">#</span>
+
+	<span class="s1">varData = self.VarData</span>
+	<span class="s1">newVarData = []</span>
+	<span class="s1">varDataMap = {NO_VARIATION_INDEX: NO_VARIATION_INDEX}</span>
+	<span class="s0">for </span><span class="s1">major</span><span class="s0">,</span><span class="s1">data </span><span class="s0">in </span><span class="s1">enumerate(varData):</span>
+		<span class="s1">usedMinors = used.get(major)</span>
+		<span class="s0">if </span><span class="s1">usedMinors </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">continue</span>
+		<span class="s1">newMajor = len(newVarData)</span>
+		<span class="s1">newVarData.append(data)</span>
+
+		<span class="s1">items = data.Item</span>
+		<span class="s1">newItems = []</span>
+		<span class="s0">if </span><span class="s1">major == </span><span class="s2">0 </span><span class="s0">and </span><span class="s1">retainFirstMap:</span>
+			<span class="s0">for </span><span class="s1">minor </span><span class="s0">in </span><span class="s1">range(len(items)):</span>
+				<span class="s1">newItems.append(items[minor] </span><span class="s0">if </span><span class="s1">minor </span><span class="s0">in </span><span class="s1">usedMinors </span><span class="s0">else </span><span class="s1">[</span><span class="s2">0</span><span class="s1">] * len(items[minor]))</span>
+				<span class="s1">varDataMap[minor] = minor</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">if </span><span class="s1">major == </span><span class="s2">0</span><span class="s1">:</span>
+				<span class="s1">minors = sorted(advIdxes) + sorted(usedMinors - advIdxes)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">minors = sorted(usedMinors)</span>
+			<span class="s0">for </span><span class="s1">minor </span><span class="s0">in </span><span class="s1">minors:</span>
+				<span class="s1">newMinor = len(newItems)</span>
+				<span class="s1">newItems.append(items[minor])</span>
+				<span class="s1">varDataMap[(major&lt;&lt;</span><span class="s2">16</span><span class="s1">)+minor] = (newMajor&lt;&lt;</span><span class="s2">16</span><span class="s1">)+newMinor</span>
+
+		<span class="s1">data.Item = newItems</span>
+		<span class="s1">data.ItemCount = len(data.Item)</span>
+
+		<span class="s1">data.calculateNumShorts(optimize=optimize)</span>
+
+	<span class="s1">self.VarData = newVarData</span>
+	<span class="s1">self.VarDataCount = len(self.VarData)</span>
+
+	<span class="s1">self.prune_regions()</span>
+
+	<span class="s0">return </span><span class="s1">varDataMap</span>
+
+<span class="s1">ot.VarStore.subset_varidxes = VarStore_subset_varidxes</span>
+
+<span class="s0">def </span><span class="s1">VarStore_prune_regions(self):</span>
+	<span class="s4">&quot;&quot;&quot;Remove unused VarRegions.&quot;&quot;&quot;</span>
+	<span class="s3">#</span>
+	<span class="s3"># Subset VarRegionList</span>
+	<span class="s3">#</span>
+
+	<span class="s3"># Collect.</span>
+	<span class="s1">usedRegions = set()</span>
+	<span class="s0">for </span><span class="s1">data </span><span class="s0">in </span><span class="s1">self.VarData:</span>
+		<span class="s1">usedRegions.update(data.VarRegionIndex)</span>
+	<span class="s3"># Subset.</span>
+	<span class="s1">regionList = self.VarRegionList</span>
+	<span class="s1">regions = regionList.Region</span>
+	<span class="s1">newRegions = []</span>
+	<span class="s1">regionMap = {}</span>
+	<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">sorted(usedRegions):</span>
+		<span class="s1">regionMap[i] = len(newRegions)</span>
+		<span class="s1">newRegions.append(regions[i])</span>
+	<span class="s1">regionList.Region = newRegions</span>
+	<span class="s1">regionList.RegionCount = len(regionList.Region)</span>
+	<span class="s3"># Map.</span>
+	<span class="s0">for </span><span class="s1">data </span><span class="s0">in </span><span class="s1">self.VarData:</span>
+		<span class="s1">data.VarRegionIndex = [regionMap[i] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">data.VarRegionIndex]</span>
+
+<span class="s1">ot.VarStore.prune_regions = VarStore_prune_regions</span>
+
+
+<span class="s0">def </span><span class="s1">_visit(self</span><span class="s0">, </span><span class="s1">func):</span>
+	<span class="s4">&quot;&quot;&quot;Recurse down from self, if type of an object is ot.Device, 
+    call func() on it.  Works on otData-style classes.&quot;&quot;&quot;</span>
+
+	<span class="s0">if </span><span class="s1">type(self) == ot.Device:</span>
+		<span class="s1">func(self)</span>
+
+	<span class="s0">elif </span><span class="s1">isinstance(self</span><span class="s0">, </span><span class="s1">list):</span>
+		<span class="s0">for </span><span class="s1">that </span><span class="s0">in </span><span class="s1">self:</span>
+			<span class="s1">_visit(that</span><span class="s0">, </span><span class="s1">func)</span>
+
+	<span class="s0">elif </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s5">'getConverters'</span><span class="s1">) </span><span class="s0">and not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s5">'postRead'</span><span class="s1">):</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s1">that = getattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, None</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">that </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s1">_visit(that</span><span class="s0">, </span><span class="s1">func)</span>
+
+	<span class="s0">elif </span><span class="s1">isinstance(self</span><span class="s0">, </span><span class="s1">ot.ValueRecord):</span>
+		<span class="s0">for </span><span class="s1">that </span><span class="s0">in </span><span class="s1">self.__dict__.values():</span>
+			<span class="s1">_visit(that</span><span class="s0">, </span><span class="s1">func)</span>
+
+<span class="s0">def </span><span class="s1">_Device_recordVarIdx(self</span><span class="s0">, </span><span class="s1">s):</span>
+	<span class="s4">&quot;&quot;&quot;Add VarIdx in this Device table (if any) to the set s.&quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">self.DeltaFormat == </span><span class="s2">0x8000</span><span class="s1">:</span>
+		<span class="s1">s.add((self.StartSize&lt;&lt;</span><span class="s2">16</span><span class="s1">)+self.EndSize)</span>
+
+<span class="s0">def </span><span class="s1">Object_collect_device_varidxes(self</span><span class="s0">, </span><span class="s1">varidxes):</span>
+	<span class="s1">adder = partial(_Device_recordVarIdx</span><span class="s0">, </span><span class="s1">s=varidxes)</span>
+	<span class="s1">_visit(self</span><span class="s0">, </span><span class="s1">adder)</span>
+
+<span class="s1">ot.GDEF.collect_device_varidxes = Object_collect_device_varidxes</span>
+<span class="s1">ot.GPOS.collect_device_varidxes = Object_collect_device_varidxes</span>
+
+<span class="s0">def </span><span class="s1">_Device_mapVarIdx(self</span><span class="s0">, </span><span class="s1">mapping</span><span class="s0">, </span><span class="s1">done):</span>
+	<span class="s4">&quot;&quot;&quot;Map VarIdx in this Device table (if any) through mapping.&quot;&quot;&quot;</span>
+	<span class="s0">if </span><span class="s1">id(self) </span><span class="s0">in </span><span class="s1">done:</span>
+		<span class="s0">return</span>
+	<span class="s1">done.add(id(self))</span>
+	<span class="s0">if </span><span class="s1">self.DeltaFormat == </span><span class="s2">0x8000</span><span class="s1">:</span>
+		<span class="s1">varIdx = mapping[(self.StartSize&lt;&lt;</span><span class="s2">16</span><span class="s1">)+self.EndSize]</span>
+		<span class="s1">self.StartSize = varIdx &gt;&gt; </span><span class="s2">16</span>
+		<span class="s1">self.EndSize = varIdx &amp; </span><span class="s2">0xFFFF</span>
+
+<span class="s0">def </span><span class="s1">Object_remap_device_varidxes(self</span><span class="s0">, </span><span class="s1">varidxes_map):</span>
+	<span class="s1">mapper = partial(_Device_mapVarIdx</span><span class="s0">, </span><span class="s1">mapping=varidxes_map</span><span class="s0">, </span><span class="s1">done=set())</span>
+	<span class="s1">_visit(self</span><span class="s0">, </span><span class="s1">mapper)</span>
+
+<span class="s1">ot.GDEF.remap_device_varidxes = Object_remap_device_varidxes</span>
+<span class="s1">ot.GPOS.remap_device_varidxes = Object_remap_device_varidxes</span>
+
+
+<span class="s0">class </span><span class="s1">_Encoding(object):</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">chars):</span>
+		<span class="s1">self.chars = chars</span>
+		<span class="s1">self.width = self._popcount(chars)</span>
+		<span class="s1">self.overhead = self._characteristic_overhead(chars)</span>
+		<span class="s1">self.items = set()</span>
+
+	<span class="s0">def </span><span class="s1">append(self</span><span class="s0">, </span><span class="s1">row):</span>
+		<span class="s1">self.items.add(row)</span>
+
+	<span class="s0">def </span><span class="s1">extend(self</span><span class="s0">, </span><span class="s1">lst):</span>
+		<span class="s1">self.items.update(lst)</span>
+
+	<span class="s0">def </span><span class="s1">get_room(self):</span>
+		<span class="s4">&quot;&quot;&quot;Maximum number of bytes that can be added to characteristic 
+        while still being beneficial to merge it into another one.&quot;&quot;&quot;</span>
+		<span class="s1">count = len(self.items)</span>
+		<span class="s0">return </span><span class="s1">max(</span><span class="s2">0</span><span class="s0">, </span><span class="s1">(self.overhead - </span><span class="s2">1</span><span class="s1">) // count - self.width)</span>
+	<span class="s1">room = property(get_room)</span>
+
+	<span class="s1">@property</span>
+	<span class="s0">def </span><span class="s1">gain(self):</span>
+		<span class="s4">&quot;&quot;&quot;Maximum possible byte gain from merging this into another 
+        characteristic.&quot;&quot;&quot;</span>
+		<span class="s1">count = len(self.items)</span>
+		<span class="s0">return </span><span class="s1">max(</span><span class="s2">0</span><span class="s0">, </span><span class="s1">self.overhead - count * (self.width + </span><span class="s2">1</span><span class="s1">))</span>
+
+	<span class="s0">def </span><span class="s1">sort_key(self):</span>
+		<span class="s0">return </span><span class="s1">self.width</span><span class="s0">, </span><span class="s1">self.chars</span>
+
+	<span class="s0">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">return </span><span class="s1">len(self.items)</span>
+
+	<span class="s0">def </span><span class="s1">can_encode(self</span><span class="s0">, </span><span class="s1">chars):</span>
+		<span class="s0">return not </span><span class="s1">(chars &amp; ~self.chars)</span>
+
+	<span class="s0">def </span><span class="s1">__sub__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">return </span><span class="s1">self._popcount(self.chars &amp; ~other.chars)</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">_popcount(n):</span>
+		<span class="s3"># Apparently this is the fastest native way to do it...</span>
+		<span class="s3"># https://stackoverflow.com/a/9831671</span>
+		<span class="s0">return </span><span class="s1">bin(n).count(</span><span class="s5">'1'</span><span class="s1">)</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">_characteristic_overhead(chars):</span>
+		<span class="s4">&quot;&quot;&quot;Returns overhead in bytes of encoding this characteristic 
+        as a VarData.&quot;&quot;&quot;</span>
+		<span class="s1">c = </span><span class="s2">6</span>
+		<span class="s0">while </span><span class="s1">chars:</span>
+			<span class="s0">if </span><span class="s1">chars &amp; </span><span class="s2">0b1111</span><span class="s1">:</span>
+				<span class="s1">c += </span><span class="s2">2</span>
+			<span class="s1">chars &gt;&gt;= </span><span class="s2">4</span>
+		<span class="s0">return </span><span class="s1">c</span>
+
+	<span class="s0">def </span><span class="s1">_find_yourself_best_new_encoding(self</span><span class="s0">, </span><span class="s1">done_by_width):</span>
+		<span class="s1">self.best_new_encoding = </span><span class="s0">None</span>
+		<span class="s0">for </span><span class="s1">new_width </span><span class="s0">in </span><span class="s1">range(self.width+</span><span class="s2">1</span><span class="s0">, </span><span class="s1">self.width+self.room+</span><span class="s2">1</span><span class="s1">):</span>
+			<span class="s0">for </span><span class="s1">new_encoding </span><span class="s0">in </span><span class="s1">done_by_width[new_width]:</span>
+				<span class="s0">if </span><span class="s1">new_encoding.can_encode(self.chars):</span>
+					<span class="s0">break</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">new_encoding = </span><span class="s0">None</span>
+			<span class="s1">self.best_new_encoding = new_encoding</span>
+
+
+<span class="s0">class </span><span class="s1">_EncodingDict(dict):</span>
+
+	<span class="s0">def </span><span class="s1">__missing__(self</span><span class="s0">, </span><span class="s1">chars):</span>
+		<span class="s1">r = self[chars] = _Encoding(chars)</span>
+		<span class="s0">return </span><span class="s1">r</span>
+
+	<span class="s0">def </span><span class="s1">add_row(self</span><span class="s0">, </span><span class="s1">row):</span>
+		<span class="s1">chars = self._row_characteristics(row)</span>
+		<span class="s1">self[chars].append(row)</span>
+
+	<span class="s1">@staticmethod</span>
+	<span class="s0">def </span><span class="s1">_row_characteristics(row):</span>
+		<span class="s4">&quot;&quot;&quot;Returns encoding characteristics for a row.&quot;&quot;&quot;</span>
+		<span class="s1">longWords = </span><span class="s0">False</span>
+
+		<span class="s1">chars = </span><span class="s2">0</span>
+		<span class="s1">i = </span><span class="s2">1</span>
+		<span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">row:</span>
+			<span class="s0">if </span><span class="s1">v:</span>
+				<span class="s1">chars += i</span>
+			<span class="s0">if not </span><span class="s1">(-</span><span class="s2">128 </span><span class="s1">&lt;= v &lt;= </span><span class="s2">127</span><span class="s1">):</span>
+				<span class="s1">chars += i * </span><span class="s2">0b0010</span>
+			<span class="s0">if not </span><span class="s1">(-</span><span class="s2">32768 </span><span class="s1">&lt;= v &lt;= </span><span class="s2">32767</span><span class="s1">):</span>
+				<span class="s1">longWords = </span><span class="s0">True</span>
+				<span class="s0">break</span>
+			<span class="s1">i &lt;&lt;= </span><span class="s2">4</span>
+
+		<span class="s0">if </span><span class="s1">longWords:</span>
+			<span class="s3"># Redo; only allow 2byte/4byte encoding</span>
+			<span class="s1">chars = </span><span class="s2">0</span>
+			<span class="s1">i = </span><span class="s2">1</span>
+			<span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">row:</span>
+				<span class="s0">if </span><span class="s1">v:</span>
+					<span class="s1">chars += i * </span><span class="s2">0b0011</span>
+				<span class="s0">if not </span><span class="s1">(-</span><span class="s2">32768 </span><span class="s1">&lt;= v &lt;= </span><span class="s2">32767</span><span class="s1">):</span>
+					<span class="s1">chars += i * </span><span class="s2">0b1100</span>
+				<span class="s1">i &lt;&lt;= </span><span class="s2">4</span>
+
+		<span class="s0">return </span><span class="s1">chars</span>
+
+
+<span class="s0">def </span><span class="s1">VarStore_optimize(self</span><span class="s0">, </span><span class="s1">use_NO_VARIATION_INDEX=</span><span class="s0">True</span><span class="s1">):</span>
+	<span class="s4">&quot;&quot;&quot;Optimize storage. Returns mapping from old VarIdxes to new ones.&quot;&quot;&quot;</span>
+
+	<span class="s3"># TODO</span>
+	<span class="s3"># Check that no two VarRegions are the same; if they are, fold them.</span>
+
+	<span class="s1">n = len(self.VarRegionList.Region) </span><span class="s3"># Number of columns</span>
+	<span class="s1">zeroes = [</span><span class="s2">0</span><span class="s1">] * n</span>
+
+	<span class="s1">front_mapping = {} </span><span class="s3"># Map from old VarIdxes to full row tuples</span>
+
+	<span class="s1">encodings = _EncodingDict()</span>
+
+	<span class="s3"># Collect all items into a set of full rows (with lots of zeroes.)</span>
+	<span class="s0">for </span><span class="s1">major</span><span class="s0">,</span><span class="s1">data </span><span class="s0">in </span><span class="s1">enumerate(self.VarData):</span>
+		<span class="s1">regionIndices = data.VarRegionIndex</span>
+
+		<span class="s0">for </span><span class="s1">minor</span><span class="s0">,</span><span class="s1">item </span><span class="s0">in </span><span class="s1">enumerate(data.Item):</span>
+
+			<span class="s1">row = list(zeroes)</span>
+			<span class="s0">for </span><span class="s1">regionIdx</span><span class="s0">,</span><span class="s1">v </span><span class="s0">in </span><span class="s1">zip(regionIndices</span><span class="s0">, </span><span class="s1">item):</span>
+				<span class="s1">row[regionIdx] += v</span>
+			<span class="s1">row = tuple(row)</span>
+
+			<span class="s0">if </span><span class="s1">use_NO_VARIATION_INDEX </span><span class="s0">and not </span><span class="s1">any(row):</span>
+				<span class="s1">front_mapping[(major&lt;&lt;</span><span class="s2">16</span><span class="s1">)+minor] = </span><span class="s0">None</span>
+				<span class="s0">continue</span>
+
+			<span class="s1">encodings.add_row(row)</span>
+			<span class="s1">front_mapping[(major&lt;&lt;</span><span class="s2">16</span><span class="s1">)+minor] = row</span>
+
+	<span class="s3"># Separate encodings that have no gain (are decided) and those having</span>
+	<span class="s3"># possible gain (possibly to be merged into others.)</span>
+	<span class="s1">encodings = sorted(encodings.values()</span><span class="s0">, </span><span class="s1">key=_Encoding.__len__</span><span class="s0">, </span><span class="s1">reverse=</span><span class="s0">True</span><span class="s1">)</span>
+	<span class="s1">done_by_width = defaultdict(list)</span>
+	<span class="s1">todo = []</span>
+	<span class="s0">for </span><span class="s1">encoding </span><span class="s0">in </span><span class="s1">encodings:</span>
+		<span class="s0">if not </span><span class="s1">encoding.gain:</span>
+			<span class="s1">done_by_width[encoding.width].append(encoding)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">todo.append(encoding)</span>
+
+	<span class="s3"># For each encoding that is possibly to be merged, find the best match</span>
+	<span class="s3"># in the decided encodings, and record that.</span>
+	<span class="s1">todo.sort(key=_Encoding.get_room)</span>
+	<span class="s0">for </span><span class="s1">encoding </span><span class="s0">in </span><span class="s1">todo:</span>
+		<span class="s1">encoding._find_yourself_best_new_encoding(done_by_width)</span>
+
+	<span class="s3"># Walk through todo encodings, for each, see if merging it with</span>
+	<span class="s3"># another todo encoding gains more than each of them merging with</span>
+	<span class="s3"># their best decided encoding. If yes, merge them and add resulting</span>
+	<span class="s3"># encoding back to todo queue.  If not, move the enconding to decided</span>
+	<span class="s3"># list.  Repeat till done.</span>
+	<span class="s0">while </span><span class="s1">todo:</span>
+		<span class="s1">encoding = todo.pop()</span>
+		<span class="s1">best_idx = </span><span class="s0">None</span>
+		<span class="s1">best_gain = </span><span class="s2">0</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">,</span><span class="s1">other_encoding </span><span class="s0">in </span><span class="s1">enumerate(todo):</span>
+			<span class="s1">combined_chars = other_encoding.chars | encoding.chars</span>
+			<span class="s1">combined_width = _Encoding._popcount(combined_chars)</span>
+			<span class="s1">combined_overhead = _Encoding._characteristic_overhead(combined_chars)</span>
+			<span class="s1">combined_gain = (</span>
+					<span class="s1">+ encoding.overhead</span>
+					<span class="s1">+ other_encoding.overhead</span>
+					<span class="s1">- combined_overhead</span>
+					<span class="s1">- (combined_width - encoding.width) * len(encoding)</span>
+					<span class="s1">- (combined_width - other_encoding.width) * len(other_encoding)</span>
+					<span class="s1">)</span>
+			<span class="s1">this_gain = </span><span class="s2">0 </span><span class="s0">if </span><span class="s1">encoding.best_new_encoding </span><span class="s0">is None else </span><span class="s1">(</span>
+						<span class="s1">+ encoding.overhead</span>
+						<span class="s1">- (encoding.best_new_encoding.width - encoding.width) * len(encoding)</span>
+					<span class="s1">)</span>
+			<span class="s1">other_gain = </span><span class="s2">0 </span><span class="s0">if </span><span class="s1">other_encoding.best_new_encoding </span><span class="s0">is None else </span><span class="s1">(</span>
+						<span class="s1">+ other_encoding.overhead</span>
+						<span class="s1">- (other_encoding.best_new_encoding.width - other_encoding.width) * len(other_encoding)</span>
+					<span class="s1">)</span>
+			<span class="s1">separate_gain = this_gain + other_gain</span>
+
+			<span class="s0">if </span><span class="s1">combined_gain &gt; separate_gain:</span>
+				<span class="s1">best_idx = i</span>
+				<span class="s1">best_gain = combined_gain - separate_gain</span>
+
+		<span class="s0">if </span><span class="s1">best_idx </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s3"># Encoding is decided as is</span>
+			<span class="s1">done_by_width[encoding.width].append(encoding)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">other_encoding = todo[best_idx]</span>
+			<span class="s1">combined_chars = other_encoding.chars | encoding.chars</span>
+			<span class="s1">combined_encoding = _Encoding(combined_chars)</span>
+			<span class="s1">combined_encoding.extend(encoding.items)</span>
+			<span class="s1">combined_encoding.extend(other_encoding.items)</span>
+			<span class="s1">combined_encoding._find_yourself_best_new_encoding(done_by_width)</span>
+			<span class="s0">del </span><span class="s1">todo[best_idx]</span>
+			<span class="s1">todo.append(combined_encoding)</span>
+
+	<span class="s3"># Assemble final store.</span>
+	<span class="s1">back_mapping = {} </span><span class="s3"># Mapping from full rows to new VarIdxes</span>
+	<span class="s1">encodings = sum(done_by_width.values()</span><span class="s0">, </span><span class="s1">[])</span>
+	<span class="s1">encodings.sort(key=_Encoding.sort_key)</span>
+	<span class="s1">self.VarData = []</span>
+	<span class="s0">for </span><span class="s1">major</span><span class="s0">,</span><span class="s1">encoding </span><span class="s0">in </span><span class="s1">enumerate(encodings):</span>
+		<span class="s1">data = ot.VarData()</span>
+		<span class="s1">self.VarData.append(data)</span>
+		<span class="s1">data.VarRegionIndex = range(n)</span>
+		<span class="s1">data.VarRegionCount = len(data.VarRegionIndex)</span>
+		<span class="s1">data.Item = sorted(encoding.items)</span>
+		<span class="s0">for </span><span class="s1">minor</span><span class="s0">,</span><span class="s1">item </span><span class="s0">in </span><span class="s1">enumerate(data.Item):</span>
+			<span class="s1">back_mapping[item] = (major&lt;&lt;</span><span class="s2">16</span><span class="s1">)+minor</span>
+
+	<span class="s3"># Compile final mapping.</span>
+	<span class="s1">varidx_map = {NO_VARIATION_INDEX:NO_VARIATION_INDEX}</span>
+	<span class="s0">for </span><span class="s1">k</span><span class="s0">,</span><span class="s1">v </span><span class="s0">in </span><span class="s1">front_mapping.items():</span>
+		<span class="s1">varidx_map[k] = back_mapping[v] </span><span class="s0">if </span><span class="s1">v </span><span class="s0">is not None else </span><span class="s1">NO_VARIATION_INDEX</span>
+
+	<span class="s3"># Remove unused regions.</span>
+	<span class="s1">self.prune_regions()</span>
+
+	<span class="s3"># Recalculate things and go home.</span>
+	<span class="s1">self.VarRegionList.RegionCount = len(self.VarRegionList.Region)</span>
+	<span class="s1">self.VarDataCount = len(self.VarData)</span>
+	<span class="s0">for </span><span class="s1">data </span><span class="s0">in </span><span class="s1">self.VarData:</span>
+		<span class="s1">data.ItemCount = len(data.Item)</span>
+		<span class="s1">data.optimize()</span>
+
+	<span class="s0">return </span><span class="s1">varidx_map</span>
+
+<span class="s1">ot.VarStore.optimize = VarStore_optimize</span>
+
+
+<span class="s0">def </span><span class="s1">main(args=</span><span class="s0">None</span><span class="s1">):</span>
+	<span class="s4">&quot;&quot;&quot;Optimize a font's GDEF variation store&quot;&quot;&quot;</span>
+	<span class="s0">from </span><span class="s1">argparse </span><span class="s0">import </span><span class="s1">ArgumentParser</span>
+	<span class="s0">from </span><span class="s1">fontTools </span><span class="s0">import </span><span class="s1">configLogger</span>
+	<span class="s0">from </span><span class="s1">fontTools.ttLib </span><span class="s0">import </span><span class="s1">TTFont</span>
+	<span class="s0">from </span><span class="s1">fontTools.ttLib.tables.otBase </span><span class="s0">import </span><span class="s1">OTTableWriter</span>
+
+	<span class="s1">parser = ArgumentParser(prog=</span><span class="s5">'varLib.varStore'</span><span class="s0">, </span><span class="s1">description= main.__doc__)</span>
+	<span class="s1">parser.add_argument(</span><span class="s5">'fontfile'</span><span class="s1">)</span>
+	<span class="s1">parser.add_argument(</span><span class="s5">'outfile'</span><span class="s0">, </span><span class="s1">nargs=</span><span class="s5">'?'</span><span class="s1">)</span>
+	<span class="s1">options = parser.parse_args(args)</span>
+
+	<span class="s3"># TODO: allow user to configure logging via command-line options</span>
+	<span class="s1">configLogger(level=</span><span class="s5">&quot;INFO&quot;</span><span class="s1">)</span>
+
+	<span class="s1">fontfile = options.fontfile</span>
+	<span class="s1">outfile = options.outfile</span>
+
+	<span class="s1">font = TTFont(fontfile)</span>
+	<span class="s1">gdef = font[</span><span class="s5">'GDEF'</span><span class="s1">]</span>
+	<span class="s1">store = gdef.table.VarStore</span>
+
+	<span class="s1">writer = OTTableWriter()</span>
+	<span class="s1">store.compile(writer</span><span class="s0">, </span><span class="s1">font)</span>
+	<span class="s1">size = len(writer.getAllData())</span>
+	<span class="s1">print(</span><span class="s5">&quot;Before: %7d bytes&quot; </span><span class="s1">% size)</span>
+
+	<span class="s1">varidx_map = store.optimize()</span>
+
+	<span class="s1">gdef.table.remap_device_varidxes(varidx_map)</span>
+	<span class="s0">if </span><span class="s5">'GPOS' </span><span class="s0">in </span><span class="s1">font:</span>
+		<span class="s1">font[</span><span class="s5">'GPOS'</span><span class="s1">].table.remap_device_varidxes(varidx_map)</span>
+
+	<span class="s1">writer = OTTableWriter()</span>
+	<span class="s1">store.compile(writer</span><span class="s0">, </span><span class="s1">font)</span>
+	<span class="s1">size = len(writer.getAllData())</span>
+	<span class="s1">print(</span><span class="s5">&quot;After:  %7d bytes&quot; </span><span class="s1">% size)</span>
+
+	<span class="s0">if </span><span class="s1">outfile </span><span class="s0">is not None</span><span class="s1">:</span>
+		<span class="s1">font.save(outfile)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ == </span><span class="s5">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s0">import </span><span class="s1">sys</span>
+	<span class="s0">if </span><span class="s1">len(sys.argv) &gt; </span><span class="s2">1</span><span class="s1">:</span>
+		<span class="s1">sys.exit(main())</span>
+	<span class="s0">import </span><span class="s1">doctest</span>
+	<span class="s1">sys.exit(doctest.testmod().failed)</span>
+</pre>
+</body>
+</html>

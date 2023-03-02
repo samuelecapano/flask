@@ -1,0 +1,728 @@
+<html>
+<head>
+<title>metadata_writer.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+metadata_writer.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2022 The MediaPipe Authors. All Rights Reserved.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#     http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+<span class="s0"># ==============================================================================</span>
+<span class="s2">&quot;&quot;&quot;Generic metadata writer.&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">collections</span>
+<span class="s3">import </span><span class="s1">csv</span>
+<span class="s3">import </span><span class="s1">dataclasses</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">tempfile</span>
+<span class="s3">from </span><span class="s1">typing </span><span class="s3">import </span><span class="s1">List</span><span class="s3">, </span><span class="s1">Optional</span><span class="s3">, </span><span class="s1">Tuple</span><span class="s3">, </span><span class="s1">Union</span>
+
+<span class="s3">import </span><span class="s1">flatbuffers</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.metadata </span><span class="s3">import </span><span class="s1">metadata_schema_py_generated </span><span class="s3">as </span><span class="s1">metadata_fb</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.python.metadata </span><span class="s3">import </span><span class="s1">metadata</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.python.metadata.metadata_writers </span><span class="s3">import </span><span class="s1">metadata_info</span>
+<span class="s3">from </span><span class="s1">mediapipe.tasks.python.metadata.metadata_writers </span><span class="s3">import </span><span class="s1">writer_utils</span>
+
+<span class="s1">_INPUT_IMAGE_NAME = </span><span class="s4">'image'</span>
+<span class="s1">_INPUT_IMAGE_DESCRIPTION = </span><span class="s4">'Input image to be processed.'</span>
+<span class="s1">_INPUT_REGEX_TEXT_NAME = </span><span class="s4">'input_text'</span>
+<span class="s1">_INPUT_REGEX_TEXT_DESCRIPTION = (</span><span class="s4">'Embedding vectors representing the input '</span>
+                                 <span class="s4">'text to be processed.'</span><span class="s1">)</span>
+<span class="s1">_OUTPUT_CLASSIFICATION_NAME = </span><span class="s4">'score'</span>
+<span class="s1">_OUTPUT_CLASSIFICATION_DESCRIPTION = </span><span class="s4">'Score of the labels respectively.'</span>
+
+
+<span class="s1">@dataclasses.dataclass</span>
+<span class="s3">class </span><span class="s1">CalibrationParameter:</span>
+  <span class="s2">&quot;&quot;&quot;Parameters for score calibration [1]. 
+ 
+  Score calibration is performed on an output tensor through sigmoid functions. 
+  One of the main purposes of score calibration is to make scores across classes 
+  comparable, so that a common threshold can be used for all output classes. 
+ 
+  For each index in the output tensor, this applies: 
+    * `f(x) = scale / (1 + e^-(slope * g(x) + offset))` if `x &gt; min_score` or if 
+      no `min_score` has been specified. 
+    * `f(x) = default_score` otherwise or if no scale, slope and offset have 
+      been specified. 
+ 
+  [1]: 
+    https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L434 
+  &quot;&quot;&quot;</span>
+  <span class="s1">scale: float</span>
+  <span class="s1">slope: float</span>
+  <span class="s1">offset: float</span>
+  <span class="s1">min_score: Optional[float] = </span><span class="s3">None</span>
+
+
+<span class="s1">@dataclasses.dataclass</span>
+<span class="s3">class </span><span class="s1">LabelItem:</span>
+  <span class="s2">&quot;&quot;&quot;Label item for labels per locale. 
+ 
+  Attributes: 
+    filename: The file name to save the labels. 
+    names: A list of label names. 
+    locale: The specified locale for labels. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">filename: str</span>
+  <span class="s1">names: List[str]</span>
+  <span class="s1">locale: Optional[str] = </span><span class="s3">None</span>
+
+
+<span class="s1">@dataclasses.dataclass</span>
+<span class="s3">class </span><span class="s1">ScoreThresholding:</span>
+  <span class="s2">&quot;&quot;&quot;Parameters to performs thresholding on output tensor values [1]. 
+ 
+  Attributes: 
+    global_score_threshold: The recommended global threshold below which results 
+      are considered low-confidence and should be filtered out.  [1]: 
+    https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L468 
+  &quot;&quot;&quot;</span>
+  <span class="s1">global_score_threshold: float</span>
+
+
+<span class="s1">@dataclasses.dataclass</span>
+<span class="s3">class </span><span class="s1">RegexTokenizer:</span>
+  <span class="s2">&quot;&quot;&quot;Parameters of the Regex tokenizer [1] metadata information. 
+ 
+  [1]: 
+    https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L500 
+ 
+  Attributes: 
+    delim_regex_pattern: the regular expression to segment strings and create 
+      tokens. 
+    vocab_file_path: path to the vocabulary file. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">delim_regex_pattern: str</span>
+  <span class="s1">vocab_file_path: str</span>
+
+
+<span class="s1">@dataclasses.dataclass</span>
+<span class="s3">class </span><span class="s1">BertTokenizer:</span>
+  <span class="s2">&quot;&quot;&quot;Parameters of the Bert tokenizer [1] metadata information. 
+ 
+  [1]: 
+    https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L477 
+ 
+  Attributes: 
+    vocab_file_path: path to the vocabulary file. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">vocab_file_path: str</span>
+
+
+<span class="s1">@dataclasses.dataclass</span>
+<span class="s3">class </span><span class="s1">SentencePieceTokenizer:</span>
+  <span class="s2">&quot;&quot;&quot;Parameters of the sentence piece tokenizer tokenizer [1] metadata information. 
+ 
+  [1]: 
+    https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L485 
+ 
+  Attributes: 
+    sentence_piece_model_path: path to the sentence piece model file. 
+    vocab_file_path: path to the vocabulary file. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">sentence_piece_model_path: str</span>
+  <span class="s1">vocab_file_path: Optional[str] = </span><span class="s3">None</span>
+
+
+<span class="s3">class </span><span class="s1">Labels(object):</span>
+  <span class="s2">&quot;&quot;&quot;Simple container holding classification labels of a particular tensor. 
+ 
+  Example usage: 
+    # The first added label list can be used as category names as needed. 
+    labels = Labels() 
+      .add(['/m/011l78', '/m/031d23']) 
+      .add(['cat', 'dog], 'en') 
+      .add(['chat', 'chien], 'fr') 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self) -&gt; </span><span class="s3">None</span><span class="s1">:</span>
+    <span class="s1">self._labels = []  </span><span class="s0"># [LabelItem]</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">labels(self) -&gt; List[LabelItem]:</span>
+    <span class="s3">return </span><span class="s1">self._labels</span>
+
+  <span class="s3">def </span><span class="s1">add(self</span><span class="s3">,</span>
+          <span class="s1">labels: List[str]</span><span class="s3">,</span>
+          <span class="s1">locale: Optional[str] = </span><span class="s3">None,</span>
+          <span class="s1">exported_filename: Optional[str] = </span><span class="s3">None</span><span class="s1">) -&gt; </span><span class="s4">'Labels'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds labels in the container. 
+ 
+    Args: 
+      labels: A list of label names, e.g. ['apple', 'pear', 'banana']. 
+      locale: The specified locale for labels. 
+      exported_filename: The file name to export the labels. If not set, 
+        filename defaults to 'labels.txt'. 
+ 
+    Returns: 
+      The Labels instance, can be used for chained operation. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">labels:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'The list of labels is empty.'</span><span class="s1">)</span>
+
+    <span class="s0"># Prepare the new item to be inserted</span>
+    <span class="s3">if not </span><span class="s1">exported_filename:</span>
+      <span class="s1">exported_filename = </span><span class="s4">'labels'</span>
+      <span class="s3">if </span><span class="s1">locale:</span>
+        <span class="s1">exported_filename += </span><span class="s4">f'_</span><span class="s3">{</span><span class="s1">locale</span><span class="s3">}</span><span class="s4">'</span>
+      <span class="s1">exported_filename += </span><span class="s4">'.txt'</span>
+    <span class="s1">item = LabelItem(filename=exported_filename</span><span class="s3">, </span><span class="s1">names=labels</span><span class="s3">, </span><span class="s1">locale=locale)</span>
+
+    <span class="s0"># Insert the new element at the end of the list</span>
+    <span class="s1">self._labels.append(item)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">add_from_file(self</span><span class="s3">,</span>
+                    <span class="s1">label_filepath: str</span><span class="s3">,</span>
+                    <span class="s1">locale: Optional[str] = </span><span class="s3">None,</span>
+                    <span class="s1">exported_filename: Optional[str] = </span><span class="s3">None</span><span class="s1">) -&gt; </span><span class="s4">'Labels'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds a label file in the container. 
+ 
+    Args: 
+      label_filepath: File path to read labels. Each line is a label name in the 
+        file. 
+      locale: The specified locale for labels. 
+      exported_filename: The file name to export the labels. If not set, 
+        filename defaults to 'labels.txt'. 
+ 
+    Returns: 
+      The Labels instance, can be used for chained operation. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">with </span><span class="s1">open(label_filepath</span><span class="s3">, </span><span class="s4">'r'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s1">labels = f.read().split(</span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">)</span>
+      <span class="s3">return </span><span class="s1">self.add(labels</span><span class="s3">, </span><span class="s1">locale</span><span class="s3">, </span><span class="s1">exported_filename)</span>
+
+
+<span class="s3">class </span><span class="s1">ScoreCalibration:</span>
+  <span class="s2">&quot;&quot;&quot;Simple container holding score calibration related parameters.&quot;&quot;&quot;</span>
+
+  <span class="s0"># A shortcut to avoid client side code importing metadata_fb</span>
+  <span class="s1">transformation_types = metadata_fb.ScoreTransformationType</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">,</span>
+               <span class="s1">transformation_type: metadata_fb.ScoreTransformationType</span><span class="s3">,</span>
+               <span class="s1">parameters: List[Optional[CalibrationParameter]]</span><span class="s3">,</span>
+               <span class="s1">default_score: int = </span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s1">self.transformation_type = transformation_type</span>
+    <span class="s1">self.parameters = parameters</span>
+    <span class="s1">self.default_score = default_score</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">create_from_file(cls</span><span class="s3">,</span>
+                       <span class="s1">transformation_type: metadata_fb.ScoreTransformationType</span><span class="s3">,</span>
+                       <span class="s1">file_path: str</span><span class="s3">,</span>
+                       <span class="s1">default_score: int = </span><span class="s5">0</span><span class="s1">) -&gt; </span><span class="s4">'ScoreCalibration'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Creates ScoreCalibration from the file. 
+ 
+    Args: 
+      transformation_type: type of the function used for transforming the 
+        uncalibrated score before applying score calibration. 
+      file_path: file_path of the score calibration file [1]. Contains 
+        sigmoid-based score calibration parameters, formatted as CSV. Lines 
+        contain for each index of an output tensor the scale, slope, offset and 
+        (optional) min_score parameters to be used for sigmoid fitting (in this 
+        order and in `strtof`-compatible [2] format). Scale should be a 
+        non-negative value. A line may be left empty to default calibrated 
+        scores for this index to default_score. In summary, each line should 
+        thus contain 0, 3 or 4 comma-separated values. 
+      default_score: the default calibrated score to apply if the uncalibrated 
+        score is below min_score or if no parameters were specified for a given 
+        index. 
+      [1]: 
+        https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L133 
+      [2]: 
+        https://en.cppreference.com/w/c/string/byte/strtof 
+ 
+    Returns: 
+      A ScoreCalibration object. 
+    Raises: 
+      ValueError: if the score_calibration file is malformed. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">open(file_path</span><span class="s3">, </span><span class="s4">'r'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">calibration_file:</span>
+      <span class="s1">csv_reader = csv.reader(calibration_file</span><span class="s3">, </span><span class="s1">delimiter=</span><span class="s4">','</span><span class="s1">)</span>
+      <span class="s1">parameters = []</span>
+      <span class="s3">for </span><span class="s1">row </span><span class="s3">in </span><span class="s1">csv_reader:</span>
+        <span class="s3">if not </span><span class="s1">row:</span>
+          <span class="s1">parameters.append(</span><span class="s3">None</span><span class="s1">)</span>
+          <span class="s3">continue</span>
+
+        <span class="s3">if </span><span class="s1">len(row) != </span><span class="s5">3 </span><span class="s3">and </span><span class="s1">len(row) != </span><span class="s5">4</span><span class="s1">:</span>
+          <span class="s3">raise </span><span class="s1">ValueError(</span>
+              <span class="s4">f'Expected empty lines or 3 or 4 parameters per line in score'</span>
+              <span class="s4">f' calibration file, but got </span><span class="s3">{</span><span class="s1">len(row)</span><span class="s3">}</span><span class="s4">.'</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">float(row[</span><span class="s5">0</span><span class="s1">]) &lt; </span><span class="s5">0</span><span class="s1">:</span>
+          <span class="s3">raise </span><span class="s1">ValueError(</span>
+              <span class="s4">f'Expected scale to be a non-negative value, but got '</span>
+              <span class="s4">f'</span><span class="s3">{</span><span class="s1">float(row[</span><span class="s5">0</span><span class="s1">])</span><span class="s3">}</span><span class="s4">.'</span><span class="s1">)</span>
+
+        <span class="s1">parameters.append(</span>
+            <span class="s1">CalibrationParameter(</span>
+                <span class="s1">scale=float(row[</span><span class="s5">0</span><span class="s1">])</span><span class="s3">,</span>
+                <span class="s1">slope=float(row[</span><span class="s5">1</span><span class="s1">])</span><span class="s3">,</span>
+                <span class="s1">offset=float(row[</span><span class="s5">2</span><span class="s1">])</span><span class="s3">,</span>
+                <span class="s1">min_score=</span><span class="s3">None if </span><span class="s1">len(row) == </span><span class="s5">3 </span><span class="s3">else </span><span class="s1">float(row[</span><span class="s5">3</span><span class="s1">])))</span>
+
+    <span class="s3">return </span><span class="s1">cls(transformation_type</span><span class="s3">, </span><span class="s1">parameters</span><span class="s3">, </span><span class="s1">default_score)</span>
+
+
+<span class="s3">def </span><span class="s1">_fill_default_tensor_names(</span>
+    <span class="s1">tensor_metadata_list: List[metadata_fb.TensorMetadataT]</span><span class="s3">,</span>
+    <span class="s1">tensor_names_from_model: List[str]):</span>
+  <span class="s2">&quot;&quot;&quot;Fills the default tensor names.&quot;&quot;&quot;</span>
+  <span class="s0"># If tensor name in metadata is empty, default to the tensor name saved in</span>
+  <span class="s0"># the model.</span>
+  <span class="s3">for </span><span class="s1">tensor_metadata</span><span class="s3">, </span><span class="s1">name </span><span class="s3">in </span><span class="s1">zip(tensor_metadata_list</span><span class="s3">,</span>
+                                   <span class="s1">tensor_names_from_model):</span>
+    <span class="s1">tensor_metadata.name = tensor_metadata.name </span><span class="s3">or </span><span class="s1">name</span>
+
+
+<span class="s3">def </span><span class="s1">_pair_tensor_metadata(</span>
+    <span class="s1">tensor_md: List[metadata_info.TensorMd]</span><span class="s3">,</span>
+    <span class="s1">tensor_names_from_model: List[str]) -&gt; List[metadata_info.TensorMd]:</span>
+  <span class="s2">&quot;&quot;&quot;Pairs tensor_md according to the tensor names from the model.&quot;&quot;&quot;</span>
+  <span class="s1">tensor_names_from_arg = [</span>
+      <span class="s1">md.tensor_name </span><span class="s3">for </span><span class="s1">md </span><span class="s3">in </span><span class="s1">tensor_md </span><span class="s3">or </span><span class="s1">[] </span><span class="s3">if </span><span class="s1">md.tensor_name </span><span class="s3">is not None</span>
+  <span class="s1">]</span>
+  <span class="s3">if not </span><span class="s1">tensor_names_from_arg:</span>
+    <span class="s3">return </span><span class="s1">tensor_md</span>
+
+  <span class="s3">if </span><span class="s1">collections.Counter(tensor_names_from_arg) != collections.Counter(</span>
+      <span class="s1">tensor_names_from_model):</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span>
+        <span class="s4">'The tensor names from arguments ({}) do not match the tensor names'</span>
+        <span class="s4">' read from the model ({}).'</span><span class="s1">.format(tensor_names_from_arg</span><span class="s3">,</span>
+                                            <span class="s1">tensor_names_from_model))</span>
+  <span class="s1">pairs_tensor_md = []</span>
+  <span class="s1">name_md_dict = dict(zip(tensor_names_from_arg</span><span class="s3">, </span><span class="s1">tensor_md))</span>
+  <span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">tensor_names_from_model:</span>
+    <span class="s1">pairs_tensor_md.append(name_md_dict[name])</span>
+  <span class="s3">return </span><span class="s1">pairs_tensor_md</span>
+
+
+<span class="s3">def </span><span class="s1">_create_metadata_buffer(</span>
+    <span class="s1">model_buffer: bytearray</span><span class="s3">,</span>
+    <span class="s1">general_md: Optional[metadata_info.GeneralMd] = </span><span class="s3">None,</span>
+    <span class="s1">input_md: Optional[List[metadata_info.TensorMd]] = </span><span class="s3">None,</span>
+    <span class="s1">output_md: Optional[List[metadata_info.TensorMd]] = </span><span class="s3">None,</span>
+    <span class="s1">input_process_units: Optional[List[metadata_fb.ProcessUnitT]] = </span><span class="s3">None</span>
+<span class="s1">) -&gt; bytearray:</span>
+  <span class="s2">&quot;&quot;&quot;Creates a buffer of the metadata. 
+ 
+  Args: 
+    model_buffer: valid buffer of the model file. 
+    general_md: general information about the model. 
+    input_md: metadata information of the input tensors. 
+    output_md: metadata information of the output tensors. 
+    input_process_units: a lists of metadata of the input process units [1]. 
+    [1]: 
+      https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L655 
+  Returns: 
+    A buffer of the metadata. 
+ 
+  Raises: 
+    ValueError: if the tensor names from `input_md` and `output_md` do not 
+    match the tensor names read from the model. 
+  &quot;&quot;&quot;</span>
+  <span class="s0"># Create input metadata from `input_md`.</span>
+  <span class="s3">if </span><span class="s1">input_md:</span>
+    <span class="s1">input_md = _pair_tensor_metadata(</span>
+        <span class="s1">input_md</span><span class="s3">, </span><span class="s1">writer_utils.get_input_tensor_names(model_buffer))</span>
+    <span class="s1">input_metadata = [m.create_metadata() </span><span class="s3">for </span><span class="s1">m </span><span class="s3">in </span><span class="s1">input_md]</span>
+  <span class="s3">else</span><span class="s1">:</span>
+    <span class="s1">num_input_tensors = writer_utils.get_subgraph(model_buffer).InputsLength()</span>
+    <span class="s1">input_metadata = [metadata_fb.TensorMetadataT()] * num_input_tensors</span>
+
+  <span class="s1">_fill_default_tensor_names(input_metadata</span><span class="s3">,</span>
+                             <span class="s1">writer_utils.get_input_tensor_names(model_buffer))</span>
+
+  <span class="s0"># Create output metadata from `output_md`.</span>
+  <span class="s3">if </span><span class="s1">output_md:</span>
+    <span class="s1">output_md = _pair_tensor_metadata(</span>
+        <span class="s1">output_md</span><span class="s3">, </span><span class="s1">writer_utils.get_output_tensor_names(model_buffer))</span>
+    <span class="s1">output_metadata = [m.create_metadata() </span><span class="s3">for </span><span class="s1">m </span><span class="s3">in </span><span class="s1">output_md]</span>
+  <span class="s3">else</span><span class="s1">:</span>
+    <span class="s1">num_output_tensors = writer_utils.get_subgraph(model_buffer).OutputsLength()</span>
+    <span class="s1">output_metadata = [metadata_fb.TensorMetadataT()] * num_output_tensors</span>
+  <span class="s1">_fill_default_tensor_names(output_metadata</span><span class="s3">,</span>
+                             <span class="s1">writer_utils.get_output_tensor_names(model_buffer))</span>
+
+  <span class="s0"># Create the subgraph metadata.</span>
+  <span class="s1">subgraph_metadata = metadata_fb.SubGraphMetadataT()</span>
+  <span class="s1">subgraph_metadata.inputTensorMetadata = input_metadata</span>
+  <span class="s1">subgraph_metadata.outputTensorMetadata = output_metadata</span>
+  <span class="s3">if </span><span class="s1">input_process_units:</span>
+    <span class="s1">subgraph_metadata.inputProcessUnits = input_process_units</span>
+
+  <span class="s0"># Create the whole model metadata.</span>
+  <span class="s3">if </span><span class="s1">general_md </span><span class="s3">is None</span><span class="s1">:</span>
+    <span class="s1">general_md = metadata_info.GeneralMd()</span>
+  <span class="s1">model_metadata = general_md.create_metadata()</span>
+  <span class="s1">model_metadata.subgraphMetadata = [subgraph_metadata]</span>
+
+  <span class="s0"># Get the metadata flatbuffer.</span>
+  <span class="s1">b = flatbuffers.Builder(</span><span class="s5">0</span><span class="s1">)</span>
+  <span class="s1">b.Finish(</span>
+      <span class="s1">model_metadata.Pack(b)</span><span class="s3">,</span>
+      <span class="s1">metadata.MetadataPopulator.METADATA_FILE_IDENTIFIER)</span>
+  <span class="s3">return </span><span class="s1">b.Output()</span>
+
+
+<span class="s3">class </span><span class="s1">MetadataWriter(object):</span>
+  <span class="s2">&quot;&quot;&quot;Generic Metadata writer. 
+ 
+  Example usage: 
+ 
+  For an example model which requires two inputs: image and general feature 
+  inputs, and generates one output: classification. 
+ 
+  with open(model_path, 'rb') as f: 
+    writer = MetadataWriter.create(f.read()) 
+    model_content, metadata_json_content = writer 
+        .add_genernal_info('model_name', 'model description') 
+        .add_image_input() 
+        .add_feature_input() 
+        .add_classification_output(Labels().add(['A', 'B'])) 
+        .populate() 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">@classmethod</span>
+  <span class="s3">def </span><span class="s1">create(cls</span><span class="s3">, </span><span class="s1">model_buffer: bytearray) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s3">return </span><span class="s1">cls(model_buffer)</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model_buffer: bytearray) -&gt; </span><span class="s3">None</span><span class="s1">:</span>
+    <span class="s1">self._model_buffer = model_buffer</span>
+    <span class="s1">self._general_md = </span><span class="s3">None</span>
+    <span class="s1">self._input_mds = []</span>
+    <span class="s1">self._input_process_units = []</span>
+    <span class="s1">self._output_mds = []</span>
+    <span class="s1">self._associated_files = []</span>
+    <span class="s1">self._temp_folder = tempfile.TemporaryDirectory()</span>
+
+  <span class="s3">def </span><span class="s1">__del__(self):</span>
+    <span class="s3">if </span><span class="s1">os.path.exists(self._temp_folder.name):</span>
+      <span class="s1">self._temp_folder.cleanup()</span>
+
+  <span class="s3">def </span><span class="s1">add_general_info(</span>
+      <span class="s1">self</span><span class="s3">,</span>
+      <span class="s1">model_name: str</span><span class="s3">,</span>
+      <span class="s1">model_description: Optional[str] = </span><span class="s3">None</span><span class="s1">) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds a general info metadata for the general metadata informantion.&quot;&quot;&quot;</span>
+    <span class="s0"># Will overwrite the previous `self._general_md` if exists.</span>
+    <span class="s1">self._general_md = metadata_info.GeneralMd(</span>
+        <span class="s1">name=model_name</span><span class="s3">, </span><span class="s1">description=model_description)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s1">color_space_types = metadata_fb.ColorSpaceType</span>
+
+  <span class="s3">def </span><span class="s1">add_feature_input(self</span><span class="s3">,</span>
+                        <span class="s1">name: Optional[str] = </span><span class="s3">None,</span>
+                        <span class="s1">description: Optional[str] = </span><span class="s3">None</span><span class="s1">) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds an input tensor metadata for the general basic feature input.&quot;&quot;&quot;</span>
+    <span class="s1">input_md = metadata_info.TensorMd(name=name</span><span class="s3">, </span><span class="s1">description=description)</span>
+    <span class="s1">self._input_mds.append(input_md)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">add_image_input(</span>
+      <span class="s1">self</span><span class="s3">,</span>
+      <span class="s1">norm_mean: List[float]</span><span class="s3">,</span>
+      <span class="s1">norm_std: List[float]</span><span class="s3">,</span>
+      <span class="s1">color_space_type: Optional[int] = metadata_fb.ColorSpaceType.RGB</span><span class="s3">,</span>
+      <span class="s1">name: str = _INPUT_IMAGE_NAME</span><span class="s3">,</span>
+      <span class="s1">description: str = _INPUT_IMAGE_DESCRIPTION) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds an input image metadata for the image input. 
+ 
+    Args: 
+      norm_mean: The mean value used to normalize each input channel. If there 
+        is only one element in the list, its value will be broadcasted to all 
+        channels. Also note that norm_mean and norm_std should have the same 
+        number of elements. [1] 
+      norm_std: The std value used to normalize each input channel. If there is 
+        only one element in the list, its value will be broadcasted to all 
+        channels. [1] 
+      color_space_type: The color space type of the input image. [2] 
+      name: Name of the input tensor. 
+      description: Description of the input tensor. 
+ 
+    Returns: 
+      The MetadataWriter instance, can be used for chained operation. 
+ 
+    [1]: 
+      https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L389 
+    [2]: 
+      https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L198 
+    &quot;&quot;&quot;</span>
+    <span class="s1">input_md = metadata_info.InputImageTensorMd(</span>
+        <span class="s1">name=name</span><span class="s3">,</span>
+        <span class="s1">description=description</span><span class="s3">,</span>
+        <span class="s1">norm_mean=norm_mean</span><span class="s3">,</span>
+        <span class="s1">norm_std=norm_std</span><span class="s3">,</span>
+        <span class="s1">color_space_type=color_space_type</span><span class="s3">,</span>
+        <span class="s1">tensor_type=self._input_tensor_type(len(self._input_mds)))</span>
+
+    <span class="s1">self._input_mds.append(input_md)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">add_regex_text_input(</span>
+      <span class="s1">self</span><span class="s3">,</span>
+      <span class="s1">regex_tokenizer: RegexTokenizer</span><span class="s3">,</span>
+      <span class="s1">name: str = _INPUT_REGEX_TEXT_NAME</span><span class="s3">,</span>
+      <span class="s1">description: str = _INPUT_REGEX_TEXT_DESCRIPTION) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds an input text metadata for the text input with regex tokenizer. 
+ 
+    Args: 
+      regex_tokenizer: information of the regex tokenizer [1] used to process 
+        the input string. 
+      name: Name of the input tensor. 
+      description: Description of the input tensor. 
+ 
+    Returns: 
+      The MetadataWriter instance, can be used for chained operation. 
+ 
+    [1]: 
+      https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L500 
+    &quot;&quot;&quot;</span>
+    <span class="s1">tokenizer_md = metadata_info.RegexTokenizerMd(</span>
+        <span class="s1">delim_regex_pattern=regex_tokenizer.delim_regex_pattern</span><span class="s3">,</span>
+        <span class="s1">vocab_file_path=regex_tokenizer.vocab_file_path)</span>
+    <span class="s1">input_md = metadata_info.InputTextTensorMd(</span>
+        <span class="s1">name=name</span><span class="s3">, </span><span class="s1">description=description</span><span class="s3">, </span><span class="s1">tokenizer_md=tokenizer_md)</span>
+    <span class="s1">self._input_mds.append(input_md)</span>
+    <span class="s1">self._associated_files.append(regex_tokenizer.vocab_file_path)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">add_bert_text_input(self</span><span class="s3">, </span><span class="s1">tokenizer: Union[BertTokenizer</span><span class="s3">,</span>
+                                                 <span class="s1">SentencePieceTokenizer]</span><span class="s3">,</span>
+                          <span class="s1">ids_name: str</span><span class="s3">, </span><span class="s1">mask_name: str</span><span class="s3">,</span>
+                          <span class="s1">segment_name: str) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds an metadata for the text input with bert / sentencepiece tokenizer. 
+ 
+    `ids_name`, `mask_name`, and `segment_name` correspond to the `Tensor.name` 
+    in the TFLite schema, which help to determine the tensor order when 
+    populating metadata. 
+ 
+    Args: 
+      tokenizer: information of the tokenizer used to process the input string, 
+        if any. Supported tokenziers are: `BertTokenizer` [1] and 
+        `SentencePieceTokenizer` [2]. 
+      ids_name: name of the ids tensor, which represents the tokenized ids of 
+        the input text. 
+      mask_name: name of the mask tensor, which represents the mask with `1` for 
+        real tokens and `0` for padding tokens. 
+      segment_name: name of the segment ids tensor, where `0` stands for the 
+        first sequence, and `1` stands for the second sequence if exists. 
+ 
+    Returns: 
+      The MetadataWriter instance, can be used for chained operation. 
+ 
+    Raises: 
+      ValueError: if the type tokenizer is not BertTokenizer or 
+        SentencePieceTokenizer. 
+ 
+    [1]: 
+      https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L477 
+    [2]: 
+      https://github.com/google/mediapipe/blob/f8af41b1eb49ff4bdad756ff19d1d36f486be614/mediapipe/tasks/metadata/metadata_schema.fbs#L485 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(tokenizer</span><span class="s3">, </span><span class="s1">BertTokenizer):</span>
+      <span class="s1">tokenizer_md = metadata_info.BertTokenizerMd(</span>
+          <span class="s1">vocab_file_path=tokenizer.vocab_file_path)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(tokenizer</span><span class="s3">, </span><span class="s1">SentencePieceTokenizer):</span>
+      <span class="s1">tokenizer_md = metadata_info.SentencePieceTokenizerMd(</span>
+          <span class="s1">sentence_piece_model_path=tokenizer.sentence_piece_model_path</span><span class="s3">,</span>
+          <span class="s1">vocab_file_path=tokenizer.vocab_file_path)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">f'The type of tokenizer, </span><span class="s3">{</span><span class="s1">type(tokenizer)</span><span class="s3">}</span><span class="s4">, is unsupported'</span><span class="s1">)</span>
+    <span class="s1">bert_input_md = metadata_info.BertInputTensorsMd(</span>
+        <span class="s1">self._model_buffer</span><span class="s3">,</span>
+        <span class="s1">ids_name</span><span class="s3">,</span>
+        <span class="s1">mask_name</span><span class="s3">,</span>
+        <span class="s1">segment_name</span><span class="s3">,</span>
+        <span class="s1">tokenizer_md=tokenizer_md)</span>
+
+    <span class="s1">self._input_mds.extend(bert_input_md.input_md)</span>
+    <span class="s1">self._associated_files.extend(</span>
+        <span class="s1">bert_input_md.get_tokenizer_associated_files())</span>
+    <span class="s1">self._input_process_units.extend(</span>
+        <span class="s1">bert_input_md.create_input_process_unit_metadata())</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">add_classification_output(</span>
+      <span class="s1">self</span><span class="s3">,</span>
+      <span class="s1">labels: Optional[Labels] = </span><span class="s3">None,</span>
+      <span class="s1">score_calibration: Optional[ScoreCalibration] = </span><span class="s3">None,</span>
+      <span class="s1">score_thresholding: Optional[ScoreThresholding] = </span><span class="s3">None,</span>
+      <span class="s1">name: str = _OUTPUT_CLASSIFICATION_NAME</span><span class="s3">,</span>
+      <span class="s1">description: str = _OUTPUT_CLASSIFICATION_DESCRIPTION</span>
+  <span class="s1">) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Add a classification head metadata for classification output tensor. 
+ 
+    Example usage: 
+      writer.add_classification_output( 
+        Labels() 
+          .add(['/m/011l78', '/m/031d23']) 
+          .add(['cat', 'dog], 'en') 
+          .add(['chat', 'chien], 'fr') 
+          ) 
+ 
+    Args: 
+      labels: an instance of Labels helper class. 
+      score_calibration: an instance of ScoreCalibration helper class. 
+      score_thresholding: an instance of ScoreThresholding. 
+      name: Metadata name of the tensor. Note that this is different from tensor 
+        name in the flatbuffer. 
+      description: human readable description of what the output is. 
+ 
+    Returns: 
+      The current Writer instance to allow chained operation. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">calibration_md = </span><span class="s3">None</span>
+    <span class="s3">if </span><span class="s1">score_calibration:</span>
+      <span class="s1">calibration_md = metadata_info.ScoreCalibrationMd(</span>
+          <span class="s1">score_transformation_type=score_calibration.transformation_type</span><span class="s3">,</span>
+          <span class="s1">default_score=score_calibration.default_score</span><span class="s3">,</span>
+          <span class="s1">file_path=self._export_calibration_file(</span><span class="s4">'score_calibration.txt'</span><span class="s3">,</span>
+                                                  <span class="s1">score_calibration.parameters))</span>
+    <span class="s1">score_thresholding_md = </span><span class="s3">None</span>
+    <span class="s3">if </span><span class="s1">score_thresholding:</span>
+      <span class="s1">score_thresholding_md = metadata_info.ScoreThresholdingMd(</span>
+          <span class="s1">score_thresholding.global_score_threshold)</span>
+
+    <span class="s1">label_files = </span><span class="s3">None</span>
+    <span class="s3">if </span><span class="s1">labels:</span>
+      <span class="s1">label_files = []</span>
+      <span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">labels.labels:</span>
+        <span class="s1">label_files.append(</span>
+            <span class="s1">metadata_info.LabelFileMd(</span>
+                <span class="s1">self._export_labels(item.filename</span><span class="s3">, </span><span class="s1">item.names)</span><span class="s3">,</span>
+                <span class="s1">locale=item.locale))</span>
+
+    <span class="s1">output_md = metadata_info.ClassificationTensorMd(</span>
+        <span class="s1">name=name</span><span class="s3">,</span>
+        <span class="s1">description=description</span><span class="s3">,</span>
+        <span class="s1">label_files=label_files</span><span class="s3">,</span>
+        <span class="s1">tensor_type=self._output_tensor_type(len(self._output_mds))</span><span class="s3">,</span>
+        <span class="s1">score_calibration_md=calibration_md</span><span class="s3">,</span>
+        <span class="s1">score_thresholding_md=score_thresholding_md</span><span class="s3">,</span>
+    <span class="s1">)</span>
+    <span class="s1">self._output_mds.append(output_md)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">add_feature_output(self</span><span class="s3">,</span>
+                         <span class="s1">name: Optional[str] = </span><span class="s3">None,</span>
+                         <span class="s1">description: Optional[str] = </span><span class="s3">None</span><span class="s1">) -&gt; </span><span class="s4">'MetadataWriter'</span><span class="s1">:</span>
+    <span class="s2">&quot;&quot;&quot;Adds an output tensor metadata for the general basic feature output.&quot;&quot;&quot;</span>
+    <span class="s1">output_md = metadata_info.TensorMd(name=name</span><span class="s3">, </span><span class="s1">description=description)</span>
+    <span class="s1">self._output_mds.append(output_md)</span>
+    <span class="s3">return </span><span class="s1">self</span>
+
+  <span class="s3">def </span><span class="s1">populate(self) -&gt; Tuple[bytearray</span><span class="s3">, </span><span class="s1">str]:</span>
+    <span class="s2">&quot;&quot;&quot;Populates metadata into the TFLite file. 
+ 
+    Note that only the output tflite is used for deployment. The output JSON 
+    content is used to interpret the metadata content. 
+ 
+    Returns: 
+      A tuple of (model_with_metadata_in_bytes, metdata_json_content) 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Populates metadata and associated files into TFLite model buffer.</span>
+    <span class="s1">populator = metadata.MetadataPopulator.with_model_buffer(self._model_buffer)</span>
+    <span class="s1">metadata_buffer = _create_metadata_buffer(</span>
+        <span class="s1">model_buffer=self._model_buffer</span><span class="s3">,</span>
+        <span class="s1">general_md=self._general_md</span><span class="s3">,</span>
+        <span class="s1">input_md=self._input_mds</span><span class="s3">,</span>
+        <span class="s1">output_md=self._output_mds</span><span class="s3">,</span>
+        <span class="s1">input_process_units=self._input_process_units)</span>
+    <span class="s1">populator.load_metadata_buffer(metadata_buffer)</span>
+    <span class="s3">if </span><span class="s1">self._associated_files:</span>
+      <span class="s1">populator.load_associated_files(self._associated_files)</span>
+    <span class="s1">populator.populate()</span>
+    <span class="s1">tflite_content = populator.get_model_buffer()</span>
+
+    <span class="s1">displayer = metadata.MetadataDisplayer.with_model_buffer(tflite_content)</span>
+    <span class="s1">metadata_json_content = displayer.get_metadata_json()</span>
+
+    <span class="s3">return </span><span class="s1">tflite_content</span><span class="s3">, </span><span class="s1">metadata_json_content</span>
+
+  <span class="s3">def </span><span class="s1">_input_tensor_type(self</span><span class="s3">, </span><span class="s1">idx):</span>
+    <span class="s3">return </span><span class="s1">writer_utils.get_input_tensor_types(self._model_buffer)[idx]</span>
+
+  <span class="s3">def </span><span class="s1">_output_tensor_type(self</span><span class="s3">, </span><span class="s1">idx):</span>
+    <span class="s3">return </span><span class="s1">writer_utils.get_output_tensor_types(self._model_buffer)[idx]</span>
+
+  <span class="s3">def </span><span class="s1">_export_labels(self</span><span class="s3">, </span><span class="s1">filename: str</span><span class="s3">, </span><span class="s1">index_to_label: List[str]) -&gt; str:</span>
+    <span class="s1">filepath = os.path.join(self._temp_folder.name</span><span class="s3">, </span><span class="s1">filename)</span>
+    <span class="s3">with </span><span class="s1">open(filepath</span><span class="s3">, </span><span class="s4">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s1">f.write(</span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">.join(index_to_label))</span>
+    <span class="s1">self._associated_files.append(filepath)</span>
+    <span class="s3">return </span><span class="s1">filepath</span>
+
+  <span class="s3">def </span><span class="s1">_export_calibration_file(self</span><span class="s3">, </span><span class="s1">filename: str</span><span class="s3">,</span>
+                               <span class="s1">calibrations: List[CalibrationParameter]) -&gt; str:</span>
+    <span class="s2">&quot;&quot;&quot;Stores calibration parameters in a csv file.&quot;&quot;&quot;</span>
+    <span class="s1">filepath = os.path.join(self._temp_folder.name</span><span class="s3">, </span><span class="s1">filename)</span>
+    <span class="s3">with </span><span class="s1">open(filepath</span><span class="s3">, </span><span class="s4">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+      <span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">calibrations:</span>
+        <span class="s3">if </span><span class="s1">item:</span>
+          <span class="s3">if </span><span class="s1">item.scale </span><span class="s3">is None or </span><span class="s1">item.slope </span><span class="s3">is None or </span><span class="s1">item.offset </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'scale, slope and offset values can not be set to '</span>
+                             <span class="s4">'None.'</span><span class="s1">)</span>
+          <span class="s3">elif </span><span class="s1">item.min_score </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">f.write(</span><span class="s4">f'</span><span class="s3">{</span><span class="s1">item.scale</span><span class="s3">}</span><span class="s4">,</span><span class="s3">{</span><span class="s1">item.slope</span><span class="s3">}</span><span class="s4">,</span><span class="s3">{</span><span class="s1">item.offset</span><span class="s3">}</span><span class="s4">,</span><span class="s3">{</span><span class="s1">item.min_score</span><span class="s3">}</span><span class="s4">'</span><span class="s1">)</span>
+          <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">f.write(</span><span class="s4">f'</span><span class="s3">{</span><span class="s1">item.scale</span><span class="s3">}</span><span class="s4">,</span><span class="s3">{</span><span class="s1">item.slope</span><span class="s3">}</span><span class="s4">,</span><span class="s3">{</span><span class="s1">item.offset</span><span class="s3">}</span><span class="s4">'</span><span class="s1">)</span>
+        <span class="s1">f.write(</span><span class="s4">'</span><span class="s3">\n</span><span class="s4">'</span><span class="s1">)</span>
+
+    <span class="s1">self._associated_files.append(filepath)</span>
+    <span class="s3">return </span><span class="s1">filepath</span>
+
+
+<span class="s3">class </span><span class="s1">MetadataWriterBase:</span>
+  <span class="s2">&quot;&quot;&quot;Base MetadataWriter class which contains the apis exposed to users. 
+ 
+  MetadataWriter for Tasks e.g. image classifier / object detector will inherit 
+  this class for their own usage. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">writer: MetadataWriter) -&gt; </span><span class="s3">None</span><span class="s1">:</span>
+    <span class="s1">self.writer = writer</span>
+
+  <span class="s3">def </span><span class="s1">populate(self) -&gt; Tuple[bytearray</span><span class="s3">, </span><span class="s1">str]:</span>
+    <span class="s2">&quot;&quot;&quot;Populates metadata into the TFLite file. 
+ 
+    Note that only the output tflite is used for deployment. The output JSON 
+    content is used to interpret the metadata content. 
+ 
+    Returns: 
+      A tuple of (model_with_metadata_in_bytes, metdata_json_content) 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.writer.populate()</span>
+</pre>
+</body>
+</html>

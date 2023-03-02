@@ -1,0 +1,651 @@
+<html>
+<head>
+<title>_argument_parser.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_argument_parser.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright 2017 The Abseil Authors.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;Contains base classes used to parse and convert arguments. 
+ 
+Do NOT import this module directly. Import the flags package and use the 
+aliases defined at the package level instead. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">collections</span>
+<span class="s3">import </span><span class="s1">csv</span>
+<span class="s3">import </span><span class="s1">io</span>
+<span class="s3">import </span><span class="s1">string</span>
+
+<span class="s3">from </span><span class="s1">absl.flags </span><span class="s3">import </span><span class="s1">_helpers</span>
+
+
+<span class="s3">def </span><span class="s1">_is_integer_type(instance):</span>
+  <span class="s2">&quot;&quot;&quot;Returns True if instance is an integer, and not a bool.&quot;&quot;&quot;</span>
+  <span class="s3">return </span><span class="s1">(isinstance(instance</span><span class="s3">, </span><span class="s1">int) </span><span class="s3">and</span>
+          <span class="s3">not </span><span class="s1">isinstance(instance</span><span class="s3">, </span><span class="s1">bool))</span>
+
+
+<span class="s3">class </span><span class="s1">_ArgumentParserCache(type):</span>
+  <span class="s2">&quot;&quot;&quot;Metaclass used to cache and share argument parsers among flags.&quot;&quot;&quot;</span>
+
+  <span class="s1">_instances = {}</span>
+
+  <span class="s3">def </span><span class="s1">__call__(cls</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Returns an instance of the argument parser cls. 
+ 
+    This method overrides behavior of the __new__ methods in 
+    all subclasses of ArgumentParser (inclusive). If an instance 
+    for cls with the same set of arguments exists, this instance is 
+    returned, otherwise a new instance is created. 
+ 
+    If any keyword arguments are defined, or the values in args 
+    are not hashable, this method always returns a new instance of 
+    cls. 
+ 
+    Args: 
+      *args: Positional initializer arguments. 
+      **kwargs: Initializer keyword arguments. 
+ 
+    Returns: 
+      An instance of cls, shared or new. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">kwargs:</span>
+      <span class="s3">return </span><span class="s1">type.__call__(cls</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">instances = cls._instances</span>
+      <span class="s1">key = (cls</span><span class="s3">,</span><span class="s1">) + tuple(args)</span>
+      <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">instances[key]</span>
+      <span class="s3">except </span><span class="s1">KeyError:</span>
+        <span class="s0"># No cache entry for key exists, create a new one.</span>
+        <span class="s3">return </span><span class="s1">instances.setdefault(key</span><span class="s3">, </span><span class="s1">type.__call__(cls</span><span class="s3">, </span><span class="s1">*args))</span>
+      <span class="s3">except </span><span class="s1">TypeError:</span>
+        <span class="s0"># An object in args cannot be hashed, always return</span>
+        <span class="s0"># a new instance.</span>
+        <span class="s3">return </span><span class="s1">type.__call__(cls</span><span class="s3">, </span><span class="s1">*args)</span>
+
+
+<span class="s0"># NOTE about Genericity and Metaclass of ArgumentParser.</span>
+<span class="s0"># (1) In the .py source (this file)</span>
+<span class="s0">#     - is not declared as Generic</span>
+<span class="s0">#     - has _ArgumentParserCache as a metaclass</span>
+<span class="s0"># (2) In the .pyi source (type stub)</span>
+<span class="s0">#     - is declared as Generic</span>
+<span class="s0">#     - doesn't have a metaclass</span>
+<span class="s0"># The reason we need this is due to Generic having a different metaclass</span>
+<span class="s0"># (for python versions &lt;= 3.7) and a class can have only one metaclass.</span>
+<span class="s0">#</span>
+<span class="s0"># * Lack of metaclass in .pyi is not a deal breaker, since the metaclass</span>
+<span class="s0">#   doesn't affect any type information. Also type checkers can check the type</span>
+<span class="s0">#   parameters.</span>
+<span class="s0"># * However, not declaring ArgumentParser as Generic in the source affects</span>
+<span class="s0">#   runtime annotation processing. In particular this means, subclasses should</span>
+<span class="s0">#   inherit from `ArgumentParser` and not `ArgumentParser[SomeType]`.</span>
+<span class="s0">#   The corresponding DEFINE_someType method (the public API) can be annotated</span>
+<span class="s0">#   to return FlagHolder[SomeType].</span>
+<span class="s3">class </span><span class="s1">ArgumentParser(metaclass=_ArgumentParserCache):</span>
+  <span class="s2">&quot;&quot;&quot;Base class used to parse and convert arguments. 
+ 
+  The :meth:`parse` method checks to make sure that the string argument is a 
+  legal value and convert it to a native type.  If the value cannot be 
+  converted, it should throw a ``ValueError`` exception with a human 
+  readable explanation of why the value is illegal. 
+ 
+  Subclasses should also define a syntactic_help string which may be 
+  presented to the user to describe the form of the legal values. 
+ 
+  Argument parser classes must be stateless, since instances are cached 
+  and shared between flags. Initializer arguments are allowed, but all 
+  member variables must be derived from initializer arguments only. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">syntactic_help = </span><span class="s4">''</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Parses the string argument and returns the native value. 
+ 
+    By default it returns its argument unmodified. 
+ 
+    Args: 
+      argument: string argument passed in the commandline. 
+ 
+    Raises: 
+      ValueError: Raised when it fails to parse the argument. 
+      TypeError: Raised when the argument has the wrong type. 
+ 
+    Returns: 
+      The parsed value in native type. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'flag value must be a string, found &quot;{}&quot;'</span><span class="s1">.format(</span>
+          <span class="s1">type(argument)))</span>
+    <span class="s3">return </span><span class="s1">argument</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a string representing the type of the flag.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'string'</span>
+
+  <span class="s3">def </span><span class="s1">_custom_xml_dom_elements(self</span><span class="s3">, </span><span class="s1">doc):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a list of minidom.Element to add additional flag information. 
+ 
+    Args: 
+      doc: minidom.Document, the DOM document it should create nodes from. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">del </span><span class="s1">doc  </span><span class="s0"># Unused.</span>
+    <span class="s3">return </span><span class="s1">[]</span>
+
+
+<span class="s3">class </span><span class="s1">ArgumentSerializer(object):</span>
+  <span class="s2">&quot;&quot;&quot;Base class for generating string representations of a flag value.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">serialize(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a serialized string of the value.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">str(value)</span>
+
+
+<span class="s3">class </span><span class="s1">NumericParser(ArgumentParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser of numeric values. 
+ 
+  Parsed value may be bounded to a given upper and lower bound. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">is_outside_bounds(self</span><span class="s3">, </span><span class="s1">val):</span>
+    <span class="s2">&quot;&quot;&quot;Returns whether the value is outside the bounds or not.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">((self.lower_bound </span><span class="s3">is not None and </span><span class="s1">val &lt; self.lower_bound) </span><span class="s3">or</span>
+            <span class="s1">(self.upper_bound </span><span class="s3">is not None and </span><span class="s1">val &gt; self.upper_bound))</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s1">val = self.convert(argument)</span>
+    <span class="s3">if </span><span class="s1">self.is_outside_bounds(val):</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'%s is not %s' </span><span class="s1">% (val</span><span class="s3">, </span><span class="s1">self.syntactic_help))</span>
+    <span class="s3">return </span><span class="s1">val</span>
+
+  <span class="s3">def </span><span class="s1">_custom_xml_dom_elements(self</span><span class="s3">, </span><span class="s1">doc):</span>
+    <span class="s1">elements = []</span>
+    <span class="s3">if </span><span class="s1">self.lower_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">elements.append(_helpers.create_xml_dom_element(</span>
+          <span class="s1">doc</span><span class="s3">, </span><span class="s4">'lower_bound'</span><span class="s3">, </span><span class="s1">self.lower_bound))</span>
+    <span class="s3">if </span><span class="s1">self.upper_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">elements.append(_helpers.create_xml_dom_element(</span>
+          <span class="s1">doc</span><span class="s3">, </span><span class="s4">'upper_bound'</span><span class="s3">, </span><span class="s1">self.upper_bound))</span>
+    <span class="s3">return </span><span class="s1">elements</span>
+
+  <span class="s3">def </span><span class="s1">convert(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the correct numeric value of argument. 
+ 
+    Subclass must implement this method, and raise TypeError if argument is not 
+    string or has the right numeric type. 
+ 
+    Args: 
+      argument: string argument passed in the commandline, or the numeric type. 
+ 
+    Raises: 
+      TypeError: Raised when argument is not a string or the right numeric type. 
+      ValueError: Raised when failed to convert argument to the numeric value. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s3">class </span><span class="s1">FloatParser(NumericParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser of floating point values. 
+ 
+  Parsed value may be bounded to a given upper and lower bound. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">number_article = </span><span class="s4">'a'</span>
+  <span class="s1">number_name = </span><span class="s4">'number'</span>
+  <span class="s1">syntactic_help = </span><span class="s4">' '</span><span class="s1">.join((number_article</span><span class="s3">, </span><span class="s1">number_name))</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">lower_bound=</span><span class="s3">None, </span><span class="s1">upper_bound=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">super(FloatParser</span><span class="s3">, </span><span class="s1">self).__init__()</span>
+    <span class="s1">self.lower_bound = lower_bound</span>
+    <span class="s1">self.upper_bound = upper_bound</span>
+    <span class="s1">sh = self.syntactic_help</span>
+    <span class="s3">if </span><span class="s1">lower_bound </span><span class="s3">is not None and </span><span class="s1">upper_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">sh = (</span><span class="s4">'%s in the range [%s, %s]' </span><span class="s1">% (sh</span><span class="s3">, </span><span class="s1">lower_bound</span><span class="s3">, </span><span class="s1">upper_bound))</span>
+    <span class="s3">elif </span><span class="s1">lower_bound == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'a non-negative %s' </span><span class="s1">% self.number_name</span>
+    <span class="s3">elif </span><span class="s1">upper_bound == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'a non-positive %s' </span><span class="s1">% self.number_name</span>
+    <span class="s3">elif </span><span class="s1">upper_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'%s &lt;= %s' </span><span class="s1">% (self.number_name</span><span class="s3">, </span><span class="s1">upper_bound)</span>
+    <span class="s3">elif </span><span class="s1">lower_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'%s &gt;= %s' </span><span class="s1">% (self.number_name</span><span class="s3">, </span><span class="s1">lower_bound)</span>
+    <span class="s1">self.syntactic_help = sh</span>
+
+  <span class="s3">def </span><span class="s1">convert(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the float value of argument.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">(_is_integer_type(argument) </span><span class="s3">or </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">float) </span><span class="s3">or</span>
+        <span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">str)):</span>
+      <span class="s3">return </span><span class="s1">float(argument)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span>
+          <span class="s4">'Expect argument to be a string, int, or float, found {}'</span><span class="s1">.format(</span>
+              <span class="s1">type(argument)))</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'float'</span>
+
+
+<span class="s3">class </span><span class="s1">IntegerParser(NumericParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser of an integer value. 
+ 
+  Parsed value may be bounded to a given upper and lower bound. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">number_article = </span><span class="s4">'an'</span>
+  <span class="s1">number_name = </span><span class="s4">'integer'</span>
+  <span class="s1">syntactic_help = </span><span class="s4">' '</span><span class="s1">.join((number_article</span><span class="s3">, </span><span class="s1">number_name))</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">lower_bound=</span><span class="s3">None, </span><span class="s1">upper_bound=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">super(IntegerParser</span><span class="s3">, </span><span class="s1">self).__init__()</span>
+    <span class="s1">self.lower_bound = lower_bound</span>
+    <span class="s1">self.upper_bound = upper_bound</span>
+    <span class="s1">sh = self.syntactic_help</span>
+    <span class="s3">if </span><span class="s1">lower_bound </span><span class="s3">is not None and </span><span class="s1">upper_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">sh = (</span><span class="s4">'%s in the range [%s, %s]' </span><span class="s1">% (sh</span><span class="s3">, </span><span class="s1">lower_bound</span><span class="s3">, </span><span class="s1">upper_bound))</span>
+    <span class="s3">elif </span><span class="s1">lower_bound == </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'a positive %s' </span><span class="s1">% self.number_name</span>
+    <span class="s3">elif </span><span class="s1">upper_bound == -</span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'a negative %s' </span><span class="s1">% self.number_name</span>
+    <span class="s3">elif </span><span class="s1">lower_bound == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'a non-negative %s' </span><span class="s1">% self.number_name</span>
+    <span class="s3">elif </span><span class="s1">upper_bound == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'a non-positive %s' </span><span class="s1">% self.number_name</span>
+    <span class="s3">elif </span><span class="s1">upper_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'%s &lt;= %s' </span><span class="s1">% (self.number_name</span><span class="s3">, </span><span class="s1">upper_bound)</span>
+    <span class="s3">elif </span><span class="s1">lower_bound </span><span class="s3">is not None</span><span class="s1">:</span>
+      <span class="s1">sh = </span><span class="s4">'%s &gt;= %s' </span><span class="s1">% (self.number_name</span><span class="s3">, </span><span class="s1">lower_bound)</span>
+    <span class="s1">self.syntactic_help = sh</span>
+
+  <span class="s3">def </span><span class="s1">convert(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the int value of argument.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">_is_integer_type(argument):</span>
+      <span class="s3">return </span><span class="s1">argument</span>
+    <span class="s3">elif </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s1">base = </span><span class="s5">10</span>
+      <span class="s3">if </span><span class="s1">len(argument) &gt; </span><span class="s5">2 </span><span class="s3">and </span><span class="s1">argument[</span><span class="s5">0</span><span class="s1">] == </span><span class="s4">'0'</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">argument[</span><span class="s5">1</span><span class="s1">] == </span><span class="s4">'o'</span><span class="s1">:</span>
+          <span class="s1">base = </span><span class="s5">8</span>
+        <span class="s3">elif </span><span class="s1">argument[</span><span class="s5">1</span><span class="s1">] == </span><span class="s4">'x'</span><span class="s1">:</span>
+          <span class="s1">base = </span><span class="s5">16</span>
+      <span class="s3">return </span><span class="s1">int(argument</span><span class="s3">, </span><span class="s1">base)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'Expect argument to be a string or int, found {}'</span><span class="s1">.format(</span>
+          <span class="s1">type(argument)))</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'int'</span>
+
+
+<span class="s3">class </span><span class="s1">BooleanParser(ArgumentParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser of boolean values.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s3">if </span><span class="s1">argument.lower() </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'true'</span><span class="s3">, </span><span class="s4">'t'</span><span class="s3">, </span><span class="s4">'1'</span><span class="s1">):</span>
+        <span class="s3">return True</span>
+      <span class="s3">elif </span><span class="s1">argument.lower() </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'false'</span><span class="s3">, </span><span class="s4">'f'</span><span class="s3">, </span><span class="s4">'0'</span><span class="s1">):</span>
+        <span class="s3">return False</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'Non-boolean argument to boolean flag'</span><span class="s3">, </span><span class="s1">argument)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">int):</span>
+      <span class="s0"># Only allow bool or integer 0, 1.</span>
+      <span class="s0"># Note that float 1.0 == True, 0.0 == False.</span>
+      <span class="s1">bool_value = bool(argument)</span>
+      <span class="s3">if </span><span class="s1">argument == bool_value:</span>
+        <span class="s3">return </span><span class="s1">bool_value</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'Non-boolean argument to boolean flag'</span><span class="s3">, </span><span class="s1">argument)</span>
+
+    <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'Non-boolean argument to boolean flag'</span><span class="s3">, </span><span class="s1">argument)</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'bool'</span>
+
+
+<span class="s3">class </span><span class="s1">EnumParser(ArgumentParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser of a string enum value (a string value from a given set).&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">enum_values</span><span class="s3">, </span><span class="s1">case_sensitive=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes EnumParser. 
+ 
+    Args: 
+      enum_values: [str], a non-empty list of string values in the enum. 
+      case_sensitive: bool, whether or not the enum is to be case-sensitive. 
+ 
+    Raises: 
+      ValueError: When enum_values is empty. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">enum_values:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">'enum_values cannot be empty, found &quot;{}&quot;'</span><span class="s1">.format(enum_values))</span>
+    <span class="s1">super(EnumParser</span><span class="s3">, </span><span class="s1">self).__init__()</span>
+    <span class="s1">self.enum_values = enum_values</span>
+    <span class="s1">self.case_sensitive = case_sensitive</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Determines validity of argument and returns the correct element of enum. 
+ 
+    Args: 
+      argument: str, the supplied flag value. 
+ 
+    Returns: 
+      The first matching element from enum_values. 
+ 
+    Raises: 
+      ValueError: Raised when argument didn't match anything in enum. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self.case_sensitive:</span>
+      <span class="s3">if </span><span class="s1">argument </span><span class="s3">not in </span><span class="s1">self.enum_values:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'value should be one of &lt;%s&gt;' </span><span class="s1">%</span>
+                         <span class="s4">'|'</span><span class="s1">.join(self.enum_values))</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">argument</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">if </span><span class="s1">argument.upper() </span><span class="s3">not in </span><span class="s1">[value.upper() </span><span class="s3">for </span><span class="s1">value </span><span class="s3">in </span><span class="s1">self.enum_values]:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'value should be one of &lt;%s&gt;' </span><span class="s1">%</span>
+                         <span class="s4">'|'</span><span class="s1">.join(self.enum_values))</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">[value </span><span class="s3">for </span><span class="s1">value </span><span class="s3">in </span><span class="s1">self.enum_values</span>
+                <span class="s3">if </span><span class="s1">value.upper() == argument.upper()][</span><span class="s5">0</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'string enum'</span>
+
+
+<span class="s3">class </span><span class="s1">EnumClassParser(ArgumentParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser of an Enum class member.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">enum_class</span><span class="s3">, </span><span class="s1">case_sensitive=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes EnumParser. 
+ 
+    Args: 
+      enum_class: class, the Enum class with all possible flag values. 
+      case_sensitive: bool, whether or not the enum is to be case-sensitive. If 
+        False, all member names must be unique when case is ignored. 
+ 
+    Raises: 
+      TypeError: When enum_class is not a subclass of Enum. 
+      ValueError: When enum_class is empty. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Users must have an Enum class defined before using EnumClass flag.</span>
+    <span class="s0"># Therefore this dependency is guaranteed.</span>
+    <span class="s3">import </span><span class="s1">enum</span>
+
+    <span class="s3">if not </span><span class="s1">issubclass(enum_class</span><span class="s3">, </span><span class="s1">enum.Enum):</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'{} is not a subclass of Enum.'</span><span class="s1">.format(enum_class))</span>
+    <span class="s3">if not </span><span class="s1">enum_class.__members__:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'enum_class cannot be empty, but &quot;{}&quot; is empty.'</span>
+                       <span class="s1">.format(enum_class))</span>
+    <span class="s3">if not </span><span class="s1">case_sensitive:</span>
+      <span class="s1">members = collections.Counter(</span>
+          <span class="s1">name.lower() </span><span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">enum_class.__members__)</span>
+      <span class="s1">duplicate_keys = {</span>
+          <span class="s1">member </span><span class="s3">for </span><span class="s1">member</span><span class="s3">, </span><span class="s1">count </span><span class="s3">in </span><span class="s1">members.items() </span><span class="s3">if </span><span class="s1">count &gt; </span><span class="s5">1</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">duplicate_keys:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">'Duplicate enum values for {} using case_sensitive=False'</span><span class="s1">.format(</span>
+                <span class="s1">duplicate_keys))</span>
+
+    <span class="s1">super(EnumClassParser</span><span class="s3">, </span><span class="s1">self).__init__()</span>
+    <span class="s1">self.enum_class = enum_class</span>
+    <span class="s1">self._case_sensitive = case_sensitive</span>
+    <span class="s3">if </span><span class="s1">case_sensitive:</span>
+      <span class="s1">self._member_names = tuple(enum_class.__members__)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">self._member_names = tuple(</span>
+          <span class="s1">name.lower() </span><span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">enum_class.__members__)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">member_names(self):</span>
+    <span class="s2">&quot;&quot;&quot;The accepted enum names, in lowercase if not case sensitive.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self._member_names</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Determines validity of argument and returns the correct element of enum. 
+ 
+    Args: 
+      argument: str or Enum class member, the supplied flag value. 
+ 
+    Returns: 
+      The first matching Enum class member in Enum class. 
+ 
+    Raises: 
+      ValueError: Raised when argument didn't match anything in enum. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">self.enum_class):</span>
+      <span class="s3">return </span><span class="s1">argument</span>
+    <span class="s3">elif not </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span>
+          <span class="s4">'{} is not an enum member or a name of a member in {}'</span><span class="s1">.format(</span>
+              <span class="s1">argument</span><span class="s3">, </span><span class="s1">self.enum_class))</span>
+    <span class="s1">key = EnumParser(</span>
+        <span class="s1">self._member_names</span><span class="s3">, </span><span class="s1">case_sensitive=self._case_sensitive).parse(argument)</span>
+    <span class="s3">if </span><span class="s1">self._case_sensitive:</span>
+      <span class="s3">return </span><span class="s1">self.enum_class[key]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s0"># If EnumParser.parse() return a value, we're guaranteed to find it</span>
+      <span class="s0"># as a member of the class</span>
+      <span class="s3">return </span><span class="s1">next(value </span><span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">self.enum_class.__members__.items()</span>
+                  <span class="s3">if </span><span class="s1">name.lower() == key.lower())</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'enum class'</span>
+
+
+<span class="s3">class </span><span class="s1">ListSerializer(ArgumentSerializer):</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">list_sep):</span>
+    <span class="s1">self.list_sep = list_sep</span>
+
+  <span class="s3">def </span><span class="s1">serialize(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.list_sep.join([str(x) </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">value])</span>
+
+
+<span class="s3">class </span><span class="s1">EnumClassListSerializer(ListSerializer):</span>
+  <span class="s2">&quot;&quot;&quot;A serializer for :class:`MultiEnumClass` flags. 
+ 
+  This serializer simply joins the output of `EnumClassSerializer` using a 
+  provided separator. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">list_sep</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes EnumClassListSerializer. 
+ 
+    Args: 
+      list_sep: String to be used as a separator when serializing 
+      **kwargs: Keyword arguments to the `EnumClassSerializer` used to serialize 
+        individual values. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">super(EnumClassListSerializer</span><span class="s3">, </span><span class="s1">self).__init__(list_sep)</span>
+    <span class="s1">self._element_serializer = EnumClassSerializer(**kwargs)</span>
+
+  <span class="s3">def </span><span class="s1">serialize(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">list):</span>
+      <span class="s3">return </span><span class="s1">self.list_sep.join(</span>
+          <span class="s1">self._element_serializer.serialize(x) </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">value)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">self._element_serializer.serialize(value)</span>
+
+
+<span class="s3">class </span><span class="s1">CsvListSerializer(ArgumentSerializer):</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">list_sep):</span>
+    <span class="s1">self.list_sep = list_sep</span>
+
+  <span class="s3">def </span><span class="s1">serialize(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Serializes a list as a CSV string or unicode.&quot;&quot;&quot;</span>
+    <span class="s1">output = io.StringIO()</span>
+    <span class="s1">writer = csv.writer(output</span><span class="s3">, </span><span class="s1">delimiter=self.list_sep)</span>
+    <span class="s1">writer.writerow([str(x) </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">value])</span>
+    <span class="s1">serialized_value = output.getvalue().strip()</span>
+
+    <span class="s0"># We need the returned value to be pure ascii or Unicodes so that</span>
+    <span class="s0"># when the xml help is generated they are usefully encodable.</span>
+    <span class="s3">return </span><span class="s1">str(serialized_value)</span>
+
+
+<span class="s3">class </span><span class="s1">EnumClassSerializer(ArgumentSerializer):</span>
+  <span class="s2">&quot;&quot;&quot;Class for generating string representations of an enum class flag value.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">lowercase):</span>
+    <span class="s2">&quot;&quot;&quot;Initializes EnumClassSerializer. 
+ 
+    Args: 
+      lowercase: If True, enum member names are lowercased during serialization. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self._lowercase = lowercase</span>
+
+  <span class="s3">def </span><span class="s1">serialize(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a serialized string of the Enum class value.&quot;&quot;&quot;</span>
+    <span class="s1">as_string = str(value.name)</span>
+    <span class="s3">return </span><span class="s1">as_string.lower() </span><span class="s3">if </span><span class="s1">self._lowercase </span><span class="s3">else </span><span class="s1">as_string</span>
+
+
+<span class="s3">class </span><span class="s1">BaseListParser(ArgumentParser):</span>
+  <span class="s2">&quot;&quot;&quot;Base class for a parser of lists of strings. 
+ 
+  To extend, inherit from this class; from the subclass ``__init__``, call:: 
+ 
+      super().__init__(token, name) 
+ 
+  where token is a character used to tokenize, and name is a description 
+  of the separator. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">token=</span><span class="s3">None, </span><span class="s1">name=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s3">assert </span><span class="s1">name</span>
+    <span class="s1">super(BaseListParser</span><span class="s3">, </span><span class="s1">self).__init__()</span>
+    <span class="s1">self._token = token</span>
+    <span class="s1">self._name = name</span>
+    <span class="s1">self.syntactic_help = </span><span class="s4">'a %s separated list' </span><span class="s1">% self._name</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">list):</span>
+      <span class="s3">return </span><span class="s1">argument</span>
+    <span class="s3">elif not </span><span class="s1">argument:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">[s.strip() </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">argument.split(self._token)]</span>
+
+  <span class="s3">def </span><span class="s1">flag_type(self):</span>
+    <span class="s2">&quot;&quot;&quot;See base class.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s4">'%s separated list of strings' </span><span class="s1">% self._name</span>
+
+
+<span class="s3">class </span><span class="s1">ListParser(BaseListParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser for a comma-separated list of strings.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self):</span>
+    <span class="s1">super(ListParser</span><span class="s3">, </span><span class="s1">self).__init__(</span><span class="s4">','</span><span class="s3">, </span><span class="s4">'comma'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Parses argument as comma-separated list of strings.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">list):</span>
+      <span class="s3">return </span><span class="s1">argument</span>
+    <span class="s3">elif not </span><span class="s1">argument:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">[s.strip() </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">list(csv.reader([argument]</span><span class="s3">, </span><span class="s1">strict=</span><span class="s3">True</span><span class="s1">))[</span><span class="s5">0</span><span class="s1">]]</span>
+      <span class="s3">except </span><span class="s1">csv.Error </span><span class="s3">as </span><span class="s1">e:</span>
+        <span class="s0"># Provide a helpful report for case like</span>
+        <span class="s0">#   --listflag=&quot;$(printf 'hello,\nworld')&quot;</span>
+        <span class="s0"># IOW, list flag values containing naked newlines.  This error</span>
+        <span class="s0"># was previously &quot;reported&quot; by allowing csv.Error to</span>
+        <span class="s0"># propagate.</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'Unable to parse the value %r as a %s: %s'</span>
+                         <span class="s1">% (argument</span><span class="s3">, </span><span class="s1">self.flag_type()</span><span class="s3">, </span><span class="s1">e))</span>
+
+  <span class="s3">def </span><span class="s1">_custom_xml_dom_elements(self</span><span class="s3">, </span><span class="s1">doc):</span>
+    <span class="s1">elements = super(ListParser</span><span class="s3">, </span><span class="s1">self)._custom_xml_dom_elements(doc)</span>
+    <span class="s1">elements.append(_helpers.create_xml_dom_element(</span>
+        <span class="s1">doc</span><span class="s3">, </span><span class="s4">'list_separator'</span><span class="s3">, </span><span class="s1">repr(</span><span class="s4">','</span><span class="s1">)))</span>
+    <span class="s3">return </span><span class="s1">elements</span>
+
+
+<span class="s3">class </span><span class="s1">WhitespaceSeparatedListParser(BaseListParser):</span>
+  <span class="s2">&quot;&quot;&quot;Parser for a whitespace-separated list of strings.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">comma_compat=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Initializer. 
+ 
+    Args: 
+      comma_compat: bool, whether to support comma as an additional separator. 
+          If False then only whitespace is supported.  This is intended only for 
+          backwards compatibility with flags that used to be comma-separated. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self._comma_compat = comma_compat</span>
+    <span class="s1">name = </span><span class="s4">'whitespace or comma' </span><span class="s3">if </span><span class="s1">self._comma_compat </span><span class="s3">else </span><span class="s4">'whitespace'</span>
+    <span class="s1">super(WhitespaceSeparatedListParser</span><span class="s3">, </span><span class="s1">self).__init__(</span><span class="s3">None, </span><span class="s1">name)</span>
+
+  <span class="s3">def </span><span class="s1">parse(self</span><span class="s3">, </span><span class="s1">argument):</span>
+    <span class="s2">&quot;&quot;&quot;Parses argument as whitespace-separated list of strings. 
+ 
+    It also parses argument as comma-separated list of strings if requested. 
+ 
+    Args: 
+      argument: string argument passed in the commandline. 
+ 
+    Returns: 
+      [str], the parsed flag value. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(argument</span><span class="s3">, </span><span class="s1">list):</span>
+      <span class="s3">return </span><span class="s1">argument</span>
+    <span class="s3">elif not </span><span class="s1">argument:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">if </span><span class="s1">self._comma_compat:</span>
+        <span class="s1">argument = argument.replace(</span><span class="s4">','</span><span class="s3">, </span><span class="s4">' '</span><span class="s1">)</span>
+      <span class="s3">return </span><span class="s1">argument.split()</span>
+
+  <span class="s3">def </span><span class="s1">_custom_xml_dom_elements(self</span><span class="s3">, </span><span class="s1">doc):</span>
+    <span class="s1">elements = super(WhitespaceSeparatedListParser</span><span class="s3">, </span><span class="s1">self</span>
+                    <span class="s1">)._custom_xml_dom_elements(doc)</span>
+    <span class="s1">separators = list(string.whitespace)</span>
+    <span class="s3">if </span><span class="s1">self._comma_compat:</span>
+      <span class="s1">separators.append(</span><span class="s4">','</span><span class="s1">)</span>
+    <span class="s1">separators.sort()</span>
+    <span class="s3">for </span><span class="s1">sep_char </span><span class="s3">in </span><span class="s1">separators:</span>
+      <span class="s1">elements.append(_helpers.create_xml_dom_element(</span>
+          <span class="s1">doc</span><span class="s3">, </span><span class="s4">'list_separator'</span><span class="s3">, </span><span class="s1">repr(sep_char)))</span>
+    <span class="s3">return </span><span class="s1">elements</span>
+</pre>
+</body>
+</html>

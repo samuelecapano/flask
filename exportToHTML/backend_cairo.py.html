@@ -1,0 +1,543 @@
+<html>
+<head>
+<title>backend_cairo.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_cairo.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A Cairo backend for Matplotlib 
+============================== 
+:Author: Steve Chaplin and others 
+ 
+This backend depends on cairocffi or pycairo. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">gzip</span>
+<span class="s2">import </span><span class="s1">math</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">try</span><span class="s1">:</span>
+    <span class="s2">import </span><span class="s1">cairo</span>
+    <span class="s2">if </span><span class="s1">cairo.version_info &lt; (</span><span class="s3">1</span><span class="s2">, </span><span class="s3">14</span><span class="s2">, </span><span class="s3">0</span><span class="s1">):  </span><span class="s4"># Introduced set_device_scale.</span>
+        <span class="s2">raise </span><span class="s1">ImportError</span>
+<span class="s2">except </span><span class="s1">ImportError:</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">import </span><span class="s1">cairocffi </span><span class="s2">as </span><span class="s1">cairo</span>
+    <span class="s2">except </span><span class="s1">ImportError </span><span class="s2">as </span><span class="s1">err:</span>
+        <span class="s2">raise </span><span class="s1">ImportError(</span>
+            <span class="s5">&quot;cairo backend requires that pycairo&gt;=1.14.0 or cairocffi &quot;</span>
+            <span class="s5">&quot;is installed&quot;</span><span class="s1">) </span><span class="s2">from </span><span class="s1">err</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">.. </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span><span class="s2">, </span><span class="s1">font_manager</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s2">, </span><span class="s1">FigureCanvasBase</span><span class="s2">, </span><span class="s1">FigureManagerBase</span><span class="s2">, </span><span class="s1">GraphicsContextBase</span><span class="s2">,</span>
+    <span class="s1">RendererBase)</span>
+<span class="s2">from </span><span class="s1">matplotlib.font_manager </span><span class="s2">import </span><span class="s1">ttfFontProperty</span>
+<span class="s2">from </span><span class="s1">matplotlib.path </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">from </span><span class="s1">matplotlib.transforms </span><span class="s2">import </span><span class="s1">Affine2D</span>
+
+
+<span class="s2">def </span><span class="s1">_append_path(ctx</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">clip=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s2">for </span><span class="s1">points</span><span class="s2">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">path.iter_segments(</span>
+            <span class="s1">transform</span><span class="s2">, </span><span class="s1">remove_nans=</span><span class="s2">True, </span><span class="s1">clip=clip):</span>
+        <span class="s2">if </span><span class="s1">code == Path.MOVETO:</span>
+            <span class="s1">ctx.move_to(*points)</span>
+        <span class="s2">elif </span><span class="s1">code == Path.CLOSEPOLY:</span>
+            <span class="s1">ctx.close_path()</span>
+        <span class="s2">elif </span><span class="s1">code == Path.LINETO:</span>
+            <span class="s1">ctx.line_to(*points)</span>
+        <span class="s2">elif </span><span class="s1">code == Path.CURVE3:</span>
+            <span class="s1">cur = np.asarray(ctx.get_current_point())</span>
+            <span class="s1">a = points[:</span><span class="s3">2</span><span class="s1">]</span>
+            <span class="s1">b = points[-</span><span class="s3">2</span><span class="s1">:]</span>
+            <span class="s1">ctx.curve_to(*(cur / </span><span class="s3">3 </span><span class="s1">+ a * </span><span class="s3">2 </span><span class="s1">/ </span><span class="s3">3</span><span class="s1">)</span><span class="s2">, </span><span class="s1">*(a * </span><span class="s3">2 </span><span class="s1">/ </span><span class="s3">3 </span><span class="s1">+ b / </span><span class="s3">3</span><span class="s1">)</span><span class="s2">, </span><span class="s1">*b)</span>
+        <span class="s2">elif </span><span class="s1">code == Path.CURVE4:</span>
+            <span class="s1">ctx.curve_to(*points)</span>
+
+
+<span class="s2">def </span><span class="s1">_cairo_font_args_from_font_prop(prop):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert a `.FontProperties` or a `.FontEntry` to arguments that can be 
+    passed to `.Context.select_font_face`. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">attr(field):</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">getattr(prop</span><span class="s2">, </span><span class="s5">f&quot;get_</span><span class="s2">{</span><span class="s1">field</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s1">)()</span>
+        <span class="s2">except </span><span class="s1">AttributeError:</span>
+            <span class="s2">return </span><span class="s1">getattr(prop</span><span class="s2">, </span><span class="s1">field)</span>
+
+    <span class="s1">name = attr(</span><span class="s5">&quot;name&quot;</span><span class="s1">)</span>
+    <span class="s1">slant = getattr(cairo</span><span class="s2">, </span><span class="s5">f&quot;FONT_SLANT_</span><span class="s2">{</span><span class="s1">attr(</span><span class="s5">'style'</span><span class="s1">).upper()</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s1">)</span>
+    <span class="s1">weight = attr(</span><span class="s5">&quot;weight&quot;</span><span class="s1">)</span>
+    <span class="s1">weight = (cairo.FONT_WEIGHT_NORMAL</span>
+              <span class="s2">if </span><span class="s1">font_manager.weight_dict.get(weight</span><span class="s2">, </span><span class="s1">weight) &lt; </span><span class="s3">550</span>
+              <span class="s2">else </span><span class="s1">cairo.FONT_WEIGHT_BOLD)</span>
+    <span class="s2">return </span><span class="s1">name</span><span class="s2">, </span><span class="s1">slant</span><span class="s2">, </span><span class="s1">weight</span>
+
+
+<span class="s2">class </span><span class="s1">RendererCairo(RendererBase):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">dpi):</span>
+        <span class="s1">self.dpi = dpi</span>
+        <span class="s1">self.gc = GraphicsContextCairo(renderer=self)</span>
+        <span class="s1">self.width = </span><span class="s2">None</span>
+        <span class="s1">self.height = </span><span class="s2">None</span>
+        <span class="s1">self.text_ctx = cairo.Context(</span>
+           <span class="s1">cairo.ImageSurface(cairo.FORMAT_ARGB32</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s1">))</span>
+        <span class="s1">super().__init__()</span>
+
+    <span class="s2">def </span><span class="s1">set_context(self</span><span class="s2">, </span><span class="s1">ctx):</span>
+        <span class="s1">surface = ctx.get_target()</span>
+        <span class="s2">if </span><span class="s1">hasattr(surface</span><span class="s2">, </span><span class="s5">&quot;get_width&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">hasattr(surface</span><span class="s2">, </span><span class="s5">&quot;get_height&quot;</span><span class="s1">):</span>
+            <span class="s1">size = surface.get_width()</span><span class="s2">, </span><span class="s1">surface.get_height()</span>
+        <span class="s2">elif </span><span class="s1">hasattr(surface</span><span class="s2">, </span><span class="s5">&quot;get_extents&quot;</span><span class="s1">):  </span><span class="s4"># GTK4 RecordingSurface.</span>
+            <span class="s1">ext = surface.get_extents()</span>
+            <span class="s1">size = ext.width</span><span class="s2">, </span><span class="s1">ext.height</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s4"># vector surfaces.</span>
+            <span class="s1">ctx.save()</span>
+            <span class="s1">ctx.reset_clip()</span>
+            <span class="s1">rect</span><span class="s2">, </span><span class="s1">*rest = ctx.copy_clip_rectangle_list()</span>
+            <span class="s2">if </span><span class="s1">rest:</span>
+                <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s5">&quot;Cannot infer surface size&quot;</span><span class="s1">)</span>
+            <span class="s1">size = rect.width</span><span class="s2">, </span><span class="s1">rect.height</span>
+            <span class="s1">ctx.restore()</span>
+        <span class="s1">self.gc.ctx = ctx</span>
+        <span class="s1">self.width</span><span class="s2">, </span><span class="s1">self.height = size</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s5">&quot;set_context&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">set_ctx_from_surface(self</span><span class="s2">, </span><span class="s1">surface):</span>
+        <span class="s1">self.gc.ctx = cairo.Context(surface)</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">set_width_height(self</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height):</span>
+        <span class="s1">self.width = width</span>
+        <span class="s1">self.height = height</span>
+
+    <span class="s2">def </span><span class="s1">_fill_and_stroke(self</span><span class="s2">, </span><span class="s1">ctx</span><span class="s2">, </span><span class="s1">fill_c</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">alpha_overrides):</span>
+        <span class="s2">if </span><span class="s1">fill_c </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">ctx.save()</span>
+            <span class="s2">if </span><span class="s1">len(fill_c) == </span><span class="s3">3 </span><span class="s2">or </span><span class="s1">alpha_overrides:</span>
+                <span class="s1">ctx.set_source_rgba(fill_c[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">fill_c[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">fill_c[</span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">alpha)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">ctx.set_source_rgba(fill_c[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">fill_c[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">fill_c[</span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">fill_c[</span><span class="s3">3</span><span class="s1">])</span>
+            <span class="s1">ctx.fill_preserve()</span>
+            <span class="s1">ctx.restore()</span>
+        <span class="s1">ctx.stroke()</span>
+
+    <span class="s2">def </span><span class="s1">draw_path(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">rgbFace=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s1">ctx = gc.ctx</span>
+        <span class="s4"># Clip the path to the actual rendering extents if it isn't filled.</span>
+        <span class="s1">clip = (ctx.clip_extents()</span>
+                <span class="s2">if </span><span class="s1">rgbFace </span><span class="s2">is None and </span><span class="s1">gc.get_hatch() </span><span class="s2">is None</span>
+                <span class="s2">else None</span><span class="s1">)</span>
+        <span class="s1">transform = (transform</span>
+                     <span class="s1">+ Affine2D().scale(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">).translate(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">self.height))</span>
+        <span class="s1">ctx.new_path()</span>
+        <span class="s1">_append_path(ctx</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">clip)</span>
+        <span class="s1">self._fill_and_stroke(</span>
+            <span class="s1">ctx</span><span class="s2">, </span><span class="s1">rgbFace</span><span class="s2">, </span><span class="s1">gc.get_alpha()</span><span class="s2">, </span><span class="s1">gc.get_forced_alpha())</span>
+
+    <span class="s2">def </span><span class="s1">draw_markers(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">marker_path</span><span class="s2">, </span><span class="s1">marker_trans</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">,</span>
+                     <span class="s1">rgbFace=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s1">ctx = gc.ctx</span>
+        <span class="s1">ctx.new_path()</span>
+        <span class="s4"># Create the path for the marker; it needs to be flipped here already!</span>
+        <span class="s1">_append_path(ctx</span><span class="s2">, </span><span class="s1">marker_path</span><span class="s2">, </span><span class="s1">marker_trans + Affine2D().scale(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">))</span>
+        <span class="s1">marker_path = ctx.copy_path_flat()</span>
+
+        <span class="s4"># Figure out whether the path has a fill</span>
+        <span class="s1">x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2 = ctx.fill_extents()</span>
+        <span class="s2">if </span><span class="s1">x1 == </span><span class="s3">0 </span><span class="s2">and </span><span class="s1">y1 == </span><span class="s3">0 </span><span class="s2">and </span><span class="s1">x2 == </span><span class="s3">0 </span><span class="s2">and </span><span class="s1">y2 == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">filled = </span><span class="s2">False</span>
+            <span class="s4"># No fill, just unset this (so we don't try to fill it later on)</span>
+            <span class="s1">rgbFace = </span><span class="s2">None</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">filled = </span><span class="s2">True</span>
+
+        <span class="s1">transform = (transform</span>
+                     <span class="s1">+ Affine2D().scale(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">).translate(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">self.height))</span>
+
+        <span class="s1">ctx.new_path()</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(vertices</span><span class="s2">, </span><span class="s1">codes) </span><span class="s2">in </span><span class="s1">enumerate(</span>
+                <span class="s1">path.iter_segments(transform</span><span class="s2">, </span><span class="s1">simplify=</span><span class="s2">False</span><span class="s1">)):</span>
+            <span class="s2">if </span><span class="s1">len(vertices):</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">y = vertices[-</span><span class="s3">2</span><span class="s1">:]</span>
+                <span class="s1">ctx.save()</span>
+
+                <span class="s4"># Translate and apply path</span>
+                <span class="s1">ctx.translate(x</span><span class="s2">, </span><span class="s1">y)</span>
+                <span class="s1">ctx.append_path(marker_path)</span>
+
+                <span class="s1">ctx.restore()</span>
+
+                <span class="s4"># Slower code path if there is a fill; we need to draw</span>
+                <span class="s4"># the fill and stroke for each marker at the same time.</span>
+                <span class="s4"># Also flush out the drawing every once in a while to</span>
+                <span class="s4"># prevent the paths from getting way too long.</span>
+                <span class="s2">if </span><span class="s1">filled </span><span class="s2">or </span><span class="s1">i % </span><span class="s3">1000 </span><span class="s1">== </span><span class="s3">0</span><span class="s1">:</span>
+                    <span class="s1">self._fill_and_stroke(</span>
+                        <span class="s1">ctx</span><span class="s2">, </span><span class="s1">rgbFace</span><span class="s2">, </span><span class="s1">gc.get_alpha()</span><span class="s2">, </span><span class="s1">gc.get_forced_alpha())</span>
+
+        <span class="s4"># Fast path, if there is no fill, draw everything in one step</span>
+        <span class="s2">if not </span><span class="s1">filled:</span>
+            <span class="s1">self._fill_and_stroke(</span>
+                <span class="s1">ctx</span><span class="s2">, </span><span class="s1">rgbFace</span><span class="s2">, </span><span class="s1">gc.get_alpha()</span><span class="s2">, </span><span class="s1">gc.get_forced_alpha())</span>
+
+    <span class="s2">def </span><span class="s1">draw_image(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">im):</span>
+        <span class="s1">im = cbook._unmultiplied_rgba8888_to_premultiplied_argb32(im[::-</span><span class="s3">1</span><span class="s1">])</span>
+        <span class="s1">surface = cairo.ImageSurface.create_for_data(</span>
+            <span class="s1">im.ravel().data</span><span class="s2">, </span><span class="s1">cairo.FORMAT_ARGB32</span><span class="s2">,</span>
+            <span class="s1">im.shape[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">im.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">im.shape[</span><span class="s3">1</span><span class="s1">] * </span><span class="s3">4</span><span class="s1">)</span>
+        <span class="s1">ctx = gc.ctx</span>
+        <span class="s1">y = self.height - y - im.shape[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s1">ctx.save()</span>
+        <span class="s1">ctx.set_source_surface(surface</span><span class="s2">, </span><span class="s1">float(x)</span><span class="s2">, </span><span class="s1">float(y))</span>
+        <span class="s1">ctx.paint()</span>
+        <span class="s1">ctx.restore()</span>
+
+    <span class="s2">def </span><span class="s1">draw_text(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">ismath=</span><span class="s2">False, </span><span class="s1">mtext=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s4"># Note: (x, y) are device/display coords, not user-coords, unlike other</span>
+        <span class="s4"># draw_* methods</span>
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s1">self._draw_mathtext(gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle)</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">ctx = gc.ctx</span>
+            <span class="s1">ctx.new_path()</span>
+            <span class="s1">ctx.move_to(x</span><span class="s2">, </span><span class="s1">y)</span>
+
+            <span class="s1">ctx.save()</span>
+            <span class="s1">ctx.select_font_face(*_cairo_font_args_from_font_prop(prop))</span>
+            <span class="s1">ctx.set_font_size(self.points_to_pixels(prop.get_size_in_points()))</span>
+            <span class="s1">opts = cairo.FontOptions()</span>
+            <span class="s1">opts.set_antialias(</span>
+                <span class="s1">cairo.ANTIALIAS_DEFAULT </span><span class="s2">if </span><span class="s1">mpl.rcParams[</span><span class="s5">&quot;text.antialiased&quot;</span><span class="s1">]</span>
+                <span class="s2">else </span><span class="s1">cairo.ANTIALIAS_NONE)</span>
+            <span class="s1">ctx.set_font_options(opts)</span>
+            <span class="s2">if </span><span class="s1">angle:</span>
+                <span class="s1">ctx.rotate(np.deg2rad(-angle))</span>
+            <span class="s1">ctx.show_text(s)</span>
+            <span class="s1">ctx.restore()</span>
+
+    <span class="s2">def </span><span class="s1">_draw_mathtext(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle):</span>
+        <span class="s1">ctx = gc.ctx</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span><span class="s2">, </span><span class="s1">glyphs</span><span class="s2">, </span><span class="s1">rects = \</span>
+            <span class="s1">self._text2path.mathtext_parser.parse(s</span><span class="s2">, </span><span class="s1">self.dpi</span><span class="s2">, </span><span class="s1">prop)</span>
+
+        <span class="s1">ctx.save()</span>
+        <span class="s1">ctx.translate(x</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s2">if </span><span class="s1">angle:</span>
+            <span class="s1">ctx.rotate(np.deg2rad(-angle))</span>
+
+        <span class="s2">for </span><span class="s1">font</span><span class="s2">, </span><span class="s1">fontsize</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">ox</span><span class="s2">, </span><span class="s1">oy </span><span class="s2">in </span><span class="s1">glyphs:</span>
+            <span class="s1">ctx.new_path()</span>
+            <span class="s1">ctx.move_to(ox</span><span class="s2">, </span><span class="s1">-oy)</span>
+            <span class="s1">ctx.select_font_face(</span>
+                <span class="s1">*_cairo_font_args_from_font_prop(ttfFontProperty(font)))</span>
+            <span class="s1">ctx.set_font_size(self.points_to_pixels(fontsize))</span>
+            <span class="s1">ctx.show_text(chr(idx))</span>
+
+        <span class="s2">for </span><span class="s1">ox</span><span class="s2">, </span><span class="s1">oy</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h </span><span class="s2">in </span><span class="s1">rects:</span>
+            <span class="s1">ctx.new_path()</span>
+            <span class="s1">ctx.rectangle(ox</span><span class="s2">, </span><span class="s1">-oy</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">-h)</span>
+            <span class="s1">ctx.set_source_rgb(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)</span>
+            <span class="s1">ctx.fill_preserve()</span>
+
+        <span class="s1">ctx.restore()</span>
+
+    <span class="s2">def </span><span class="s1">get_canvas_width_height(self):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">self.width</span><span class="s2">, </span><span class="s1">self.height</span>
+
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent(self</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s2">if </span><span class="s1">ismath == </span><span class="s5">'TeX'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">super().get_text_width_height_descent(s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath)</span>
+
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span><span class="s2">, </span><span class="s1">*_ = \</span>
+                <span class="s1">self._text2path.mathtext_parser.parse(s</span><span class="s2">, </span><span class="s1">self.dpi</span><span class="s2">, </span><span class="s1">prop)</span>
+            <span class="s2">return </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span>
+
+        <span class="s1">ctx = self.text_ctx</span>
+        <span class="s4"># problem - scale remembers last setting and font can become</span>
+        <span class="s4"># enormous causing program to crash</span>
+        <span class="s4"># save/restore prevents the problem</span>
+        <span class="s1">ctx.save()</span>
+        <span class="s1">ctx.select_font_face(*_cairo_font_args_from_font_prop(prop))</span>
+        <span class="s1">ctx.set_font_size(self.points_to_pixels(prop.get_size_in_points()))</span>
+
+        <span class="s1">y_bearing</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h = ctx.text_extents(s)[</span><span class="s3">1</span><span class="s1">:</span><span class="s3">4</span><span class="s1">]</span>
+        <span class="s1">ctx.restore()</span>
+
+        <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">h + y_bearing</span>
+
+    <span class="s2">def </span><span class="s1">new_gc(self):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s1">self.gc.ctx.save()</span>
+        <span class="s1">self.gc._alpha = </span><span class="s3">1</span>
+        <span class="s1">self.gc._forced_alpha = </span><span class="s2">False  </span><span class="s4"># if True, _alpha overrides A from RGBA</span>
+        <span class="s2">return </span><span class="s1">self.gc</span>
+
+    <span class="s2">def </span><span class="s1">points_to_pixels(self</span><span class="s2">, </span><span class="s1">points):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">points / </span><span class="s3">72 </span><span class="s1">* self.dpi</span>
+
+
+<span class="s2">class </span><span class="s1">GraphicsContextCairo(GraphicsContextBase):</span>
+    <span class="s1">_joind = {</span>
+        <span class="s5">'bevel'</span><span class="s1">:  cairo.LINE_JOIN_BEVEL</span><span class="s2">,</span>
+        <span class="s5">'miter'</span><span class="s1">:  cairo.LINE_JOIN_MITER</span><span class="s2">,</span>
+        <span class="s5">'round'</span><span class="s1">:  cairo.LINE_JOIN_ROUND</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_capd = {</span>
+        <span class="s5">'butt'</span><span class="s1">:        cairo.LINE_CAP_BUTT</span><span class="s2">,</span>
+        <span class="s5">'projecting'</span><span class="s1">:  cairo.LINE_CAP_SQUARE</span><span class="s2">,</span>
+        <span class="s5">'round'</span><span class="s1">:       cairo.LINE_CAP_ROUND</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">renderer):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.renderer = renderer</span>
+
+    <span class="s2">def </span><span class="s1">restore(self):</span>
+        <span class="s1">self.ctx.restore()</span>
+
+    <span class="s2">def </span><span class="s1">set_alpha(self</span><span class="s2">, </span><span class="s1">alpha):</span>
+        <span class="s1">super().set_alpha(alpha)</span>
+        <span class="s1">_alpha = self.get_alpha()</span>
+        <span class="s1">rgb = self._rgb</span>
+        <span class="s2">if </span><span class="s1">self.get_forced_alpha():</span>
+            <span class="s1">self.ctx.set_source_rgba(rgb[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rgb[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rgb[</span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">_alpha)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.ctx.set_source_rgba(rgb[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rgb[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rgb[</span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rgb[</span><span class="s3">3</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">set_antialiased(self</span><span class="s2">, </span><span class="s1">b):</span>
+        <span class="s1">self.ctx.set_antialias(</span>
+            <span class="s1">cairo.ANTIALIAS_DEFAULT </span><span class="s2">if </span><span class="s1">b </span><span class="s2">else </span><span class="s1">cairo.ANTIALIAS_NONE)</span>
+
+    <span class="s2">def </span><span class="s1">set_capstyle(self</span><span class="s2">, </span><span class="s1">cs):</span>
+        <span class="s1">self.ctx.set_line_cap(_api.check_getitem(self._capd</span><span class="s2">, </span><span class="s1">capstyle=cs))</span>
+        <span class="s1">self._capstyle = cs</span>
+
+    <span class="s2">def </span><span class="s1">set_clip_rectangle(self</span><span class="s2">, </span><span class="s1">rectangle):</span>
+        <span class="s2">if not </span><span class="s1">rectangle:</span>
+            <span class="s2">return</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h = np.round(rectangle.bounds)</span>
+        <span class="s1">ctx = self.ctx</span>
+        <span class="s1">ctx.new_path()</span>
+        <span class="s1">ctx.rectangle(x</span><span class="s2">, </span><span class="s1">self.renderer.height - h - y</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h)</span>
+        <span class="s1">ctx.clip()</span>
+
+    <span class="s2">def </span><span class="s1">set_clip_path(self</span><span class="s2">, </span><span class="s1">path):</span>
+        <span class="s2">if not </span><span class="s1">path:</span>
+            <span class="s2">return</span>
+        <span class="s1">tpath</span><span class="s2">, </span><span class="s1">affine = path.get_transformed_path_and_affine()</span>
+        <span class="s1">ctx = self.ctx</span>
+        <span class="s1">ctx.new_path()</span>
+        <span class="s1">affine = (affine</span>
+                  <span class="s1">+ Affine2D().scale(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">).translate(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">self.renderer.height))</span>
+        <span class="s1">_append_path(ctx</span><span class="s2">, </span><span class="s1">tpath</span><span class="s2">, </span><span class="s1">affine)</span>
+        <span class="s1">ctx.clip()</span>
+
+    <span class="s2">def </span><span class="s1">set_dashes(self</span><span class="s2">, </span><span class="s1">offset</span><span class="s2">, </span><span class="s1">dashes):</span>
+        <span class="s1">self._dashes = offset</span><span class="s2">, </span><span class="s1">dashes</span>
+        <span class="s2">if </span><span class="s1">dashes </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.ctx.set_dash([]</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)  </span><span class="s4"># switch dashes off</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.ctx.set_dash(</span>
+                <span class="s1">list(self.renderer.points_to_pixels(np.asarray(dashes)))</span><span class="s2">,</span>
+                <span class="s1">offset)</span>
+
+    <span class="s2">def </span><span class="s1">set_foreground(self</span><span class="s2">, </span><span class="s1">fg</span><span class="s2">, </span><span class="s1">isRGBA=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">super().set_foreground(fg</span><span class="s2">, </span><span class="s1">isRGBA)</span>
+        <span class="s2">if </span><span class="s1">len(self._rgb) == </span><span class="s3">3</span><span class="s1">:</span>
+            <span class="s1">self.ctx.set_source_rgb(*self._rgb)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.ctx.set_source_rgba(*self._rgb)</span>
+
+    <span class="s2">def </span><span class="s1">get_rgb(self):</span>
+        <span class="s2">return </span><span class="s1">self.ctx.get_source().get_rgba()[:</span><span class="s3">3</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">set_joinstyle(self</span><span class="s2">, </span><span class="s1">js):</span>
+        <span class="s1">self.ctx.set_line_join(_api.check_getitem(self._joind</span><span class="s2">, </span><span class="s1">joinstyle=js))</span>
+        <span class="s1">self._joinstyle = js</span>
+
+    <span class="s2">def </span><span class="s1">set_linewidth(self</span><span class="s2">, </span><span class="s1">w):</span>
+        <span class="s1">self._linewidth = float(w)</span>
+        <span class="s1">self.ctx.set_line_width(self.renderer.points_to_pixels(w))</span>
+
+
+<span class="s2">class </span><span class="s1">_CairoRegion:</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">slices</span><span class="s2">, </span><span class="s1">data):</span>
+        <span class="s1">self._slices = slices</span>
+        <span class="s1">self._data = data</span>
+
+
+<span class="s2">class </span><span class="s1">FigureCanvasCairo(FigureCanvasBase):</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">_renderer(self):</span>
+        <span class="s4"># In theory, _renderer should be set in __init__, but GUI canvas</span>
+        <span class="s4"># subclasses (FigureCanvasFooCairo) don't always interact well with</span>
+        <span class="s4"># multiple inheritance (FigureCanvasFoo inits but doesn't super-init</span>
+        <span class="s4"># FigureCanvasCairo), so initialize it in the getter instead.</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s5">&quot;_cached_renderer&quot;</span><span class="s1">):</span>
+            <span class="s1">self._cached_renderer = RendererCairo(self.figure.dpi)</span>
+        <span class="s2">return </span><span class="s1">self._cached_renderer</span>
+
+    <span class="s2">def </span><span class="s1">get_renderer(self):</span>
+        <span class="s2">return </span><span class="s1">self._renderer</span>
+
+    <span class="s2">def </span><span class="s1">copy_from_bbox(self</span><span class="s2">, </span><span class="s1">bbox):</span>
+        <span class="s1">surface = self._renderer.gc.ctx.get_target()</span>
+        <span class="s2">if not </span><span class="s1">isinstance(surface</span><span class="s2">, </span><span class="s1">cairo.ImageSurface):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s5">&quot;copy_from_bbox only works when rendering to an ImageSurface&quot;</span><span class="s1">)</span>
+        <span class="s1">sw = surface.get_width()</span>
+        <span class="s1">sh = surface.get_height()</span>
+        <span class="s1">x0 = math.ceil(bbox.x0)</span>
+        <span class="s1">x1 = math.floor(bbox.x1)</span>
+        <span class="s1">y0 = math.ceil(sh - bbox.y1)</span>
+        <span class="s1">y1 = math.floor(sh - bbox.y0)</span>
+        <span class="s2">if not </span><span class="s1">(</span><span class="s3">0 </span><span class="s1">&lt;= x0 </span><span class="s2">and </span><span class="s1">x1 &lt;= sw </span><span class="s2">and </span><span class="s1">bbox.x0 &lt;= bbox.x1</span>
+                <span class="s2">and </span><span class="s3">0 </span><span class="s1">&lt;= y0 </span><span class="s2">and </span><span class="s1">y1 &lt;= sh </span><span class="s2">and </span><span class="s1">bbox.y0 &lt;= bbox.y1):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Invalid bbox&quot;</span><span class="s1">)</span>
+        <span class="s1">sls = slice(y0</span><span class="s2">, </span><span class="s1">y0 + max(y1 - y0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">))</span><span class="s2">, </span><span class="s1">slice(x0</span><span class="s2">, </span><span class="s1">x0 + max(x1 - x0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">))</span>
+        <span class="s1">data = (np.frombuffer(surface.get_data()</span><span class="s2">, </span><span class="s1">np.uint32)</span>
+                <span class="s1">.reshape((sh</span><span class="s2">, </span><span class="s1">sw))[sls].copy())</span>
+        <span class="s2">return </span><span class="s1">_CairoRegion(sls</span><span class="s2">, </span><span class="s1">data)</span>
+
+    <span class="s2">def </span><span class="s1">restore_region(self</span><span class="s2">, </span><span class="s1">region):</span>
+        <span class="s1">surface = self._renderer.gc.ctx.get_target()</span>
+        <span class="s2">if not </span><span class="s1">isinstance(surface</span><span class="s2">, </span><span class="s1">cairo.ImageSurface):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s5">&quot;restore_region only works when rendering to an ImageSurface&quot;</span><span class="s1">)</span>
+        <span class="s1">surface.flush()</span>
+        <span class="s1">sw = surface.get_width()</span>
+        <span class="s1">sh = surface.get_height()</span>
+        <span class="s1">sly</span><span class="s2">, </span><span class="s1">slx = region._slices</span>
+        <span class="s1">(np.frombuffer(surface.get_data()</span><span class="s2">, </span><span class="s1">np.uint32)</span>
+         <span class="s1">.reshape((sh</span><span class="s2">, </span><span class="s1">sw))[sly</span><span class="s2">, </span><span class="s1">slx]) = region._data</span>
+        <span class="s1">surface.mark_dirty_rectangle(</span>
+            <span class="s1">slx.start</span><span class="s2">, </span><span class="s1">sly.start</span><span class="s2">, </span><span class="s1">slx.stop - slx.start</span><span class="s2">, </span><span class="s1">sly.stop - sly.start)</span>
+
+    <span class="s2">def </span><span class="s1">print_png(self</span><span class="s2">, </span><span class="s1">fobj):</span>
+        <span class="s1">self._get_printed_image_surface().write_to_png(fobj)</span>
+
+    <span class="s2">def </span><span class="s1">print_rgba(self</span><span class="s2">, </span><span class="s1">fobj):</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height = self.get_width_height()</span>
+        <span class="s1">buf = self._get_printed_image_surface().get_data()</span>
+        <span class="s1">fobj.write(cbook._premultiplied_argb32_to_unmultiplied_rgba8888(</span>
+            <span class="s1">np.asarray(buf).reshape((width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s3">4</span><span class="s1">))))</span>
+
+    <span class="s1">print_raw = print_rgba</span>
+
+    <span class="s2">def </span><span class="s1">_get_printed_image_surface(self):</span>
+        <span class="s1">self._renderer.dpi = self.figure.dpi</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height = self.get_width_height()</span>
+        <span class="s1">surface = cairo.ImageSurface(cairo.FORMAT_ARGB32</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height)</span>
+        <span class="s1">self._renderer.set_context(cairo.Context(surface))</span>
+        <span class="s1">self.figure.draw(self._renderer)</span>
+        <span class="s2">return </span><span class="s1">surface</span>
+
+    <span class="s2">def </span><span class="s1">_save(self</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, </span><span class="s1">fobj</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">orientation=</span><span class="s5">'portrait'</span><span class="s1">):</span>
+        <span class="s4"># save PDF/PS/SVG</span>
+
+        <span class="s1">dpi = </span><span class="s3">72</span>
+        <span class="s1">self.figure.dpi = dpi</span>
+        <span class="s1">w_in</span><span class="s2">, </span><span class="s1">h_in = self.figure.get_size_inches()</span>
+        <span class="s1">width_in_points</span><span class="s2">, </span><span class="s1">height_in_points = w_in * dpi</span><span class="s2">, </span><span class="s1">h_in * dpi</span>
+
+        <span class="s2">if </span><span class="s1">orientation == </span><span class="s5">'landscape'</span><span class="s1">:</span>
+            <span class="s1">width_in_points</span><span class="s2">, </span><span class="s1">height_in_points = (</span>
+                <span class="s1">height_in_points</span><span class="s2">, </span><span class="s1">width_in_points)</span>
+
+        <span class="s2">if </span><span class="s1">fmt == </span><span class="s5">'ps'</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">hasattr(cairo</span><span class="s2">, </span><span class="s5">'PSSurface'</span><span class="s1">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">'cairo has not been compiled with PS '</span>
+                                   <span class="s5">'support enabled'</span><span class="s1">)</span>
+            <span class="s1">surface = cairo.PSSurface(fobj</span><span class="s2">, </span><span class="s1">width_in_points</span><span class="s2">, </span><span class="s1">height_in_points)</span>
+        <span class="s2">elif </span><span class="s1">fmt == </span><span class="s5">'pdf'</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">hasattr(cairo</span><span class="s2">, </span><span class="s5">'PDFSurface'</span><span class="s1">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">'cairo has not been compiled with PDF '</span>
+                                   <span class="s5">'support enabled'</span><span class="s1">)</span>
+            <span class="s1">surface = cairo.PDFSurface(fobj</span><span class="s2">, </span><span class="s1">width_in_points</span><span class="s2">, </span><span class="s1">height_in_points)</span>
+        <span class="s2">elif </span><span class="s1">fmt </span><span class="s2">in </span><span class="s1">(</span><span class="s5">'svg'</span><span class="s2">, </span><span class="s5">'svgz'</span><span class="s1">):</span>
+            <span class="s2">if not </span><span class="s1">hasattr(cairo</span><span class="s2">, </span><span class="s5">'SVGSurface'</span><span class="s1">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">'cairo has not been compiled with SVG '</span>
+                                   <span class="s5">'support enabled'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">fmt == </span><span class="s5">'svgz'</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">isinstance(fobj</span><span class="s2">, </span><span class="s1">str):</span>
+                    <span class="s1">fobj = gzip.GzipFile(fobj</span><span class="s2">, </span><span class="s5">'wb'</span><span class="s1">)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">fobj = gzip.GzipFile(</span><span class="s2">None, </span><span class="s5">'wb'</span><span class="s2">, </span><span class="s1">fileobj=fobj)</span>
+            <span class="s1">surface = cairo.SVGSurface(fobj</span><span class="s2">, </span><span class="s1">width_in_points</span><span class="s2">, </span><span class="s1">height_in_points)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Unknown format: {!r}&quot;</span><span class="s1">.format(fmt))</span>
+
+        <span class="s1">self._renderer.dpi = self.figure.dpi</span>
+        <span class="s1">self._renderer.set_context(cairo.Context(surface))</span>
+        <span class="s1">ctx = self._renderer.gc.ctx</span>
+
+        <span class="s2">if </span><span class="s1">orientation == </span><span class="s5">'landscape'</span><span class="s1">:</span>
+            <span class="s1">ctx.rotate(np.pi / </span><span class="s3">2</span><span class="s1">)</span>
+            <span class="s1">ctx.translate(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">-height_in_points)</span>
+            <span class="s4"># Perhaps add an '%%Orientation: Landscape' comment?</span>
+
+        <span class="s1">self.figure.draw(self._renderer)</span>
+
+        <span class="s1">ctx.show_page()</span>
+        <span class="s1">surface.finish()</span>
+        <span class="s2">if </span><span class="s1">fmt == </span><span class="s5">'svgz'</span><span class="s1">:</span>
+            <span class="s1">fobj.close()</span>
+
+    <span class="s1">print_pdf = functools.partialmethod(_save</span><span class="s2">, </span><span class="s5">&quot;pdf&quot;</span><span class="s1">)</span>
+    <span class="s1">print_ps = functools.partialmethod(_save</span><span class="s2">, </span><span class="s5">&quot;ps&quot;</span><span class="s1">)</span>
+    <span class="s1">print_svg = functools.partialmethod(_save</span><span class="s2">, </span><span class="s5">&quot;svg&quot;</span><span class="s1">)</span>
+    <span class="s1">print_svgz = functools.partialmethod(_save</span><span class="s2">, </span><span class="s5">&quot;svgz&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">@_api.deprecated(</span><span class="s5">&quot;3.6&quot;</span><span class="s1">)</span>
+<span class="s2">class </span><span class="s1">_RendererGTKCairo(RendererCairo):</span>
+    <span class="s2">def </span><span class="s1">set_context(self</span><span class="s2">, </span><span class="s1">ctx):</span>
+        <span class="s2">if </span><span class="s1">(cairo.__name__ == </span><span class="s5">&quot;cairocffi&quot;</span>
+                <span class="s2">and not </span><span class="s1">isinstance(ctx</span><span class="s2">, </span><span class="s1">cairo.Context)):</span>
+            <span class="s1">ctx = cairo.Context._from_pointer(</span>
+                <span class="s1">cairo.ffi.cast(</span>
+                    <span class="s5">'cairo_t **'</span><span class="s2">,</span>
+                    <span class="s1">id(ctx) + object.__basicsize__)[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">incref=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.gc.ctx = ctx</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s2">class </span><span class="s1">_BackendCairo(_Backend):</span>
+    <span class="s1">backend_version = cairo.version</span>
+    <span class="s1">FigureCanvas = FigureCanvasCairo</span>
+    <span class="s1">FigureManager = FigureManagerBase</span>
+</pre>
+</body>
+</html>

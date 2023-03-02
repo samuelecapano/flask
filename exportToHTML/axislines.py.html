@@ -1,0 +1,594 @@
+<html>
+<head>
+<title>axislines.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+axislines.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Axislines includes modified implementation of the Axes class. The 
+biggest difference is that the artists responsible for drawing the axis spine, 
+ticks, ticklabels and axis labels are separated out from Matplotlib's Axis 
+class. Originally, this change was motivated to support curvilinear 
+grid. Here are a few reasons that I came up with a new axes class: 
+ 
+* &quot;top&quot; and &quot;bottom&quot; x-axis (or &quot;left&quot; and &quot;right&quot; y-axis) can have 
+  different ticks (tick locations and labels). This is not possible 
+  with the current Matplotlib, although some twin axes trick can help. 
+ 
+* Curvilinear grid. 
+ 
+* angled ticks. 
+ 
+In the new axes class, xaxis and yaxis is set to not visible by 
+default, and new set of artist (AxisArtist) are defined to draw axis 
+line, ticks, ticklabels and axis label. Axes.axis attribute serves as 
+a dictionary of these artists, i.e., ax.axis[&quot;left&quot;] is a AxisArtist 
+instance responsible to draw left y-axis. The default Axes.axis contains 
+&quot;bottom&quot;, &quot;left&quot;, &quot;top&quot; and &quot;right&quot;. 
+ 
+AxisArtist can be considered as a container artist and has the following 
+children artists which will draw ticks, labels, etc. 
+ 
+* line 
+* major_ticks, major_ticklabels 
+* minor_ticks, minor_ticklabels 
+* offsetText 
+* label 
+ 
+Note that these are separate artists from `matplotlib.axis.Axis`, thus most 
+tick-related functions in Matplotlib won't work. For example, color and 
+markerwidth of the ``ax.axis[&quot;bottom&quot;].major_ticks`` will follow those of 
+Axes.xaxis unless explicitly specified. 
+ 
+In addition to AxisArtist, the Axes will have *gridlines* attribute, 
+which obviously draws grid lines. The gridlines needs to be separated 
+from the axis as some gridlines can never pass any axis. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span>
+<span class="s2">import </span><span class="s1">matplotlib.axes </span><span class="s2">as </span><span class="s1">maxes</span>
+<span class="s2">from </span><span class="s1">matplotlib.path </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">from </span><span class="s1">mpl_toolkits.axes_grid1 </span><span class="s2">import </span><span class="s1">mpl_axes</span>
+<span class="s2">from </span><span class="s1">.axisline_style </span><span class="s2">import </span><span class="s1">AxislineStyle  </span><span class="s3"># noqa</span>
+<span class="s2">from </span><span class="s1">.axis_artist </span><span class="s2">import </span><span class="s1">AxisArtist</span><span class="s2">, </span><span class="s1">GridlinesCollection</span>
+
+
+<span class="s2">class </span><span class="s1">AxisArtistHelper:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Axis helpers should define the methods listed below.  The *axes* argument 
+    will be the axes attribute of the caller artist. 
+ 
+    :: 
+ 
+        # Construct the spine. 
+ 
+        def get_line_transform(self, axes): 
+            return transform 
+ 
+        def get_line(self, axes): 
+            return path 
+ 
+        # Construct the label. 
+ 
+        def get_axislabel_transform(self, axes): 
+            return transform 
+ 
+        def get_axislabel_pos_angle(self, axes): 
+            return (x, y), angle 
+ 
+        # Construct the ticks. 
+ 
+        def get_tick_transform(self, axes): 
+            return transform 
+ 
+        def get_tick_iterators(self, axes): 
+            # A pair of iterables (one for major ticks, one for minor ticks) 
+            # that yield (tick_position, tick_angle, tick_label). 
+            return iter_major, iter_minor 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">class </span><span class="s1">_Base:</span>
+        <span class="s0">&quot;&quot;&quot;Base class for axis helper.&quot;&quot;&quot;</span>
+
+        <span class="s2">def </span><span class="s1">update_lim(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">pass</span>
+
+        <span class="s1">delta1 = _api.deprecated(</span><span class="s4">&quot;3.6&quot;</span><span class="s1">)(</span>
+            <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: </span><span class="s5">0.00001</span><span class="s2">, lambda </span><span class="s1">self</span><span class="s2">, </span><span class="s1">value: </span><span class="s2">None</span><span class="s1">))</span>
+        <span class="s1">delta2 = _api.deprecated(</span><span class="s4">&quot;3.6&quot;</span><span class="s1">)(</span>
+            <span class="s1">property(</span><span class="s2">lambda </span><span class="s1">self: </span><span class="s5">0.00001</span><span class="s2">, lambda </span><span class="s1">self</span><span class="s2">, </span><span class="s1">value: </span><span class="s2">None</span><span class="s1">))</span>
+
+        <span class="s2">def </span><span class="s1">_to_xy(self</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">const):</span>
+            <span class="s0">&quot;&quot;&quot; 
+            Create a (*values.shape, 2)-shape array representing (x, y) pairs. 
+ 
+            *values* go into the coordinate determined by ``self.nth_coord``. 
+            The other coordinate is filled with the constant *const*. 
+ 
+            Example:: 
+ 
+                &gt;&gt;&gt; self.nth_coord = 0 
+                &gt;&gt;&gt; self._to_xy([1, 2, 3], const=0) 
+                array([[1, 0], 
+                       [2, 0], 
+                       [3, 0]]) 
+            &quot;&quot;&quot;</span>
+            <span class="s2">if </span><span class="s1">self.nth_coord == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">np.stack(np.broadcast_arrays(values</span><span class="s2">, </span><span class="s1">const)</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">self.nth_coord == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">np.stack(np.broadcast_arrays(const</span><span class="s2">, </span><span class="s1">values)</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unexpected nth_coord&quot;</span><span class="s1">)</span>
+
+    <span class="s2">class </span><span class="s1">Fixed(_Base):</span>
+        <span class="s0">&quot;&quot;&quot;Helper class for a fixed (in the axes coordinate) axis.&quot;&quot;&quot;</span>
+
+        <span class="s1">passthru_pt = _api.deprecated(</span><span class="s4">&quot;3.7&quot;</span><span class="s1">)(property(</span>
+            <span class="s2">lambda </span><span class="s1">self: {</span><span class="s4">&quot;left&quot;</span><span class="s1">: (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">: (</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+                          <span class="s4">&quot;bottom&quot;</span><span class="s1">: (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s1">: (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)}[self._loc]))</span>
+
+        <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">nth_coord=</span><span class="s2">None</span><span class="s1">):</span>
+            <span class="s0">&quot;&quot;&quot;``nth_coord = 0``: x-axis; ``nth_coord = 1``: y-axis.&quot;&quot;&quot;</span>
+            <span class="s1">self.nth_coord = (</span>
+                <span class="s1">nth_coord </span><span class="s2">if </span><span class="s1">nth_coord </span><span class="s2">is not None else</span>
+                <span class="s1">_api.check_getitem(</span>
+                    <span class="s1">{</span><span class="s4">&quot;bottom&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s4">&quot;left&quot;</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">: </span><span class="s5">1</span><span class="s1">}</span><span class="s2">, </span><span class="s1">loc=loc))</span>
+            <span class="s2">if </span><span class="s1">(nth_coord == </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">loc </span><span class="s2">not in </span><span class="s1">[</span><span class="s4">&quot;left&quot;</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">]</span>
+                    <span class="s2">or </span><span class="s1">nth_coord == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">loc </span><span class="s2">not in </span><span class="s1">[</span><span class="s4">&quot;bottom&quot;</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s1">]):</span>
+                <span class="s1">_api.warn_deprecated(</span>
+                    <span class="s4">&quot;3.7&quot;</span><span class="s2">, </span><span class="s1">message=</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">loc=</span><span class="s2">!r} </span><span class="s4">is incompatible with &quot;</span>
+                    <span class="s4">&quot;{nth_coord=}; support is deprecated since %(since)s&quot;</span><span class="s1">)</span>
+            <span class="s1">self._loc = loc</span>
+            <span class="s1">self._pos = {</span><span class="s4">&quot;bottom&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s4">&quot;left&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">: </span><span class="s5">1</span><span class="s1">}[loc]</span>
+            <span class="s1">super().__init__()</span>
+            <span class="s3"># axis line in transAxes</span>
+            <span class="s1">self._path = Path(self._to_xy((</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">const=self._pos))</span>
+
+        <span class="s2">def </span><span class="s1">get_nth_coord(self):</span>
+            <span class="s2">return </span><span class="s1">self.nth_coord</span>
+
+        <span class="s3"># LINE</span>
+
+        <span class="s2">def </span><span class="s1">get_line(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">self._path</span>
+
+        <span class="s2">def </span><span class="s1">get_line_transform(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">axes.transAxes</span>
+
+        <span class="s3"># LABEL</span>
+
+        <span class="s2">def </span><span class="s1">get_axislabel_transform(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">axes.transAxes</span>
+
+        <span class="s2">def </span><span class="s1">get_axislabel_pos_angle(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s0">&quot;&quot;&quot; 
+            Return the label reference position in transAxes. 
+ 
+            get_label_transform() returns a transform of (transAxes+offset) 
+            &quot;&quot;&quot;</span>
+            <span class="s2">return </span><span class="s1">dict(left=((</span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.5</span><span class="s1">)</span><span class="s2">, </span><span class="s5">90</span><span class="s1">)</span><span class="s2">,  </span><span class="s3"># (position, angle_tangent)</span>
+                        <span class="s1">right=((</span><span class="s5">1.</span><span class="s2">, </span><span class="s5">0.5</span><span class="s1">)</span><span class="s2">, </span><span class="s5">90</span><span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">bottom=((</span><span class="s5">0.5</span><span class="s2">, </span><span class="s5">0.</span><span class="s1">)</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">top=((</span><span class="s5">0.5</span><span class="s2">, </span><span class="s5">1.</span><span class="s1">)</span><span class="s2">, </span><span class="s5">0</span><span class="s1">))[self._loc]</span>
+
+        <span class="s3"># TICK</span>
+
+        <span class="s2">def </span><span class="s1">get_tick_transform(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">[axes.get_xaxis_transform()</span><span class="s2">,</span>
+                    <span class="s1">axes.get_yaxis_transform()][self.nth_coord]</span>
+
+    <span class="s2">class </span><span class="s1">Floating(_Base):</span>
+
+        <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">nth_coord</span><span class="s2">, </span><span class="s1">value):</span>
+            <span class="s1">self.nth_coord = nth_coord</span>
+            <span class="s1">self._value = value</span>
+            <span class="s1">super().__init__()</span>
+
+        <span class="s2">def </span><span class="s1">get_nth_coord(self):</span>
+            <span class="s2">return </span><span class="s1">self.nth_coord</span>
+
+        <span class="s2">def </span><span class="s1">get_line(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span>
+                <span class="s4">&quot;get_line method should be defined by the derived class&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">AxisArtistHelperRectlinear:</span>
+
+    <span class="s2">class </span><span class="s1">Fixed(AxisArtistHelper.Fixed):</span>
+
+        <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">axes</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">nth_coord=</span><span class="s2">None</span><span class="s1">):</span>
+            <span class="s0">&quot;&quot;&quot; 
+            nth_coord = along which coordinate value varies 
+            in 2D, nth_coord = 0 -&gt;  x axis, nth_coord = 1 -&gt; y axis 
+            &quot;&quot;&quot;</span>
+            <span class="s1">super().__init__(loc</span><span class="s2">, </span><span class="s1">nth_coord)</span>
+            <span class="s1">self.axis = [axes.xaxis</span><span class="s2">, </span><span class="s1">axes.yaxis][self.nth_coord]</span>
+
+        <span class="s3"># TICK</span>
+
+        <span class="s2">def </span><span class="s1">get_tick_iterators(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s0">&quot;&quot;&quot;tick_loc, tick_angle, tick_label&quot;&quot;&quot;</span>
+            <span class="s2">if </span><span class="s1">self._loc </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;bottom&quot;</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s1">]:</span>
+                <span class="s1">angle_normal</span><span class="s2">, </span><span class="s1">angle_tangent = </span><span class="s5">90</span><span class="s2">, </span><span class="s5">0</span>
+            <span class="s2">else</span><span class="s1">:  </span><span class="s3"># &quot;left&quot;, &quot;right&quot;</span>
+                <span class="s1">angle_normal</span><span class="s2">, </span><span class="s1">angle_tangent = </span><span class="s5">0</span><span class="s2">, </span><span class="s5">90</span>
+
+            <span class="s1">major = self.axis.major</span>
+            <span class="s1">major_locs = major.locator()</span>
+            <span class="s1">major_labels = major.formatter.format_ticks(major_locs)</span>
+
+            <span class="s1">minor = self.axis.minor</span>
+            <span class="s1">minor_locs = minor.locator()</span>
+            <span class="s1">minor_labels = minor.formatter.format_ticks(minor_locs)</span>
+
+            <span class="s1">tick_to_axes = self.get_tick_transform(axes) - axes.transAxes</span>
+
+            <span class="s2">def </span><span class="s1">_f(locs</span><span class="s2">, </span><span class="s1">labels):</span>
+                <span class="s2">for </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">label </span><span class="s2">in </span><span class="s1">zip(locs</span><span class="s2">, </span><span class="s1">labels):</span>
+                    <span class="s1">c = self._to_xy(loc</span><span class="s2">, </span><span class="s1">const=self._pos)</span>
+                    <span class="s3"># check if the tick point is inside axes</span>
+                    <span class="s1">c2 = tick_to_axes.transform(c)</span>
+                    <span class="s2">if </span><span class="s1">mpl.transforms._interval_contains_close(</span>
+                            <span class="s1">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">c2[self.nth_coord]):</span>
+                        <span class="s2">yield </span><span class="s1">c</span><span class="s2">, </span><span class="s1">angle_normal</span><span class="s2">, </span><span class="s1">angle_tangent</span><span class="s2">, </span><span class="s1">label</span>
+
+            <span class="s2">return </span><span class="s1">_f(major_locs</span><span class="s2">, </span><span class="s1">major_labels)</span><span class="s2">, </span><span class="s1">_f(minor_locs</span><span class="s2">, </span><span class="s1">minor_labels)</span>
+
+    <span class="s2">class </span><span class="s1">Floating(AxisArtistHelper.Floating):</span>
+        <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">axes</span><span class="s2">, </span><span class="s1">nth_coord</span><span class="s2">,</span>
+                     <span class="s1">passingthrough_point</span><span class="s2">, </span><span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s1">):</span>
+            <span class="s1">super().__init__(nth_coord</span><span class="s2">, </span><span class="s1">passingthrough_point)</span>
+            <span class="s1">self._axis_direction = axis_direction</span>
+            <span class="s1">self.axis = [axes.xaxis</span><span class="s2">, </span><span class="s1">axes.yaxis][self.nth_coord]</span>
+
+        <span class="s2">def </span><span class="s1">get_line(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s1">fixed_coord = </span><span class="s5">1 </span><span class="s1">- self.nth_coord</span>
+            <span class="s1">data_to_axes = axes.transData - axes.transAxes</span>
+            <span class="s1">p = data_to_axes.transform([self._value</span><span class="s2">, </span><span class="s1">self._value])</span>
+            <span class="s2">return </span><span class="s1">Path(self._to_xy((</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">const=p[fixed_coord]))</span>
+
+        <span class="s2">def </span><span class="s1">get_line_transform(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">axes.transAxes</span>
+
+        <span class="s2">def </span><span class="s1">get_axislabel_transform(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">axes.transAxes</span>
+
+        <span class="s2">def </span><span class="s1">get_axislabel_pos_angle(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s0">&quot;&quot;&quot; 
+            Return the label reference position in transAxes. 
+ 
+            get_label_transform() returns a transform of (transAxes+offset) 
+            &quot;&quot;&quot;</span>
+            <span class="s1">angle = [</span><span class="s5">0</span><span class="s2">, </span><span class="s5">90</span><span class="s1">][self.nth_coord]</span>
+            <span class="s1">fixed_coord = </span><span class="s5">1 </span><span class="s1">- self.nth_coord</span>
+            <span class="s1">data_to_axes = axes.transData - axes.transAxes</span>
+            <span class="s1">p = data_to_axes.transform([self._value</span><span class="s2">, </span><span class="s1">self._value])</span>
+            <span class="s1">verts = self._to_xy(</span><span class="s5">0.5</span><span class="s2">, </span><span class="s1">const=p[fixed_coord])</span>
+            <span class="s2">if </span><span class="s5">0 </span><span class="s1">&lt;= verts[fixed_coord] &lt;= </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">verts</span><span class="s2">, </span><span class="s1">angle</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">return None, None</span>
+
+        <span class="s2">def </span><span class="s1">get_tick_transform(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s2">return </span><span class="s1">axes.transData</span>
+
+        <span class="s2">def </span><span class="s1">get_tick_iterators(self</span><span class="s2">, </span><span class="s1">axes):</span>
+            <span class="s0">&quot;&quot;&quot;tick_loc, tick_angle, tick_label&quot;&quot;&quot;</span>
+            <span class="s2">if </span><span class="s1">self.nth_coord == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s1">angle_normal</span><span class="s2">, </span><span class="s1">angle_tangent = </span><span class="s5">90</span><span class="s2">, </span><span class="s5">0</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">angle_normal</span><span class="s2">, </span><span class="s1">angle_tangent = </span><span class="s5">0</span><span class="s2">, </span><span class="s5">90</span>
+
+            <span class="s1">major = self.axis.major</span>
+            <span class="s1">major_locs = major.locator()</span>
+            <span class="s1">major_labels = major.formatter.format_ticks(major_locs)</span>
+
+            <span class="s1">minor = self.axis.minor</span>
+            <span class="s1">minor_locs = minor.locator()</span>
+            <span class="s1">minor_labels = minor.formatter.format_ticks(minor_locs)</span>
+
+            <span class="s1">data_to_axes = axes.transData - axes.transAxes</span>
+
+            <span class="s2">def </span><span class="s1">_f(locs</span><span class="s2">, </span><span class="s1">labels):</span>
+                <span class="s2">for </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">label </span><span class="s2">in </span><span class="s1">zip(locs</span><span class="s2">, </span><span class="s1">labels):</span>
+                    <span class="s1">c = self._to_xy(loc</span><span class="s2">, </span><span class="s1">const=self._value)</span>
+                    <span class="s1">c1</span><span class="s2">, </span><span class="s1">c2 = data_to_axes.transform(c)</span>
+                    <span class="s2">if </span><span class="s5">0 </span><span class="s1">&lt;= c1 &lt;= </span><span class="s5">1 </span><span class="s2">and </span><span class="s5">0 </span><span class="s1">&lt;= c2 &lt;= </span><span class="s5">1</span><span class="s1">:</span>
+                        <span class="s2">yield </span><span class="s1">c</span><span class="s2">, </span><span class="s1">angle_normal</span><span class="s2">, </span><span class="s1">angle_tangent</span><span class="s2">, </span><span class="s1">label</span>
+
+            <span class="s2">return </span><span class="s1">_f(major_locs</span><span class="s2">, </span><span class="s1">major_labels)</span><span class="s2">, </span><span class="s1">_f(minor_locs</span><span class="s2">, </span><span class="s1">minor_labels)</span>
+
+
+<span class="s2">class </span><span class="s1">GridHelperBase:</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._old_limits = </span><span class="s2">None</span>
+        <span class="s1">super().__init__()</span>
+
+    <span class="s2">def </span><span class="s1">update_lim(self</span><span class="s2">, </span><span class="s1">axes):</span>
+        <span class="s1">x1</span><span class="s2">, </span><span class="s1">x2 = axes.get_xlim()</span>
+        <span class="s1">y1</span><span class="s2">, </span><span class="s1">y2 = axes.get_ylim()</span>
+        <span class="s2">if </span><span class="s1">self._old_limits != (x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">y2):</span>
+            <span class="s1">self._update_grid(x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2)</span>
+            <span class="s1">self._old_limits = (x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">y2)</span>
+
+    <span class="s2">def </span><span class="s1">_update_grid(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2):</span>
+        <span class="s0">&quot;&quot;&quot;Cache relevant computations when the axes limits have changed.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_gridlines(self</span><span class="s2">, </span><span class="s1">which</span><span class="s2">, </span><span class="s1">axis):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return list of grid lines as a list of paths (list of points). 
+ 
+        Parameters 
+        ---------- 
+        which : {&quot;both&quot;, &quot;major&quot;, &quot;minor&quot;} 
+        axis : {&quot;both&quot;, &quot;x&quot;, &quot;y&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">[]</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">new_gridlines(self</span><span class="s2">, </span><span class="s1">ax):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create and return a new GridlineCollection instance. 
+ 
+        *which* : &quot;major&quot; or &quot;minor&quot; 
+        *axis* : &quot;both&quot;, &quot;x&quot; or &quot;y&quot; 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">gridlines = GridlinesCollection(</span>
+            <span class="s2">None, </span><span class="s1">transform=ax.transData</span><span class="s2">, </span><span class="s1">colors=mpl.rcParams[</span><span class="s4">'grid.color'</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">linestyles=mpl.rcParams[</span><span class="s4">'grid.linestyle'</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">linewidths=mpl.rcParams[</span><span class="s4">'grid.linewidth'</span><span class="s1">])</span>
+        <span class="s1">ax._set_artist_props(gridlines)</span>
+        <span class="s1">gridlines.set_grid_helper(self)</span>
+
+        <span class="s1">ax.axes._set_artist_props(gridlines)</span>
+        <span class="s3"># gridlines.set_clip_path(self.axes.patch)</span>
+        <span class="s3"># set_clip_path need to be deferred after Axes.cla is completed.</span>
+        <span class="s3"># It is done inside the cla.</span>
+
+        <span class="s2">return </span><span class="s1">gridlines</span>
+
+
+<span class="s2">class </span><span class="s1">GridHelperRectlinear(GridHelperBase):</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">axes):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.axes = axes</span>
+
+    <span class="s2">def </span><span class="s1">new_fixed_axis(self</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">,</span>
+                       <span class="s1">nth_coord=</span><span class="s2">None,</span>
+                       <span class="s1">axis_direction=</span><span class="s2">None,</span>
+                       <span class="s1">offset=</span><span class="s2">None,</span>
+                       <span class="s1">axes=</span><span class="s2">None,</span>
+                       <span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">axes </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">_api.warn_external(</span>
+                <span class="s4">&quot;'new_fixed_axis' explicitly requires the axes keyword.&quot;</span><span class="s1">)</span>
+            <span class="s1">axes = self.axes</span>
+
+        <span class="s1">_helper = AxisArtistHelperRectlinear.Fixed(axes</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">nth_coord)</span>
+
+        <span class="s2">if </span><span class="s1">axis_direction </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">axis_direction = loc</span>
+        <span class="s1">axisline = AxisArtist(axes</span><span class="s2">, </span><span class="s1">_helper</span><span class="s2">, </span><span class="s1">offset=offset</span><span class="s2">,</span>
+                              <span class="s1">axis_direction=axis_direction</span><span class="s2">,</span>
+                              <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">axisline</span>
+
+    <span class="s2">def </span><span class="s1">new_floating_axis(self</span><span class="s2">, </span><span class="s1">nth_coord</span><span class="s2">, </span><span class="s1">value</span><span class="s2">,</span>
+                          <span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s2">,</span>
+                          <span class="s1">axes=</span><span class="s2">None,</span>
+                          <span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">axes </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">_api.warn_external(</span>
+                <span class="s4">&quot;'new_floating_axis' explicitly requires the axes keyword.&quot;</span><span class="s1">)</span>
+            <span class="s1">axes = self.axes</span>
+
+        <span class="s1">_helper = AxisArtistHelperRectlinear.Floating(</span>
+            <span class="s1">axes</span><span class="s2">, </span><span class="s1">nth_coord</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">axis_direction)</span>
+
+        <span class="s1">axisline = AxisArtist(axes</span><span class="s2">, </span><span class="s1">_helper</span><span class="s2">, </span><span class="s1">axis_direction=axis_direction)</span>
+
+        <span class="s1">axisline.line.set_clip_on(</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">axisline.line.set_clip_box(axisline.axes.bbox)</span>
+        <span class="s2">return </span><span class="s1">axisline</span>
+
+    <span class="s2">def </span><span class="s1">get_gridlines(self</span><span class="s2">, </span><span class="s1">which=</span><span class="s4">&quot;major&quot;</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">&quot;both&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return list of gridline coordinates in data coordinates. 
+ 
+        Parameters 
+        ---------- 
+        which : {&quot;both&quot;, &quot;major&quot;, &quot;minor&quot;} 
+        axis : {&quot;both&quot;, &quot;x&quot;, &quot;y&quot;} 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_api.check_in_list([</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;major&quot;</span><span class="s2">, </span><span class="s4">&quot;minor&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">which=which)</span>
+        <span class="s1">_api.check_in_list([</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s4">&quot;y&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+        <span class="s1">gridlines = []</span>
+
+        <span class="s2">if </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">(</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;x&quot;</span><span class="s1">):</span>
+            <span class="s1">locs = []</span>
+            <span class="s1">y1</span><span class="s2">, </span><span class="s1">y2 = self.axes.get_ylim()</span>
+            <span class="s2">if </span><span class="s1">which </span><span class="s2">in </span><span class="s1">(</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;major&quot;</span><span class="s1">):</span>
+                <span class="s1">locs.extend(self.axes.xaxis.major.locator())</span>
+            <span class="s2">if </span><span class="s1">which </span><span class="s2">in </span><span class="s1">(</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;minor&quot;</span><span class="s1">):</span>
+                <span class="s1">locs.extend(self.axes.xaxis.minor.locator())</span>
+
+            <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">locs:</span>
+                <span class="s1">gridlines.append([[x</span><span class="s2">, </span><span class="s1">x]</span><span class="s2">, </span><span class="s1">[y1</span><span class="s2">, </span><span class="s1">y2]])</span>
+
+        <span class="s2">if </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">(</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;y&quot;</span><span class="s1">):</span>
+            <span class="s1">x1</span><span class="s2">, </span><span class="s1">x2 = self.axes.get_xlim()</span>
+            <span class="s1">locs = []</span>
+            <span class="s2">if </span><span class="s1">self.axes.yaxis._major_tick_kw[</span><span class="s4">&quot;gridOn&quot;</span><span class="s1">]:</span>
+                <span class="s1">locs.extend(self.axes.yaxis.major.locator())</span>
+            <span class="s2">if </span><span class="s1">self.axes.yaxis._minor_tick_kw[</span><span class="s4">&quot;gridOn&quot;</span><span class="s1">]:</span>
+                <span class="s1">locs.extend(self.axes.yaxis.minor.locator())</span>
+
+            <span class="s2">for </span><span class="s1">y </span><span class="s2">in </span><span class="s1">locs:</span>
+                <span class="s1">gridlines.append([[x1</span><span class="s2">, </span><span class="s1">x2]</span><span class="s2">, </span><span class="s1">[y</span><span class="s2">, </span><span class="s1">y]])</span>
+
+        <span class="s2">return </span><span class="s1">gridlines</span>
+
+
+<span class="s2">class </span><span class="s1">Axes(maxes.Axes):</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">return </span><span class="s1">maxes.Axes.axis(self.axes</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">grid_helper=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._axisline_on = </span><span class="s2">True</span>
+        <span class="s1">self._grid_helper = (grid_helper </span><span class="s2">if </span><span class="s1">grid_helper</span>
+                             <span class="s2">else </span><span class="s1">GridHelperRectlinear(self))</span>
+        <span class="s1">super().__init__(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self.toggle_axisline(</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">toggle_axisline(self</span><span class="s2">, </span><span class="s1">b=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">b </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">b = </span><span class="s2">not </span><span class="s1">self._axisline_on</span>
+        <span class="s2">if </span><span class="s1">b:</span>
+            <span class="s1">self._axisline_on = </span><span class="s2">True</span>
+            <span class="s1">self.spines[:].set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">self.xaxis.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">self.yaxis.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._axisline_on = </span><span class="s2">False</span>
+            <span class="s1">self.spines[:].set_visible(</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.xaxis.set_visible(</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.yaxis.set_visible(</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">axis(self):</span>
+        <span class="s2">return </span><span class="s1">self._axislines</span>
+
+    <span class="s1">@_api.deprecated(</span><span class="s4">&quot;3.6&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">new_gridlines(self</span><span class="s2">, </span><span class="s1">grid_helper=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create and return a new GridlineCollection instance. 
+ 
+        *which* : &quot;major&quot; or &quot;minor&quot; 
+        *axis* : &quot;both&quot;, &quot;x&quot; or &quot;y&quot; 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">grid_helper </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">grid_helper = self.get_grid_helper()</span>
+
+        <span class="s1">gridlines = grid_helper.new_gridlines(self)</span>
+        <span class="s2">return </span><span class="s1">gridlines</span>
+
+    <span class="s2">def </span><span class="s1">clear(self):</span>
+        <span class="s3"># docstring inherited</span>
+
+        <span class="s3"># Init gridlines before clear() as clear() calls grid().</span>
+        <span class="s1">self.gridlines = gridlines = GridlinesCollection(</span>
+            <span class="s2">None, </span><span class="s1">transform=self.transData</span><span class="s2">,</span>
+            <span class="s1">colors=mpl.rcParams[</span><span class="s4">'grid.color'</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">linestyles=mpl.rcParams[</span><span class="s4">'grid.linestyle'</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">linewidths=mpl.rcParams[</span><span class="s4">'grid.linewidth'</span><span class="s1">])</span>
+        <span class="s1">self._set_artist_props(gridlines)</span>
+        <span class="s1">gridlines.set_grid_helper(self.get_grid_helper())</span>
+
+        <span class="s1">super().clear()</span>
+
+        <span class="s3"># clip_path is set after Axes.clear(): that's when a patch is created.</span>
+        <span class="s1">gridlines.set_clip_path(self.axes.patch)</span>
+
+        <span class="s3"># Init axis artists.</span>
+        <span class="s1">self._axislines = mpl_axes.Axes.AxisDict(self)</span>
+        <span class="s1">new_fixed_axis = self.get_grid_helper().new_fixed_axis</span>
+        <span class="s1">self._axislines.update({</span>
+            <span class="s1">loc: new_fixed_axis(loc=loc</span><span class="s2">, </span><span class="s1">axes=self</span><span class="s2">, </span><span class="s1">axis_direction=loc)</span>
+            <span class="s2">for </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;bottom&quot;</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s2">, </span><span class="s4">&quot;left&quot;</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">]})</span>
+        <span class="s2">for </span><span class="s1">axisline </span><span class="s2">in </span><span class="s1">[self._axislines[</span><span class="s4">&quot;top&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self._axislines[</span><span class="s4">&quot;right&quot;</span><span class="s1">]]:</span>
+            <span class="s1">axisline.label.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">axisline.major_ticklabels.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s1">axisline.minor_ticklabels.set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_grid_helper(self):</span>
+        <span class="s2">return </span><span class="s1">self._grid_helper</span>
+
+    <span class="s2">def </span><span class="s1">grid(self</span><span class="s2">, </span><span class="s1">visible=</span><span class="s2">None, </span><span class="s1">which=</span><span class="s4">'major'</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Toggle the gridlines, and optionally set the properties of the lines. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># There are some discrepancies in the behavior of grid() between</span>
+        <span class="s3"># axes_grid and Matplotlib, because axes_grid explicitly sets the</span>
+        <span class="s3"># visibility of the gridlines.</span>
+        <span class="s1">super().grid(visible</span><span class="s2">, </span><span class="s1">which=which</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s2">if not </span><span class="s1">self._axisline_on:</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">visible </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">visible = (self.axes.xaxis._minor_tick_kw[</span><span class="s4">&quot;gridOn&quot;</span><span class="s1">]</span>
+                       <span class="s2">or </span><span class="s1">self.axes.xaxis._major_tick_kw[</span><span class="s4">&quot;gridOn&quot;</span><span class="s1">]</span>
+                       <span class="s2">or </span><span class="s1">self.axes.yaxis._minor_tick_kw[</span><span class="s4">&quot;gridOn&quot;</span><span class="s1">]</span>
+                       <span class="s2">or </span><span class="s1">self.axes.yaxis._major_tick_kw[</span><span class="s4">&quot;gridOn&quot;</span><span class="s1">])</span>
+        <span class="s1">self.gridlines.set(which=which</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">visible=visible)</span>
+        <span class="s1">self.gridlines.set(**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">get_children(self):</span>
+        <span class="s2">if </span><span class="s1">self._axisline_on:</span>
+            <span class="s1">children = [*self._axislines.values()</span><span class="s2">, </span><span class="s1">self.gridlines]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">children = []</span>
+        <span class="s1">children.extend(super().get_children())</span>
+        <span class="s2">return </span><span class="s1">children</span>
+
+    <span class="s2">def </span><span class="s1">new_fixed_axis(self</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">offset=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">gh = self.get_grid_helper()</span>
+        <span class="s1">axis = gh.new_fixed_axis(loc</span><span class="s2">,</span>
+                                 <span class="s1">nth_coord=</span><span class="s2">None,</span>
+                                 <span class="s1">axis_direction=</span><span class="s2">None,</span>
+                                 <span class="s1">offset=offset</span><span class="s2">,</span>
+                                 <span class="s1">axes=self</span><span class="s2">,</span>
+                                 <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">axis</span>
+
+    <span class="s2">def </span><span class="s1">new_floating_axis(self</span><span class="s2">, </span><span class="s1">nth_coord</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s1">):</span>
+        <span class="s1">gh = self.get_grid_helper()</span>
+        <span class="s1">axis = gh.new_floating_axis(nth_coord</span><span class="s2">, </span><span class="s1">value</span><span class="s2">,</span>
+                                    <span class="s1">axis_direction=axis_direction</span><span class="s2">,</span>
+                                    <span class="s1">axes=self)</span>
+        <span class="s2">return </span><span class="s1">axis</span>
+
+
+<span class="s2">class </span><span class="s1">AxesZero(Axes):</span>
+
+    <span class="s2">def </span><span class="s1">clear(self):</span>
+        <span class="s1">super().clear()</span>
+        <span class="s1">new_floating_axis = self.get_grid_helper().new_floating_axis</span>
+        <span class="s1">self._axislines.update(</span>
+            <span class="s1">xzero=new_floating_axis(</span>
+                <span class="s1">nth_coord=</span><span class="s5">0</span><span class="s2">, </span><span class="s1">value=</span><span class="s5">0.</span><span class="s2">, </span><span class="s1">axis_direction=</span><span class="s4">&quot;bottom&quot;</span><span class="s2">, </span><span class="s1">axes=self)</span><span class="s2">,</span>
+            <span class="s1">yzero=new_floating_axis(</span>
+                <span class="s1">nth_coord=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">value=</span><span class="s5">0.</span><span class="s2">, </span><span class="s1">axis_direction=</span><span class="s4">&quot;left&quot;</span><span class="s2">, </span><span class="s1">axes=self)</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;xzero&quot;</span><span class="s2">, </span><span class="s4">&quot;yzero&quot;</span><span class="s1">]:</span>
+            <span class="s1">self._axislines[k].line.set_clip_path(self.patch)</span>
+            <span class="s1">self._axislines[k].set_visible(</span><span class="s2">False</span><span class="s1">)</span>
+
+
+<span class="s1">Subplot = Axes</span>
+<span class="s1">SubplotZero = AxesZero</span>
+</pre>
+</body>
+</html>

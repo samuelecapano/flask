@@ -1,0 +1,1559 @@
+<html>
+<head>
+<title>flexbuffers.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+flexbuffers.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Lint as: python3</span>
+<span class="s0"># Copyright 2020 Google Inc. All rights reserved.</span>
+<span class="s0">#</span>
+<span class="s0"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0"># you may not use this file except in compliance with the License.</span>
+<span class="s0"># You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#     http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0"># See the License for the specific language governing permissions and</span>
+<span class="s0"># limitations under the License.</span>
+<span class="s2">&quot;&quot;&quot;Implementation of FlexBuffers binary format. 
+ 
+For more info check https://google.github.io/flatbuffers/flexbuffers.html and 
+corresponding C++ implementation at 
+https://github.com/google/flatbuffers/blob/master/include/flatbuffers/flexbuffers.h 
+&quot;&quot;&quot;</span>
+
+<span class="s0"># pylint: disable=invalid-name</span>
+<span class="s0"># TODO(dkovalev): Add type hints everywhere, so tools like pytypes could work.</span>
+
+<span class="s3">import </span><span class="s1">array</span>
+<span class="s3">import </span><span class="s1">contextlib</span>
+<span class="s3">import </span><span class="s1">enum</span>
+<span class="s3">import </span><span class="s1">struct</span>
+
+<span class="s1">__all__ = (</span><span class="s4">'Type'</span><span class="s3">, </span><span class="s4">'Builder'</span><span class="s3">, </span><span class="s4">'GetRoot'</span><span class="s3">, </span><span class="s4">'Dumps'</span><span class="s3">, </span><span class="s4">'Loads'</span><span class="s1">)</span>
+
+
+<span class="s3">class </span><span class="s1">BitWidth(enum.IntEnum):</span>
+  <span class="s2">&quot;&quot;&quot;Supported bit widths of value types. 
+ 
+  These are used in the lower 2 bits of a type field to determine the size of 
+  the elements (and or size field) of the item pointed to (e.g. vector). 
+  &quot;&quot;&quot;</span>
+  <span class="s1">W8 = </span><span class="s5">0  </span><span class="s0"># 2^0 = 1 byte</span>
+  <span class="s1">W16 = </span><span class="s5">1  </span><span class="s0"># 2^1 = 2 bytes</span>
+  <span class="s1">W32 = </span><span class="s5">2  </span><span class="s0"># 2^2 = 4 bytes</span>
+  <span class="s1">W64 = </span><span class="s5">3  </span><span class="s0"># 2^3 = 8 bytes</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">U(value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the minimum `BitWidth` to encode unsigned integer value.&quot;&quot;&quot;</span>
+    <span class="s3">assert </span><span class="s1">value &gt;= </span><span class="s5">0</span>
+
+    <span class="s3">if </span><span class="s1">value &lt; (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">8</span><span class="s1">):</span>
+      <span class="s3">return </span><span class="s1">BitWidth.W8</span>
+    <span class="s3">elif </span><span class="s1">value &lt; (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">16</span><span class="s1">):</span>
+      <span class="s3">return </span><span class="s1">BitWidth.W16</span>
+    <span class="s3">elif </span><span class="s1">value &lt; (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">32</span><span class="s1">):</span>
+      <span class="s3">return </span><span class="s1">BitWidth.W32</span>
+    <span class="s3">elif </span><span class="s1">value &lt; (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">64</span><span class="s1">):</span>
+      <span class="s3">return </span><span class="s1">BitWidth.W64</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'value is too big to encode: %s' </span><span class="s1">% value)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">I(value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the minimum `BitWidth` to encode signed integer value.&quot;&quot;&quot;</span>
+    <span class="s0"># -2^(n-1) &lt;=     value &lt; 2^(n-1)</span>
+    <span class="s0"># -2^n     &lt;= 2 * value &lt; 2^n</span>
+    <span class="s0"># 2 * value &lt; 2^n, when value &gt;= 0 or 2 * (-value) &lt;= 2^n, when value &lt; 0</span>
+    <span class="s0"># 2 * value &lt; 2^n, when value &gt;= 0 or 2 * (-value) - 1 &lt; 2^n, when value &lt; 0</span>
+    <span class="s0">#</span>
+    <span class="s0"># if value &gt;= 0:</span>
+    <span class="s0">#   return BitWidth.U(2 * value)</span>
+    <span class="s0"># else:</span>
+    <span class="s0">#   return BitWidth.U(2 * (-value) - 1)  # ~x = -x - 1</span>
+    <span class="s1">value *= </span><span class="s5">2</span>
+    <span class="s3">return </span><span class="s1">BitWidth.U(value </span><span class="s3">if </span><span class="s1">value &gt;= </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">~value)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">F(value):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the `BitWidth` to encode floating point value.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">struct.unpack(</span><span class="s4">'&lt;f'</span><span class="s3">, </span><span class="s1">struct.pack(</span><span class="s4">'&lt;f'</span><span class="s3">, </span><span class="s1">value))[</span><span class="s5">0</span><span class="s1">] == value:</span>
+      <span class="s3">return </span><span class="s1">BitWidth.W32</span>
+    <span class="s3">return </span><span class="s1">BitWidth.W64</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">B(byte_width):</span>
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s5">1</span><span class="s1">: BitWidth.W8</span><span class="s3">,</span>
+        <span class="s5">2</span><span class="s1">: BitWidth.W16</span><span class="s3">,</span>
+        <span class="s5">4</span><span class="s1">: BitWidth.W32</span><span class="s3">,</span>
+        <span class="s5">8</span><span class="s1">: BitWidth.W64</span>
+    <span class="s1">}[byte_width]</span>
+
+
+<span class="s1">I = {</span><span class="s5">1</span><span class="s1">: </span><span class="s4">'b'</span><span class="s3">, </span><span class="s5">2</span><span class="s1">: </span><span class="s4">'h'</span><span class="s3">, </span><span class="s5">4</span><span class="s1">: </span><span class="s4">'i'</span><span class="s3">, </span><span class="s5">8</span><span class="s1">: </span><span class="s4">'q'</span><span class="s1">}  </span><span class="s0"># Integer formats</span>
+<span class="s1">U = {</span><span class="s5">1</span><span class="s1">: </span><span class="s4">'B'</span><span class="s3">, </span><span class="s5">2</span><span class="s1">: </span><span class="s4">'H'</span><span class="s3">, </span><span class="s5">4</span><span class="s1">: </span><span class="s4">'I'</span><span class="s3">, </span><span class="s5">8</span><span class="s1">: </span><span class="s4">'Q'</span><span class="s1">}  </span><span class="s0"># Unsigned integer formats</span>
+<span class="s1">F = {</span><span class="s5">4</span><span class="s1">: </span><span class="s4">'f'</span><span class="s3">, </span><span class="s5">8</span><span class="s1">: </span><span class="s4">'d'</span><span class="s1">}  </span><span class="s0"># Floating point formats</span>
+
+
+<span class="s3">def </span><span class="s1">_Unpack(fmt</span><span class="s3">, </span><span class="s1">buf):</span>
+  <span class="s3">return </span><span class="s1">struct.unpack(</span><span class="s4">'&lt;%s' </span><span class="s1">% fmt[len(buf)]</span><span class="s3">, </span><span class="s1">buf)[</span><span class="s5">0</span><span class="s1">]</span>
+
+
+<span class="s3">def </span><span class="s1">_UnpackVector(fmt</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">length):</span>
+  <span class="s1">byte_width = len(buf) // length</span>
+  <span class="s3">return </span><span class="s1">struct.unpack(</span><span class="s4">'&lt;%d%s' </span><span class="s1">% (length</span><span class="s3">, </span><span class="s1">fmt[byte_width])</span><span class="s3">, </span><span class="s1">buf)</span>
+
+
+<span class="s3">def </span><span class="s1">_Pack(fmt</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width):</span>
+  <span class="s3">return </span><span class="s1">struct.pack(</span><span class="s4">'&lt;%s' </span><span class="s1">% fmt[byte_width]</span><span class="s3">, </span><span class="s1">value)</span>
+
+
+<span class="s3">def </span><span class="s1">_PackVector(fmt</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">byte_width):</span>
+  <span class="s3">return </span><span class="s1">struct.pack(</span><span class="s4">'&lt;%d%s' </span><span class="s1">% (len(values)</span><span class="s3">, </span><span class="s1">fmt[byte_width])</span><span class="s3">, </span><span class="s1">*values)</span>
+
+
+<span class="s3">def </span><span class="s1">_Mutate(fmt</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">value_bit_width):</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s5">1 </span><span class="s1">&lt;&lt; value_bit_width) &lt;= byte_width:</span>
+    <span class="s1">buf[:byte_width] = _Pack(fmt</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width)</span>
+    <span class="s3">return True</span>
+  <span class="s3">return False</span>
+
+
+<span class="s0"># Computes how many bytes you'd have to pad to be able to write an</span>
+<span class="s0"># &quot;scalar_size&quot; scalar if the buffer had grown to &quot;buf_size&quot;,</span>
+<span class="s0"># &quot;scalar_size&quot; is a power of two.</span>
+<span class="s3">def </span><span class="s1">_PaddingBytes(buf_size</span><span class="s3">, </span><span class="s1">scalar_size):</span>
+  <span class="s0"># ((buf_size + (scalar_size - 1)) // scalar_size) * scalar_size - buf_size</span>
+  <span class="s3">return </span><span class="s1">-buf_size &amp; (scalar_size - </span><span class="s5">1</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">_ShiftSlice(s</span><span class="s3">, </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">length):</span>
+  <span class="s1">start = offset + (</span><span class="s5">0 </span><span class="s3">if </span><span class="s1">s.start </span><span class="s3">is None else </span><span class="s1">s.start)</span>
+  <span class="s1">stop = offset + (length </span><span class="s3">if </span><span class="s1">s.stop </span><span class="s3">is None else </span><span class="s1">s.stop)</span>
+  <span class="s3">return </span><span class="s1">slice(start</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">, </span><span class="s1">s.step)</span>
+
+
+<span class="s0"># https://en.cppreference.com/w/cpp/algorithm/lower_bound</span>
+<span class="s3">def </span><span class="s1">_LowerBound(values</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">pred):</span>
+  <span class="s2">&quot;&quot;&quot;Implementation of C++ std::lower_bound() algorithm.&quot;&quot;&quot;</span>
+  <span class="s1">first</span><span class="s3">, </span><span class="s1">last = </span><span class="s5">0</span><span class="s3">, </span><span class="s1">len(values)</span>
+  <span class="s1">count = last - first</span>
+  <span class="s3">while </span><span class="s1">count &gt; </span><span class="s5">0</span><span class="s1">:</span>
+    <span class="s1">i = first</span>
+    <span class="s1">step = count // </span><span class="s5">2</span>
+    <span class="s1">i += step</span>
+    <span class="s3">if </span><span class="s1">pred(values[i]</span><span class="s3">, </span><span class="s1">value):</span>
+      <span class="s1">i += </span><span class="s5">1</span>
+      <span class="s1">first = i</span>
+      <span class="s1">count -= step + </span><span class="s5">1</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">count = step</span>
+  <span class="s3">return </span><span class="s1">first</span>
+
+
+<span class="s0"># https://en.cppreference.com/w/cpp/algorithm/binary_search</span>
+<span class="s3">def </span><span class="s1">_BinarySearch(values</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">pred=</span><span class="s3">lambda </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y: x &lt; y):</span>
+  <span class="s2">&quot;&quot;&quot;Implementation of C++ std::binary_search() algorithm.&quot;&quot;&quot;</span>
+  <span class="s1">index = _LowerBound(values</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">pred)</span>
+  <span class="s3">if </span><span class="s1">index != len(values) </span><span class="s3">and not </span><span class="s1">pred(value</span><span class="s3">, </span><span class="s1">values[index]):</span>
+    <span class="s3">return </span><span class="s1">index</span>
+  <span class="s3">return </span><span class="s1">-</span><span class="s5">1</span>
+
+
+<span class="s3">class </span><span class="s1">Type(enum.IntEnum):</span>
+  <span class="s2">&quot;&quot;&quot;Supported types of encoded data. 
+ 
+  These are used as the upper 6 bits of a type field to indicate the actual 
+  type. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">NULL = </span><span class="s5">0</span>
+  <span class="s1">INT = </span><span class="s5">1</span>
+  <span class="s1">UINT = </span><span class="s5">2</span>
+  <span class="s1">FLOAT = </span><span class="s5">3</span>
+  <span class="s0"># Types above stored inline, types below store an offset.</span>
+  <span class="s1">KEY = </span><span class="s5">4</span>
+  <span class="s1">STRING = </span><span class="s5">5</span>
+  <span class="s1">INDIRECT_INT = </span><span class="s5">6</span>
+  <span class="s1">INDIRECT_UINT = </span><span class="s5">7</span>
+  <span class="s1">INDIRECT_FLOAT = </span><span class="s5">8</span>
+  <span class="s1">MAP = </span><span class="s5">9</span>
+  <span class="s1">VECTOR = </span><span class="s5">10  </span><span class="s0"># Untyped.</span>
+
+  <span class="s1">VECTOR_INT = </span><span class="s5">11  </span><span class="s0"># Typed any size (stores no type table).</span>
+  <span class="s1">VECTOR_UINT = </span><span class="s5">12</span>
+  <span class="s1">VECTOR_FLOAT = </span><span class="s5">13</span>
+  <span class="s1">VECTOR_KEY = </span><span class="s5">14</span>
+  <span class="s0"># DEPRECATED, use VECTOR or VECTOR_KEY instead.</span>
+  <span class="s0"># Read test.cpp/FlexBuffersDeprecatedTest() for details on why.</span>
+  <span class="s1">VECTOR_STRING_DEPRECATED = </span><span class="s5">15</span>
+
+  <span class="s1">VECTOR_INT2 = </span><span class="s5">16  </span><span class="s0"># Typed tuple (no type table, no size field).</span>
+  <span class="s1">VECTOR_UINT2 = </span><span class="s5">17</span>
+  <span class="s1">VECTOR_FLOAT2 = </span><span class="s5">18</span>
+  <span class="s1">VECTOR_INT3 = </span><span class="s5">19  </span><span class="s0"># Typed triple (no type table, no size field).</span>
+  <span class="s1">VECTOR_UINT3 = </span><span class="s5">20</span>
+  <span class="s1">VECTOR_FLOAT3 = </span><span class="s5">21</span>
+  <span class="s1">VECTOR_INT4 = </span><span class="s5">22  </span><span class="s0"># Typed quad (no type table, no size field).</span>
+  <span class="s1">VECTOR_UINT4 = </span><span class="s5">23</span>
+  <span class="s1">VECTOR_FLOAT4 = </span><span class="s5">24</span>
+
+  <span class="s1">BLOB = </span><span class="s5">25</span>
+  <span class="s1">BOOL = </span><span class="s5">26</span>
+  <span class="s1">VECTOR_BOOL = </span><span class="s5">36  </span><span class="s0"># To do the same type of conversion of type to vector type</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Pack(type_</span><span class="s3">, </span><span class="s1">bit_width):</span>
+    <span class="s3">return </span><span class="s1">(int(type_) &lt;&lt; </span><span class="s5">2</span><span class="s1">) | bit_width</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Unpack(packed_type):</span>
+    <span class="s3">return </span><span class="s5">1 </span><span class="s1">&lt;&lt; (packed_type &amp; </span><span class="s5">0b11</span><span class="s1">)</span><span class="s3">, </span><span class="s1">Type(packed_type &gt;&gt; </span><span class="s5">2</span><span class="s1">)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">IsInline(type_):</span>
+    <span class="s3">return </span><span class="s1">type_ &lt;= Type.FLOAT </span><span class="s3">or </span><span class="s1">type_ == Type.BOOL</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">IsTypedVector(type_):</span>
+    <span class="s3">return </span><span class="s1">Type.VECTOR_INT &lt;= type_ &lt;= Type.VECTOR_STRING_DEPRECATED </span><span class="s3">or </span><span class="s1">\</span>
+           <span class="s1">type_ == Type.VECTOR_BOOL</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">IsTypedVectorElementType(type_):</span>
+    <span class="s3">return </span><span class="s1">Type.INT &lt;= type_ &lt;= Type.STRING </span><span class="s3">or </span><span class="s1">type_ == Type.BOOL</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">ToTypedVectorElementType(type_):</span>
+    <span class="s3">if not </span><span class="s1">Type.IsTypedVector(type_):</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'must be typed vector type'</span><span class="s1">)</span>
+
+    <span class="s3">return </span><span class="s1">Type(type_ - Type.VECTOR_INT + Type.INT)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">IsFixedTypedVector(type_):</span>
+    <span class="s3">return </span><span class="s1">Type.VECTOR_INT2 &lt;= type_ &lt;= Type.VECTOR_FLOAT4</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">IsFixedTypedVectorElementType(type_):</span>
+    <span class="s3">return </span><span class="s1">Type.INT &lt;= type_ &lt;= Type.FLOAT</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">ToFixedTypedVectorElementType(type_):</span>
+    <span class="s3">if not </span><span class="s1">Type.IsFixedTypedVector(type_):</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'must be fixed typed vector type'</span><span class="s1">)</span>
+
+    <span class="s0"># 3 types each, starting from length 2.</span>
+    <span class="s1">fixed_type = type_ - Type.VECTOR_INT2</span>
+    <span class="s3">return </span><span class="s1">Type(fixed_type % </span><span class="s5">3 </span><span class="s1">+ Type.INT)</span><span class="s3">, </span><span class="s1">fixed_type // </span><span class="s5">3 </span><span class="s1">+ </span><span class="s5">2</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">ToTypedVector(element_type</span><span class="s3">, </span><span class="s1">fixed_len=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Converts element type to corresponding vector type. 
+ 
+    Args: 
+      element_type: vector element type 
+      fixed_len: number of elements: 0 for typed vector; 2, 3, or 4 for fixed 
+        typed vector. 
+ 
+    Returns: 
+      Typed vector type or fixed typed vector type. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">fixed_len == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s3">if not </span><span class="s1">Type.IsTypedVectorElementType(element_type):</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'must be typed vector element type'</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">if not </span><span class="s1">Type.IsFixedTypedVectorElementType(element_type):</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'must be fixed typed vector element type'</span><span class="s1">)</span>
+
+    <span class="s1">offset = element_type - Type.INT</span>
+    <span class="s3">if </span><span class="s1">fixed_len == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">Type(offset + Type.VECTOR_INT)  </span><span class="s0"># TypedVector</span>
+    <span class="s3">elif </span><span class="s1">fixed_len == </span><span class="s5">2</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">Type(offset + Type.VECTOR_INT2)  </span><span class="s0"># FixedTypedVector</span>
+    <span class="s3">elif </span><span class="s1">fixed_len == </span><span class="s5">3</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">Type(offset + Type.VECTOR_INT3)  </span><span class="s0"># FixedTypedVector</span>
+    <span class="s3">elif </span><span class="s1">fixed_len == </span><span class="s5">4</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">Type(offset + Type.VECTOR_INT4)  </span><span class="s0"># FixedTypedVector</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'unsupported fixed_len: %s' </span><span class="s1">% fixed_len)</span>
+
+
+<span class="s3">class </span><span class="s1">Buf:</span>
+  <span class="s2">&quot;&quot;&quot;Class to access underlying buffer object starting from the given offset.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">offset):</span>
+    <span class="s1">self._buf = buf</span>
+    <span class="s1">self._offset = offset </span><span class="s3">if </span><span class="s1">offset &gt;= </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">len(buf) + offset</span>
+    <span class="s1">self._length = len(buf) - self._offset</span>
+
+  <span class="s3">def </span><span class="s1">__getitem__(self</span><span class="s3">, </span><span class="s1">key):</span>
+    <span class="s3">if </span><span class="s1">isinstance(key</span><span class="s3">, </span><span class="s1">slice):</span>
+      <span class="s3">return </span><span class="s1">self._buf[_ShiftSlice(key</span><span class="s3">, </span><span class="s1">self._offset</span><span class="s3">, </span><span class="s1">self._length)]</span>
+    <span class="s3">elif </span><span class="s1">isinstance(key</span><span class="s3">, </span><span class="s1">int):</span>
+      <span class="s3">return </span><span class="s1">self._buf[self._offset + key]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'invalid key type'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__setitem__(self</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s3">if </span><span class="s1">isinstance(key</span><span class="s3">, </span><span class="s1">slice):</span>
+      <span class="s1">self._buf[_ShiftSlice(key</span><span class="s3">, </span><span class="s1">self._offset</span><span class="s3">, </span><span class="s1">self._length)] = value</span>
+    <span class="s3">elif </span><span class="s1">isinstance(key</span><span class="s3">, </span><span class="s1">int):</span>
+      <span class="s1">self._buf[self._offset + key] = key</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'invalid key type'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'buf[%d:]' </span><span class="s1">% self._offset</span>
+
+  <span class="s3">def </span><span class="s1">Find(self</span><span class="s3">, </span><span class="s1">sub):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the lowest index where the sub subsequence is found.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self._buf[self._offset:].find(sub)</span>
+
+  <span class="s3">def </span><span class="s1">Slice(self</span><span class="s3">, </span><span class="s1">offset):</span>
+    <span class="s2">&quot;&quot;&quot;Returns new `Buf` which starts from the given offset.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">Buf(self._buf</span><span class="s3">, </span><span class="s1">self._offset + offset)</span>
+
+  <span class="s3">def </span><span class="s1">Indirect(self</span><span class="s3">, </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s2">&quot;&quot;&quot;Return new `Buf` based on the encoded offset (indirect encoding).&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.Slice(offset - _Unpack(U</span><span class="s3">, </span><span class="s1">self[offset:offset + byte_width]))</span>
+
+
+<span class="s3">class </span><span class="s1">Object:</span>
+  <span class="s2">&quot;&quot;&quot;Base class for all non-trivial data accessors.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = </span><span class="s4">'_buf'</span><span class="s3">, </span><span class="s4">'_byte_width'</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s1">self._buf = buf</span>
+    <span class="s1">self._byte_width = byte_width</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">ByteWidth(self):</span>
+    <span class="s3">return </span><span class="s1">self._byte_width</span>
+
+
+<span class="s3">class </span><span class="s1">Sized(Object):</span>
+  <span class="s2">&quot;&quot;&quot;Base class for all data accessors which need to read encoded size.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = </span><span class="s4">'_size'</span><span class="s3">,</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">size=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s1">super().__init__(buf</span><span class="s3">, </span><span class="s1">byte_width)</span>
+    <span class="s3">if </span><span class="s1">size == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">self._size = _Unpack(U</span><span class="s3">, </span><span class="s1">self.SizeBytes)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">self._size = size</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">SizeBytes(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf[-self._byte_width:</span><span class="s5">0</span><span class="s1">]</span>
+
+  <span class="s3">def </span><span class="s1">__len__(self):</span>
+    <span class="s3">return </span><span class="s1">self._size</span>
+
+
+<span class="s3">class </span><span class="s1">Blob(Sized):</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded blob bytes.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = ()</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Bytes(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf[</span><span class="s5">0</span><span class="s1">:len(self)]</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'Blob(%s, size=%d)' </span><span class="s1">% (self._buf</span><span class="s3">, </span><span class="s1">len(self))</span>
+
+
+<span class="s3">class </span><span class="s1">String(Sized):</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded string bytes.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = ()</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Bytes(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf[</span><span class="s5">0</span><span class="s1">:len(self)]</span>
+
+  <span class="s3">def </span><span class="s1">Mutate(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Mutates underlying string bytes in place. 
+ 
+    Args: 
+      value: New string to replace the existing one. New string must have less 
+        or equal UTF-8-encoded bytes than the existing one to successfully 
+        mutate underlying byte buffer. 
+ 
+    Returns: 
+      Whether the value was mutated or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">encoded = value.encode(</span><span class="s4">'utf-8'</span><span class="s1">)</span>
+    <span class="s1">n = len(encoded)</span>
+    <span class="s3">if </span><span class="s1">n &lt;= len(self):</span>
+      <span class="s1">self._buf[-self._byte_width:</span><span class="s5">0</span><span class="s1">] = _Pack(U</span><span class="s3">, </span><span class="s1">n</span><span class="s3">, </span><span class="s1">self._byte_width)</span>
+      <span class="s1">self._buf[</span><span class="s5">0</span><span class="s1">:n] = encoded</span>
+      <span class="s1">self._buf[n:len(self)] = bytearray(len(self) - n)</span>
+      <span class="s3">return True</span>
+    <span class="s3">return False</span>
+
+  <span class="s3">def </span><span class="s1">__str__(self):</span>
+    <span class="s3">return </span><span class="s1">self.Bytes.decode(</span><span class="s4">'utf-8'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'String(%s, size=%d)' </span><span class="s1">% (self._buf</span><span class="s3">, </span><span class="s1">len(self))</span>
+
+
+<span class="s3">class </span><span class="s1">Key(Object):</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded key bytes.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = ()</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s3">assert </span><span class="s1">byte_width == </span><span class="s5">1</span>
+    <span class="s1">super().__init__(buf</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Bytes(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf[</span><span class="s5">0</span><span class="s1">:len(self)]</span>
+
+  <span class="s3">def </span><span class="s1">__len__(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf.Find(</span><span class="s5">0</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__str__(self):</span>
+    <span class="s3">return </span><span class="s1">self.Bytes.decode(</span><span class="s4">'ascii'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'Key(%s, size=%d)' </span><span class="s1">% (self._buf</span><span class="s3">, </span><span class="s1">len(self))</span>
+
+
+<span class="s3">class </span><span class="s1">Vector(Sized):</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded vector bytes.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = ()</span>
+
+  <span class="s3">def </span><span class="s1">__getitem__(self</span><span class="s3">, </span><span class="s1">index):</span>
+    <span class="s3">if </span><span class="s1">index &lt; </span><span class="s5">0 </span><span class="s3">or </span><span class="s1">index &gt;= len(self):</span>
+      <span class="s3">raise </span><span class="s1">IndexError(</span><span class="s4">'vector index %s is out of [0, %d) range' </span><span class="s1">% \</span>
+          <span class="s1">(index</span><span class="s3">, </span><span class="s1">len(self)))</span>
+
+    <span class="s1">packed_type = self._buf[len(self) * self._byte_width + index]</span>
+    <span class="s1">buf = self._buf.Slice(index * self._byte_width)</span>
+    <span class="s3">return </span><span class="s1">Ref.PackedType(buf</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">, </span><span class="s1">packed_type)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Value(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the underlying encoded data as a list object.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">[e.Value </span><span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">self]</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'Vector(%s, byte_width=%d, size=%d)' </span><span class="s1">% \</span>
+        <span class="s1">(self._buf</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">, </span><span class="s1">self._size)</span>
+
+
+<span class="s3">class </span><span class="s1">TypedVector(Sized):</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded typed vector or fixed typed vector bytes.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = </span><span class="s4">'_element_type'</span><span class="s3">, </span><span class="s4">'_size'</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">element_type</span><span class="s3">, </span><span class="s1">size=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s1">super().__init__(buf</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">size)</span>
+
+    <span class="s3">if </span><span class="s1">element_type == Type.STRING:</span>
+      <span class="s0"># These can't be accessed as strings, since we don't know the bit-width</span>
+      <span class="s0"># of the size field, see the declaration of</span>
+      <span class="s0"># FBT_VECTOR_STRING_DEPRECATED above for details.</span>
+      <span class="s0"># We change the type here to be keys, which are a subtype of strings,</span>
+      <span class="s0"># and will ignore the size field. This will truncate strings with</span>
+      <span class="s0"># embedded nulls.</span>
+      <span class="s1">element_type = Type.KEY</span>
+
+    <span class="s1">self._element_type = element_type</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Bytes(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf[:self._byte_width * len(self)]</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">ElementType(self):</span>
+    <span class="s3">return </span><span class="s1">self._element_type</span>
+
+  <span class="s3">def </span><span class="s1">__getitem__(self</span><span class="s3">, </span><span class="s1">index):</span>
+    <span class="s3">if </span><span class="s1">index &lt; </span><span class="s5">0 </span><span class="s3">or </span><span class="s1">index &gt;= len(self):</span>
+      <span class="s3">raise </span><span class="s1">IndexError(</span><span class="s4">'vector index %s is out of [0, %d) range' </span><span class="s1">% \</span>
+          <span class="s1">(index</span><span class="s3">, </span><span class="s1">len(self)))</span>
+
+    <span class="s1">buf = self._buf.Slice(index * self._byte_width)</span>
+    <span class="s3">return </span><span class="s1">Ref(buf</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s1">self._element_type)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Value(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns underlying data as list object.&quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">self:</span>
+      <span class="s3">return </span><span class="s1">[]</span>
+
+    <span class="s3">if </span><span class="s1">self._element_type </span><span class="s3">is </span><span class="s1">Type.BOOL:</span>
+      <span class="s3">return </span><span class="s1">[bool(e) </span><span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">_UnpackVector(U</span><span class="s3">, </span><span class="s1">self.Bytes</span><span class="s3">, </span><span class="s1">len(self))]</span>
+    <span class="s3">elif </span><span class="s1">self._element_type </span><span class="s3">is </span><span class="s1">Type.INT:</span>
+      <span class="s3">return </span><span class="s1">list(_UnpackVector(I</span><span class="s3">, </span><span class="s1">self.Bytes</span><span class="s3">, </span><span class="s1">len(self)))</span>
+    <span class="s3">elif </span><span class="s1">self._element_type </span><span class="s3">is </span><span class="s1">Type.UINT:</span>
+      <span class="s3">return </span><span class="s1">list(_UnpackVector(U</span><span class="s3">, </span><span class="s1">self.Bytes</span><span class="s3">, </span><span class="s1">len(self)))</span>
+    <span class="s3">elif </span><span class="s1">self._element_type </span><span class="s3">is </span><span class="s1">Type.FLOAT:</span>
+      <span class="s3">return </span><span class="s1">list(_UnpackVector(F</span><span class="s3">, </span><span class="s1">self.Bytes</span><span class="s3">, </span><span class="s1">len(self)))</span>
+    <span class="s3">elif </span><span class="s1">self._element_type </span><span class="s3">is </span><span class="s1">Type.KEY:</span>
+      <span class="s3">return </span><span class="s1">[e.AsKey </span><span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">self]</span>
+    <span class="s3">elif </span><span class="s1">self._element_type </span><span class="s3">is </span><span class="s1">Type.STRING:</span>
+      <span class="s3">return </span><span class="s1">[e.AsString </span><span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">self]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'unsupported element_type: %s' </span><span class="s1">% self._element_type)</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'TypedVector(%s, byte_width=%d, element_type=%s, size=%d)' </span><span class="s1">% \</span>
+        <span class="s1">(self._buf</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">, </span><span class="s1">self._element_type</span><span class="s3">, </span><span class="s1">self._size)</span>
+
+
+<span class="s3">class </span><span class="s1">Map(Vector):</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded map bytes.&quot;&quot;&quot;</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">CompareKeys(a</span><span class="s3">, </span><span class="s1">b):</span>
+    <span class="s3">if </span><span class="s1">isinstance(a</span><span class="s3">, </span><span class="s1">Ref):</span>
+      <span class="s1">a = a.AsKeyBytes</span>
+    <span class="s3">if </span><span class="s1">isinstance(b</span><span class="s3">, </span><span class="s1">Ref):</span>
+      <span class="s1">b = b.AsKeyBytes</span>
+    <span class="s3">return </span><span class="s1">a &lt; b</span>
+
+  <span class="s3">def </span><span class="s1">__getitem__(self</span><span class="s3">, </span><span class="s1">key):</span>
+    <span class="s3">if </span><span class="s1">isinstance(key</span><span class="s3">, </span><span class="s1">int):</span>
+      <span class="s3">return </span><span class="s1">super().__getitem__(key)</span>
+
+    <span class="s1">index = _BinarySearch(self.Keys</span><span class="s3">, </span><span class="s1">key.encode(</span><span class="s4">'ascii'</span><span class="s1">)</span><span class="s3">, </span><span class="s1">self.CompareKeys)</span>
+    <span class="s3">if </span><span class="s1">index != -</span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">super().__getitem__(index)</span>
+
+    <span class="s3">raise </span><span class="s1">KeyError(key)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Keys(self):</span>
+    <span class="s1">byte_width = _Unpack(U</span><span class="s3">, </span><span class="s1">self._buf[-</span><span class="s5">2 </span><span class="s1">* self._byte_width:-self._byte_width])</span>
+    <span class="s1">buf = self._buf.Indirect(-</span><span class="s5">3 </span><span class="s1">* self._byte_width</span><span class="s3">, </span><span class="s1">self._byte_width)</span>
+    <span class="s3">return </span><span class="s1">TypedVector(buf</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">Type.KEY)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Values(self):</span>
+    <span class="s3">return </span><span class="s1">Vector(self._buf</span><span class="s3">, </span><span class="s1">self._byte_width)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Value(self):</span>
+    <span class="s3">return </span><span class="s1">{k.Value: v.Value </span><span class="s3">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s3">in </span><span class="s1">zip(self.Keys</span><span class="s3">, </span><span class="s1">self.Values)}</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'Map(%s, size=%d)' </span><span class="s1">% (self._buf</span><span class="s3">, </span><span class="s1">len(self))</span>
+
+
+<span class="s3">class </span><span class="s1">Ref:</span>
+  <span class="s2">&quot;&quot;&quot;Data accessor for the encoded data bytes.&quot;&quot;&quot;</span>
+  <span class="s1">__slots__ = </span><span class="s4">'_buf'</span><span class="s3">, </span><span class="s4">'_parent_width'</span><span class="s3">, </span><span class="s4">'_byte_width'</span><span class="s3">, </span><span class="s4">'_type'</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">PackedType(buf</span><span class="s3">, </span><span class="s1">parent_width</span><span class="s3">, </span><span class="s1">packed_type):</span>
+    <span class="s1">byte_width</span><span class="s3">, </span><span class="s1">type_ = Type.Unpack(packed_type)</span>
+    <span class="s3">return </span><span class="s1">Ref(buf</span><span class="s3">, </span><span class="s1">parent_width</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">type_)</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">, </span><span class="s1">parent_width</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">type_):</span>
+    <span class="s1">self._buf = buf</span>
+    <span class="s1">self._parent_width = parent_width</span>
+    <span class="s1">self._byte_width = byte_width</span>
+    <span class="s1">self._type = type_</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'Ref(%s, parent_width=%d, byte_width=%d, type_=%s)' </span><span class="s1">% \</span>
+            <span class="s1">(self._buf</span><span class="s3">, </span><span class="s1">self._parent_width</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">, </span><span class="s1">self._type)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">_Bytes(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf[:self._parent_width]</span>
+
+  <span class="s3">def </span><span class="s1">_ConvertError(self</span><span class="s3">, </span><span class="s1">target_type):</span>
+    <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'cannot convert %s to %s' </span><span class="s1">% (self._type</span><span class="s3">, </span><span class="s1">target_type))</span>
+
+  <span class="s3">def </span><span class="s1">_Indirect(self):</span>
+    <span class="s3">return </span><span class="s1">self._buf.Indirect(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">self._parent_width)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsNull(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.NULL</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsBool(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.BOOL</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsBool(self):</span>
+    <span class="s3">if </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.BOOL:</span>
+      <span class="s3">return </span><span class="s1">bool(_Unpack(U</span><span class="s3">, </span><span class="s1">self._Bytes))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return </span><span class="s1">self.AsInt != </span><span class="s5">0</span>
+
+  <span class="s3">def </span><span class="s1">MutateBool(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Mutates underlying boolean value bytes in place. 
+ 
+    Args: 
+      value: New boolean value. 
+ 
+    Returns: 
+      Whether the value was mutated or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self.IsBool </span><span class="s3">and </span><span class="s1">\</span>
+           <span class="s1">_Mutate(U</span><span class="s3">, </span><span class="s1">self._buf</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._parent_width</span><span class="s3">, </span><span class="s1">BitWidth.W8)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsNumeric(self):</span>
+    <span class="s3">return </span><span class="s1">self.IsInt </span><span class="s3">or </span><span class="s1">self.IsFloat</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsInt(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">in </span><span class="s1">(Type.INT</span><span class="s3">, </span><span class="s1">Type.INDIRECT_INT</span><span class="s3">, </span><span class="s1">Type.UINT</span><span class="s3">,</span>
+                          <span class="s1">Type.INDIRECT_UINT)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsInt(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns current reference as integer value.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self.IsNull:</span>
+      <span class="s3">return </span><span class="s5">0</span>
+    <span class="s3">elif </span><span class="s1">self.IsBool:</span>
+      <span class="s3">return </span><span class="s1">int(self.AsBool)</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INT:</span>
+      <span class="s3">return </span><span class="s1">_Unpack(I</span><span class="s3">, </span><span class="s1">self._Bytes)</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INDIRECT_INT:</span>
+      <span class="s3">return </span><span class="s1">_Unpack(I</span><span class="s3">, </span><span class="s1">self._Indirect()[:self._byte_width])</span>
+    <span class="s3">if </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.UINT:</span>
+      <span class="s3">return </span><span class="s1">_Unpack(U</span><span class="s3">, </span><span class="s1">self._Bytes)</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INDIRECT_UINT:</span>
+      <span class="s3">return </span><span class="s1">_Unpack(U</span><span class="s3">, </span><span class="s1">self._Indirect()[:self._byte_width])</span>
+    <span class="s3">elif </span><span class="s1">self.IsString:</span>
+      <span class="s3">return </span><span class="s1">len(self.AsString)</span>
+    <span class="s3">elif </span><span class="s1">self.IsKey:</span>
+      <span class="s3">return </span><span class="s1">len(self.AsKey)</span>
+    <span class="s3">elif </span><span class="s1">self.IsBlob:</span>
+      <span class="s3">return </span><span class="s1">len(self.AsBlob)</span>
+    <span class="s3">elif </span><span class="s1">self.IsVector:</span>
+      <span class="s3">return </span><span class="s1">len(self.AsVector)</span>
+    <span class="s3">elif </span><span class="s1">self.IsTypedVector:</span>
+      <span class="s3">return </span><span class="s1">len(self.AsTypedVector)</span>
+    <span class="s3">elif </span><span class="s1">self.IsFixedTypedVector:</span>
+      <span class="s3">return </span><span class="s1">len(self.AsFixedTypedVector)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.INT)</span>
+
+  <span class="s3">def </span><span class="s1">MutateInt(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Mutates underlying integer value bytes in place. 
+ 
+    Args: 
+      value: New integer value. It must fit to the byte size of the existing 
+        encoded value. 
+ 
+    Returns: 
+      Whether the value was mutated or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INT:</span>
+      <span class="s3">return </span><span class="s1">_Mutate(I</span><span class="s3">, </span><span class="s1">self._buf</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._parent_width</span><span class="s3">, </span><span class="s1">BitWidth.I(value))</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INDIRECT_INT:</span>
+      <span class="s3">return </span><span class="s1">_Mutate(I</span><span class="s3">, </span><span class="s1">self._Indirect()</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">,</span>
+                     <span class="s1">BitWidth.I(value))</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.UINT:</span>
+      <span class="s3">return </span><span class="s1">_Mutate(U</span><span class="s3">, </span><span class="s1">self._buf</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._parent_width</span><span class="s3">, </span><span class="s1">BitWidth.U(value))</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INDIRECT_UINT:</span>
+      <span class="s3">return </span><span class="s1">_Mutate(U</span><span class="s3">, </span><span class="s1">self._Indirect()</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">,</span>
+                     <span class="s1">BitWidth.U(value))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return False</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsFloat(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">in </span><span class="s1">(Type.FLOAT</span><span class="s3">, </span><span class="s1">Type.INDIRECT_FLOAT)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsFloat(self):</span>
+    <span class="s2">&quot;&quot;&quot;Returns current reference as floating point value.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self.IsNull:</span>
+      <span class="s3">return </span><span class="s5">0.0</span>
+    <span class="s3">elif </span><span class="s1">self.IsBool:</span>
+      <span class="s3">return </span><span class="s1">float(self.AsBool)</span>
+    <span class="s3">elif </span><span class="s1">self.IsInt:</span>
+      <span class="s3">return </span><span class="s1">float(self.AsInt)</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.FLOAT:</span>
+      <span class="s3">return </span><span class="s1">_Unpack(F</span><span class="s3">, </span><span class="s1">self._Bytes)</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INDIRECT_FLOAT:</span>
+      <span class="s3">return </span><span class="s1">_Unpack(F</span><span class="s3">, </span><span class="s1">self._Indirect()[:self._byte_width])</span>
+    <span class="s3">elif </span><span class="s1">self.IsString:</span>
+      <span class="s3">return </span><span class="s1">float(self.AsString)</span>
+    <span class="s3">elif </span><span class="s1">self.IsVector:</span>
+      <span class="s3">return </span><span class="s1">float(len(self.AsVector))</span>
+    <span class="s3">elif </span><span class="s1">self.IsTypedVector():</span>
+      <span class="s3">return </span><span class="s1">float(len(self.AsTypedVector))</span>
+    <span class="s3">elif </span><span class="s1">self.IsFixedTypedVector():</span>
+      <span class="s3">return </span><span class="s1">float(len(self.FixedTypedVector))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.FLOAT)</span>
+
+  <span class="s3">def </span><span class="s1">MutateFloat(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Mutates underlying floating point value bytes in place. 
+ 
+    Args: 
+      value: New float value. It must fit to the byte size of the existing 
+        encoded value. 
+ 
+    Returns: 
+      Whether the value was mutated or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.FLOAT:</span>
+      <span class="s3">return </span><span class="s1">_Mutate(F</span><span class="s3">, </span><span class="s1">self._buf</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._parent_width</span><span class="s3">,</span>
+                     <span class="s1">BitWidth.B(self._parent_width))</span>
+    <span class="s3">elif </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.INDIRECT_FLOAT:</span>
+      <span class="s3">return </span><span class="s1">_Mutate(F</span><span class="s3">, </span><span class="s1">self._Indirect()</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">,</span>
+                     <span class="s1">BitWidth.B(self._byte_width))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">return False</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsKey(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.KEY</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsKeyBytes(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsKey:</span>
+      <span class="s3">return </span><span class="s1">Key(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width).Bytes</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.KEY)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsKey(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsKey:</span>
+      <span class="s3">return </span><span class="s1">str(Key(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.KEY)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsString(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.STRING</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsStringBytes(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsString:</span>
+      <span class="s3">return </span><span class="s1">String(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width).Bytes</span>
+    <span class="s3">elif </span><span class="s1">self.IsKey:</span>
+      <span class="s3">return </span><span class="s1">self.AsKeyBytes</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.STRING)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsString(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsString:</span>
+      <span class="s3">return </span><span class="s1">str(String(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width))</span>
+    <span class="s3">elif </span><span class="s1">self.IsKey:</span>
+      <span class="s3">return </span><span class="s1">self.AsKey</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.STRING)</span>
+
+  <span class="s3">def </span><span class="s1">MutateString(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s3">return </span><span class="s1">String(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width).Mutate(value)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsBlob(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.BLOB</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsBlob(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsBlob:</span>
+      <span class="s3">return </span><span class="s1">Blob(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width).Bytes</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.BLOB)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsAnyVector(self):</span>
+    <span class="s3">return </span><span class="s1">self.IsVector </span><span class="s3">or </span><span class="s1">self.IsTypedVector </span><span class="s3">or </span><span class="s1">self.IsFixedTypedVector()</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsVector(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">in </span><span class="s1">(Type.VECTOR</span><span class="s3">, </span><span class="s1">Type.MAP)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsVector(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsVector:</span>
+      <span class="s3">return </span><span class="s1">Vector(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.VECTOR)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsTypedVector(self):</span>
+    <span class="s3">return </span><span class="s1">Type.IsTypedVector(self._type)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsTypedVector(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsTypedVector:</span>
+      <span class="s3">return </span><span class="s1">TypedVector(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">,</span>
+                         <span class="s1">Type.ToTypedVectorElementType(self._type))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(</span><span class="s4">'TYPED_VECTOR'</span><span class="s1">)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsFixedTypedVector(self):</span>
+    <span class="s3">return </span><span class="s1">Type.IsFixedTypedVector(self._type)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsFixedTypedVector(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsFixedTypedVector:</span>
+      <span class="s1">element_type</span><span class="s3">, </span><span class="s1">size = Type.ToFixedTypedVectorElementType(self._type)</span>
+      <span class="s3">return </span><span class="s1">TypedVector(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width</span><span class="s3">, </span><span class="s1">element_type</span><span class="s3">, </span><span class="s1">size)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(</span><span class="s4">'FIXED_TYPED_VECTOR'</span><span class="s1">)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">IsMap(self):</span>
+    <span class="s3">return </span><span class="s1">self._type </span><span class="s3">is </span><span class="s1">Type.MAP</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">AsMap(self):</span>
+    <span class="s3">if </span><span class="s1">self.IsMap:</span>
+      <span class="s3">return </span><span class="s1">Map(self._Indirect()</span><span class="s3">, </span><span class="s1">self._byte_width)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">self._ConvertError(Type.MAP)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Value(self):</span>
+    <span class="s2">&quot;&quot;&quot;Converts current reference to value of corresponding type. 
+ 
+    This is equivalent to calling `AsInt` for integer values, `AsFloat` for 
+    floating point values, etc. 
+ 
+    Returns: 
+      Value of corresponding type. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self.IsNull:</span>
+      <span class="s3">return None</span>
+    <span class="s3">elif </span><span class="s1">self.IsBool:</span>
+      <span class="s3">return </span><span class="s1">self.AsBool</span>
+    <span class="s3">elif </span><span class="s1">self.IsInt:</span>
+      <span class="s3">return </span><span class="s1">self.AsInt</span>
+    <span class="s3">elif </span><span class="s1">self.IsFloat:</span>
+      <span class="s3">return </span><span class="s1">self.AsFloat</span>
+    <span class="s3">elif </span><span class="s1">self.IsString:</span>
+      <span class="s3">return </span><span class="s1">self.AsString</span>
+    <span class="s3">elif </span><span class="s1">self.IsKey:</span>
+      <span class="s3">return </span><span class="s1">self.AsKey</span>
+    <span class="s3">elif </span><span class="s1">self.IsBlob:</span>
+      <span class="s3">return </span><span class="s1">self.AsBlob</span>
+    <span class="s3">elif </span><span class="s1">self.IsMap:</span>
+      <span class="s3">return </span><span class="s1">self.AsMap.Value</span>
+    <span class="s3">elif </span><span class="s1">self.IsVector:</span>
+      <span class="s3">return </span><span class="s1">self.AsVector.Value</span>
+    <span class="s3">elif </span><span class="s1">self.IsTypedVector:</span>
+      <span class="s3">return </span><span class="s1">self.AsTypedVector.Value</span>
+    <span class="s3">elif </span><span class="s1">self.IsFixedTypedVector:</span>
+      <span class="s3">return </span><span class="s1">self.AsFixedTypedVector.Value</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'cannot convert %r to value' </span><span class="s1">% self)</span>
+
+
+<span class="s3">def </span><span class="s1">_IsIterable(obj):</span>
+  <span class="s3">try</span><span class="s1">:</span>
+    <span class="s1">iter(obj)</span>
+    <span class="s3">return True</span>
+  <span class="s3">except </span><span class="s1">TypeError:</span>
+    <span class="s3">return False</span>
+
+
+<span class="s3">class </span><span class="s1">Value:</span>
+  <span class="s2">&quot;&quot;&quot;Class to represent given value during the encoding process.&quot;&quot;&quot;</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Null():</span>
+    <span class="s3">return </span><span class="s1">Value(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">Type.NULL</span><span class="s3">, </span><span class="s1">BitWidth.W8)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Bool(value):</span>
+    <span class="s3">return </span><span class="s1">Value(value</span><span class="s3">, </span><span class="s1">Type.BOOL</span><span class="s3">, </span><span class="s1">BitWidth.W8)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Int(value</span><span class="s3">, </span><span class="s1">bit_width):</span>
+    <span class="s3">return </span><span class="s1">Value(value</span><span class="s3">, </span><span class="s1">Type.INT</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">UInt(value</span><span class="s3">, </span><span class="s1">bit_width):</span>
+    <span class="s3">return </span><span class="s1">Value(value</span><span class="s3">, </span><span class="s1">Type.UINT</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Float(value</span><span class="s3">, </span><span class="s1">bit_width):</span>
+    <span class="s3">return </span><span class="s1">Value(value</span><span class="s3">, </span><span class="s1">Type.FLOAT</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s1">@staticmethod</span>
+  <span class="s3">def </span><span class="s1">Key(offset):</span>
+    <span class="s3">return </span><span class="s1">Value(offset</span><span class="s3">, </span><span class="s1">Type.KEY</span><span class="s3">, </span><span class="s1">BitWidth.W8)</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">type_</span><span class="s3">, </span><span class="s1">min_bit_width):</span>
+    <span class="s1">self._value = value</span>
+    <span class="s1">self._type = type_</span>
+
+    <span class="s0"># For scalars: of itself, for vector: of its elements, for string: length.</span>
+    <span class="s1">self._min_bit_width = min_bit_width</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Value(self):</span>
+    <span class="s3">return </span><span class="s1">self._value</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Type(self):</span>
+    <span class="s3">return </span><span class="s1">self._type</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">MinBitWidth(self):</span>
+    <span class="s3">return </span><span class="s1">self._min_bit_width</span>
+
+  <span class="s3">def </span><span class="s1">StoredPackedType(self</span><span class="s3">, </span><span class="s1">parent_bit_width=BitWidth.W8):</span>
+    <span class="s3">return </span><span class="s1">Type.Pack(self._type</span><span class="s3">, </span><span class="s1">self.StoredWidth(parent_bit_width))</span>
+
+  <span class="s0"># We have an absolute offset, but want to store a relative offset</span>
+  <span class="s0"># elem_index elements beyond the current buffer end. Since whether</span>
+  <span class="s0"># the relative offset fits in a certain byte_width depends on</span>
+  <span class="s0"># the size of the elements before it (and their alignment), we have</span>
+  <span class="s0"># to test for each size in turn.</span>
+  <span class="s3">def </span><span class="s1">ElemWidth(self</span><span class="s3">, </span><span class="s1">buf_size</span><span class="s3">, </span><span class="s1">elem_index=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s3">if </span><span class="s1">Type.IsInline(self._type):</span>
+      <span class="s3">return </span><span class="s1">self._min_bit_width</span>
+    <span class="s3">for </span><span class="s1">byte_width </span><span class="s3">in </span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">4</span><span class="s3">, </span><span class="s5">8</span><span class="s1">:</span>
+      <span class="s1">offset_loc = buf_size + _PaddingBytes(buf_size</span><span class="s3">, </span><span class="s1">byte_width) + \</span>
+                   <span class="s1">elem_index * byte_width</span>
+      <span class="s1">bit_width = BitWidth.U(offset_loc - self._value)</span>
+      <span class="s3">if </span><span class="s1">byte_width == (</span><span class="s5">1 </span><span class="s1">&lt;&lt; bit_width):</span>
+        <span class="s3">return </span><span class="s1">bit_width</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'relative offset is too big'</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">StoredWidth(self</span><span class="s3">, </span><span class="s1">parent_bit_width=BitWidth.W8):</span>
+    <span class="s3">if </span><span class="s1">Type.IsInline(self._type):</span>
+      <span class="s3">return </span><span class="s1">max(self._min_bit_width</span><span class="s3">, </span><span class="s1">parent_bit_width)</span>
+    <span class="s3">return </span><span class="s1">self._min_bit_width</span>
+
+  <span class="s3">def </span><span class="s1">__repr__(self):</span>
+    <span class="s3">return </span><span class="s4">'Value(%s, %s, %s)' </span><span class="s1">% (self._value</span><span class="s3">, </span><span class="s1">self._type</span><span class="s3">, </span><span class="s1">self._min_bit_width)</span>
+
+  <span class="s3">def </span><span class="s1">__str__(self):</span>
+    <span class="s3">return </span><span class="s1">str(self._value)</span>
+
+
+<span class="s3">def </span><span class="s1">InMap(func):</span>
+  <span class="s3">def </span><span class="s1">wrapper(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+    <span class="s3">if </span><span class="s1">isinstance(args[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s1">self.Key(args[</span><span class="s5">0</span><span class="s1">])</span>
+      <span class="s1">func(self</span><span class="s3">, </span><span class="s1">*args[</span><span class="s5">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">func(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+  <span class="s3">return </span><span class="s1">wrapper</span>
+
+
+<span class="s3">def </span><span class="s1">InMapForString(func):</span>
+  <span class="s3">def </span><span class="s1">wrapper(self</span><span class="s3">, </span><span class="s1">*args):</span>
+    <span class="s3">if </span><span class="s1">len(args) == </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">func(self</span><span class="s3">, </span><span class="s1">args[</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s3">elif </span><span class="s1">len(args) == </span><span class="s5">2</span><span class="s1">:</span>
+      <span class="s1">self.Key(args[</span><span class="s5">0</span><span class="s1">])</span>
+      <span class="s1">func(self</span><span class="s3">, </span><span class="s1">args[</span><span class="s5">1</span><span class="s1">])</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'invalid number of arguments'</span><span class="s1">)</span>
+  <span class="s3">return </span><span class="s1">wrapper</span>
+
+
+<span class="s3">class </span><span class="s1">Pool:</span>
+  <span class="s2">&quot;&quot;&quot;Collection of (data, offset) pairs sorted by data for quick access.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self):</span>
+    <span class="s1">self._pool = []  </span><span class="s0"># sorted list of (data, offset) tuples</span>
+
+  <span class="s3">def </span><span class="s1">FindOrInsert(self</span><span class="s3">, </span><span class="s1">data</span><span class="s3">, </span><span class="s1">offset):</span>
+    <span class="s1">do = data</span><span class="s3">, </span><span class="s1">offset</span>
+    <span class="s1">index = _BinarySearch(self._pool</span><span class="s3">, </span><span class="s1">do</span><span class="s3">, lambda </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b: a[</span><span class="s5">0</span><span class="s1">] &lt; b[</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s3">if </span><span class="s1">index != -</span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">_</span><span class="s3">, </span><span class="s1">offset = self._pool[index]</span>
+      <span class="s3">return </span><span class="s1">offset</span>
+    <span class="s1">self._pool.insert(index</span><span class="s3">, </span><span class="s1">do)</span>
+    <span class="s3">return None</span>
+
+  <span class="s3">def </span><span class="s1">Clear(self):</span>
+    <span class="s1">self._pool = []</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">Elements(self):</span>
+    <span class="s3">return </span><span class="s1">[data </span><span class="s3">for </span><span class="s1">data</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">self._pool]</span>
+
+
+<span class="s3">class </span><span class="s1">Builder:</span>
+  <span class="s2">&quot;&quot;&quot;Helper class to encode structural data into flexbuffers format.&quot;&quot;&quot;</span>
+
+  <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">,</span>
+               <span class="s1">share_strings=</span><span class="s3">False,</span>
+               <span class="s1">share_keys=</span><span class="s3">True,</span>
+               <span class="s1">force_min_bit_width=BitWidth.W8):</span>
+    <span class="s1">self._share_strings = share_strings</span>
+    <span class="s1">self._share_keys = share_keys</span>
+    <span class="s1">self._force_min_bit_width = force_min_bit_width</span>
+
+    <span class="s1">self._string_pool = Pool()</span>
+    <span class="s1">self._key_pool = Pool()</span>
+
+    <span class="s1">self._finished = </span><span class="s3">False</span>
+    <span class="s1">self._buf = bytearray()</span>
+    <span class="s1">self._stack = []</span>
+
+  <span class="s3">def </span><span class="s1">__len__(self):</span>
+    <span class="s3">return </span><span class="s1">len(self._buf)</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">StringPool(self):</span>
+    <span class="s3">return </span><span class="s1">self._string_pool</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">KeyPool(self):</span>
+    <span class="s3">return </span><span class="s1">self._key_pool</span>
+
+  <span class="s3">def </span><span class="s1">Clear(self):</span>
+    <span class="s1">self._string_pool.Clear()</span>
+    <span class="s1">self._key_pool.Clear()</span>
+    <span class="s1">self._finished = </span><span class="s3">False</span>
+    <span class="s1">self._buf = bytearray()</span>
+    <span class="s1">self._stack = []</span>
+
+  <span class="s3">def </span><span class="s1">Finish(self):</span>
+    <span class="s2">&quot;&quot;&quot;Finishes encoding process and returns underlying buffer.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">self._finished:</span>
+      <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">'builder has been already finished'</span><span class="s1">)</span>
+
+    <span class="s0"># If you hit this exception, you likely have objects that were never</span>
+    <span class="s0"># included in a parent. You need to have exactly one root to finish a</span>
+    <span class="s0"># buffer. Check your Start/End calls are matched, and all objects are inside</span>
+    <span class="s0"># some other object.</span>
+    <span class="s3">if </span><span class="s1">len(self._stack) != </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">'internal stack size must be one'</span><span class="s1">)</span>
+
+    <span class="s1">value = self._stack[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">byte_width = self._Align(value.ElemWidth(len(self._buf)))</span>
+    <span class="s1">self._WriteAny(value</span><span class="s3">, </span><span class="s1">byte_width=byte_width)  </span><span class="s0"># Root value</span>
+    <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s1">value.StoredPackedType()</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">1</span><span class="s1">)  </span><span class="s0"># Root type</span>
+    <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">1</span><span class="s1">)  </span><span class="s0"># Root size</span>
+
+    <span class="s1">self.finished = </span><span class="s3">True</span>
+    <span class="s3">return </span><span class="s1">self._buf</span>
+
+  <span class="s3">def </span><span class="s1">_ReadKey(self</span><span class="s3">, </span><span class="s1">offset):</span>
+    <span class="s1">key = self._buf[offset:]</span>
+    <span class="s3">return </span><span class="s1">key[:key.find(</span><span class="s5">0</span><span class="s1">)]</span>
+
+  <span class="s3">def </span><span class="s1">_Align(self</span><span class="s3">, </span><span class="s1">alignment):</span>
+    <span class="s1">byte_width = </span><span class="s5">1 </span><span class="s1">&lt;&lt; alignment</span>
+    <span class="s1">self._buf.extend(</span><span class="s6">b'</span><span class="s3">\x00</span><span class="s6">' </span><span class="s1">* _PaddingBytes(len(self._buf)</span><span class="s3">, </span><span class="s1">byte_width))</span>
+    <span class="s3">return </span><span class="s1">byte_width</span>
+
+  <span class="s3">def </span><span class="s1">_Write(self</span><span class="s3">, </span><span class="s1">fmt</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s1">self._buf.extend(_Pack(fmt</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width))</span>
+
+  <span class="s3">def </span><span class="s1">_WriteVector(self</span><span class="s3">, </span><span class="s1">fmt</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s1">self._buf.extend(_PackVector(fmt</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">byte_width))</span>
+
+  <span class="s3">def </span><span class="s1">_WriteOffset(self</span><span class="s3">, </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s1">relative_offset = len(self._buf) - offset</span>
+    <span class="s3">assert </span><span class="s1">byte_width == </span><span class="s5">8 </span><span class="s3">or </span><span class="s1">relative_offset &lt; (</span><span class="s5">1 </span><span class="s1">&lt;&lt; (</span><span class="s5">8 </span><span class="s1">* byte_width))</span>
+    <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s1">relative_offset</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+  <span class="s3">def </span><span class="s1">_WriteAny(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width):</span>
+    <span class="s1">fmt = {</span>
+        <span class="s1">Type.NULL: U</span><span class="s3">, </span><span class="s1">Type.BOOL: U</span><span class="s3">, </span><span class="s1">Type.INT: I</span><span class="s3">, </span><span class="s1">Type.UINT: U</span><span class="s3">, </span><span class="s1">Type.FLOAT: F</span>
+    <span class="s1">}.get(value.Type)</span>
+    <span class="s3">if </span><span class="s1">fmt:</span>
+      <span class="s1">self._Write(fmt</span><span class="s3">, </span><span class="s1">value.Value</span><span class="s3">, </span><span class="s1">byte_width)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">self._WriteOffset(value.Value</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+  <span class="s3">def </span><span class="s1">_WriteBlob(self</span><span class="s3">, </span><span class="s1">data</span><span class="s3">, </span><span class="s1">append_zero</span><span class="s3">, </span><span class="s1">type_):</span>
+    <span class="s1">bit_width = BitWidth.U(len(data))</span>
+    <span class="s1">byte_width = self._Align(bit_width)</span>
+    <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s1">len(data)</span><span class="s3">, </span><span class="s1">byte_width)</span>
+    <span class="s1">loc = len(self._buf)</span>
+    <span class="s1">self._buf.extend(data)</span>
+    <span class="s3">if </span><span class="s1">append_zero:</span>
+      <span class="s1">self._buf.append(</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">self._stack.append(Value(loc</span><span class="s3">, </span><span class="s1">type_</span><span class="s3">, </span><span class="s1">bit_width))</span>
+    <span class="s3">return </span><span class="s1">loc</span>
+
+  <span class="s3">def </span><span class="s1">_WriteScalarVector(self</span><span class="s3">, </span><span class="s1">element_type</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">fixed):</span>
+    <span class="s2">&quot;&quot;&quot;Writes scalar vector elements to the underlying buffer.&quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.B(byte_width)</span>
+    <span class="s0"># If you get this exception, you're trying to write a vector with a size</span>
+    <span class="s0"># field that is bigger than the scalars you're trying to write (e.g. a</span>
+    <span class="s0"># byte vector &gt; 255 elements). For such types, write a &quot;blob&quot; instead.</span>
+    <span class="s3">if </span><span class="s1">BitWidth.U(len(elements)) &gt; bit_width:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'too many elements for the given byte_width'</span><span class="s1">)</span>
+
+    <span class="s1">self._Align(bit_width)</span>
+    <span class="s3">if not </span><span class="s1">fixed:</span>
+      <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s1">len(elements)</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+    <span class="s1">loc = len(self._buf)</span>
+
+    <span class="s1">fmt = {Type.INT: I</span><span class="s3">, </span><span class="s1">Type.UINT: U</span><span class="s3">, </span><span class="s1">Type.FLOAT: F}.get(element_type)</span>
+    <span class="s3">if not </span><span class="s1">fmt:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'unsupported element_type'</span><span class="s1">)</span>
+    <span class="s1">self._WriteVector(fmt</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+    <span class="s1">type_ = Type.ToTypedVector(element_type</span><span class="s3">, </span><span class="s1">len(elements) </span><span class="s3">if </span><span class="s1">fixed </span><span class="s3">else </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">self._stack.append(Value(loc</span><span class="s3">, </span><span class="s1">type_</span><span class="s3">, </span><span class="s1">bit_width))</span>
+    <span class="s3">return </span><span class="s1">loc</span>
+
+  <span class="s3">def </span><span class="s1">_CreateVector(self</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">typed</span><span class="s3">, </span><span class="s1">fixed</span><span class="s3">, </span><span class="s1">keys=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Writes vector elements to the underlying buffer.&quot;&quot;&quot;</span>
+    <span class="s1">length = len(elements)</span>
+
+    <span class="s3">if </span><span class="s1">fixed </span><span class="s3">and not </span><span class="s1">typed:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'fixed vector must be typed'</span><span class="s1">)</span>
+
+    <span class="s0"># Figure out smallest bit width we can store this vector with.</span>
+    <span class="s1">bit_width = max(self._force_min_bit_width</span><span class="s3">, </span><span class="s1">BitWidth.U(length))</span>
+    <span class="s1">prefix_elems = </span><span class="s5">1  </span><span class="s0"># Vector size</span>
+    <span class="s3">if </span><span class="s1">keys:</span>
+      <span class="s1">bit_width = max(bit_width</span><span class="s3">, </span><span class="s1">keys.ElemWidth(len(self._buf)))</span>
+      <span class="s1">prefix_elems += </span><span class="s5">2  </span><span class="s0"># Offset to the keys vector and its byte width.</span>
+
+    <span class="s1">vector_type = Type.KEY</span>
+    <span class="s0"># Check bit widths and types for all elements.</span>
+    <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">e </span><span class="s3">in </span><span class="s1">enumerate(elements):</span>
+      <span class="s1">bit_width = max(bit_width</span><span class="s3">, </span><span class="s1">e.ElemWidth(len(self._buf)</span><span class="s3">, </span><span class="s1">prefix_elems + i))</span>
+
+      <span class="s3">if </span><span class="s1">typed:</span>
+        <span class="s3">if </span><span class="s1">i == </span><span class="s5">0</span><span class="s1">:</span>
+          <span class="s1">vector_type = e.Type</span>
+        <span class="s3">else</span><span class="s1">:</span>
+          <span class="s3">if </span><span class="s1">vector_type != e.Type:</span>
+            <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">'typed vector elements must be of the same type'</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">fixed </span><span class="s3">and not </span><span class="s1">Type.IsFixedTypedVectorElementType(vector_type):</span>
+      <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">'must be fixed typed vector element type'</span><span class="s1">)</span>
+
+    <span class="s1">byte_width = self._Align(bit_width)</span>
+    <span class="s0"># Write vector. First the keys width/offset if available, and size.</span>
+    <span class="s3">if </span><span class="s1">keys:</span>
+      <span class="s1">self._WriteOffset(keys.Value</span><span class="s3">, </span><span class="s1">byte_width)</span>
+      <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s5">1 </span><span class="s1">&lt;&lt; keys.MinBitWidth</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+    <span class="s3">if not </span><span class="s1">fixed:</span>
+      <span class="s1">self._Write(U</span><span class="s3">, </span><span class="s1">length</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+    <span class="s0"># Then the actual data.</span>
+    <span class="s1">loc = len(self._buf)</span>
+    <span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">elements:</span>
+      <span class="s1">self._WriteAny(e</span><span class="s3">, </span><span class="s1">byte_width)</span>
+
+    <span class="s0"># Then the types.</span>
+    <span class="s3">if not </span><span class="s1">typed:</span>
+      <span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">elements:</span>
+        <span class="s1">self._buf.append(e.StoredPackedType(bit_width))</span>
+
+    <span class="s3">if </span><span class="s1">keys:</span>
+      <span class="s1">type_ = Type.MAP</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">if </span><span class="s1">typed:</span>
+        <span class="s1">type_ = Type.ToTypedVector(vector_type</span><span class="s3">, </span><span class="s1">length </span><span class="s3">if </span><span class="s1">fixed </span><span class="s3">else </span><span class="s5">0</span><span class="s1">)</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">type_ = Type.VECTOR</span>
+
+    <span class="s3">return </span><span class="s1">Value(loc</span><span class="s3">, </span><span class="s1">type_</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s3">def </span><span class="s1">_PushIndirect(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">type_</span><span class="s3">, </span><span class="s1">bit_width):</span>
+    <span class="s1">byte_width = self._Align(bit_width)</span>
+    <span class="s1">loc = len(self._buf)</span>
+    <span class="s1">fmt = {</span>
+        <span class="s1">Type.INDIRECT_INT: I</span><span class="s3">,</span>
+        <span class="s1">Type.INDIRECT_UINT: U</span><span class="s3">,</span>
+        <span class="s1">Type.INDIRECT_FLOAT: F</span>
+    <span class="s1">}[type_]</span>
+    <span class="s1">self._Write(fmt</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width)</span>
+    <span class="s1">self._stack.append(Value(loc</span><span class="s3">, </span><span class="s1">type_</span><span class="s3">, </span><span class="s1">bit_width))</span>
+
+  <span class="s1">@InMapForString</span>
+  <span class="s3">def </span><span class="s1">String(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes string value.&quot;&quot;&quot;</span>
+    <span class="s1">reset_to = len(self._buf)</span>
+    <span class="s1">encoded = value.encode(</span><span class="s4">'utf-8'</span><span class="s1">)</span>
+    <span class="s1">loc = self._WriteBlob(encoded</span><span class="s3">, </span><span class="s1">append_zero=</span><span class="s3">True, </span><span class="s1">type_=Type.STRING)</span>
+    <span class="s3">if </span><span class="s1">self._share_strings:</span>
+      <span class="s1">prev_loc = self._string_pool.FindOrInsert(encoded</span><span class="s3">, </span><span class="s1">loc)</span>
+      <span class="s3">if </span><span class="s1">prev_loc </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s3">del </span><span class="s1">self._buf[reset_to:]</span>
+        <span class="s1">self._stack[-</span><span class="s5">1</span><span class="s1">]._value = loc = prev_loc  </span><span class="s0"># pylint: disable=protected-access</span>
+
+    <span class="s3">return </span><span class="s1">loc</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">Blob(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes binary blob value. 
+ 
+    Args: 
+      value: A byte/bytearray value to encode 
+ 
+    Returns: 
+      Offset of the encoded value in underlying the byte buffer. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">self._WriteBlob(value</span><span class="s3">, </span><span class="s1">append_zero=</span><span class="s3">False, </span><span class="s1">type_=Type.BLOB)</span>
+
+  <span class="s3">def </span><span class="s1">Key(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes key value. 
+ 
+    Args: 
+      value: A byte/bytearray/str value to encode. Byte object must not contain 
+        zero bytes. String object must be convertible to ASCII. 
+ 
+    Returns: 
+      Offset of the encoded value in the underlying byte buffer. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">(bytes</span><span class="s3">, </span><span class="s1">bytearray)):</span>
+      <span class="s1">encoded = value</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">encoded = value.encode(</span><span class="s4">'ascii'</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s5">0 </span><span class="s3">in </span><span class="s1">encoded:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'key contains zero byte'</span><span class="s1">)</span>
+
+    <span class="s1">loc = len(self._buf)</span>
+    <span class="s1">self._buf.extend(encoded)</span>
+    <span class="s1">self._buf.append(</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">self._share_keys:</span>
+      <span class="s1">prev_loc = self._key_pool.FindOrInsert(encoded</span><span class="s3">, </span><span class="s1">loc)</span>
+      <span class="s3">if </span><span class="s1">prev_loc </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s3">del </span><span class="s1">self._buf[loc:]</span>
+        <span class="s1">loc = prev_loc</span>
+
+    <span class="s1">self._stack.append(Value.Key(loc))</span>
+    <span class="s3">return </span><span class="s1">loc</span>
+
+  <span class="s3">def </span><span class="s1">Null(self</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes None value.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">key:</span>
+      <span class="s1">self.Key(key)</span>
+    <span class="s1">self._stack.append(Value.Null())</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">Bool(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes boolean value. 
+ 
+    Args: 
+      value: A boolean value. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">self._stack.append(Value.Bool(value))</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">Int(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes signed integer value. 
+ 
+    Args: 
+      value: A signed integer value. 
+      byte_width: Number of bytes to use: 1, 2, 4, or 8. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.I(value) </span><span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">BitWidth.B(byte_width)</span>
+    <span class="s1">self._stack.append(Value.Int(value</span><span class="s3">, </span><span class="s1">bit_width))</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">IndirectInt(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes signed integer value indirectly. 
+ 
+    Args: 
+      value: A signed integer value. 
+      byte_width: Number of bytes to use: 1, 2, 4, or 8. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.I(value) </span><span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">BitWidth.B(byte_width)</span>
+    <span class="s1">self._PushIndirect(value</span><span class="s3">, </span><span class="s1">Type.INDIRECT_INT</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">UInt(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes unsigned integer value. 
+ 
+    Args: 
+      value: An unsigned integer value. 
+      byte_width: Number of bytes to use: 1, 2, 4, or 8. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.U(value) </span><span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">BitWidth.B(byte_width)</span>
+    <span class="s1">self._stack.append(Value.UInt(value</span><span class="s3">, </span><span class="s1">bit_width))</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">IndirectUInt(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes unsigned integer value indirectly. 
+ 
+    Args: 
+      value: An unsigned integer value. 
+      byte_width: Number of bytes to use: 1, 2, 4, or 8. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.U(value) </span><span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">BitWidth.B(byte_width)</span>
+    <span class="s1">self._PushIndirect(value</span><span class="s3">, </span><span class="s1">Type.INDIRECT_UINT</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">Float(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes floating point value. 
+ 
+    Args: 
+      value: A floating point value. 
+      byte_width: Number of bytes to use: 4 or 8. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.F(value) </span><span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">BitWidth.B(byte_width)</span>
+    <span class="s1">self._stack.append(Value.Float(value</span><span class="s3">, </span><span class="s1">bit_width))</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">IndirectFloat(self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes floating point value indirectly. 
+ 
+    Args: 
+      value: A floating point value. 
+      byte_width: Number of bytes to use: 4 or 8. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bit_width = BitWidth.F(value) </span><span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0 </span><span class="s3">else </span><span class="s1">BitWidth.B(byte_width)</span>
+    <span class="s1">self._PushIndirect(value</span><span class="s3">, </span><span class="s1">Type.INDIRECT_FLOAT</span><span class="s3">, </span><span class="s1">bit_width)</span>
+
+  <span class="s3">def </span><span class="s1">_StartVector(self):</span>
+    <span class="s2">&quot;&quot;&quot;Starts vector construction.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">len(self._stack)</span>
+
+  <span class="s3">def </span><span class="s1">_EndVector(self</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">typed</span><span class="s3">, </span><span class="s1">fixed):</span>
+    <span class="s2">&quot;&quot;&quot;Finishes vector construction by encodung its elements.&quot;&quot;&quot;</span>
+    <span class="s1">vec = self._CreateVector(self._stack[start:]</span><span class="s3">, </span><span class="s1">typed</span><span class="s3">, </span><span class="s1">fixed)</span>
+    <span class="s3">del </span><span class="s1">self._stack[start:]</span>
+    <span class="s1">self._stack.append(vec)</span>
+    <span class="s3">return </span><span class="s1">vec.Value</span>
+
+  <span class="s1">@contextlib.contextmanager</span>
+  <span class="s3">def </span><span class="s1">Vector(self</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s3">if </span><span class="s1">key:</span>
+      <span class="s1">self.Key(key)</span>
+
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s1">start = self._StartVector()</span>
+      <span class="s3">yield </span><span class="s1">self</span>
+    <span class="s3">finally</span><span class="s1">:</span>
+      <span class="s1">self._EndVector(start</span><span class="s3">, </span><span class="s1">typed=</span><span class="s3">False, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">VectorFromElements(self</span><span class="s3">, </span><span class="s1">elements):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes sequence of any elements as a vector. 
+ 
+    Args: 
+      elements: sequence of elements, they may have different types. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">self.Vector():</span>
+      <span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">elements:</span>
+        <span class="s1">self.Add(e)</span>
+
+  <span class="s1">@contextlib.contextmanager</span>
+  <span class="s3">def </span><span class="s1">TypedVector(self</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s3">if </span><span class="s1">key:</span>
+      <span class="s1">self.Key(key)</span>
+
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s1">start = self._StartVector()</span>
+      <span class="s3">yield </span><span class="s1">self</span>
+    <span class="s3">finally</span><span class="s1">:</span>
+      <span class="s1">self._EndVector(start</span><span class="s3">, </span><span class="s1">typed=</span><span class="s3">True, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">TypedVectorFromElements(self</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">element_type=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes sequence of elements of the same type as typed vector. 
+ 
+    Args: 
+      elements: Sequence of elements, they must be of the same type. 
+      element_type: Suggested element type. Setting it to None means determining 
+        correct value automatically based on the given elements. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(elements</span><span class="s3">, </span><span class="s1">array.array):</span>
+      <span class="s3">if </span><span class="s1">elements.typecode == </span><span class="s4">'f'</span><span class="s1">:</span>
+        <span class="s1">self._WriteScalarVector(Type.FLOAT</span><span class="s3">, </span><span class="s5">4</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+      <span class="s3">elif </span><span class="s1">elements.typecode == </span><span class="s4">'d'</span><span class="s1">:</span>
+        <span class="s1">self._WriteScalarVector(Type.FLOAT</span><span class="s3">, </span><span class="s5">8</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+      <span class="s3">elif </span><span class="s1">elements.typecode </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'b'</span><span class="s3">, </span><span class="s4">'h'</span><span class="s3">, </span><span class="s4">'i'</span><span class="s3">, </span><span class="s4">'l'</span><span class="s3">, </span><span class="s4">'q'</span><span class="s1">):</span>
+        <span class="s1">self._WriteScalarVector(</span>
+            <span class="s1">Type.INT</span><span class="s3">, </span><span class="s1">elements.itemsize</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+      <span class="s3">elif </span><span class="s1">elements.typecode </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'B'</span><span class="s3">, </span><span class="s4">'H'</span><span class="s3">, </span><span class="s4">'I'</span><span class="s3">, </span><span class="s4">'L'</span><span class="s3">, </span><span class="s4">'Q'</span><span class="s1">):</span>
+        <span class="s1">self._WriteScalarVector(</span>
+            <span class="s1">Type.UINT</span><span class="s3">, </span><span class="s1">elements.itemsize</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+      <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'unsupported array typecode: %s' </span><span class="s1">% elements.typecode)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s1">add = self.Add </span><span class="s3">if </span><span class="s1">element_type </span><span class="s3">is None else </span><span class="s1">self.Adder(element_type)</span>
+      <span class="s3">with </span><span class="s1">self.TypedVector():</span>
+        <span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">elements:</span>
+          <span class="s1">add(e)</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">FixedTypedVectorFromElements(self</span><span class="s3">,</span>
+                                   <span class="s1">elements</span><span class="s3">,</span>
+                                   <span class="s1">element_type=</span><span class="s3">None,</span>
+                                   <span class="s1">byte_width=</span><span class="s5">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes sequence of elements of the same type as fixed typed vector. 
+ 
+    Args: 
+      elements: Sequence of elements, they must be of the same type. Allowed 
+        types are `Type.INT`, `Type.UINT`, `Type.FLOAT`. Allowed number of 
+        elements are 2, 3, or 4. 
+      element_type: Suggested element type. Setting it to None means determining 
+        correct value automatically based on the given elements. 
+      byte_width: Number of bytes to use per element. For `Type.INT` and 
+        `Type.UINT`: 1, 2, 4, or 8. For `Type.FLOAT`: 4 or 8. Setting it to 0 
+        means determining correct value automatically based on the given 
+        elements. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s5">2 </span><span class="s1">&lt;= len(elements) &lt;= </span><span class="s5">4</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'only 2, 3, or 4 elements are supported'</span><span class="s1">)</span>
+
+    <span class="s1">types = {type(e) </span><span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">elements}</span>
+    <span class="s3">if </span><span class="s1">len(types) != </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'all elements must be of the same type'</span><span class="s1">)</span>
+
+    <span class="s1">type_</span><span class="s3">, </span><span class="s1">= types</span>
+
+    <span class="s3">if </span><span class="s1">element_type </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s1">element_type = {int: Type.INT</span><span class="s3">, </span><span class="s1">float: Type.FLOAT}.get(type_)</span>
+      <span class="s3">if not </span><span class="s1">element_type:</span>
+        <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'unsupported element_type: %s' </span><span class="s1">% type_)</span>
+
+    <span class="s3">if </span><span class="s1">byte_width == </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s1">width = {</span>
+          <span class="s1">Type.UINT: BitWidth.U</span><span class="s3">,</span>
+          <span class="s1">Type.INT: BitWidth.I</span><span class="s3">,</span>
+          <span class="s1">Type.FLOAT: BitWidth.F</span>
+      <span class="s1">}[element_type]</span>
+      <span class="s1">byte_width = </span><span class="s5">1 </span><span class="s1">&lt;&lt; max(width(e) </span><span class="s3">for </span><span class="s1">e </span><span class="s3">in </span><span class="s1">elements)</span>
+
+    <span class="s1">self._WriteScalarVector(element_type</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">elements</span><span class="s3">, </span><span class="s1">fixed=</span><span class="s3">True</span><span class="s1">)</span>
+
+  <span class="s3">def </span><span class="s1">_StartMap(self):</span>
+    <span class="s2">&quot;&quot;&quot;Starts map construction.&quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">len(self._stack)</span>
+
+  <span class="s3">def </span><span class="s1">_EndMap(self</span><span class="s3">, </span><span class="s1">start):</span>
+    <span class="s2">&quot;&quot;&quot;Finishes map construction by encodung its elements.&quot;&quot;&quot;</span>
+    <span class="s0"># Interleaved keys and values on the stack.</span>
+    <span class="s1">stack = self._stack[start:]</span>
+
+    <span class="s3">if </span><span class="s1">len(stack) % </span><span class="s5">2 </span><span class="s1">!= </span><span class="s5">0</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">'must be even number of keys and values'</span><span class="s1">)</span>
+
+    <span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s1">stack[::</span><span class="s5">2</span><span class="s1">]:</span>
+      <span class="s3">if </span><span class="s1">key.Type </span><span class="s3">is not </span><span class="s1">Type.KEY:</span>
+        <span class="s3">raise </span><span class="s1">RuntimeError(</span><span class="s4">'all map keys must be of %s type' </span><span class="s1">% Type.KEY)</span>
+
+    <span class="s1">pairs = zip(stack[::</span><span class="s5">2</span><span class="s1">]</span><span class="s3">, </span><span class="s1">stack[</span><span class="s5">1</span><span class="s1">::</span><span class="s5">2</span><span class="s1">])  </span><span class="s0"># [(key, value), ...]</span>
+    <span class="s1">pairs = sorted(pairs</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">lambda </span><span class="s1">pair: self._ReadKey(pair[</span><span class="s5">0</span><span class="s1">].Value))</span>
+
+    <span class="s3">del </span><span class="s1">self._stack[start:]</span>
+    <span class="s3">for </span><span class="s1">pair </span><span class="s3">in </span><span class="s1">pairs:</span>
+      <span class="s1">self._stack.extend(pair)</span>
+
+    <span class="s1">keys = self._CreateVector(self._stack[start::</span><span class="s5">2</span><span class="s1">]</span><span class="s3">, </span><span class="s1">typed=</span><span class="s3">True, </span><span class="s1">fixed=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s1">values = self._CreateVector(</span>
+        <span class="s1">self._stack[start + </span><span class="s5">1</span><span class="s1">::</span><span class="s5">2</span><span class="s1">]</span><span class="s3">, </span><span class="s1">typed=</span><span class="s3">False, </span><span class="s1">fixed=</span><span class="s3">False, </span><span class="s1">keys=keys)</span>
+
+    <span class="s3">del </span><span class="s1">self._stack[start:]</span>
+    <span class="s1">self._stack.append(values)</span>
+    <span class="s3">return </span><span class="s1">values.Value</span>
+
+  <span class="s1">@contextlib.contextmanager</span>
+  <span class="s3">def </span><span class="s1">Map(self</span><span class="s3">, </span><span class="s1">key=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s3">if </span><span class="s1">key:</span>
+      <span class="s1">self.Key(key)</span>
+
+    <span class="s3">try</span><span class="s1">:</span>
+      <span class="s1">start = self._StartMap()</span>
+      <span class="s3">yield </span><span class="s1">self</span>
+    <span class="s3">finally</span><span class="s1">:</span>
+      <span class="s1">self._EndMap(start)</span>
+
+  <span class="s3">def </span><span class="s1">MapFromElements(self</span><span class="s3">, </span><span class="s1">elements):</span>
+    <span class="s1">start = self._StartMap()</span>
+    <span class="s3">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s3">in </span><span class="s1">elements.items():</span>
+      <span class="s1">self.Key(k)</span>
+      <span class="s1">self.Add(v)</span>
+    <span class="s1">self._EndMap(start)</span>
+
+  <span class="s3">def </span><span class="s1">Adder(self</span><span class="s3">, </span><span class="s1">type_):</span>
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">Type.BOOL: self.Bool</span><span class="s3">,</span>
+        <span class="s1">Type.INT: self.Int</span><span class="s3">,</span>
+        <span class="s1">Type.INDIRECT_INT: self.IndirectInt</span><span class="s3">,</span>
+        <span class="s1">Type.UINT: self.UInt</span><span class="s3">,</span>
+        <span class="s1">Type.INDIRECT_UINT: self.IndirectUInt</span><span class="s3">,</span>
+        <span class="s1">Type.FLOAT: self.Float</span><span class="s3">,</span>
+        <span class="s1">Type.INDIRECT_FLOAT: self.IndirectFloat</span><span class="s3">,</span>
+        <span class="s1">Type.KEY: self.Key</span><span class="s3">,</span>
+        <span class="s1">Type.BLOB: self.Blob</span><span class="s3">,</span>
+        <span class="s1">Type.STRING: self.String</span><span class="s3">,</span>
+    <span class="s1">}[type_]</span>
+
+  <span class="s1">@InMapForString</span>
+  <span class="s3">def </span><span class="s1">Add(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Encodes value of any supported type.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">value </span><span class="s3">is None</span><span class="s1">:</span>
+      <span class="s1">self.Null()</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">bool):</span>
+      <span class="s1">self.Bool(value)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">int):</span>
+      <span class="s1">self.Int(value)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">float):</span>
+      <span class="s1">self.Float(value)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">str):</span>
+      <span class="s1">self.String(value)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">(bytes</span><span class="s3">, </span><span class="s1">bytearray)):</span>
+      <span class="s1">self.Blob(value)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">dict):</span>
+      <span class="s3">with </span><span class="s1">self.Map():</span>
+        <span class="s3">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s3">in </span><span class="s1">value.items():</span>
+          <span class="s1">self.Key(k)</span>
+          <span class="s1">self.Add(v)</span>
+    <span class="s3">elif </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">array.array):</span>
+      <span class="s1">self.TypedVectorFromElements(value)</span>
+    <span class="s3">elif </span><span class="s1">_IsIterable(value):</span>
+      <span class="s1">self.VectorFromElements(value)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+      <span class="s3">raise </span><span class="s1">TypeError(</span><span class="s4">'unsupported python type: %s' </span><span class="s1">% type(value))</span>
+
+  <span class="s1">@property</span>
+  <span class="s3">def </span><span class="s1">LastValue(self):</span>
+    <span class="s3">return </span><span class="s1">self._stack[-</span><span class="s5">1</span><span class="s1">]</span>
+
+  <span class="s1">@InMap</span>
+  <span class="s3">def </span><span class="s1">ReuseValue(self</span><span class="s3">, </span><span class="s1">value):</span>
+    <span class="s1">self._stack.append(value)</span>
+
+
+<span class="s3">def </span><span class="s1">GetRoot(buf):</span>
+  <span class="s2">&quot;&quot;&quot;Returns root `Ref` object for the given buffer.&quot;&quot;&quot;</span>
+  <span class="s3">if </span><span class="s1">len(buf) &lt; </span><span class="s5">3</span><span class="s1">:</span>
+    <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'buffer is too small'</span><span class="s1">)</span>
+  <span class="s1">byte_width = buf[-</span><span class="s5">1</span><span class="s1">]</span>
+  <span class="s3">return </span><span class="s1">Ref.PackedType(</span>
+      <span class="s1">Buf(buf</span><span class="s3">, </span><span class="s1">-(</span><span class="s5">2 </span><span class="s1">+ byte_width))</span><span class="s3">, </span><span class="s1">byte_width</span><span class="s3">, </span><span class="s1">packed_type=buf[-</span><span class="s5">2</span><span class="s1">])</span>
+
+
+<span class="s3">def </span><span class="s1">Dumps(obj):</span>
+  <span class="s2">&quot;&quot;&quot;Returns bytearray with the encoded python object.&quot;&quot;&quot;</span>
+  <span class="s1">fbb = Builder()</span>
+  <span class="s1">fbb.Add(obj)</span>
+  <span class="s3">return </span><span class="s1">fbb.Finish()</span>
+
+
+<span class="s3">def </span><span class="s1">Loads(buf):</span>
+  <span class="s2">&quot;&quot;&quot;Returns python object decoded from the buffer.&quot;&quot;&quot;</span>
+  <span class="s3">return </span><span class="s1">GetRoot(buf).Value</span>
+</pre>
+</body>
+</html>

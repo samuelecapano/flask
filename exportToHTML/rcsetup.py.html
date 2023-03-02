@@ -1,0 +1,1288 @@
+<html>
+<head>
+<title>rcsetup.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+rcsetup.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+The rcsetup module contains the validation code for customization using 
+Matplotlib's rc settings. 
+ 
+Each rc setting is assigned a function used to validate any attempted changes 
+to that setting.  The validation functions are defined in the rcsetup module, 
+and are used to construct the rcParams global object which stores the settings 
+and is referenced throughout Matplotlib. 
+ 
+The default values of the rc settings are set in the default matplotlibrc file. 
+Any additions or deletions to the parameter set listed here should also be 
+propagated to the :file:`matplotlibrc.template` in Matplotlib's root source 
+directory. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">ast</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">lru_cache</span><span class="s2">, </span><span class="s1">reduce</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Number</span>
+<span class="s2">import </span><span class="s1">operator</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">re</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span>
+<span class="s2">from </span><span class="s1">matplotlib.cbook </span><span class="s2">import </span><span class="s1">ls_mapper</span>
+<span class="s2">from </span><span class="s1">matplotlib.colors </span><span class="s2">import </span><span class="s1">Colormap</span><span class="s2">, </span><span class="s1">is_color_like</span>
+<span class="s2">from </span><span class="s1">matplotlib._fontconfig_pattern </span><span class="s2">import </span><span class="s1">parse_fontconfig_pattern</span>
+<span class="s2">from </span><span class="s1">matplotlib._enums </span><span class="s2">import </span><span class="s1">JoinStyle</span><span class="s2">, </span><span class="s1">CapStyle</span>
+
+<span class="s3"># Don't let the original cycler collide with our validating cycler</span>
+<span class="s2">from </span><span class="s1">cycler </span><span class="s2">import </span><span class="s1">Cycler</span><span class="s2">, </span><span class="s1">cycler </span><span class="s2">as </span><span class="s1">ccycler</span>
+
+
+<span class="s3"># The capitalized forms are needed for ipython at present; this may</span>
+<span class="s3"># change for later versions.</span>
+<span class="s1">interactive_bk = [</span>
+    <span class="s4">'GTK3Agg'</span><span class="s2">, </span><span class="s4">'GTK3Cairo'</span><span class="s2">, </span><span class="s4">'GTK4Agg'</span><span class="s2">, </span><span class="s4">'GTK4Cairo'</span><span class="s2">,</span>
+    <span class="s4">'MacOSX'</span><span class="s2">,</span>
+    <span class="s4">'nbAgg'</span><span class="s2">,</span>
+    <span class="s4">'QtAgg'</span><span class="s2">, </span><span class="s4">'QtCairo'</span><span class="s2">, </span><span class="s4">'Qt5Agg'</span><span class="s2">, </span><span class="s4">'Qt5Cairo'</span><span class="s2">,</span>
+    <span class="s4">'TkAgg'</span><span class="s2">, </span><span class="s4">'TkCairo'</span><span class="s2">,</span>
+    <span class="s4">'WebAgg'</span><span class="s2">,</span>
+    <span class="s4">'WX'</span><span class="s2">, </span><span class="s4">'WXAgg'</span><span class="s2">, </span><span class="s4">'WXCairo'</span><span class="s2">,</span>
+<span class="s1">]</span>
+<span class="s1">non_interactive_bk = [</span><span class="s4">'agg'</span><span class="s2">, </span><span class="s4">'cairo'</span><span class="s2">,</span>
+                      <span class="s4">'pdf'</span><span class="s2">, </span><span class="s4">'pgf'</span><span class="s2">, </span><span class="s4">'ps'</span><span class="s2">, </span><span class="s4">'svg'</span><span class="s2">, </span><span class="s4">'template'</span><span class="s1">]</span>
+<span class="s1">all_backends = interactive_bk + non_interactive_bk</span>
+
+
+<span class="s2">class </span><span class="s1">ValidateInStrings:</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">valid</span><span class="s2">, </span><span class="s1">ignorecase=</span><span class="s2">False, </span><span class="s1">*</span><span class="s2">,</span>
+                 <span class="s1">_deprecated_since=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;*valid* is a list of legal strings.&quot;&quot;&quot;</span>
+        <span class="s1">self.key = key</span>
+        <span class="s1">self.ignorecase = ignorecase</span>
+        <span class="s1">self._deprecated_since = _deprecated_since</span>
+
+        <span class="s2">def </span><span class="s1">func(s):</span>
+            <span class="s2">if </span><span class="s1">ignorecase:</span>
+                <span class="s2">return </span><span class="s1">s.lower()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">s</span>
+        <span class="s1">self.valid = {func(k): k </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">valid}</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s2">if </span><span class="s1">self._deprecated_since:</span>
+            <span class="s1">name</span><span class="s2">, </span><span class="s1">= (k </span><span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">globals().items() </span><span class="s2">if </span><span class="s1">v </span><span class="s2">is </span><span class="s1">self)</span>
+            <span class="s1">_api.warn_deprecated(</span>
+                <span class="s1">self._deprecated_since</span><span class="s2">, </span><span class="s1">name=name</span><span class="s2">, </span><span class="s1">obj_type=</span><span class="s4">&quot;function&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.ignorecase </span><span class="s2">and </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">s = s.lower()</span>
+        <span class="s2">if </span><span class="s1">s </span><span class="s2">in </span><span class="s1">self.valid:</span>
+            <span class="s2">return </span><span class="s1">self.valid[s]</span>
+        <span class="s1">msg = (</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">is not a valid value for </span><span class="s2">{</span><span class="s1">self.key</span><span class="s2">}</span><span class="s4">; supported values &quot;</span>
+               <span class="s4">f&quot;are </span><span class="s2">{</span><span class="s1">[*self.valid.values()]</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">(isinstance(s</span><span class="s2">, </span><span class="s1">str)</span>
+                <span class="s2">and </span><span class="s1">(s.startswith(</span><span class="s4">'&quot;'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">s.endswith(</span><span class="s4">'&quot;'</span><span class="s1">)</span>
+                     <span class="s2">or </span><span class="s1">s.startswith(</span><span class="s4">&quot;'&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">s.endswith(</span><span class="s4">&quot;'&quot;</span><span class="s1">))</span>
+                <span class="s2">and </span><span class="s1">s[</span><span class="s5">1</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">] </span><span class="s2">in </span><span class="s1">self.valid):</span>
+            <span class="s1">msg += </span><span class="s4">&quot;; remove quotes surrounding your string&quot;</span>
+        <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+
+<span class="s1">@lru_cache()</span>
+<span class="s2">def </span><span class="s1">_listify_validator(scalar_validator</span><span class="s2">, </span><span class="s1">allow_stringlist=</span><span class="s2">False, </span><span class="s1">*</span><span class="s2">,</span>
+                       <span class="s1">n=</span><span class="s2">None, </span><span class="s1">doc=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s2">def </span><span class="s1">f(s):</span>
+        <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">val = [scalar_validator(v.strip()) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">s.split(</span><span class="s4">','</span><span class="s1">)</span>
+                       <span class="s2">if </span><span class="s1">v.strip()]</span>
+            <span class="s2">except </span><span class="s1">Exception:</span>
+                <span class="s2">if </span><span class="s1">allow_stringlist:</span>
+                    <span class="s3"># Sometimes, a list of colors might be a single string</span>
+                    <span class="s3"># of single-letter colornames. So give that a shot.</span>
+                    <span class="s1">val = [scalar_validator(v.strip()) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">s </span><span class="s2">if </span><span class="s1">v.strip()]</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">raise</span>
+        <span class="s3"># Allow any ordered sequence type -- generators, np.ndarray, pd.Series</span>
+        <span class="s3"># -- but not sets, whose iteration order is non-deterministic.</span>
+        <span class="s2">elif </span><span class="s1">np.iterable(s) </span><span class="s2">and not </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">(set</span><span class="s2">, </span><span class="s1">frozenset)):</span>
+            <span class="s3"># The condition on this list comprehension will preserve the</span>
+            <span class="s3"># behavior of filtering out any empty strings (behavior was</span>
+            <span class="s3"># from the original validate_stringlist()), while allowing</span>
+            <span class="s3"># any non-string/text scalar values such as numbers and arrays.</span>
+            <span class="s1">val = [scalar_validator(v) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">s</span>
+                   <span class="s2">if not </span><span class="s1">isinstance(v</span><span class="s2">, </span><span class="s1">str) </span><span class="s2">or </span><span class="s1">v]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">f&quot;Expected str or other non-set iterable, but got </span><span class="s2">{</span><span class="s1">s</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s2">is not None and </span><span class="s1">len(val) != n:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">f&quot;Expected </span><span class="s2">{</span><span class="s1">n</span><span class="s2">} </span><span class="s4">values, but there are </span><span class="s2">{</span><span class="s1">len(val)</span><span class="s2">} </span><span class="s4">values in </span><span class="s2">{</span><span class="s1">s</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">val</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">f.__name__ = </span><span class="s4">&quot;{}list&quot;</span><span class="s1">.format(scalar_validator.__name__)</span>
+    <span class="s2">except </span><span class="s1">AttributeError:  </span><span class="s3"># class instance.</span>
+        <span class="s1">f.__name__ = </span><span class="s4">&quot;{}List&quot;</span><span class="s1">.format(type(scalar_validator).__name__)</span>
+    <span class="s1">f.__qualname__ = f.__qualname__.rsplit(</span><span class="s4">&quot;.&quot;</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">] + </span><span class="s4">&quot;.&quot; </span><span class="s1">+ f.__name__</span>
+    <span class="s1">f.__doc__ = doc </span><span class="s2">if </span><span class="s1">doc </span><span class="s2">is not None else </span><span class="s1">scalar_validator.__doc__</span>
+    <span class="s2">return </span><span class="s1">f</span>
+
+
+<span class="s2">def </span><span class="s1">validate_any(s):</span>
+    <span class="s2">return </span><span class="s1">s</span>
+<span class="s1">validate_anylist = _listify_validator(validate_any)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_date(s):</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">np.datetime64(s)</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">except </span><span class="s1">ValueError:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">should be a string that can be parsed by numpy.datetime64'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_bool(b):</span>
+    <span class="s0">&quot;&quot;&quot;Convert b to ``bool`` or raise.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">isinstance(b</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">b = b.lower()</span>
+    <span class="s2">if </span><span class="s1">b </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'t'</span><span class="s2">, </span><span class="s4">'y'</span><span class="s2">, </span><span class="s4">'yes'</span><span class="s2">, </span><span class="s4">'on'</span><span class="s2">, </span><span class="s4">'true'</span><span class="s2">, </span><span class="s4">'1'</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, True</span><span class="s1">):</span>
+        <span class="s2">return True</span>
+    <span class="s2">elif </span><span class="s1">b </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'f'</span><span class="s2">, </span><span class="s4">'n'</span><span class="s2">, </span><span class="s4">'no'</span><span class="s2">, </span><span class="s4">'off'</span><span class="s2">, </span><span class="s4">'false'</span><span class="s2">, </span><span class="s4">'0'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, False</span><span class="s1">):</span>
+        <span class="s2">return False</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'Cannot convert </span><span class="s2">{</span><span class="s1">b</span><span class="s2">!r} </span><span class="s4">to bool'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_axisbelow(s):</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">validate_bool(s)</span>
+    <span class="s2">except </span><span class="s1">ValueError:</span>
+        <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">if </span><span class="s1">s == </span><span class="s4">'line'</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s4">'line'</span>
+    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">cannot be interpreted as'</span>
+                     <span class="s4">' True, False, or &quot;line&quot;'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_dpi(s):</span>
+    <span class="s0">&quot;&quot;&quot;Confirm s is string 'figure' or convert s to float or raise.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">s == </span><span class="s4">'figure'</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">float(s)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">is not string &quot;figure&quot; and '</span>
+                         <span class="s4">f'could not convert </span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">to float'</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+
+<span class="s2">def </span><span class="s1">_make_type_validator(cls</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">allow_none=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return a validator that converts inputs to *cls* or raises (and possibly 
+    allows ``None`` as well). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">validator(s):</span>
+        <span class="s2">if </span><span class="s1">(allow_none </span><span class="s2">and</span>
+                <span class="s1">(s </span><span class="s2">is None or </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str) </span><span class="s2">and </span><span class="s1">s.lower() == </span><span class="s4">&quot;none&quot;</span><span class="s1">)):</span>
+            <span class="s2">return None</span>
+        <span class="s2">if </span><span class="s1">cls </span><span class="s2">is </span><span class="s1">str </span><span class="s2">and not </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'Could not convert </span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">to str'</span><span class="s1">)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">cls(s)</span>
+        <span class="s2">except </span><span class="s1">(TypeError</span><span class="s2">, </span><span class="s1">ValueError) </span><span class="s2">as </span><span class="s1">e:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">f'Could not convert </span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">to </span><span class="s2">{</span><span class="s1">cls.__name__</span><span class="s2">}</span><span class="s4">'</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+    <span class="s1">validator.__name__ = </span><span class="s4">f&quot;validate_</span><span class="s2">{</span><span class="s1">cls.__name__</span><span class="s2">}</span><span class="s4">&quot;</span>
+    <span class="s2">if </span><span class="s1">allow_none:</span>
+        <span class="s1">validator.__name__ += </span><span class="s4">&quot;_or_None&quot;</span>
+    <span class="s1">validator.__qualname__ = (</span>
+        <span class="s1">validator.__qualname__.rsplit(</span><span class="s4">&quot;.&quot;</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">] + </span><span class="s4">&quot;.&quot; </span><span class="s1">+ validator.__name__)</span>
+    <span class="s2">return </span><span class="s1">validator</span>
+
+
+<span class="s1">validate_string = _make_type_validator(str)</span>
+<span class="s1">validate_string_or_None = _make_type_validator(str</span><span class="s2">, </span><span class="s1">allow_none=</span><span class="s2">True</span><span class="s1">)</span>
+<span class="s1">validate_stringlist = _listify_validator(</span>
+    <span class="s1">validate_string</span><span class="s2">, </span><span class="s1">doc=</span><span class="s4">'return a list of strings'</span><span class="s1">)</span>
+<span class="s1">validate_int = _make_type_validator(int)</span>
+<span class="s1">validate_int_or_None = _make_type_validator(int</span><span class="s2">, </span><span class="s1">allow_none=</span><span class="s2">True</span><span class="s1">)</span>
+<span class="s1">validate_float = _make_type_validator(float)</span>
+<span class="s1">validate_float_or_None = _make_type_validator(float</span><span class="s2">, </span><span class="s1">allow_none=</span><span class="s2">True</span><span class="s1">)</span>
+<span class="s1">validate_floatlist = _listify_validator(</span>
+    <span class="s1">validate_float</span><span class="s2">, </span><span class="s1">doc=</span><span class="s4">'return a list of floats'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_pathlike(s):</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">(str</span><span class="s2">, </span><span class="s1">os.PathLike)):</span>
+        <span class="s3"># Store value as str because savefig.directory needs to distinguish</span>
+        <span class="s3"># between &quot;&quot; (cwd) and &quot;.&quot; (cwd, but gets updated by user selections).</span>
+        <span class="s2">return </span><span class="s1">os.fsdecode(s)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">validate_string(s)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_fonttype(s):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Confirm that this is a Postscript or PDF font type that we know how to 
+    convert to. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fonttypes = {</span><span class="s4">'type3'</span><span class="s1">:    </span><span class="s5">3</span><span class="s2">,</span>
+                 <span class="s4">'truetype'</span><span class="s1">: </span><span class="s5">42</span><span class="s1">}</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">fonttype = validate_int(s)</span>
+    <span class="s2">except </span><span class="s1">ValueError:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">fonttypes[s.lower()]</span>
+        <span class="s2">except </span><span class="s1">KeyError </span><span class="s2">as </span><span class="s1">e:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Supported Postscript/PDF font types are %s'</span>
+                             <span class="s1">% list(fonttypes)) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">fonttype </span><span class="s2">not in </span><span class="s1">fonttypes.values():</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">'Supported Postscript/PDF font types are %s' </span><span class="s1">%</span>
+                <span class="s1">list(fonttypes.values()))</span>
+        <span class="s2">return </span><span class="s1">fonttype</span>
+
+
+<span class="s1">_validate_standard_backends = ValidateInStrings(</span>
+    <span class="s4">'backend'</span><span class="s2">, </span><span class="s1">all_backends</span><span class="s2">, </span><span class="s1">ignorecase=</span><span class="s2">True</span><span class="s1">)</span>
+<span class="s1">_auto_backend_sentinel = object()</span>
+
+
+<span class="s2">def </span><span class="s1">validate_backend(s):</span>
+    <span class="s1">backend = (</span>
+        <span class="s1">s </span><span class="s2">if </span><span class="s1">s </span><span class="s2">is </span><span class="s1">_auto_backend_sentinel </span><span class="s2">or </span><span class="s1">s.startswith(</span><span class="s4">&quot;module://&quot;</span><span class="s1">)</span>
+        <span class="s2">else </span><span class="s1">_validate_standard_backends(s))</span>
+    <span class="s2">return </span><span class="s1">backend</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_toolbar(s):</span>
+    <span class="s1">s = ValidateInStrings(</span>
+        <span class="s4">'toolbar'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'None'</span><span class="s2">, </span><span class="s4">'toolbar2'</span><span class="s2">, </span><span class="s4">'toolmanager'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ignorecase=</span><span class="s2">True</span><span class="s1">)(s)</span>
+    <span class="s2">if </span><span class="s1">s == </span><span class="s4">'toolmanager'</span><span class="s1">:</span>
+        <span class="s1">_api.warn_external(</span>
+            <span class="s4">&quot;Treat the new Tool classes introduced in v1.5 as experimental &quot;</span>
+            <span class="s4">&quot;for now; the API and rcParam may change in future versions.&quot;</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">s</span>
+
+
+<span class="s2">def </span><span class="s1">validate_color_or_inherit(s):</span>
+    <span class="s0">&quot;&quot;&quot;Return a valid color arg.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'inherit'</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">return </span><span class="s1">validate_color(s)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_color_or_auto(s):</span>
+    <span class="s2">if </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'auto'</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">return </span><span class="s1">validate_color(s)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_color_for_prop_cycle(s):</span>
+    <span class="s3"># N-th color cycle syntax can't go into the color cycle.</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str) </span><span class="s2">and </span><span class="s1">re.match(</span><span class="s4">&quot;^C[0-9]$&quot;</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;Cannot put cycle reference (</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r}</span><span class="s4">) in prop_cycler&quot;</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">validate_color(s)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_color_or_linecolor(s):</span>
+    <span class="s2">if </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'linecolor'</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">elif </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'mfc'</span><span class="s1">) </span><span class="s2">or </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'markerfacecolor'</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s4">'markerfacecolor'</span>
+    <span class="s2">elif </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'mec'</span><span class="s1">) </span><span class="s2">or </span><span class="s1">cbook._str_equal(s</span><span class="s2">, </span><span class="s4">'markeredgecolor'</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s4">'markeredgecolor'</span>
+    <span class="s2">elif </span><span class="s1">s </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return None</span>
+    <span class="s2">elif </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str) </span><span class="s2">and </span><span class="s1">len(s) == </span><span class="s5">6 </span><span class="s2">or </span><span class="s1">len(s) == </span><span class="s5">8</span><span class="s1">:</span>
+        <span class="s1">stmp = </span><span class="s4">'#' </span><span class="s1">+ s</span>
+        <span class="s2">if </span><span class="s1">is_color_like(stmp):</span>
+            <span class="s2">return </span><span class="s1">stmp</span>
+        <span class="s2">if </span><span class="s1">s.lower() == </span><span class="s4">'none'</span><span class="s1">:</span>
+            <span class="s2">return None</span>
+    <span class="s2">elif </span><span class="s1">is_color_like(s):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+
+    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">does not look like a color arg'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_color(s):</span>
+    <span class="s0">&quot;&quot;&quot;Return a valid color arg.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s2">if </span><span class="s1">s.lower() == </span><span class="s4">'none'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s4">'none'</span>
+        <span class="s2">if </span><span class="s1">len(s) == </span><span class="s5">6 </span><span class="s2">or </span><span class="s1">len(s) == </span><span class="s5">8</span><span class="s1">:</span>
+            <span class="s1">stmp = </span><span class="s4">'#' </span><span class="s1">+ s</span>
+            <span class="s2">if </span><span class="s1">is_color_like(stmp):</span>
+                <span class="s2">return </span><span class="s1">stmp</span>
+
+    <span class="s2">if </span><span class="s1">is_color_like(s):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+
+    <span class="s3"># If it is still valid, it must be a tuple (as a string from matplotlibrc).</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">color = ast.literal_eval(s)</span>
+    <span class="s2">except </span><span class="s1">(SyntaxError</span><span class="s2">, </span><span class="s1">ValueError):</span>
+        <span class="s2">pass</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">is_color_like(color):</span>
+            <span class="s2">return </span><span class="s1">color</span>
+
+    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">does not look like a color arg'</span><span class="s1">)</span>
+
+
+<span class="s1">validate_colorlist = _listify_validator(</span>
+    <span class="s1">validate_color</span><span class="s2">, </span><span class="s1">allow_stringlist=</span><span class="s2">True, </span><span class="s1">doc=</span><span class="s4">'return a list of colorspecs'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_cmap(s):</span>
+    <span class="s1">_api.check_isinstance((str</span><span class="s2">, </span><span class="s1">Colormap)</span><span class="s2">, </span><span class="s1">cmap=s)</span>
+    <span class="s2">return </span><span class="s1">s</span>
+
+
+<span class="s2">def </span><span class="s1">validate_aspect(s):</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'auto'</span><span class="s2">, </span><span class="s4">'equal'</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">float(s)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'not a valid aspect specification'</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+
+<span class="s2">def </span><span class="s1">validate_fontsize_None(s):</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">is None or </span><span class="s1">s == </span><span class="s4">'None'</span><span class="s1">:</span>
+        <span class="s2">return None</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">validate_fontsize(s)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_fontsize(s):</span>
+    <span class="s1">fontsizes = [</span><span class="s4">'xx-small'</span><span class="s2">, </span><span class="s4">'x-small'</span><span class="s2">, </span><span class="s4">'small'</span><span class="s2">, </span><span class="s4">'medium'</span><span class="s2">, </span><span class="s4">'large'</span><span class="s2">,</span>
+                 <span class="s4">'x-large'</span><span class="s2">, </span><span class="s4">'xx-large'</span><span class="s2">, </span><span class="s4">'smaller'</span><span class="s2">, </span><span class="s4">'larger'</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">s = s.lower()</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">in </span><span class="s1">fontsizes:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">float(s)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;%s is not a valid font size. Valid font sizes &quot;</span>
+                         <span class="s4">&quot;are %s.&quot; </span><span class="s1">% (s</span><span class="s2">, </span><span class="s4">&quot;, &quot;</span><span class="s1">.join(fontsizes))) </span><span class="s2">from </span><span class="s1">e</span>
+
+
+<span class="s1">validate_fontsizelist = _listify_validator(validate_fontsize)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_fontweight(s):</span>
+    <span class="s1">weights = [</span>
+        <span class="s4">'ultralight'</span><span class="s2">, </span><span class="s4">'light'</span><span class="s2">, </span><span class="s4">'normal'</span><span class="s2">, </span><span class="s4">'regular'</span><span class="s2">, </span><span class="s4">'book'</span><span class="s2">, </span><span class="s4">'medium'</span><span class="s2">, </span><span class="s4">'roman'</span><span class="s2">,</span>
+        <span class="s4">'semibold'</span><span class="s2">, </span><span class="s4">'demibold'</span><span class="s2">, </span><span class="s4">'demi'</span><span class="s2">, </span><span class="s4">'bold'</span><span class="s2">, </span><span class="s4">'heavy'</span><span class="s2">, </span><span class="s4">'extra bold'</span><span class="s2">, </span><span class="s4">'black'</span><span class="s1">]</span>
+    <span class="s3"># Note: Historically, weights have been case-sensitive in Matplotlib</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">in </span><span class="s1">weights:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">int(s)</span>
+    <span class="s2">except </span><span class="s1">(ValueError</span><span class="s2">, </span><span class="s1">TypeError) </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">} </span><span class="s4">is not a valid font weight.'</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+
+<span class="s2">def </span><span class="s1">validate_fontstretch(s):</span>
+    <span class="s1">stretchvalues = [</span>
+        <span class="s4">'ultra-condensed'</span><span class="s2">, </span><span class="s4">'extra-condensed'</span><span class="s2">, </span><span class="s4">'condensed'</span><span class="s2">, </span><span class="s4">'semi-condensed'</span><span class="s2">,</span>
+        <span class="s4">'normal'</span><span class="s2">, </span><span class="s4">'semi-expanded'</span><span class="s2">, </span><span class="s4">'expanded'</span><span class="s2">, </span><span class="s4">'extra-expanded'</span><span class="s2">,</span>
+        <span class="s4">'ultra-expanded'</span><span class="s1">]</span>
+    <span class="s3"># Note: Historically, stretchvalues have been case-sensitive in Matplotlib</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">in </span><span class="s1">stretchvalues:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">int(s)</span>
+    <span class="s2">except </span><span class="s1">(ValueError</span><span class="s2">, </span><span class="s1">TypeError) </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f'</span><span class="s2">{</span><span class="s1">s</span><span class="s2">} </span><span class="s4">is not a valid font stretch.'</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+
+<span class="s2">def </span><span class="s1">validate_font_properties(s):</span>
+    <span class="s1">parse_fontconfig_pattern(s)</span>
+    <span class="s2">return </span><span class="s1">s</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_mathtext_fallback(s):</span>
+    <span class="s1">_fallback_fonts = [</span><span class="s4">'cm'</span><span class="s2">, </span><span class="s4">'stix'</span><span class="s2">, </span><span class="s4">'stixsans'</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">s = s.lower()</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">is None or </span><span class="s1">s == </span><span class="s4">'none'</span><span class="s1">:</span>
+        <span class="s2">return None</span>
+    <span class="s2">elif </span><span class="s1">s.lower() </span><span class="s2">in </span><span class="s1">_fallback_fonts:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">s</span><span class="s2">} </span><span class="s4">is not a valid fallback font name. Valid fallback font &quot;</span>
+            <span class="s4">f&quot;names are </span><span class="s2">{</span><span class="s4">','</span><span class="s1">.join(_fallback_fonts)</span><span class="s2">}</span><span class="s4">. Passing 'None' will turn &quot;</span>
+            <span class="s4">&quot;fallback off.&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_whiskers(s):</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_listify_validator(validate_float</span><span class="s2">, </span><span class="s1">n=</span><span class="s5">2</span><span class="s1">)(s)</span>
+    <span class="s2">except </span><span class="s1">(TypeError</span><span class="s2">, </span><span class="s1">ValueError):</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">float(s)</span>
+        <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Not a valid whisker value [float, &quot;</span>
+                             <span class="s4">&quot;(float, float)]&quot;</span><span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+
+<span class="s2">def </span><span class="s1">validate_ps_distiller(s):</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">s = s.lower()</span>
+    <span class="s2">if </span><span class="s1">s </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'none'</span><span class="s2">, None, </span><span class="s4">'false'</span><span class="s2">, False</span><span class="s1">):</span>
+        <span class="s2">return None</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">ValidateInStrings(</span><span class="s4">'ps.usedistiller'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'ghostscript'</span><span class="s2">, </span><span class="s4">'xpdf'</span><span class="s1">])(s)</span>
+
+
+<span class="s3"># A validator dedicated to the named line styles, based on the items in</span>
+<span class="s3"># ls_mapper, and a list of possible strings read from Line2D.set_linestyle</span>
+<span class="s1">_validate_named_linestyle = ValidateInStrings(</span>
+    <span class="s4">'linestyle'</span><span class="s2">,</span>
+    <span class="s1">[*ls_mapper.keys()</span><span class="s2">, </span><span class="s1">*ls_mapper.values()</span><span class="s2">, </span><span class="s4">'None'</span><span class="s2">, </span><span class="s4">'none'</span><span class="s2">, </span><span class="s4">' '</span><span class="s2">, </span><span class="s4">''</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s1">ignorecase=</span><span class="s2">True</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_linestyle(ls):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A validator for all possible line styles, the named ones *and* 
+    the on-off ink sequences. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">isinstance(ls</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s2">try</span><span class="s1">:  </span><span class="s3"># Look first for a valid named line style, like '--' or 'solid'.</span>
+            <span class="s2">return </span><span class="s1">_validate_named_linestyle(ls)</span>
+        <span class="s2">except </span><span class="s1">ValueError:</span>
+            <span class="s2">pass</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">ls = ast.literal_eval(ls)  </span><span class="s3"># Parsing matplotlibrc.</span>
+        <span class="s2">except </span><span class="s1">(SyntaxError</span><span class="s2">, </span><span class="s1">ValueError):</span>
+            <span class="s2">pass  </span><span class="s3"># Will error with the ValueError at the end.</span>
+
+    <span class="s2">def </span><span class="s1">_is_iterable_not_string_like(x):</span>
+        <span class="s3"># Explicitly exclude bytes/bytearrays so that they are not</span>
+        <span class="s3"># nonsensically interpreted as sequences of numbers (codepoints).</span>
+        <span class="s2">return </span><span class="s1">np.iterable(x) </span><span class="s2">and not </span><span class="s1">isinstance(x</span><span class="s2">, </span><span class="s1">(str</span><span class="s2">, </span><span class="s1">bytes</span><span class="s2">, </span><span class="s1">bytearray))</span>
+
+    <span class="s2">if </span><span class="s1">_is_iterable_not_string_like(ls):</span>
+        <span class="s2">if </span><span class="s1">len(ls) == </span><span class="s5">2 </span><span class="s2">and </span><span class="s1">_is_iterable_not_string_like(ls[</span><span class="s5">1</span><span class="s1">]):</span>
+            <span class="s3"># (offset, (on, off, on, off, ...))</span>
+            <span class="s1">offset</span><span class="s2">, </span><span class="s1">onoff = ls</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s3"># For backcompat: (on, off, on, off, ...); the offset is implicit.</span>
+            <span class="s1">offset = </span><span class="s5">0</span>
+            <span class="s1">onoff = ls</span>
+
+        <span class="s2">if </span><span class="s1">(isinstance(offset</span><span class="s2">, </span><span class="s1">Number)</span>
+                <span class="s2">and </span><span class="s1">len(onoff) % </span><span class="s5">2 </span><span class="s1">== </span><span class="s5">0</span>
+                <span class="s2">and </span><span class="s1">all(isinstance(elem</span><span class="s2">, </span><span class="s1">Number) </span><span class="s2">for </span><span class="s1">elem </span><span class="s2">in </span><span class="s1">onoff)):</span>
+            <span class="s2">return </span><span class="s1">(offset</span><span class="s2">, </span><span class="s1">onoff)</span>
+
+    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;linestyle </span><span class="s2">{</span><span class="s1">ls</span><span class="s2">!r} </span><span class="s4">is not a valid on-off ink sequence.&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">validate_fillstyle = ValidateInStrings(</span>
+    <span class="s4">'markers.fillstyle'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'full'</span><span class="s2">, </span><span class="s4">'left'</span><span class="s2">, </span><span class="s4">'right'</span><span class="s2">, </span><span class="s4">'bottom'</span><span class="s2">, </span><span class="s4">'top'</span><span class="s2">, </span><span class="s4">'none'</span><span class="s1">])</span>
+
+
+<span class="s1">validate_fillstylelist = _listify_validator(validate_fillstyle)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_markevery(s):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Validate the markevery property of a Line2D object. 
+ 
+    Parameters 
+    ---------- 
+    s : None, int, (int, int), slice, float, (float, float), or list[int] 
+ 
+    Returns 
+    ------- 
+    None, int, (int, int), slice, float, (float, float), or list[int] 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># Validate s against type slice float int and None</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">(slice</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">int</span><span class="s2">, </span><span class="s1">type(</span><span class="s2">None</span><span class="s1">))):</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s3"># Validate s against type tuple</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">tuple):</span>
+        <span class="s2">if </span><span class="s1">(len(s) == </span><span class="s5">2</span>
+                <span class="s2">and </span><span class="s1">(all(isinstance(e</span><span class="s2">, </span><span class="s1">int) </span><span class="s2">for </span><span class="s1">e </span><span class="s2">in </span><span class="s1">s)</span>
+                     <span class="s2">or </span><span class="s1">all(isinstance(e</span><span class="s2">, </span><span class="s1">float) </span><span class="s2">for </span><span class="s1">e </span><span class="s2">in </span><span class="s1">s))):</span>
+            <span class="s2">return </span><span class="s1">s</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span>
+                <span class="s4">&quot;'markevery' tuple must be pair of ints or of floats&quot;</span><span class="s1">)</span>
+    <span class="s3"># Validate s against type list</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">list):</span>
+        <span class="s2">if </span><span class="s1">all(isinstance(e</span><span class="s2">, </span><span class="s1">int) </span><span class="s2">for </span><span class="s1">e </span><span class="s2">in </span><span class="s1">s):</span>
+            <span class="s2">return </span><span class="s1">s</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span>
+                <span class="s4">&quot;'markevery' list must have all elements of type int&quot;</span><span class="s1">)</span>
+    <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;'markevery' is of an invalid type&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">validate_markeverylist = _listify_validator(validate_markevery)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_bbox(s):</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">s = s.lower()</span>
+        <span class="s2">if </span><span class="s1">s == </span><span class="s4">'tight'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">s</span>
+        <span class="s2">if </span><span class="s1">s == </span><span class="s4">'standard'</span><span class="s1">:</span>
+            <span class="s2">return None</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;bbox should be 'tight' or 'standard'&quot;</span><span class="s1">)</span>
+    <span class="s2">elif </span><span class="s1">s </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s3"># Backwards compatibility. None is equivalent to 'standard'.</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;bbox should be 'tight' or 'standard'&quot;</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">s</span>
+
+
+<span class="s2">def </span><span class="s1">validate_sketch(s):</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">s = s.lower()</span>
+    <span class="s2">if </span><span class="s1">s == </span><span class="s4">'none' </span><span class="s2">or </span><span class="s1">s </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return None</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">tuple(_listify_validator(validate_float</span><span class="s2">, </span><span class="s1">n=</span><span class="s5">3</span><span class="s1">)(s))</span>
+    <span class="s2">except </span><span class="s1">ValueError:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Expected a (scale, length, randomness) triplet&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_greaterequal0_lessthan1(s):</span>
+    <span class="s1">s = validate_float(s)</span>
+    <span class="s2">if </span><span class="s5">0 </span><span class="s1">&lt;= s &lt; </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">f'Value must be &gt;=0 and &lt;1; got </span><span class="s2">{</span><span class="s1">s</span><span class="s2">}</span><span class="s4">'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_greaterequal0_lessequal1(s):</span>
+    <span class="s1">s = validate_float(s)</span>
+    <span class="s2">if </span><span class="s5">0 </span><span class="s1">&lt;= s &lt;= </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">f'Value must be &gt;=0 and &lt;=1; got </span><span class="s2">{</span><span class="s1">s</span><span class="s2">}</span><span class="s4">'</span><span class="s1">)</span>
+
+
+<span class="s1">_range_validators = {  </span><span class="s3"># Slightly nicer (internal) API.</span>
+    <span class="s4">&quot;0 &lt;= x &lt; 1&quot;</span><span class="s1">: _validate_greaterequal0_lessthan1</span><span class="s2">,</span>
+    <span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">: _validate_greaterequal0_lessequal1</span><span class="s2">,</span>
+<span class="s1">}</span>
+
+
+<span class="s2">def </span><span class="s1">validate_hatch(s):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Validate a hatch pattern. 
+    A hatch pattern string can have any sequence of the following 
+    characters: ``\ / | - + * . x o O``. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if not </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Hatch pattern must be a string&quot;</span><span class="s1">)</span>
+    <span class="s1">_api.check_isinstance(str</span><span class="s2">, </span><span class="s1">hatch_pattern=s)</span>
+    <span class="s1">unknown = set(s) - {</span><span class="s4">'</span><span class="s2">\\</span><span class="s4">'</span><span class="s2">, </span><span class="s4">'/'</span><span class="s2">, </span><span class="s4">'|'</span><span class="s2">, </span><span class="s4">'-'</span><span class="s2">, </span><span class="s4">'+'</span><span class="s2">, </span><span class="s4">'*'</span><span class="s2">, </span><span class="s4">'.'</span><span class="s2">, </span><span class="s4">'x'</span><span class="s2">, </span><span class="s4">'o'</span><span class="s2">, </span><span class="s4">'O'</span><span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">unknown:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unknown hatch symbol(s): %s&quot; </span><span class="s1">% list(unknown))</span>
+    <span class="s2">return </span><span class="s1">s</span>
+
+
+<span class="s1">validate_hatchlist = _listify_validator(validate_hatch)</span>
+<span class="s1">validate_dashlist = _listify_validator(validate_floatlist)</span>
+
+
+<span class="s1">_prop_validators = {</span>
+        <span class="s4">'color'</span><span class="s1">: _listify_validator(validate_color_for_prop_cycle</span><span class="s2">,</span>
+                                    <span class="s1">allow_stringlist=</span><span class="s2">True</span><span class="s1">)</span><span class="s2">,</span>
+        <span class="s4">'linewidth'</span><span class="s1">: validate_floatlist</span><span class="s2">,</span>
+        <span class="s4">'linestyle'</span><span class="s1">: _listify_validator(_validate_linestyle)</span><span class="s2">,</span>
+        <span class="s4">'facecolor'</span><span class="s1">: validate_colorlist</span><span class="s2">,</span>
+        <span class="s4">'edgecolor'</span><span class="s1">: validate_colorlist</span><span class="s2">,</span>
+        <span class="s4">'joinstyle'</span><span class="s1">: _listify_validator(JoinStyle)</span><span class="s2">,</span>
+        <span class="s4">'capstyle'</span><span class="s1">: _listify_validator(CapStyle)</span><span class="s2">,</span>
+        <span class="s4">'fillstyle'</span><span class="s1">: validate_fillstylelist</span><span class="s2">,</span>
+        <span class="s4">'markerfacecolor'</span><span class="s1">: validate_colorlist</span><span class="s2">,</span>
+        <span class="s4">'markersize'</span><span class="s1">: validate_floatlist</span><span class="s2">,</span>
+        <span class="s4">'markeredgewidth'</span><span class="s1">: validate_floatlist</span><span class="s2">,</span>
+        <span class="s4">'markeredgecolor'</span><span class="s1">: validate_colorlist</span><span class="s2">,</span>
+        <span class="s4">'markevery'</span><span class="s1">: validate_markeverylist</span><span class="s2">,</span>
+        <span class="s4">'alpha'</span><span class="s1">: validate_floatlist</span><span class="s2">,</span>
+        <span class="s4">'marker'</span><span class="s1">: validate_stringlist</span><span class="s2">,</span>
+        <span class="s4">'hatch'</span><span class="s1">: validate_hatchlist</span><span class="s2">,</span>
+        <span class="s4">'dashes'</span><span class="s1">: validate_dashlist</span><span class="s2">,</span>
+    <span class="s1">}</span>
+<span class="s1">_prop_aliases = {</span>
+        <span class="s4">'c'</span><span class="s1">: </span><span class="s4">'color'</span><span class="s2">,</span>
+        <span class="s4">'lw'</span><span class="s1">: </span><span class="s4">'linewidth'</span><span class="s2">,</span>
+        <span class="s4">'ls'</span><span class="s1">: </span><span class="s4">'linestyle'</span><span class="s2">,</span>
+        <span class="s4">'fc'</span><span class="s1">: </span><span class="s4">'facecolor'</span><span class="s2">,</span>
+        <span class="s4">'ec'</span><span class="s1">: </span><span class="s4">'edgecolor'</span><span class="s2">,</span>
+        <span class="s4">'mfc'</span><span class="s1">: </span><span class="s4">'markerfacecolor'</span><span class="s2">,</span>
+        <span class="s4">'mec'</span><span class="s1">: </span><span class="s4">'markeredgecolor'</span><span class="s2">,</span>
+        <span class="s4">'mew'</span><span class="s1">: </span><span class="s4">'markeredgewidth'</span><span class="s2">,</span>
+        <span class="s4">'ms'</span><span class="s1">: </span><span class="s4">'markersize'</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+
+<span class="s2">def </span><span class="s1">cycler(*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Create a `~cycler.Cycler` object much like :func:`cycler.cycler`, 
+    but includes input validation. 
+ 
+    Call signatures:: 
+ 
+      cycler(cycler) 
+      cycler(label=values[, label2=values2[, ...]]) 
+      cycler(label, values) 
+ 
+    Form 1 copies a given `~cycler.Cycler` object. 
+ 
+    Form 2 creates a `~cycler.Cycler` which cycles over one or more 
+    properties simultaneously. If multiple properties are given, their 
+    value lists must have the same length. 
+ 
+    Form 3 creates a `~cycler.Cycler` for a single property. This form 
+    exists for compatibility with the original cycler. Its use is 
+    discouraged in favor of the kwarg form, i.e. ``cycler(label=values)``. 
+ 
+    Parameters 
+    ---------- 
+    cycler : Cycler 
+        Copy constructor for Cycler. 
+ 
+    label : str 
+        The property key. Must be a valid `.Artist` property. 
+        For example, 'color' or 'linestyle'. Aliases are allowed, 
+        such as 'c' for 'color' and 'lw' for 'linewidth'. 
+ 
+    values : iterable 
+        Finite-length iterable of the property values. These values 
+        are validated and will raise a ValueError if invalid. 
+ 
+    Returns 
+    ------- 
+    Cycler 
+        A new :class:`~cycler.Cycler` for the given properties. 
+ 
+    Examples 
+    -------- 
+    Creating a cycler for a single property: 
+ 
+    &gt;&gt;&gt; c = cycler(color=['red', 'green', 'blue']) 
+ 
+    Creating a cycler for simultaneously cycling over multiple properties 
+    (e.g. red circle, green plus, blue cross): 
+ 
+    &gt;&gt;&gt; c = cycler(color=['red', 'green', 'blue'], 
+    ...            marker=['o', '+', 'x']) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">args </span><span class="s2">and </span><span class="s1">kwargs:</span>
+        <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;cycler() can only accept positional OR keyword &quot;</span>
+                        <span class="s4">&quot;arguments -- not both.&quot;</span><span class="s1">)</span>
+    <span class="s2">elif not </span><span class="s1">args </span><span class="s2">and not </span><span class="s1">kwargs:</span>
+        <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;cycler() must have positional OR keyword arguments&quot;</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">len(args) == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s2">if not </span><span class="s1">isinstance(args[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">Cycler):</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;If only one positional argument given, it must &quot;</span>
+                            <span class="s4">&quot;be a Cycler instance.&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">validate_cycler(args[</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s2">elif </span><span class="s1">len(args) == </span><span class="s5">2</span><span class="s1">:</span>
+        <span class="s1">pairs = [(args[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">args[</span><span class="s5">1</span><span class="s1">])]</span>
+    <span class="s2">elif </span><span class="s1">len(args) &gt; </span><span class="s5">2</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;No more than 2 positional arguments allowed&quot;</span><span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">pairs = kwargs.items()</span>
+
+    <span class="s1">validated = []</span>
+    <span class="s2">for </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">vals </span><span class="s2">in </span><span class="s1">pairs:</span>
+        <span class="s1">norm_prop = _prop_aliases.get(prop</span><span class="s2">, </span><span class="s1">prop)</span>
+        <span class="s1">validator = _prop_validators.get(norm_prop</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">validator </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s4">&quot;Unknown artist property: %s&quot; </span><span class="s1">% prop)</span>
+        <span class="s1">vals = validator(vals)</span>
+        <span class="s3"># We will normalize the property names as well to reduce</span>
+        <span class="s3"># the amount of alias handling code elsewhere.</span>
+        <span class="s1">validated.append((norm_prop</span><span class="s2">, </span><span class="s1">vals))</span>
+
+    <span class="s2">return </span><span class="s1">reduce(operator.add</span><span class="s2">, </span><span class="s1">(ccycler(k</span><span class="s2">, </span><span class="s1">v) </span><span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">validated))</span>
+
+
+<span class="s2">class </span><span class="s1">_DunderChecker(ast.NodeVisitor):</span>
+    <span class="s2">def </span><span class="s1">visit_Attribute(self</span><span class="s2">, </span><span class="s1">node):</span>
+        <span class="s2">if </span><span class="s1">node.attr.startswith(</span><span class="s4">&quot;__&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">node.attr.endswith(</span><span class="s4">&quot;__&quot;</span><span class="s1">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;cycler strings with dunders are forbidden&quot;</span><span class="s1">)</span>
+        <span class="s1">self.generic_visit(node)</span>
+
+
+<span class="s2">def </span><span class="s1">validate_cycler(s):</span>
+    <span class="s0">&quot;&quot;&quot;Return a Cycler object from a string repr or the object itself.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s3"># TODO: We might want to rethink this...</span>
+        <span class="s3"># While I think I have it quite locked down, it is execution of</span>
+        <span class="s3"># arbitrary code without sanitation.</span>
+        <span class="s3"># Combine this with the possibility that rcparams might come from the</span>
+        <span class="s3"># internet (future plans), this could be downright dangerous.</span>
+        <span class="s3"># I locked it down by only having the 'cycler()' function available.</span>
+        <span class="s3"># UPDATE: Partly plugging a security hole.</span>
+        <span class="s3"># I really should have read this:</span>
+        <span class="s3"># https://nedbatchelder.com/blog/201206/eval_really_is_dangerous.html</span>
+        <span class="s3"># We should replace this eval with a combo of PyParsing and</span>
+        <span class="s3"># ast.literal_eval()</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">_DunderChecker().visit(ast.parse(s))</span>
+            <span class="s1">s = eval(s</span><span class="s2">, </span><span class="s1">{</span><span class="s4">'cycler'</span><span class="s1">: cycler</span><span class="s2">, </span><span class="s4">'__builtins__'</span><span class="s1">: {}})</span>
+        <span class="s2">except </span><span class="s1">BaseException </span><span class="s2">as </span><span class="s1">e:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r} </span><span class="s4">is not a valid cycler construction: </span><span class="s2">{</span><span class="s1">e</span><span class="s2">}</span><span class="s4">&quot;</span>
+                             <span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s3"># Should make sure what comes from the above eval()</span>
+    <span class="s3"># is a Cycler object.</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">Cycler):</span>
+        <span class="s1">cycler_inst = s</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;Object is not a string or Cycler instance: </span><span class="s2">{</span><span class="s1">s</span><span class="s2">!r}</span><span class="s4">&quot;</span><span class="s1">)</span>
+
+    <span class="s1">unknowns = cycler_inst.keys - (set(_prop_validators) | set(_prop_aliases))</span>
+    <span class="s2">if </span><span class="s1">unknowns:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Unknown artist properties: %s&quot; </span><span class="s1">% unknowns)</span>
+
+    <span class="s3"># Not a full validation, but it'll at least normalize property names</span>
+    <span class="s3"># A fuller validation would require v0.10 of cycler.</span>
+    <span class="s1">checker = set()</span>
+    <span class="s2">for </span><span class="s1">prop </span><span class="s2">in </span><span class="s1">cycler_inst.keys:</span>
+        <span class="s1">norm_prop = _prop_aliases.get(prop</span><span class="s2">, </span><span class="s1">prop)</span>
+        <span class="s2">if </span><span class="s1">norm_prop != prop </span><span class="s2">and </span><span class="s1">norm_prop </span><span class="s2">in </span><span class="s1">cycler_inst.keys:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;Cannot specify both </span><span class="s2">{</span><span class="s1">norm_prop</span><span class="s2">!r} </span><span class="s4">and alias &quot;</span>
+                             <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">prop</span><span class="s2">!r} </span><span class="s4">in the same prop_cycle&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">norm_prop </span><span class="s2">in </span><span class="s1">checker:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;Another property was already aliased to &quot;</span>
+                             <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">norm_prop</span><span class="s2">!r}</span><span class="s4">. Collision normalizing </span><span class="s2">{</span><span class="s1">prop</span><span class="s2">!r}</span><span class="s4">.&quot;</span><span class="s1">)</span>
+        <span class="s1">checker.update([norm_prop])</span>
+
+    <span class="s3"># This is just an extra-careful check, just in case there is some</span>
+    <span class="s3"># edge-case I haven't thought of.</span>
+    <span class="s2">assert </span><span class="s1">len(checker) == len(cycler_inst.keys)</span>
+
+    <span class="s3"># Now, it should be safe to mutate this cycler</span>
+    <span class="s2">for </span><span class="s1">prop </span><span class="s2">in </span><span class="s1">cycler_inst.keys:</span>
+        <span class="s1">norm_prop = _prop_aliases.get(prop</span><span class="s2">, </span><span class="s1">prop)</span>
+        <span class="s1">cycler_inst.change_key(prop</span><span class="s2">, </span><span class="s1">norm_prop)</span>
+
+    <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">vals </span><span class="s2">in </span><span class="s1">cycler_inst.by_key().items():</span>
+        <span class="s1">_prop_validators[key](vals)</span>
+
+    <span class="s2">return </span><span class="s1">cycler_inst</span>
+
+
+<span class="s2">def </span><span class="s1">validate_hist_bins(s):</span>
+    <span class="s1">valid_strs = [</span><span class="s4">&quot;auto&quot;</span><span class="s2">, </span><span class="s4">&quot;sturges&quot;</span><span class="s2">, </span><span class="s4">&quot;fd&quot;</span><span class="s2">, </span><span class="s4">&quot;doane&quot;</span><span class="s2">, </span><span class="s4">&quot;scott&quot;</span><span class="s2">, </span><span class="s4">&quot;rice&quot;</span><span class="s2">, </span><span class="s4">&quot;sqrt&quot;</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str) </span><span class="s2">and </span><span class="s1">s </span><span class="s2">in </span><span class="s1">valid_strs:</span>
+        <span class="s2">return </span><span class="s1">s</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">int(s)</span>
+    <span class="s2">except </span><span class="s1">(TypeError</span><span class="s2">, </span><span class="s1">ValueError):</span>
+        <span class="s2">pass</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">validate_floatlist(s)</span>
+    <span class="s2">except </span><span class="s1">ValueError:</span>
+        <span class="s2">pass</span>
+    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;'hist.bins' must be one of {}, an int or&quot;</span>
+                     <span class="s4">&quot; a sequence of floats&quot;</span><span class="s1">.format(valid_strs))</span>
+
+
+<span class="s2">class </span><span class="s1">_ignorecase(list):</span>
+    <span class="s0">&quot;&quot;&quot;A marker class indicating that a list-of-str is case-insensitive.&quot;&quot;&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">_convert_validator_spec(key</span><span class="s2">, </span><span class="s1">conv):</span>
+    <span class="s2">if </span><span class="s1">isinstance(conv</span><span class="s2">, </span><span class="s1">list):</span>
+        <span class="s1">ignorecase = isinstance(conv</span><span class="s2">, </span><span class="s1">_ignorecase)</span>
+        <span class="s2">return </span><span class="s1">ValidateInStrings(key</span><span class="s2">, </span><span class="s1">conv</span><span class="s2">, </span><span class="s1">ignorecase=ignorecase)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">conv</span>
+
+
+<span class="s3"># Mapping of rcParams to validators.</span>
+<span class="s3"># Converters given as lists or _ignorecase are converted to ValidateInStrings</span>
+<span class="s3"># immediately below.</span>
+<span class="s3"># The rcParams defaults are defined in matplotlibrc.template, which gets copied</span>
+<span class="s3"># to matplotlib/mpl-data/matplotlibrc by the setup script.</span>
+<span class="s1">_validators = {</span>
+    <span class="s4">&quot;backend&quot;</span><span class="s1">:           validate_backend</span><span class="s2">,</span>
+    <span class="s4">&quot;backend_fallback&quot;</span><span class="s1">:  validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.hooks&quot;</span><span class="s1">:      validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;toolbar&quot;</span><span class="s1">:           _validate_toolbar</span><span class="s2">,</span>
+    <span class="s4">&quot;interactive&quot;</span><span class="s1">:       validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;timezone&quot;</span><span class="s1">:          validate_string</span><span class="s2">,</span>
+
+    <span class="s4">&quot;webagg.port&quot;</span><span class="s1">:            validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;webagg.address&quot;</span><span class="s1">:         validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;webagg.open_in_browser&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;webagg.port_retries&quot;</span><span class="s1">:    validate_int</span><span class="s2">,</span>
+
+    <span class="s3"># line props</span>
+    <span class="s4">&quot;lines.linewidth&quot;</span><span class="s1">:       validate_float</span><span class="s2">,  </span><span class="s3"># line width in points</span>
+    <span class="s4">&quot;lines.linestyle&quot;</span><span class="s1">:       _validate_linestyle</span><span class="s2">,  </span><span class="s3"># solid line</span>
+    <span class="s4">&quot;lines.color&quot;</span><span class="s1">:           validate_color</span><span class="s2">,  </span><span class="s3"># first color in color cycle</span>
+    <span class="s4">&quot;lines.marker&quot;</span><span class="s1">:          validate_string</span><span class="s2">,  </span><span class="s3"># marker name</span>
+    <span class="s4">&quot;lines.markerfacecolor&quot;</span><span class="s1">: validate_color_or_auto</span><span class="s2">,  </span><span class="s3"># default color</span>
+    <span class="s4">&quot;lines.markeredgecolor&quot;</span><span class="s1">: validate_color_or_auto</span><span class="s2">,  </span><span class="s3"># default color</span>
+    <span class="s4">&quot;lines.markeredgewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.markersize&quot;</span><span class="s1">:      validate_float</span><span class="s2">,  </span><span class="s3"># markersize, in points</span>
+    <span class="s4">&quot;lines.antialiased&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,  </span><span class="s3"># antialiased (no jaggies)</span>
+    <span class="s4">&quot;lines.dash_joinstyle&quot;</span><span class="s1">:  JoinStyle</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.solid_joinstyle&quot;</span><span class="s1">: JoinStyle</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.dash_capstyle&quot;</span><span class="s1">:   CapStyle</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.solid_capstyle&quot;</span><span class="s1">:  CapStyle</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.dashed_pattern&quot;</span><span class="s1">:  validate_floatlist</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.dashdot_pattern&quot;</span><span class="s1">: validate_floatlist</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.dotted_pattern&quot;</span><span class="s1">:  validate_floatlist</span><span class="s2">,</span>
+    <span class="s4">&quot;lines.scale_dashes&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,</span>
+
+    <span class="s3"># marker props</span>
+    <span class="s4">&quot;markers.fillstyle&quot;</span><span class="s1">: validate_fillstyle</span><span class="s2">,</span>
+
+    <span class="s3">## pcolor(mesh) props:</span>
+    <span class="s4">&quot;pcolor.shading&quot;</span><span class="s1">: [</span><span class="s4">&quot;auto&quot;</span><span class="s2">, </span><span class="s4">&quot;flat&quot;</span><span class="s2">, </span><span class="s4">&quot;nearest&quot;</span><span class="s2">, </span><span class="s4">&quot;gouraud&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;pcolormesh.snap&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+
+    <span class="s3">## patch props</span>
+    <span class="s4">&quot;patch.linewidth&quot;</span><span class="s1">:       validate_float</span><span class="s2">,  </span><span class="s3"># line width in points</span>
+    <span class="s4">&quot;patch.edgecolor&quot;</span><span class="s1">:       validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;patch.force_edgecolor&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;patch.facecolor&quot;</span><span class="s1">:       validate_color</span><span class="s2">,  </span><span class="s3"># first color in cycle</span>
+    <span class="s4">&quot;patch.antialiased&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,  </span><span class="s3"># antialiased (no jaggies)</span>
+
+    <span class="s3">## hatch props</span>
+    <span class="s4">&quot;hatch.color&quot;</span><span class="s1">:     validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;hatch.linewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+
+    <span class="s3">## Histogram properties</span>
+    <span class="s4">&quot;hist.bins&quot;</span><span class="s1">: validate_hist_bins</span><span class="s2">,</span>
+
+    <span class="s3">## Boxplot properties</span>
+    <span class="s4">&quot;boxplot.notch&quot;</span><span class="s1">:       validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.vertical&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.whiskers&quot;</span><span class="s1">:    validate_whiskers</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.bootstrap&quot;</span><span class="s1">:   validate_int_or_None</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.patchartist&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.showmeans&quot;</span><span class="s1">:   validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.showcaps&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.showbox&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.showfliers&quot;</span><span class="s1">:  validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanline&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,</span>
+
+    <span class="s4">&quot;boxplot.flierprops.color&quot;</span><span class="s1">:           validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.marker&quot;</span><span class="s1">:          validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.markerfacecolor&quot;</span><span class="s1">: validate_color_or_auto</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.markeredgecolor&quot;</span><span class="s1">: validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.markeredgewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.markersize&quot;</span><span class="s1">:      validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.linestyle&quot;</span><span class="s1">:       _validate_linestyle</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.flierprops.linewidth&quot;</span><span class="s1">:       validate_float</span><span class="s2">,</span>
+
+    <span class="s4">&quot;boxplot.boxprops.color&quot;</span><span class="s1">:     validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.boxprops.linewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.boxprops.linestyle&quot;</span><span class="s1">: _validate_linestyle</span><span class="s2">,</span>
+
+    <span class="s4">&quot;boxplot.whiskerprops.color&quot;</span><span class="s1">:     validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.whiskerprops.linewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.whiskerprops.linestyle&quot;</span><span class="s1">: _validate_linestyle</span><span class="s2">,</span>
+
+    <span class="s4">&quot;boxplot.capprops.color&quot;</span><span class="s1">:     validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.capprops.linewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.capprops.linestyle&quot;</span><span class="s1">: _validate_linestyle</span><span class="s2">,</span>
+
+    <span class="s4">&quot;boxplot.medianprops.color&quot;</span><span class="s1">:     validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.medianprops.linewidth&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.medianprops.linestyle&quot;</span><span class="s1">: _validate_linestyle</span><span class="s2">,</span>
+
+    <span class="s4">&quot;boxplot.meanprops.color&quot;</span><span class="s1">:           validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanprops.marker&quot;</span><span class="s1">:          validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanprops.markerfacecolor&quot;</span><span class="s1">: validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanprops.markeredgecolor&quot;</span><span class="s1">: validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanprops.markersize&quot;</span><span class="s1">:      validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanprops.linestyle&quot;</span><span class="s1">:       _validate_linestyle</span><span class="s2">,</span>
+    <span class="s4">&quot;boxplot.meanprops.linewidth&quot;</span><span class="s1">:       validate_float</span><span class="s2">,</span>
+
+    <span class="s3">## font props</span>
+    <span class="s4">&quot;font.family&quot;</span><span class="s1">:     validate_stringlist</span><span class="s2">,  </span><span class="s3"># used by text object</span>
+    <span class="s4">&quot;font.style&quot;</span><span class="s1">:      validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;font.variant&quot;</span><span class="s1">:    validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;font.stretch&quot;</span><span class="s1">:    validate_fontstretch</span><span class="s2">,</span>
+    <span class="s4">&quot;font.weight&quot;</span><span class="s1">:     validate_fontweight</span><span class="s2">,</span>
+    <span class="s4">&quot;font.size&quot;</span><span class="s1">:       validate_float</span><span class="s2">,  </span><span class="s3"># Base font size in points</span>
+    <span class="s4">&quot;font.serif&quot;</span><span class="s1">:      validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;font.sans-serif&quot;</span><span class="s1">: validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;font.cursive&quot;</span><span class="s1">:    validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;font.fantasy&quot;</span><span class="s1">:    validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;font.monospace&quot;</span><span class="s1">:  validate_stringlist</span><span class="s2">,</span>
+
+    <span class="s3"># text props</span>
+    <span class="s4">&quot;text.color&quot;</span><span class="s1">:          validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;text.usetex&quot;</span><span class="s1">:         validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;text.latex.preamble&quot;</span><span class="s1">: validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;text.hinting&quot;</span><span class="s1">:        [</span><span class="s4">&quot;default&quot;</span><span class="s2">, </span><span class="s4">&quot;no_autohint&quot;</span><span class="s2">, </span><span class="s4">&quot;force_autohint&quot;</span><span class="s2">,</span>
+                            <span class="s4">&quot;no_hinting&quot;</span><span class="s2">, </span><span class="s4">&quot;auto&quot;</span><span class="s2">, </span><span class="s4">&quot;native&quot;</span><span class="s2">, </span><span class="s4">&quot;either&quot;</span><span class="s2">, </span><span class="s4">&quot;none&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;text.hinting_factor&quot;</span><span class="s1">: validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;text.kerning_factor&quot;</span><span class="s1">: validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;text.antialiased&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;text.parse_math&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,</span>
+
+    <span class="s4">&quot;mathtext.cal&quot;</span><span class="s1">:            validate_font_properties</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.rm&quot;</span><span class="s1">:             validate_font_properties</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.tt&quot;</span><span class="s1">:             validate_font_properties</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.it&quot;</span><span class="s1">:             validate_font_properties</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.bf&quot;</span><span class="s1">:             validate_font_properties</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.sf&quot;</span><span class="s1">:             validate_font_properties</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.fontset&quot;</span><span class="s1">:        [</span><span class="s4">&quot;dejavusans&quot;</span><span class="s2">, </span><span class="s4">&quot;dejavuserif&quot;</span><span class="s2">, </span><span class="s4">&quot;cm&quot;</span><span class="s2">, </span><span class="s4">&quot;stix&quot;</span><span class="s2">,</span>
+                                <span class="s4">&quot;stixsans&quot;</span><span class="s2">, </span><span class="s4">&quot;custom&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.default&quot;</span><span class="s1">:        [</span><span class="s4">&quot;rm&quot;</span><span class="s2">, </span><span class="s4">&quot;cal&quot;</span><span class="s2">, </span><span class="s4">&quot;it&quot;</span><span class="s2">, </span><span class="s4">&quot;tt&quot;</span><span class="s2">, </span><span class="s4">&quot;sf&quot;</span><span class="s2">, </span><span class="s4">&quot;bf&quot;</span><span class="s2">, </span><span class="s4">&quot;default&quot;</span><span class="s2">,</span>
+                                <span class="s4">&quot;bb&quot;</span><span class="s2">, </span><span class="s4">&quot;frak&quot;</span><span class="s2">, </span><span class="s4">&quot;scr&quot;</span><span class="s2">, </span><span class="s4">&quot;regular&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;mathtext.fallback&quot;</span><span class="s1">:       _validate_mathtext_fallback</span><span class="s2">,</span>
+
+    <span class="s4">&quot;image.aspect&quot;</span><span class="s1">:          validate_aspect</span><span class="s2">,  </span><span class="s3"># equal, auto, a number</span>
+    <span class="s4">&quot;image.interpolation&quot;</span><span class="s1">:   validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;image.cmap&quot;</span><span class="s1">:            _validate_cmap</span><span class="s2">,  </span><span class="s3"># gray, jet, etc.</span>
+    <span class="s4">&quot;image.lut&quot;</span><span class="s1">:             validate_int</span><span class="s2">,  </span><span class="s3"># lookup table</span>
+    <span class="s4">&quot;image.origin&quot;</span><span class="s1">:          [</span><span class="s4">&quot;upper&quot;</span><span class="s2">, </span><span class="s4">&quot;lower&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;image.resample&quot;</span><span class="s1">:        validate_bool</span><span class="s2">,</span>
+    <span class="s3"># Specify whether vector graphics backends will combine all images on a</span>
+    <span class="s3"># set of axes into a single composite image</span>
+    <span class="s4">&quot;image.composite_image&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+
+    <span class="s3"># contour props</span>
+    <span class="s4">&quot;contour.negative_linestyle&quot;</span><span class="s1">: _validate_linestyle</span><span class="s2">,</span>
+    <span class="s4">&quot;contour.corner_mask&quot;</span><span class="s1">:        validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;contour.linewidth&quot;</span><span class="s1">:          validate_float_or_None</span><span class="s2">,</span>
+    <span class="s4">&quot;contour.algorithm&quot;</span><span class="s1">:          [</span><span class="s4">&quot;mpl2005&quot;</span><span class="s2">, </span><span class="s4">&quot;mpl2014&quot;</span><span class="s2">, </span><span class="s4">&quot;serial&quot;</span><span class="s2">, </span><span class="s4">&quot;threaded&quot;</span><span class="s1">]</span><span class="s2">,</span>
+
+    <span class="s3"># errorbar props</span>
+    <span class="s4">&quot;errorbar.capsize&quot;</span><span class="s1">: validate_float</span><span class="s2">,</span>
+
+    <span class="s3"># axis props</span>
+    <span class="s3"># alignment of x/y axis title</span>
+    <span class="s4">&quot;xaxis.labellocation&quot;</span><span class="s1">: [</span><span class="s4">&quot;left&quot;</span><span class="s2">, </span><span class="s4">&quot;center&quot;</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;yaxis.labellocation&quot;</span><span class="s1">: [</span><span class="s4">&quot;bottom&quot;</span><span class="s2">, </span><span class="s4">&quot;center&quot;</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s1">]</span><span class="s2">,</span>
+
+    <span class="s3"># axes props</span>
+    <span class="s4">&quot;axes.axisbelow&quot;</span><span class="s1">:        validate_axisbelow</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.facecolor&quot;</span><span class="s1">:        validate_color</span><span class="s2">,  </span><span class="s3"># background color</span>
+    <span class="s4">&quot;axes.edgecolor&quot;</span><span class="s1">:        validate_color</span><span class="s2">,  </span><span class="s3"># edge color</span>
+    <span class="s4">&quot;axes.linewidth&quot;</span><span class="s1">:        validate_float</span><span class="s2">,  </span><span class="s3"># edge linewidth</span>
+
+    <span class="s4">&quot;axes.spines.left&quot;</span><span class="s1">:      validate_bool</span><span class="s2">,  </span><span class="s3"># Set visibility of axes spines,</span>
+    <span class="s4">&quot;axes.spines.right&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,  </span><span class="s3"># i.e., the lines around the chart</span>
+    <span class="s4">&quot;axes.spines.bottom&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,  </span><span class="s3"># denoting data boundary.</span>
+    <span class="s4">&quot;axes.spines.top&quot;</span><span class="s1">:       validate_bool</span><span class="s2">,</span>
+
+    <span class="s4">&quot;axes.titlesize&quot;</span><span class="s1">:     validate_fontsize</span><span class="s2">,  </span><span class="s3"># axes title fontsize</span>
+    <span class="s4">&quot;axes.titlelocation&quot;</span><span class="s1">: [</span><span class="s4">&quot;left&quot;</span><span class="s2">, </span><span class="s4">&quot;center&quot;</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># axes title alignment</span>
+    <span class="s4">&quot;axes.titleweight&quot;</span><span class="s1">:   validate_fontweight</span><span class="s2">,  </span><span class="s3"># axes title font weight</span>
+    <span class="s4">&quot;axes.titlecolor&quot;</span><span class="s1">:    validate_color_or_auto</span><span class="s2">,  </span><span class="s3"># axes title font color</span>
+    <span class="s3"># title location, axes units, None means auto</span>
+    <span class="s4">&quot;axes.titley&quot;</span><span class="s1">:        validate_float_or_None</span><span class="s2">,</span>
+    <span class="s3"># pad from axes top decoration to title in points</span>
+    <span class="s4">&quot;axes.titlepad&quot;</span><span class="s1">:      validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.grid&quot;</span><span class="s1">:          validate_bool</span><span class="s2">,  </span><span class="s3"># display grid or not</span>
+    <span class="s4">&quot;axes.grid.which&quot;</span><span class="s1">:    [</span><span class="s4">&quot;minor&quot;</span><span class="s2">, </span><span class="s4">&quot;both&quot;</span><span class="s2">, </span><span class="s4">&quot;major&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># which grids are drawn</span>
+    <span class="s4">&quot;axes.grid.axis&quot;</span><span class="s1">:     [</span><span class="s4">&quot;x&quot;</span><span class="s2">, </span><span class="s4">&quot;y&quot;</span><span class="s2">, </span><span class="s4">&quot;both&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># grid type</span>
+    <span class="s4">&quot;axes.labelsize&quot;</span><span class="s1">:     validate_fontsize</span><span class="s2">,  </span><span class="s3"># fontsize of x &amp; y labels</span>
+    <span class="s4">&quot;axes.labelpad&quot;</span><span class="s1">:      validate_float</span><span class="s2">,  </span><span class="s3"># space between label and axis</span>
+    <span class="s4">&quot;axes.labelweight&quot;</span><span class="s1">:   validate_fontweight</span><span class="s2">,  </span><span class="s3"># fontsize of x &amp; y labels</span>
+    <span class="s4">&quot;axes.labelcolor&quot;</span><span class="s1">:    validate_color</span><span class="s2">,  </span><span class="s3"># color of axis label</span>
+    <span class="s3"># use scientific notation if log10 of the axis range is smaller than the</span>
+    <span class="s3"># first or larger than the second</span>
+    <span class="s4">&quot;axes.formatter.limits&quot;</span><span class="s1">: _listify_validator(validate_int</span><span class="s2">, </span><span class="s1">n=</span><span class="s5">2</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s3"># use current locale to format ticks</span>
+    <span class="s4">&quot;axes.formatter.use_locale&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.formatter.use_mathtext&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s3"># minimum exponent to format in scientific notation</span>
+    <span class="s4">&quot;axes.formatter.min_exponent&quot;</span><span class="s1">: validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.formatter.useoffset&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.formatter.offset_threshold&quot;</span><span class="s1">: validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.unicode_minus&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s3"># This entry can be either a cycler object or a string repr of a</span>
+    <span class="s3"># cycler-object, which gets eval()'ed to create the object.</span>
+    <span class="s4">&quot;axes.prop_cycle&quot;</span><span class="s1">: validate_cycler</span><span class="s2">,</span>
+    <span class="s3"># If &quot;data&quot;, axes limits are set close to the data.</span>
+    <span class="s3"># If &quot;round_numbers&quot; axes limits are set to the nearest round numbers.</span>
+    <span class="s4">&quot;axes.autolimit_mode&quot;</span><span class="s1">: [</span><span class="s4">&quot;data&quot;</span><span class="s2">, </span><span class="s4">&quot;round_numbers&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;axes.xmargin&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># margin added to xaxis</span>
+    <span class="s4">&quot;axes.ymargin&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># margin added to yaxis</span>
+    <span class="s4">'axes.zmargin'</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># margin added to zaxis</span>
+
+    <span class="s4">&quot;polaraxes.grid&quot;</span><span class="s1">: validate_bool</span><span class="s2">,  </span><span class="s3"># display polar grid or not</span>
+    <span class="s4">&quot;axes3d.grid&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,  </span><span class="s3"># display 3d grid</span>
+
+    <span class="s4">&quot;axes3d.xaxis.panecolor&quot;</span><span class="s1">:    validate_color</span><span class="s2">,  </span><span class="s3"># 3d background pane</span>
+    <span class="s4">&quot;axes3d.yaxis.panecolor&quot;</span><span class="s1">:    validate_color</span><span class="s2">,  </span><span class="s3"># 3d background pane</span>
+    <span class="s4">&quot;axes3d.zaxis.panecolor&quot;</span><span class="s1">:    validate_color</span><span class="s2">,  </span><span class="s3"># 3d background pane</span>
+
+    <span class="s3"># scatter props</span>
+    <span class="s4">&quot;scatter.marker&quot;</span><span class="s1">:     validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;scatter.edgecolors&quot;</span><span class="s1">: validate_string</span><span class="s2">,</span>
+
+    <span class="s4">&quot;date.epoch&quot;</span><span class="s1">: _validate_date</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.year&quot;</span><span class="s1">:        validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.month&quot;</span><span class="s1">:       validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.day&quot;</span><span class="s1">:         validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.hour&quot;</span><span class="s1">:        validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.minute&quot;</span><span class="s1">:      validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.second&quot;</span><span class="s1">:      validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;date.autoformatter.microsecond&quot;</span><span class="s1">: validate_string</span><span class="s2">,</span>
+
+    <span class="s4">'date.converter'</span><span class="s1">:          [</span><span class="s4">'auto'</span><span class="s2">, </span><span class="s4">'concise'</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s3"># for auto date locator, choose interval_multiples</span>
+    <span class="s4">'date.interval_multiples'</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+
+    <span class="s3"># legend properties</span>
+    <span class="s4">&quot;legend.fancybox&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;legend.loc&quot;</span><span class="s1">: _ignorecase([</span>
+        <span class="s4">&quot;best&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;upper right&quot;</span><span class="s2">, </span><span class="s4">&quot;upper left&quot;</span><span class="s2">, </span><span class="s4">&quot;lower left&quot;</span><span class="s2">, </span><span class="s4">&quot;lower right&quot;</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;center left&quot;</span><span class="s2">, </span><span class="s4">&quot;center right&quot;</span><span class="s2">, </span><span class="s4">&quot;lower center&quot;</span><span class="s2">, </span><span class="s4">&quot;upper center&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;center&quot;</span><span class="s1">])</span><span class="s2">,</span>
+
+    <span class="s3"># the number of points in the legend line</span>
+    <span class="s4">&quot;legend.numpoints&quot;</span><span class="s1">:      validate_int</span><span class="s2">,</span>
+    <span class="s3"># the number of points in the legend line for scatter</span>
+    <span class="s4">&quot;legend.scatterpoints&quot;</span><span class="s1">:  validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;legend.fontsize&quot;</span><span class="s1">:       validate_fontsize</span><span class="s2">,</span>
+    <span class="s4">&quot;legend.title_fontsize&quot;</span><span class="s1">: validate_fontsize_None</span><span class="s2">,</span>
+    <span class="s3"># color of the legend</span>
+    <span class="s4">&quot;legend.labelcolor&quot;</span><span class="s1">:     _validate_color_or_linecolor</span><span class="s2">,</span>
+    <span class="s3"># the relative size of legend markers vs. original</span>
+    <span class="s4">&quot;legend.markerscale&quot;</span><span class="s1">:    validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;legend.shadow&quot;</span><span class="s1">:         validate_bool</span><span class="s2">,</span>
+    <span class="s3"># whether or not to draw a frame around legend</span>
+    <span class="s4">&quot;legend.frameon&quot;</span><span class="s1">:        validate_bool</span><span class="s2">,</span>
+    <span class="s3"># alpha value of the legend frame</span>
+    <span class="s4">&quot;legend.framealpha&quot;</span><span class="s1">:     validate_float_or_None</span><span class="s2">,</span>
+
+    <span class="s3">## the following dimensions are in fraction of the font size</span>
+    <span class="s4">&quot;legend.borderpad&quot;</span><span class="s1">:      validate_float</span><span class="s2">,  </span><span class="s3"># units are fontsize</span>
+    <span class="s3"># the vertical space between the legend entries</span>
+    <span class="s4">&quot;legend.labelspacing&quot;</span><span class="s1">:   validate_float</span><span class="s2">,</span>
+    <span class="s3"># the length of the legend lines</span>
+    <span class="s4">&quot;legend.handlelength&quot;</span><span class="s1">:   validate_float</span><span class="s2">,</span>
+    <span class="s3"># the length of the legend lines</span>
+    <span class="s4">&quot;legend.handleheight&quot;</span><span class="s1">:   validate_float</span><span class="s2">,</span>
+    <span class="s3"># the space between the legend line and legend text</span>
+    <span class="s4">&quot;legend.handletextpad&quot;</span><span class="s1">:  validate_float</span><span class="s2">,</span>
+    <span class="s3"># the border between the axes and legend edge</span>
+    <span class="s4">&quot;legend.borderaxespad&quot;</span><span class="s1">:  validate_float</span><span class="s2">,</span>
+    <span class="s3"># the border between the axes and legend edge</span>
+    <span class="s4">&quot;legend.columnspacing&quot;</span><span class="s1">:  validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;legend.facecolor&quot;</span><span class="s1">:      validate_color_or_inherit</span><span class="s2">,</span>
+    <span class="s4">&quot;legend.edgecolor&quot;</span><span class="s1">:      validate_color_or_inherit</span><span class="s2">,</span>
+
+    <span class="s3"># tick properties</span>
+    <span class="s4">&quot;xtick.top&quot;</span><span class="s1">:           validate_bool</span><span class="s2">,      </span><span class="s3"># draw ticks on top side</span>
+    <span class="s4">&quot;xtick.bottom&quot;</span><span class="s1">:        validate_bool</span><span class="s2">,      </span><span class="s3"># draw ticks on bottom side</span>
+    <span class="s4">&quot;xtick.labeltop&quot;</span><span class="s1">:      validate_bool</span><span class="s2">,      </span><span class="s3"># draw label on top</span>
+    <span class="s4">&quot;xtick.labelbottom&quot;</span><span class="s1">:   validate_bool</span><span class="s2">,      </span><span class="s3"># draw label on bottom</span>
+    <span class="s4">&quot;xtick.major.size&quot;</span><span class="s1">:    validate_float</span><span class="s2">,     </span><span class="s3"># major xtick size in points</span>
+    <span class="s4">&quot;xtick.minor.size&quot;</span><span class="s1">:    validate_float</span><span class="s2">,     </span><span class="s3"># minor xtick size in points</span>
+    <span class="s4">&quot;xtick.major.width&quot;</span><span class="s1">:   validate_float</span><span class="s2">,     </span><span class="s3"># major xtick width in points</span>
+    <span class="s4">&quot;xtick.minor.width&quot;</span><span class="s1">:   validate_float</span><span class="s2">,     </span><span class="s3"># minor xtick width in points</span>
+    <span class="s4">&quot;xtick.major.pad&quot;</span><span class="s1">:     validate_float</span><span class="s2">,     </span><span class="s3"># distance to label in points</span>
+    <span class="s4">&quot;xtick.minor.pad&quot;</span><span class="s1">:     validate_float</span><span class="s2">,     </span><span class="s3"># distance to label in points</span>
+    <span class="s4">&quot;xtick.color&quot;</span><span class="s1">:         validate_color</span><span class="s2">,     </span><span class="s3"># color of xticks</span>
+    <span class="s4">&quot;xtick.labelcolor&quot;</span><span class="s1">:    validate_color_or_inherit</span><span class="s2">,  </span><span class="s3"># color of xtick labels</span>
+    <span class="s4">&quot;xtick.minor.visible&quot;</span><span class="s1">: validate_bool</span><span class="s2">,      </span><span class="s3"># visibility of minor xticks</span>
+    <span class="s4">&quot;xtick.minor.top&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,      </span><span class="s3"># draw top minor xticks</span>
+    <span class="s4">&quot;xtick.minor.bottom&quot;</span><span class="s1">:  validate_bool</span><span class="s2">,      </span><span class="s3"># draw bottom minor xticks</span>
+    <span class="s4">&quot;xtick.major.top&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,      </span><span class="s3"># draw top major xticks</span>
+    <span class="s4">&quot;xtick.major.bottom&quot;</span><span class="s1">:  validate_bool</span><span class="s2">,      </span><span class="s3"># draw bottom major xticks</span>
+    <span class="s4">&quot;xtick.labelsize&quot;</span><span class="s1">:     validate_fontsize</span><span class="s2">,  </span><span class="s3"># fontsize of xtick labels</span>
+    <span class="s4">&quot;xtick.direction&quot;</span><span class="s1">:     [</span><span class="s4">&quot;out&quot;</span><span class="s2">, </span><span class="s4">&quot;in&quot;</span><span class="s2">, </span><span class="s4">&quot;inout&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># direction of xticks</span>
+    <span class="s4">&quot;xtick.alignment&quot;</span><span class="s1">:     [</span><span class="s4">&quot;center&quot;</span><span class="s2">, </span><span class="s4">&quot;right&quot;</span><span class="s2">, </span><span class="s4">&quot;left&quot;</span><span class="s1">]</span><span class="s2">,</span>
+
+    <span class="s4">&quot;ytick.left&quot;</span><span class="s1">:          validate_bool</span><span class="s2">,      </span><span class="s3"># draw ticks on left side</span>
+    <span class="s4">&quot;ytick.right&quot;</span><span class="s1">:         validate_bool</span><span class="s2">,      </span><span class="s3"># draw ticks on right side</span>
+    <span class="s4">&quot;ytick.labelleft&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,      </span><span class="s3"># draw tick labels on left side</span>
+    <span class="s4">&quot;ytick.labelright&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,      </span><span class="s3"># draw tick labels on right side</span>
+    <span class="s4">&quot;ytick.major.size&quot;</span><span class="s1">:    validate_float</span><span class="s2">,     </span><span class="s3"># major ytick size in points</span>
+    <span class="s4">&quot;ytick.minor.size&quot;</span><span class="s1">:    validate_float</span><span class="s2">,     </span><span class="s3"># minor ytick size in points</span>
+    <span class="s4">&quot;ytick.major.width&quot;</span><span class="s1">:   validate_float</span><span class="s2">,     </span><span class="s3"># major ytick width in points</span>
+    <span class="s4">&quot;ytick.minor.width&quot;</span><span class="s1">:   validate_float</span><span class="s2">,     </span><span class="s3"># minor ytick width in points</span>
+    <span class="s4">&quot;ytick.major.pad&quot;</span><span class="s1">:     validate_float</span><span class="s2">,     </span><span class="s3"># distance to label in points</span>
+    <span class="s4">&quot;ytick.minor.pad&quot;</span><span class="s1">:     validate_float</span><span class="s2">,     </span><span class="s3"># distance to label in points</span>
+    <span class="s4">&quot;ytick.color&quot;</span><span class="s1">:         validate_color</span><span class="s2">,     </span><span class="s3"># color of yticks</span>
+    <span class="s4">&quot;ytick.labelcolor&quot;</span><span class="s1">:    validate_color_or_inherit</span><span class="s2">,  </span><span class="s3"># color of ytick labels</span>
+    <span class="s4">&quot;ytick.minor.visible&quot;</span><span class="s1">: validate_bool</span><span class="s2">,      </span><span class="s3"># visibility of minor yticks</span>
+    <span class="s4">&quot;ytick.minor.left&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,      </span><span class="s3"># draw left minor yticks</span>
+    <span class="s4">&quot;ytick.minor.right&quot;</span><span class="s1">:   validate_bool</span><span class="s2">,      </span><span class="s3"># draw right minor yticks</span>
+    <span class="s4">&quot;ytick.major.left&quot;</span><span class="s1">:    validate_bool</span><span class="s2">,      </span><span class="s3"># draw left major yticks</span>
+    <span class="s4">&quot;ytick.major.right&quot;</span><span class="s1">:   validate_bool</span><span class="s2">,      </span><span class="s3"># draw right major yticks</span>
+    <span class="s4">&quot;ytick.labelsize&quot;</span><span class="s1">:     validate_fontsize</span><span class="s2">,  </span><span class="s3"># fontsize of ytick labels</span>
+    <span class="s4">&quot;ytick.direction&quot;</span><span class="s1">:     [</span><span class="s4">&quot;out&quot;</span><span class="s2">, </span><span class="s4">&quot;in&quot;</span><span class="s2">, </span><span class="s4">&quot;inout&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># direction of yticks</span>
+    <span class="s4">&quot;ytick.alignment&quot;</span><span class="s1">:     [</span>
+        <span class="s4">&quot;center&quot;</span><span class="s2">, </span><span class="s4">&quot;top&quot;</span><span class="s2">, </span><span class="s4">&quot;bottom&quot;</span><span class="s2">, </span><span class="s4">&quot;baseline&quot;</span><span class="s2">, </span><span class="s4">&quot;center_baseline&quot;</span><span class="s1">]</span><span class="s2">,</span>
+
+    <span class="s4">&quot;grid.color&quot;</span><span class="s1">:        validate_color</span><span class="s2">,  </span><span class="s3"># grid color</span>
+    <span class="s4">&quot;grid.linestyle&quot;</span><span class="s1">:    _validate_linestyle</span><span class="s2">,  </span><span class="s3"># solid</span>
+    <span class="s4">&quot;grid.linewidth&quot;</span><span class="s1">:    validate_float</span><span class="s2">,     </span><span class="s3"># in points</span>
+    <span class="s4">&quot;grid.alpha&quot;</span><span class="s1">:        validate_float</span><span class="s2">,</span>
+
+    <span class="s3">## figure props</span>
+    <span class="s3"># figure title</span>
+    <span class="s4">&quot;figure.titlesize&quot;</span><span class="s1">:   validate_fontsize</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.titleweight&quot;</span><span class="s1">: validate_fontweight</span><span class="s2">,</span>
+
+    <span class="s3"># figure labels</span>
+    <span class="s4">&quot;figure.labelsize&quot;</span><span class="s1">:   validate_fontsize</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.labelweight&quot;</span><span class="s1">: validate_fontweight</span><span class="s2">,</span>
+
+    <span class="s3"># figure size in inches: width by height</span>
+    <span class="s4">&quot;figure.figsize&quot;</span><span class="s1">:          _listify_validator(validate_float</span><span class="s2">, </span><span class="s1">n=</span><span class="s5">2</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.dpi&quot;</span><span class="s1">:              validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.facecolor&quot;</span><span class="s1">:        validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.edgecolor&quot;</span><span class="s1">:        validate_color</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.frameon&quot;</span><span class="s1">:          validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.autolayout&quot;</span><span class="s1">:       validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.max_open_warning&quot;</span><span class="s1">: validate_int</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.raise_window&quot;</span><span class="s1">:     validate_bool</span><span class="s2">,</span>
+
+    <span class="s4">&quot;figure.subplot.left&quot;</span><span class="s1">:   _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.subplot.right&quot;</span><span class="s1">:  _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.subplot.bottom&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.subplot.top&quot;</span><span class="s1">:    _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.subplot.wspace&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt; 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.subplot.hspace&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt; 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+
+    <span class="s4">&quot;figure.constrained_layout.use&quot;</span><span class="s1">: validate_bool</span><span class="s2">,  </span><span class="s3"># run constrained_layout?</span>
+    <span class="s3"># wspace and hspace are fraction of adjacent subplots to use for space.</span>
+    <span class="s3"># Much smaller than above because we don't need room for the text.</span>
+    <span class="s4">&quot;figure.constrained_layout.hspace&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt; 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;figure.constrained_layout.wspace&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt; 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s3"># buffer around the axes, in inches.</span>
+    <span class="s4">'figure.constrained_layout.h_pad'</span><span class="s1">: validate_float</span><span class="s2">,</span>
+    <span class="s4">'figure.constrained_layout.w_pad'</span><span class="s1">: validate_float</span><span class="s2">,</span>
+
+    <span class="s3">## Saving figure's properties</span>
+    <span class="s4">'savefig.dpi'</span><span class="s1">:          validate_dpi</span><span class="s2">,</span>
+    <span class="s4">'savefig.facecolor'</span><span class="s1">:    validate_color_or_auto</span><span class="s2">,</span>
+    <span class="s4">'savefig.edgecolor'</span><span class="s1">:    validate_color_or_auto</span><span class="s2">,</span>
+    <span class="s4">'savefig.orientation'</span><span class="s1">:  [</span><span class="s4">'landscape'</span><span class="s2">, </span><span class="s4">'portrait'</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;savefig.format&quot;</span><span class="s1">:       validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;savefig.bbox&quot;</span><span class="s1">:         validate_bbox</span><span class="s2">,  </span><span class="s3"># &quot;tight&quot;, or &quot;standard&quot; (= None)</span>
+    <span class="s4">&quot;savefig.pad_inches&quot;</span><span class="s1">:   validate_float</span><span class="s2">,</span>
+    <span class="s3"># default directory in savefig dialog box</span>
+    <span class="s4">&quot;savefig.directory&quot;</span><span class="s1">:    _validate_pathlike</span><span class="s2">,</span>
+    <span class="s4">&quot;savefig.transparent&quot;</span><span class="s1">:  validate_bool</span><span class="s2">,</span>
+
+    <span class="s4">&quot;tk.window_focus&quot;</span><span class="s1">: validate_bool</span><span class="s2">,  </span><span class="s3"># Maintain shell focus for TkAgg</span>
+
+    <span class="s3"># Set the papersize/type</span>
+    <span class="s4">&quot;ps.papersize&quot;</span><span class="s1">:       _ignorecase([</span><span class="s4">&quot;auto&quot;</span><span class="s2">, </span><span class="s4">&quot;letter&quot;</span><span class="s2">, </span><span class="s4">&quot;legal&quot;</span><span class="s2">, </span><span class="s4">&quot;ledger&quot;</span><span class="s2">,</span>
+                                      <span class="s1">*[</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">ab</span><span class="s2">}{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">&quot;</span>
+                                        <span class="s2">for </span><span class="s1">ab </span><span class="s2">in </span><span class="s4">&quot;ab&quot; </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">11</span><span class="s1">)]])</span><span class="s2">,</span>
+    <span class="s4">&quot;ps.useafm&quot;</span><span class="s1">:          validate_bool</span><span class="s2">,</span>
+    <span class="s3"># use ghostscript or xpdf to distill ps output</span>
+    <span class="s4">&quot;ps.usedistiller&quot;</span><span class="s1">:    validate_ps_distiller</span><span class="s2">,</span>
+    <span class="s4">&quot;ps.distiller.res&quot;</span><span class="s1">:   validate_int</span><span class="s2">,  </span><span class="s3"># dpi</span>
+    <span class="s4">&quot;ps.fonttype&quot;</span><span class="s1">:        validate_fonttype</span><span class="s2">,  </span><span class="s3"># 3 (Type3) or 42 (Truetype)</span>
+    <span class="s4">&quot;pdf.compression&quot;</span><span class="s1">:    validate_int</span><span class="s2">,  </span><span class="s3"># 0-9 compression level; 0 to disable</span>
+    <span class="s4">&quot;pdf.inheritcolor&quot;</span><span class="s1">:   validate_bool</span><span class="s2">,  </span><span class="s3"># skip color setting commands</span>
+    <span class="s3"># use only the 14 PDF core fonts embedded in every PDF viewing application</span>
+    <span class="s4">&quot;pdf.use14corefonts&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;pdf.fonttype&quot;</span><span class="s1">:       validate_fonttype</span><span class="s2">,  </span><span class="s3"># 3 (Type3) or 42 (Truetype)</span>
+
+    <span class="s4">&quot;pgf.texsystem&quot;</span><span class="s1">: [</span><span class="s4">&quot;xelatex&quot;</span><span class="s2">, </span><span class="s4">&quot;lualatex&quot;</span><span class="s2">, </span><span class="s4">&quot;pdflatex&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># latex variant used</span>
+    <span class="s4">&quot;pgf.rcfonts&quot;</span><span class="s1">:   validate_bool</span><span class="s2">,  </span><span class="s3"># use mpl's rc settings for font config</span>
+    <span class="s4">&quot;pgf.preamble&quot;</span><span class="s1">:  validate_string</span><span class="s2">,  </span><span class="s3"># custom LaTeX preamble</span>
+
+    <span class="s3"># write raster image data into the svg file</span>
+    <span class="s4">&quot;svg.image_inline&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;svg.fonttype&quot;</span><span class="s1">: [</span><span class="s4">&quot;none&quot;</span><span class="s2">, </span><span class="s4">&quot;path&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s3"># save text as text (&quot;none&quot;) or &quot;paths&quot;</span>
+    <span class="s4">&quot;svg.hashsalt&quot;</span><span class="s1">: validate_string_or_None</span><span class="s2">,</span>
+
+    <span class="s3"># set this when you want to generate hardcopy docstring</span>
+    <span class="s4">&quot;docstring.hardcopy&quot;</span><span class="s1">: validate_bool</span><span class="s2">,</span>
+
+    <span class="s4">&quot;path.simplify&quot;</span><span class="s1">:           validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;path.simplify_threshold&quot;</span><span class="s1">: _range_validators[</span><span class="s4">&quot;0 &lt;= x &lt;= 1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s4">&quot;path.snap&quot;</span><span class="s1">:               validate_bool</span><span class="s2">,</span>
+    <span class="s4">&quot;path.sketch&quot;</span><span class="s1">:             validate_sketch</span><span class="s2">,</span>
+    <span class="s4">&quot;path.effects&quot;</span><span class="s1">:            validate_anylist</span><span class="s2">,</span>
+    <span class="s4">&quot;agg.path.chunksize&quot;</span><span class="s1">:      validate_int</span><span class="s2">,  </span><span class="s3"># 0 to disable chunking</span>
+
+    <span class="s3"># key-mappings (multi-character mappings should be a list/tuple)</span>
+    <span class="s4">&quot;keymap.fullscreen&quot;</span><span class="s1">: validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.home&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.back&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.forward&quot;</span><span class="s1">:    validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.pan&quot;</span><span class="s1">:        validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.zoom&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.save&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.quit&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.quit_all&quot;</span><span class="s1">:   validate_stringlist</span><span class="s2">,  </span><span class="s3"># e.g.: &quot;W&quot;, &quot;cmd+W&quot;, &quot;Q&quot;</span>
+    <span class="s4">&quot;keymap.grid&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.grid_minor&quot;</span><span class="s1">: validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.yscale&quot;</span><span class="s1">:     validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.xscale&quot;</span><span class="s1">:     validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.help&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+    <span class="s4">&quot;keymap.copy&quot;</span><span class="s1">:       validate_stringlist</span><span class="s2">,</span>
+
+    <span class="s3"># Animation settings</span>
+    <span class="s4">&quot;animation.html&quot;</span><span class="s1">:         [</span><span class="s4">&quot;html5&quot;</span><span class="s2">, </span><span class="s4">&quot;jshtml&quot;</span><span class="s2">, </span><span class="s4">&quot;none&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s3"># Limit, in MB, of size of base64 encoded animation in HTML</span>
+    <span class="s3"># (i.e. IPython notebook)</span>
+    <span class="s4">&quot;animation.embed_limit&quot;</span><span class="s1">:  validate_float</span><span class="s2">,</span>
+    <span class="s4">&quot;animation.writer&quot;</span><span class="s1">:       validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;animation.codec&quot;</span><span class="s1">:        validate_string</span><span class="s2">,</span>
+    <span class="s4">&quot;animation.bitrate&quot;</span><span class="s1">:      validate_int</span><span class="s2">,</span>
+    <span class="s3"># Controls image format when frames are written to disk</span>
+    <span class="s4">&quot;animation.frame_format&quot;</span><span class="s1">: [</span><span class="s4">&quot;png&quot;</span><span class="s2">, </span><span class="s4">&quot;jpeg&quot;</span><span class="s2">, </span><span class="s4">&quot;tiff&quot;</span><span class="s2">, </span><span class="s4">&quot;raw&quot;</span><span class="s2">, </span><span class="s4">&quot;rgba&quot;</span><span class="s2">, </span><span class="s4">&quot;ppm&quot;</span><span class="s2">,</span>
+                               <span class="s4">&quot;sgi&quot;</span><span class="s2">, </span><span class="s4">&quot;bmp&quot;</span><span class="s2">, </span><span class="s4">&quot;pbm&quot;</span><span class="s2">, </span><span class="s4">&quot;svg&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s3"># Path to ffmpeg binary. If just binary name, subprocess uses $PATH.</span>
+    <span class="s4">&quot;animation.ffmpeg_path&quot;</span><span class="s1">:  _validate_pathlike</span><span class="s2">,</span>
+    <span class="s3"># Additional arguments for ffmpeg movie writer (using pipes)</span>
+    <span class="s4">&quot;animation.ffmpeg_args&quot;</span><span class="s1">:  validate_stringlist</span><span class="s2">,</span>
+     <span class="s3"># Path to convert binary. If just binary name, subprocess uses $PATH.</span>
+    <span class="s4">&quot;animation.convert_path&quot;</span><span class="s1">: _validate_pathlike</span><span class="s2">,</span>
+     <span class="s3"># Additional arguments for convert movie writer (using pipes)</span>
+    <span class="s4">&quot;animation.convert_args&quot;</span><span class="s1">: validate_stringlist</span><span class="s2">,</span>
+
+    <span class="s3"># Classic (pre 2.0) compatibility mode</span>
+    <span class="s3"># This is used for things that are hard to make backward compatible</span>
+    <span class="s3"># with a sane rcParam alone.  This does *not* turn on classic mode</span>
+    <span class="s3"># altogether.  For that use `matplotlib.style.use(&quot;classic&quot;)`.</span>
+    <span class="s4">&quot;_internal.classic_mode&quot;</span><span class="s1">: validate_bool</span>
+<span class="s1">}</span>
+<span class="s1">_hardcoded_defaults = {  </span><span class="s3"># Defaults not inferred from matplotlibrc.template...</span>
+    <span class="s3"># ... because they are private:</span>
+    <span class="s4">&quot;_internal.classic_mode&quot;</span><span class="s1">: </span><span class="s2">False,</span>
+    <span class="s3"># ... because they are deprecated:</span>
+    <span class="s3"># No current deprecations.</span>
+    <span class="s3"># backend is handled separately when constructing rcParamsDefault.</span>
+<span class="s1">}</span>
+<span class="s1">_validators = {k: _convert_validator_spec(k</span><span class="s2">, </span><span class="s1">conv)</span>
+               <span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">conv </span><span class="s2">in </span><span class="s1">_validators.items()}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,784 @@
+<html>
+<head>
+<title>setupcfg.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+setupcfg.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Load setuptools configuration from ``setup.cfg`` files. 
+ 
+**API will be made private in the future** 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">os</span>
+
+<span class="s2">import </span><span class="s1">contextlib</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">partial</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">wraps</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">(TYPE_CHECKING</span><span class="s2">, </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Any</span><span class="s2">, </span><span class="s1">Dict</span><span class="s2">, </span><span class="s1">Generic</span><span class="s2">, </span><span class="s1">Iterable</span><span class="s2">, </span><span class="s1">List</span><span class="s2">,</span>
+                    <span class="s1">Optional</span><span class="s2">, </span><span class="s1">Tuple</span><span class="s2">, </span><span class="s1">TypeVar</span><span class="s2">, </span><span class="s1">Union)</span>
+
+<span class="s2">from </span><span class="s1">distutils.errors </span><span class="s2">import </span><span class="s1">DistutilsOptionError</span><span class="s2">, </span><span class="s1">DistutilsFileError</span>
+<span class="s2">from </span><span class="s1">setuptools.extern.packaging.requirements </span><span class="s2">import </span><span class="s1">Requirement</span><span class="s2">, </span><span class="s1">InvalidRequirement</span>
+<span class="s2">from </span><span class="s1">setuptools.extern.packaging.version </span><span class="s2">import </span><span class="s1">Version</span><span class="s2">, </span><span class="s1">InvalidVersion</span>
+<span class="s2">from </span><span class="s1">setuptools.extern.packaging.specifiers </span><span class="s2">import </span><span class="s1">SpecifierSet</span>
+<span class="s2">from </span><span class="s1">setuptools._deprecation_warning </span><span class="s2">import </span><span class="s1">SetuptoolsDeprecationWarning</span>
+
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">expand</span>
+
+<span class="s2">if </span><span class="s1">TYPE_CHECKING:</span>
+    <span class="s2">from </span><span class="s1">setuptools.dist </span><span class="s2">import </span><span class="s1">Distribution  </span><span class="s3"># noqa</span>
+    <span class="s2">from </span><span class="s1">distutils.dist </span><span class="s2">import </span><span class="s1">DistributionMetadata  </span><span class="s3"># noqa</span>
+
+<span class="s1">_Path = Union[str</span><span class="s2">, </span><span class="s1">os.PathLike]</span>
+<span class="s1">SingleCommandOptions = Dict[</span><span class="s4">&quot;str&quot;</span><span class="s2">, </span><span class="s1">Tuple[</span><span class="s4">&quot;str&quot;</span><span class="s2">, </span><span class="s1">Any]]</span>
+<span class="s4">&quot;&quot;&quot;Dict that associate the name of the options of a particular command to a 
+tuple. The first element of the tuple indicates the origin of the option value 
+(e.g. the name of the configuration file where it was read from), 
+while the second element of the tuple is the option value itself 
+&quot;&quot;&quot;</span>
+<span class="s1">AllCommandOptions = Dict[</span><span class="s4">&quot;str&quot;</span><span class="s2">, </span><span class="s1">SingleCommandOptions]  </span><span class="s3"># cmd name =&gt; its options</span>
+<span class="s1">Target = TypeVar(</span><span class="s4">&quot;Target&quot;</span><span class="s2">, </span><span class="s1">bound=Union[</span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s4">&quot;DistributionMetadata&quot;</span><span class="s1">])</span>
+
+
+<span class="s2">def </span><span class="s1">read_configuration(</span>
+    <span class="s1">filepath: _Path</span><span class="s2">,</span>
+    <span class="s1">find_others=</span><span class="s2">False,</span>
+    <span class="s1">ignore_option_errors=</span><span class="s2">False</span>
+<span class="s1">) -&gt; dict:</span>
+    <span class="s0">&quot;&quot;&quot;Read given configuration file and returns options from it as a dict. 
+ 
+    :param str|unicode filepath: Path to configuration file 
+        to get options from. 
+ 
+    :param bool find_others: Whether to search for other configuration files 
+        which could be on in various places. 
+ 
+    :param bool ignore_option_errors: Whether to silently ignore 
+        options, values of which could not be resolved (e.g. due to exceptions 
+        in directives such as file:, attr:, etc.). 
+        If False exceptions are propagated as expected. 
+ 
+    :rtype: dict 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">setuptools.dist </span><span class="s2">import </span><span class="s1">Distribution</span>
+
+    <span class="s1">dist = Distribution()</span>
+    <span class="s1">filenames = dist.find_config_files() </span><span class="s2">if </span><span class="s1">find_others </span><span class="s2">else </span><span class="s1">[]</span>
+    <span class="s1">handlers = _apply(dist</span><span class="s2">, </span><span class="s1">filepath</span><span class="s2">, </span><span class="s1">filenames</span><span class="s2">, </span><span class="s1">ignore_option_errors)</span>
+    <span class="s2">return </span><span class="s1">configuration_to_dict(handlers)</span>
+
+
+<span class="s2">def </span><span class="s1">apply_configuration(dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">filepath: _Path) -&gt; </span><span class="s4">&quot;Distribution&quot;</span><span class="s1">:</span>
+    <span class="s0">&quot;&quot;&quot;Apply the configuration from a ``setup.cfg`` file into an existing 
+    distribution object. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_apply(dist</span><span class="s2">, </span><span class="s1">filepath)</span>
+    <span class="s1">dist._finalize_requires()</span>
+    <span class="s2">return </span><span class="s1">dist</span>
+
+
+<span class="s2">def </span><span class="s1">_apply(</span>
+    <span class="s1">dist: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">, </span><span class="s1">filepath: _Path</span><span class="s2">,</span>
+    <span class="s1">other_files: Iterable[_Path] = ()</span><span class="s2">,</span>
+    <span class="s1">ignore_option_errors: bool = </span><span class="s2">False,</span>
+<span class="s1">) -&gt; Tuple[</span><span class="s4">&quot;ConfigHandler&quot;</span><span class="s2">, </span><span class="s1">...]:</span>
+    <span class="s0">&quot;&quot;&quot;Read configuration from ``filepath`` and applies to the ``dist`` object.&quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">setuptools.dist </span><span class="s2">import </span><span class="s1">_Distribution</span>
+
+    <span class="s1">filepath = os.path.abspath(filepath)</span>
+
+    <span class="s2">if not </span><span class="s1">os.path.isfile(filepath):</span>
+        <span class="s2">raise </span><span class="s1">DistutilsFileError(</span><span class="s4">'Configuration file %s does not exist.' </span><span class="s1">% filepath)</span>
+
+    <span class="s1">current_directory = os.getcwd()</span>
+    <span class="s1">os.chdir(os.path.dirname(filepath))</span>
+    <span class="s1">filenames = [*other_files</span><span class="s2">, </span><span class="s1">filepath]</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">_Distribution.parse_config_files(dist</span><span class="s2">, </span><span class="s1">filenames=filenames)</span>
+        <span class="s1">handlers = parse_configuration(</span>
+            <span class="s1">dist</span><span class="s2">, </span><span class="s1">dist.command_options</span><span class="s2">, </span><span class="s1">ignore_option_errors=ignore_option_errors</span>
+        <span class="s1">)</span>
+        <span class="s1">dist._finalize_license_files()</span>
+    <span class="s2">finally</span><span class="s1">:</span>
+        <span class="s1">os.chdir(current_directory)</span>
+
+    <span class="s2">return </span><span class="s1">handlers</span>
+
+
+<span class="s2">def </span><span class="s1">_get_option(target_obj: Target</span><span class="s2">, </span><span class="s1">key: str):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given a target object and option key, get that option from 
+    the target object, either through a get_{key} method or 
+    from an attribute directly. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">getter_name = </span><span class="s4">'get_{key}'</span><span class="s1">.format(**locals())</span>
+    <span class="s1">by_attribute = functools.partial(getattr</span><span class="s2">, </span><span class="s1">target_obj</span><span class="s2">, </span><span class="s1">key)</span>
+    <span class="s1">getter = getattr(target_obj</span><span class="s2">, </span><span class="s1">getter_name</span><span class="s2">, </span><span class="s1">by_attribute)</span>
+    <span class="s2">return </span><span class="s1">getter()</span>
+
+
+<span class="s2">def </span><span class="s1">configuration_to_dict(handlers: Tuple[</span><span class="s4">&quot;ConfigHandler&quot;</span><span class="s2">, </span><span class="s1">...]) -&gt; dict:</span>
+    <span class="s0">&quot;&quot;&quot;Returns configuration data gathered by given handlers as a dict. 
+ 
+    :param list[ConfigHandler] handlers: Handlers list, 
+        usually from parse_configuration() 
+ 
+    :rtype: dict 
+    &quot;&quot;&quot;</span>
+    <span class="s1">config_dict: dict = defaultdict(dict)</span>
+
+    <span class="s2">for </span><span class="s1">handler </span><span class="s2">in </span><span class="s1">handlers:</span>
+        <span class="s2">for </span><span class="s1">option </span><span class="s2">in </span><span class="s1">handler.set_options:</span>
+            <span class="s1">value = _get_option(handler.target_obj</span><span class="s2">, </span><span class="s1">option)</span>
+            <span class="s1">config_dict[handler.section_prefix][option] = value</span>
+
+    <span class="s2">return </span><span class="s1">config_dict</span>
+
+
+<span class="s2">def </span><span class="s1">parse_configuration(</span>
+    <span class="s1">distribution: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">,</span>
+    <span class="s1">command_options: AllCommandOptions</span><span class="s2">,</span>
+    <span class="s1">ignore_option_errors=</span><span class="s2">False</span>
+<span class="s1">) -&gt; Tuple[</span><span class="s4">&quot;ConfigMetadataHandler&quot;</span><span class="s2">, </span><span class="s4">&quot;ConfigOptionsHandler&quot;</span><span class="s1">]:</span>
+    <span class="s0">&quot;&quot;&quot;Performs additional parsing of configuration options 
+    for a distribution. 
+ 
+    Returns a list of used option handlers. 
+ 
+    :param Distribution distribution: 
+    :param dict command_options: 
+    :param bool ignore_option_errors: Whether to silently ignore 
+        options, values of which could not be resolved (e.g. due to exceptions 
+        in directives such as file:, attr:, etc.). 
+        If False exceptions are propagated as expected. 
+    :rtype: list 
+    &quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">expand.EnsurePackagesDiscovered(distribution) </span><span class="s2">as </span><span class="s1">ensure_discovered:</span>
+        <span class="s1">options = ConfigOptionsHandler(</span>
+            <span class="s1">distribution</span><span class="s2">,</span>
+            <span class="s1">command_options</span><span class="s2">,</span>
+            <span class="s1">ignore_option_errors</span><span class="s2">,</span>
+            <span class="s1">ensure_discovered</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s1">options.parse()</span>
+        <span class="s2">if not </span><span class="s1">distribution.package_dir:</span>
+            <span class="s1">distribution.package_dir = options.package_dir  </span><span class="s3"># Filled by `find_packages`</span>
+
+        <span class="s1">meta = ConfigMetadataHandler(</span>
+            <span class="s1">distribution.metadata</span><span class="s2">,</span>
+            <span class="s1">command_options</span><span class="s2">,</span>
+            <span class="s1">ignore_option_errors</span><span class="s2">,</span>
+            <span class="s1">ensure_discovered</span><span class="s2">,</span>
+            <span class="s1">distribution.package_dir</span><span class="s2">,</span>
+            <span class="s1">distribution.src_root</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">meta.parse()</span>
+
+    <span class="s2">return </span><span class="s1">meta</span><span class="s2">, </span><span class="s1">options</span>
+
+
+<span class="s2">def </span><span class="s1">_warn_accidental_env_marker_misconfig(label: str</span><span class="s2">, </span><span class="s1">orig_value: str</span><span class="s2">, </span><span class="s1">parsed: list):</span>
+    <span class="s0">&quot;&quot;&quot;Because users sometimes misinterpret this configuration: 
+ 
+    [options.extras_require] 
+    foo = bar;python_version&lt;&quot;4&quot; 
+ 
+    It looks like one requirement with an environment marker 
+    but because there is no newline, it's parsed as two requirements 
+    with a semicolon as separator. 
+ 
+    Therefore, if: 
+        * input string does not contain a newline AND 
+        * parsed result contains two requirements AND 
+        * parsing of the two parts from the result (&quot;&lt;first&gt;;&lt;second&gt;&quot;) 
+        leads in a valid Requirement with a valid marker 
+    a UserWarning is shown to inform the user about the possible problem. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s2">in </span><span class="s1">orig_value </span><span class="s2">or </span><span class="s1">len(parsed) != </span><span class="s5">2</span><span class="s1">:</span>
+        <span class="s2">return</span>
+
+    <span class="s2">with </span><span class="s1">contextlib.suppress(InvalidRequirement):</span>
+        <span class="s1">original_requirements_str = </span><span class="s4">&quot;;&quot;</span><span class="s1">.join(parsed)</span>
+        <span class="s1">req = Requirement(original_requirements_str)</span>
+        <span class="s2">if </span><span class="s1">req.marker </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">msg = (</span>
+                <span class="s4">f&quot;One of the parsed requirements in `</span><span class="s2">{</span><span class="s1">label</span><span class="s2">}</span><span class="s4">` &quot;</span>
+                <span class="s4">f&quot;looks like a valid environment marker: '</span><span class="s2">{</span><span class="s1">parsed[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">}</span><span class="s4">'</span><span class="s2">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;Make sure that the config is correct and check &quot;</span>
+                <span class="s4">&quot;https://setuptools.pypa.io/en/latest/userguide/declarative_config.html#opt-2&quot;  </span><span class="s3"># noqa: E501</span>
+            <span class="s1">)</span>
+            <span class="s1">warnings.warn(msg</span><span class="s2">, </span><span class="s1">UserWarning)</span>
+
+
+<span class="s2">class </span><span class="s1">ConfigHandler(Generic[Target]):</span>
+    <span class="s0">&quot;&quot;&quot;Handles metadata supplied in configuration files.&quot;&quot;&quot;</span>
+
+    <span class="s1">section_prefix: str</span>
+    <span class="s4">&quot;&quot;&quot;Prefix for config sections handled by this handler. 
+    Must be provided by class heirs. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">aliases: Dict[str</span><span class="s2">, </span><span class="s1">str] = {}</span>
+    <span class="s4">&quot;&quot;&quot;Options aliases. 
+    For compatibility with various packages. E.g.: d2to1 and pbr. 
+    Note: `-` in keys is replaced with `_` by config parser. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">target_obj: Target</span><span class="s2">,</span>
+        <span class="s1">options: AllCommandOptions</span><span class="s2">,</span>
+        <span class="s1">ignore_option_errors</span><span class="s2">,</span>
+        <span class="s1">ensure_discovered: expand.EnsurePackagesDiscovered</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s1">sections: AllCommandOptions = {}</span>
+
+        <span class="s1">section_prefix = self.section_prefix</span>
+        <span class="s2">for </span><span class="s1">section_name</span><span class="s2">, </span><span class="s1">section_options </span><span class="s2">in </span><span class="s1">options.items():</span>
+            <span class="s2">if not </span><span class="s1">section_name.startswith(section_prefix):</span>
+                <span class="s2">continue</span>
+
+            <span class="s1">section_name = section_name.replace(section_prefix</span><span class="s2">, </span><span class="s4">''</span><span class="s1">).strip(</span><span class="s4">'.'</span><span class="s1">)</span>
+            <span class="s1">sections[section_name] = section_options</span>
+
+        <span class="s1">self.ignore_option_errors = ignore_option_errors</span>
+        <span class="s1">self.target_obj = target_obj</span>
+        <span class="s1">self.sections = sections</span>
+        <span class="s1">self.set_options: List[str] = []</span>
+        <span class="s1">self.ensure_discovered = ensure_discovered</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">parsers(self):</span>
+        <span class="s0">&quot;&quot;&quot;Metadata item name to parser function mapping.&quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError(</span>
+            <span class="s4">'%s must provide .parsers property' </span><span class="s1">% self.__class__.__name__</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__setitem__(self</span><span class="s2">, </span><span class="s1">option_name</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s1">unknown = tuple()</span>
+        <span class="s1">target_obj = self.target_obj</span>
+
+        <span class="s3"># Translate alias into real name.</span>
+        <span class="s1">option_name = self.aliases.get(option_name</span><span class="s2">, </span><span class="s1">option_name)</span>
+
+        <span class="s1">current_value = getattr(target_obj</span><span class="s2">, </span><span class="s1">option_name</span><span class="s2">, </span><span class="s1">unknown)</span>
+
+        <span class="s2">if </span><span class="s1">current_value </span><span class="s2">is </span><span class="s1">unknown:</span>
+            <span class="s2">raise </span><span class="s1">KeyError(option_name)</span>
+
+        <span class="s2">if </span><span class="s1">current_value:</span>
+            <span class="s3"># Already inhabited. Skipping.</span>
+            <span class="s2">return</span>
+
+        <span class="s1">skip_option = </span><span class="s2">False</span>
+        <span class="s1">parser = self.parsers.get(option_name)</span>
+        <span class="s2">if </span><span class="s1">parser:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">value = parser(value)</span>
+
+            <span class="s2">except </span><span class="s1">Exception:</span>
+                <span class="s1">skip_option = </span><span class="s2">True</span>
+                <span class="s2">if not </span><span class="s1">self.ignore_option_errors:</span>
+                    <span class="s2">raise</span>
+
+        <span class="s2">if </span><span class="s1">skip_option:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">setter = getattr(target_obj</span><span class="s2">, </span><span class="s4">'set_%s' </span><span class="s1">% option_name</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">setter </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">setattr(target_obj</span><span class="s2">, </span><span class="s1">option_name</span><span class="s2">, </span><span class="s1">value)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">setter(value)</span>
+
+        <span class="s1">self.set_options.append(option_name)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_list(cls</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">separator=</span><span class="s4">','</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Represents value as a list. 
+ 
+        Value is split either by separator (defaults to comma) or by lines. 
+ 
+        :param value: 
+        :param separator: List items separator character. 
+        :rtype: list 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance(value</span><span class="s2">, </span><span class="s1">list):  </span><span class="s3"># _get_parser_compound case</span>
+            <span class="s2">return </span><span class="s1">value</span>
+
+        <span class="s2">if </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">' </span><span class="s2">in </span><span class="s1">value:</span>
+            <span class="s1">value = value.splitlines()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">value = value.split(separator)</span>
+
+        <span class="s2">return </span><span class="s1">[chunk.strip() </span><span class="s2">for </span><span class="s1">chunk </span><span class="s2">in </span><span class="s1">value </span><span class="s2">if </span><span class="s1">chunk.strip()]</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_dict(cls</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s0">&quot;&quot;&quot;Represents value as a dict. 
+ 
+        :param value: 
+        :rtype: dict 
+        &quot;&quot;&quot;</span>
+        <span class="s1">separator = </span><span class="s4">'='</span>
+        <span class="s1">result = {}</span>
+        <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">cls._parse_list(value):</span>
+            <span class="s1">key</span><span class="s2">, </span><span class="s1">sep</span><span class="s2">, </span><span class="s1">val = line.partition(separator)</span>
+            <span class="s2">if </span><span class="s1">sep != separator:</span>
+                <span class="s2">raise </span><span class="s1">DistutilsOptionError(</span>
+                    <span class="s4">'Unable to parse option value to dict: %s' </span><span class="s1">% value</span>
+                <span class="s1">)</span>
+            <span class="s1">result[key.strip()] = val.strip()</span>
+
+        <span class="s2">return </span><span class="s1">result</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_bool(cls</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s0">&quot;&quot;&quot;Represents value as boolean. 
+ 
+        :param value: 
+        :rtype: bool 
+        &quot;&quot;&quot;</span>
+        <span class="s1">value = value.lower()</span>
+        <span class="s2">return </span><span class="s1">value </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'1'</span><span class="s2">, </span><span class="s4">'true'</span><span class="s2">, </span><span class="s4">'yes'</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_exclude_files_parser(cls</span><span class="s2">, </span><span class="s1">key):</span>
+        <span class="s0">&quot;&quot;&quot;Returns a parser function to make sure field inputs 
+        are not files. 
+ 
+        Parses a value after getting the key so error messages are 
+        more informative. 
+ 
+        :param key: 
+        :rtype: callable 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">def </span><span class="s1">parser(value):</span>
+            <span class="s1">exclude_directive = </span><span class="s4">'file:'</span>
+            <span class="s2">if </span><span class="s1">value.startswith(exclude_directive):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">'Only strings are accepted for the {0} field, '</span>
+                    <span class="s4">'files are not accepted'</span><span class="s1">.format(key)</span>
+                <span class="s1">)</span>
+            <span class="s2">return </span><span class="s1">value</span>
+
+        <span class="s2">return </span><span class="s1">parser</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_file(cls</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">root_dir: _Path):</span>
+        <span class="s0">&quot;&quot;&quot;Represents value as a string, allowing including text 
+        from nearest files using `file:` directive. 
+ 
+        Directive is sandboxed and won't reach anything outside 
+        directory with setup.py. 
+ 
+        Examples: 
+            file: README.rst, CHANGELOG.md, src/file.txt 
+ 
+        :param str value: 
+        :rtype: str 
+        &quot;&quot;&quot;</span>
+        <span class="s1">include_directive = </span><span class="s4">'file:'</span>
+
+        <span class="s2">if not </span><span class="s1">isinstance(value</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s2">return </span><span class="s1">value</span>
+
+        <span class="s2">if not </span><span class="s1">value.startswith(include_directive):</span>
+            <span class="s2">return </span><span class="s1">value</span>
+
+        <span class="s1">spec = value[len(include_directive) :]</span>
+        <span class="s1">filepaths = (path.strip() </span><span class="s2">for </span><span class="s1">path </span><span class="s2">in </span><span class="s1">spec.split(</span><span class="s4">','</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">expand.read_files(filepaths</span><span class="s2">, </span><span class="s1">root_dir)</span>
+
+    <span class="s2">def </span><span class="s1">_parse_attr(self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">package_dir</span><span class="s2">, </span><span class="s1">root_dir: _Path):</span>
+        <span class="s0">&quot;&quot;&quot;Represents value as a module attribute. 
+ 
+        Examples: 
+            attr: package.attr 
+            attr: package.module.attr 
+ 
+        :param str value: 
+        :rtype: str 
+        &quot;&quot;&quot;</span>
+        <span class="s1">attr_directive = </span><span class="s4">'attr:'</span>
+        <span class="s2">if not </span><span class="s1">value.startswith(attr_directive):</span>
+            <span class="s2">return </span><span class="s1">value</span>
+
+        <span class="s1">attr_desc = value.replace(attr_directive</span><span class="s2">, </span><span class="s4">''</span><span class="s1">)</span>
+
+        <span class="s3"># Make sure package_dir is populated correctly, so `attr:` directives can work</span>
+        <span class="s1">package_dir.update(self.ensure_discovered.package_dir)</span>
+        <span class="s2">return </span><span class="s1">expand.read_attr(attr_desc</span><span class="s2">, </span><span class="s1">package_dir</span><span class="s2">, </span><span class="s1">root_dir)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_parser_compound(cls</span><span class="s2">, </span><span class="s1">*parse_methods):</span>
+        <span class="s0">&quot;&quot;&quot;Returns parser function to represents value as a list. 
+ 
+        Parses a value applying given methods one after another. 
+ 
+        :param parse_methods: 
+        :rtype: callable 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">def </span><span class="s1">parse(value):</span>
+            <span class="s1">parsed = value</span>
+
+            <span class="s2">for </span><span class="s1">method </span><span class="s2">in </span><span class="s1">parse_methods:</span>
+                <span class="s1">parsed = method(parsed)</span>
+
+            <span class="s2">return </span><span class="s1">parsed</span>
+
+        <span class="s2">return </span><span class="s1">parse</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_section_to_dict_with_key(cls</span><span class="s2">, </span><span class="s1">section_options</span><span class="s2">, </span><span class="s1">values_parser):</span>
+        <span class="s0">&quot;&quot;&quot;Parses section options into a dictionary. 
+ 
+        Applies a given parser to each option in a section. 
+ 
+        :param dict section_options: 
+        :param callable values_parser: function with 2 args corresponding to key, value 
+        :rtype: dict 
+        &quot;&quot;&quot;</span>
+        <span class="s1">value = {}</span>
+        <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">(_</span><span class="s2">, </span><span class="s1">val) </span><span class="s2">in </span><span class="s1">section_options.items():</span>
+            <span class="s1">value[key] = values_parser(key</span><span class="s2">, </span><span class="s1">val)</span>
+        <span class="s2">return </span><span class="s1">value</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_section_to_dict(cls</span><span class="s2">, </span><span class="s1">section_options</span><span class="s2">, </span><span class="s1">values_parser=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Parses section options into a dictionary. 
+ 
+        Optionally applies a given parser to each value. 
+ 
+        :param dict section_options: 
+        :param callable values_parser: function with 1 arg corresponding to option value 
+        :rtype: dict 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parser = (</span><span class="s2">lambda </span><span class="s1">_</span><span class="s2">, </span><span class="s1">v: values_parser(v)) </span><span class="s2">if </span><span class="s1">values_parser </span><span class="s2">else </span><span class="s1">(</span><span class="s2">lambda </span><span class="s1">_</span><span class="s2">, </span><span class="s1">v: v)</span>
+        <span class="s2">return </span><span class="s1">cls._parse_section_to_dict_with_key(section_options</span><span class="s2">, </span><span class="s1">parser)</span>
+
+    <span class="s2">def </span><span class="s1">parse_section(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses configuration file section. 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">(name</span><span class="s2">, </span><span class="s1">(_</span><span class="s2">, </span><span class="s1">value)) </span><span class="s2">in </span><span class="s1">section_options.items():</span>
+            <span class="s2">with </span><span class="s1">contextlib.suppress(KeyError):</span>
+                <span class="s3"># Keep silent for a new option may appear anytime.</span>
+                <span class="s1">self[name] = value</span>
+
+    <span class="s2">def </span><span class="s1">parse(self):</span>
+        <span class="s0">&quot;&quot;&quot;Parses configuration file items from one 
+        or more related sections. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">section_name</span><span class="s2">, </span><span class="s1">section_options </span><span class="s2">in </span><span class="s1">self.sections.items():</span>
+
+            <span class="s1">method_postfix = </span><span class="s4">''</span>
+            <span class="s2">if </span><span class="s1">section_name:  </span><span class="s3"># [section.option] variant</span>
+                <span class="s1">method_postfix = </span><span class="s4">'_%s' </span><span class="s1">% section_name</span>
+
+            <span class="s1">section_parser_method: Optional[Callable] = getattr(</span>
+                <span class="s1">self</span><span class="s2">,</span>
+                <span class="s3"># Dots in section names are translated into dunderscores.</span>
+                <span class="s1">(</span><span class="s4">'parse_section%s' </span><span class="s1">% method_postfix).replace(</span><span class="s4">'.'</span><span class="s2">, </span><span class="s4">'__'</span><span class="s1">)</span><span class="s2">,</span>
+                <span class="s2">None,</span>
+            <span class="s1">)</span>
+
+            <span class="s2">if </span><span class="s1">section_parser_method </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">DistutilsOptionError(</span>
+                    <span class="s4">'Unsupported distribution option section: [%s.%s]'</span>
+                    <span class="s1">% (self.section_prefix</span><span class="s2">, </span><span class="s1">section_name)</span>
+                <span class="s1">)</span>
+
+            <span class="s1">section_parser_method(section_options)</span>
+
+    <span class="s2">def </span><span class="s1">_deprecated_config_handler(self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">, </span><span class="s1">warning_class):</span>
+        <span class="s0">&quot;&quot;&quot;this function will wrap around parameters that are deprecated 
+ 
+        :param msg: deprecation message 
+        :param warning_class: class of warning exception to be raised 
+        :param func: function to be wrapped around 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">@wraps(func)</span>
+        <span class="s2">def </span><span class="s1">config_handler(*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+            <span class="s1">warnings.warn(msg</span><span class="s2">, </span><span class="s1">warning_class)</span>
+            <span class="s2">return </span><span class="s1">func(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s2">return </span><span class="s1">config_handler</span>
+
+
+<span class="s2">class </span><span class="s1">ConfigMetadataHandler(ConfigHandler[</span><span class="s4">&quot;DistributionMetadata&quot;</span><span class="s1">]):</span>
+
+    <span class="s1">section_prefix = </span><span class="s4">'metadata'</span>
+
+    <span class="s1">aliases = {</span>
+        <span class="s4">'home_page'</span><span class="s1">: </span><span class="s4">'url'</span><span class="s2">,</span>
+        <span class="s4">'summary'</span><span class="s1">: </span><span class="s4">'description'</span><span class="s2">,</span>
+        <span class="s4">'classifier'</span><span class="s1">: </span><span class="s4">'classifiers'</span><span class="s2">,</span>
+        <span class="s4">'platform'</span><span class="s1">: </span><span class="s4">'platforms'</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s1">strict_mode = </span><span class="s2">False</span>
+    <span class="s4">&quot;&quot;&quot;We need to keep it loose, to be partially compatible with 
+    `pbr` and `d2to1` packages which also uses `metadata` section. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">target_obj: </span><span class="s4">&quot;DistributionMetadata&quot;</span><span class="s2">,</span>
+        <span class="s1">options: AllCommandOptions</span><span class="s2">,</span>
+        <span class="s1">ignore_option_errors: bool</span><span class="s2">,</span>
+        <span class="s1">ensure_discovered: expand.EnsurePackagesDiscovered</span><span class="s2">,</span>
+        <span class="s1">package_dir: Optional[dict] = </span><span class="s2">None,</span>
+        <span class="s1">root_dir: _Path = os.curdir</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(target_obj</span><span class="s2">, </span><span class="s1">options</span><span class="s2">, </span><span class="s1">ignore_option_errors</span><span class="s2">, </span><span class="s1">ensure_discovered)</span>
+        <span class="s1">self.package_dir = package_dir</span>
+        <span class="s1">self.root_dir = root_dir</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">parsers(self):</span>
+        <span class="s0">&quot;&quot;&quot;Metadata item name to parser function mapping.&quot;&quot;&quot;</span>
+        <span class="s1">parse_list = self._parse_list</span>
+        <span class="s1">parse_file = partial(self._parse_file</span><span class="s2">, </span><span class="s1">root_dir=self.root_dir)</span>
+        <span class="s1">parse_dict = self._parse_dict</span>
+        <span class="s1">exclude_files_parser = self._exclude_files_parser</span>
+
+        <span class="s2">return </span><span class="s1">{</span>
+            <span class="s4">'platforms'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'keywords'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'provides'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'requires'</span><span class="s1">: self._deprecated_config_handler(</span>
+                <span class="s1">parse_list</span><span class="s2">,</span>
+                <span class="s4">&quot;The requires parameter is deprecated, please use &quot;</span>
+                <span class="s4">&quot;install_requires for runtime dependencies.&quot;</span><span class="s2">,</span>
+                <span class="s1">SetuptoolsDeprecationWarning</span><span class="s2">,</span>
+            <span class="s1">)</span><span class="s2">,</span>
+            <span class="s4">'obsoletes'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'classifiers'</span><span class="s1">: self._get_parser_compound(parse_file</span><span class="s2">, </span><span class="s1">parse_list)</span><span class="s2">,</span>
+            <span class="s4">'license'</span><span class="s1">: exclude_files_parser(</span><span class="s4">'license'</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s4">'license_file'</span><span class="s1">: self._deprecated_config_handler(</span>
+                <span class="s1">exclude_files_parser(</span><span class="s4">'license_file'</span><span class="s1">)</span><span class="s2">,</span>
+                <span class="s4">&quot;The license_file parameter is deprecated, &quot;</span>
+                <span class="s4">&quot;use license_files instead.&quot;</span><span class="s2">,</span>
+                <span class="s1">SetuptoolsDeprecationWarning</span><span class="s2">,</span>
+            <span class="s1">)</span><span class="s2">,</span>
+            <span class="s4">'license_files'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'description'</span><span class="s1">: parse_file</span><span class="s2">,</span>
+            <span class="s4">'long_description'</span><span class="s1">: parse_file</span><span class="s2">,</span>
+            <span class="s4">'version'</span><span class="s1">: self._parse_version</span><span class="s2">,</span>
+            <span class="s4">'project_urls'</span><span class="s1">: parse_dict</span><span class="s2">,</span>
+        <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">_parse_version(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `version` option value. 
+ 
+        :param value: 
+        :rtype: str 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">version = self._parse_file(value</span><span class="s2">, </span><span class="s1">self.root_dir)</span>
+
+        <span class="s2">if </span><span class="s1">version != value:</span>
+            <span class="s1">version = version.strip()</span>
+            <span class="s3"># Be strict about versions loaded from file because it's easy to</span>
+            <span class="s3"># accidentally include newlines and other unintended content</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">Version(version)</span>
+            <span class="s2">except </span><span class="s1">InvalidVersion:</span>
+                <span class="s1">tmpl = (</span>
+                    <span class="s4">'Version loaded from {value} does not '</span>
+                    <span class="s4">'comply with PEP 440: {version}'</span>
+                <span class="s1">)</span>
+                <span class="s2">raise </span><span class="s1">DistutilsOptionError(tmpl.format(**locals()))</span>
+
+            <span class="s2">return </span><span class="s1">version</span>
+
+        <span class="s2">return </span><span class="s1">expand.version(self._parse_attr(value</span><span class="s2">, </span><span class="s1">self.package_dir</span><span class="s2">, </span><span class="s1">self.root_dir))</span>
+
+
+<span class="s2">class </span><span class="s1">ConfigOptionsHandler(ConfigHandler[</span><span class="s4">&quot;Distribution&quot;</span><span class="s1">]):</span>
+
+    <span class="s1">section_prefix = </span><span class="s4">'options'</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">target_obj: </span><span class="s4">&quot;Distribution&quot;</span><span class="s2">,</span>
+        <span class="s1">options: AllCommandOptions</span><span class="s2">,</span>
+        <span class="s1">ignore_option_errors: bool</span><span class="s2">,</span>
+        <span class="s1">ensure_discovered: expand.EnsurePackagesDiscovered</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(target_obj</span><span class="s2">, </span><span class="s1">options</span><span class="s2">, </span><span class="s1">ignore_option_errors</span><span class="s2">, </span><span class="s1">ensure_discovered)</span>
+        <span class="s1">self.root_dir = target_obj.src_root</span>
+        <span class="s1">self.package_dir: Dict[str</span><span class="s2">, </span><span class="s1">str] = {}  </span><span class="s3"># To be filled by `find_packages`</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_list_semicolon(cls</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s2">return </span><span class="s1">cls._parse_list(value</span><span class="s2">, </span><span class="s1">separator=</span><span class="s4">';'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_parse_file_in_root(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s2">return </span><span class="s1">self._parse_file(value</span><span class="s2">, </span><span class="s1">root_dir=self.root_dir)</span>
+
+    <span class="s2">def </span><span class="s1">_parse_requirements_list(self</span><span class="s2">, </span><span class="s1">label: str</span><span class="s2">, </span><span class="s1">value: str):</span>
+        <span class="s3"># Parse a requirements list, either by reading in a `file:`, or a list.</span>
+        <span class="s1">parsed = self._parse_list_semicolon(self._parse_file_in_root(value))</span>
+        <span class="s1">_warn_accidental_env_marker_misconfig(label</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">parsed)</span>
+        <span class="s3"># Filter it to only include lines that are not comments. `parse_list`</span>
+        <span class="s3"># will have stripped each line and filtered out empties.</span>
+        <span class="s2">return </span><span class="s1">[line </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">parsed </span><span class="s2">if not </span><span class="s1">line.startswith(</span><span class="s4">&quot;#&quot;</span><span class="s1">)]</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">parsers(self):</span>
+        <span class="s0">&quot;&quot;&quot;Metadata item name to parser function mapping.&quot;&quot;&quot;</span>
+        <span class="s1">parse_list = self._parse_list</span>
+        <span class="s1">parse_bool = self._parse_bool</span>
+        <span class="s1">parse_dict = self._parse_dict</span>
+        <span class="s1">parse_cmdclass = self._parse_cmdclass</span>
+
+        <span class="s2">return </span><span class="s1">{</span>
+            <span class="s4">'zip_safe'</span><span class="s1">: parse_bool</span><span class="s2">,</span>
+            <span class="s4">'include_package_data'</span><span class="s1">: parse_bool</span><span class="s2">,</span>
+            <span class="s4">'package_dir'</span><span class="s1">: parse_dict</span><span class="s2">,</span>
+            <span class="s4">'scripts'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'eager_resources'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'dependency_links'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'namespace_packages'</span><span class="s1">: self._deprecated_config_handler(</span>
+                <span class="s1">parse_list</span><span class="s2">,</span>
+                <span class="s4">&quot;The namespace_packages parameter is deprecated, &quot;</span>
+                <span class="s4">&quot;consider using implicit namespaces instead (PEP 420).&quot;</span><span class="s2">,</span>
+                <span class="s1">SetuptoolsDeprecationWarning</span><span class="s2">,</span>
+            <span class="s1">)</span><span class="s2">,</span>
+            <span class="s4">'install_requires'</span><span class="s1">: partial(</span>
+                <span class="s1">self._parse_requirements_list</span><span class="s2">, </span><span class="s4">&quot;install_requires&quot;</span>
+            <span class="s1">)</span><span class="s2">,</span>
+            <span class="s4">'setup_requires'</span><span class="s1">: self._parse_list_semicolon</span><span class="s2">,</span>
+            <span class="s4">'tests_require'</span><span class="s1">: self._parse_list_semicolon</span><span class="s2">,</span>
+            <span class="s4">'packages'</span><span class="s1">: self._parse_packages</span><span class="s2">,</span>
+            <span class="s4">'entry_points'</span><span class="s1">: self._parse_file_in_root</span><span class="s2">,</span>
+            <span class="s4">'py_modules'</span><span class="s1">: parse_list</span><span class="s2">,</span>
+            <span class="s4">'python_requires'</span><span class="s1">: SpecifierSet</span><span class="s2">,</span>
+            <span class="s4">'cmdclass'</span><span class="s1">: parse_cmdclass</span><span class="s2">,</span>
+        <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">_parse_cmdclass(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s1">package_dir = self.ensure_discovered.package_dir</span>
+        <span class="s2">return </span><span class="s1">expand.cmdclass(self._parse_dict(value)</span><span class="s2">, </span><span class="s1">package_dir</span><span class="s2">, </span><span class="s1">self.root_dir)</span>
+
+    <span class="s2">def </span><span class="s1">_parse_packages(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `packages` option value. 
+ 
+        :param value: 
+        :rtype: list 
+        &quot;&quot;&quot;</span>
+        <span class="s1">find_directives = [</span><span class="s4">'find:'</span><span class="s2">, </span><span class="s4">'find_namespace:'</span><span class="s1">]</span>
+        <span class="s1">trimmed_value = value.strip()</span>
+
+        <span class="s2">if </span><span class="s1">trimmed_value </span><span class="s2">not in </span><span class="s1">find_directives:</span>
+            <span class="s2">return </span><span class="s1">self._parse_list(value)</span>
+
+        <span class="s3"># Read function arguments from a dedicated section.</span>
+        <span class="s1">find_kwargs = self.parse_section_packages__find(</span>
+            <span class="s1">self.sections.get(</span><span class="s4">'packages.find'</span><span class="s2">, </span><span class="s1">{})</span>
+        <span class="s1">)</span>
+
+        <span class="s1">find_kwargs.update(</span>
+            <span class="s1">namespaces=(trimmed_value == find_directives[</span><span class="s5">1</span><span class="s1">])</span><span class="s2">,</span>
+            <span class="s1">root_dir=self.root_dir</span><span class="s2">,</span>
+            <span class="s1">fill_package_dir=self.package_dir</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">expand.find_packages(**find_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">parse_section_packages__find(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `packages.find` configuration file section. 
+ 
+        To be used in conjunction with _parse_packages(). 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s1">section_data = self._parse_section_to_dict(section_options</span><span class="s2">, </span><span class="s1">self._parse_list)</span>
+
+        <span class="s1">valid_keys = [</span><span class="s4">'where'</span><span class="s2">, </span><span class="s4">'include'</span><span class="s2">, </span><span class="s4">'exclude'</span><span class="s1">]</span>
+
+        <span class="s1">find_kwargs = dict(</span>
+            <span class="s1">[(k</span><span class="s2">, </span><span class="s1">v) </span><span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">section_data.items() </span><span class="s2">if </span><span class="s1">k </span><span class="s2">in </span><span class="s1">valid_keys </span><span class="s2">and </span><span class="s1">v]</span>
+        <span class="s1">)</span>
+
+        <span class="s1">where = find_kwargs.get(</span><span class="s4">'where'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">where </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">find_kwargs[</span><span class="s4">'where'</span><span class="s1">] = where[</span><span class="s5">0</span><span class="s1">]  </span><span class="s3"># cast list to single val</span>
+
+        <span class="s2">return </span><span class="s1">find_kwargs</span>
+
+    <span class="s2">def </span><span class="s1">parse_section_entry_points(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `entry_points` configuration file section. 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parsed = self._parse_section_to_dict(section_options</span><span class="s2">, </span><span class="s1">self._parse_list)</span>
+        <span class="s1">self[</span><span class="s4">'entry_points'</span><span class="s1">] = parsed</span>
+
+    <span class="s2">def </span><span class="s1">_parse_package_data(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s1">package_data = self._parse_section_to_dict(section_options</span><span class="s2">, </span><span class="s1">self._parse_list)</span>
+        <span class="s2">return </span><span class="s1">expand.canonic_package_data(package_data)</span>
+
+    <span class="s2">def </span><span class="s1">parse_section_package_data(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `package_data` configuration file section. 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self[</span><span class="s4">'package_data'</span><span class="s1">] = self._parse_package_data(section_options)</span>
+
+    <span class="s2">def </span><span class="s1">parse_section_exclude_package_data(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `exclude_package_data` configuration file section. 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self[</span><span class="s4">'exclude_package_data'</span><span class="s1">] = self._parse_package_data(section_options)</span>
+
+    <span class="s2">def </span><span class="s1">parse_section_extras_require(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `extras_require` configuration file section. 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parsed = self._parse_section_to_dict_with_key(</span>
+            <span class="s1">section_options</span><span class="s2">,</span>
+            <span class="s2">lambda </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v: self._parse_requirements_list(</span><span class="s4">f&quot;extras_require[</span><span class="s2">{</span><span class="s1">k</span><span class="s2">}</span><span class="s4">]&quot;</span><span class="s2">, </span><span class="s1">v)</span>
+        <span class="s1">)</span>
+
+        <span class="s1">self[</span><span class="s4">'extras_require'</span><span class="s1">] = parsed</span>
+
+    <span class="s2">def </span><span class="s1">parse_section_data_files(self</span><span class="s2">, </span><span class="s1">section_options):</span>
+        <span class="s0">&quot;&quot;&quot;Parses `data_files` configuration file section. 
+ 
+        :param dict section_options: 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parsed = self._parse_section_to_dict(section_options</span><span class="s2">, </span><span class="s1">self._parse_list)</span>
+        <span class="s1">self[</span><span class="s4">'data_files'</span><span class="s1">] = expand.canonic_data_files(parsed</span><span class="s2">, </span><span class="s1">self.root_dir)</span>
+</pre>
+</body>
+</html>

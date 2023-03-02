@@ -1,0 +1,558 @@
+<html>
+<head>
+<title>loggingTools.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+loggingTools.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">timeit</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">wraps</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Mapping</span><span class="s0">, </span><span class="s1">Callable</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">logging </span><span class="s0">import </span><span class="s1">PercentStyle</span>
+
+
+<span class="s2"># default logging level used by Timer class</span>
+<span class="s1">TIME_LEVEL = logging.DEBUG</span>
+
+<span class="s2"># per-level format strings used by the default formatter</span>
+<span class="s2"># (the level name is not printed for INFO and DEBUG messages)</span>
+<span class="s1">DEFAULT_FORMATS = {</span>
+	<span class="s3">&quot;*&quot;</span><span class="s1">: </span><span class="s3">&quot;%(levelname)s: %(message)s&quot;</span><span class="s0">,</span>
+	<span class="s3">&quot;INFO&quot;</span><span class="s1">: </span><span class="s3">&quot;%(message)s&quot;</span><span class="s0">,</span>
+	<span class="s3">&quot;DEBUG&quot;</span><span class="s1">: </span><span class="s3">&quot;%(message)s&quot;</span><span class="s0">,</span>
+	<span class="s1">}</span>
+
+
+<span class="s0">class </span><span class="s1">LevelFormatter(logging.Formatter):</span>
+	<span class="s4">&quot;&quot;&quot;Log formatter with level-specific formatting. 
+ 
+    Formatter class which optionally takes a dict of logging levels to 
+    format strings, allowing to customise the log records appearance for 
+    specific levels. 
+ 
+ 
+    Attributes: 
+        fmt: A dictionary mapping logging levels to format strings. 
+            The ``*`` key identifies the default format string. 
+        datefmt: As per py:class:`logging.Formatter` 
+        style: As per py:class:`logging.Formatter` 
+ 
+    &gt;&gt;&gt; import sys 
+    &gt;&gt;&gt; handler = logging.StreamHandler(sys.stdout) 
+    &gt;&gt;&gt; formatter = LevelFormatter( 
+    ...     fmt={ 
+    ...         '*':     '[%(levelname)s] %(message)s', 
+    ...         'DEBUG': '%(name)s [%(levelname)s] %(message)s', 
+    ...         'INFO':  '%(message)s', 
+    ...     }) 
+    &gt;&gt;&gt; handler.setFormatter(formatter) 
+    &gt;&gt;&gt; log = logging.getLogger('test') 
+    &gt;&gt;&gt; log.setLevel(logging.DEBUG) 
+    &gt;&gt;&gt; log.addHandler(handler) 
+    &gt;&gt;&gt; log.debug('this uses a custom format string') 
+    test [DEBUG] this uses a custom format string 
+    &gt;&gt;&gt; log.info('this also uses a custom format string') 
+    this also uses a custom format string 
+    &gt;&gt;&gt; log.warning(&quot;this one uses the default format string&quot;) 
+    [WARNING] this one uses the default format string 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fmt=</span><span class="s0">None, </span><span class="s1">datefmt=</span><span class="s0">None, </span><span class="s1">style=</span><span class="s3">&quot;%&quot;</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">style != </span><span class="s3">'%'</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">ValueError(</span>
+				<span class="s3">&quot;only '%' percent style is supported in both python 2 and 3&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">fmt </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">fmt = DEFAULT_FORMATS</span>
+		<span class="s0">if </span><span class="s1">isinstance(fmt</span><span class="s0">, </span><span class="s1">str):</span>
+			<span class="s1">default_format = fmt</span>
+			<span class="s1">custom_formats = {}</span>
+		<span class="s0">elif </span><span class="s1">isinstance(fmt</span><span class="s0">, </span><span class="s1">Mapping):</span>
+			<span class="s1">custom_formats = dict(fmt)</span>
+			<span class="s1">default_format = custom_formats.pop(</span><span class="s3">&quot;*&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">'fmt must be a str or a dict of str: %r' </span><span class="s1">% fmt)</span>
+		<span class="s1">super(LevelFormatter</span><span class="s0">, </span><span class="s1">self).__init__(default_format</span><span class="s0">, </span><span class="s1">datefmt)</span>
+		<span class="s1">self.default_format = self._fmt</span>
+		<span class="s1">self.custom_formats = {}</span>
+		<span class="s0">for </span><span class="s1">level</span><span class="s0">, </span><span class="s1">fmt </span><span class="s0">in </span><span class="s1">custom_formats.items():</span>
+			<span class="s1">level = logging._checkLevel(level)</span>
+			<span class="s1">self.custom_formats[level] = fmt</span>
+
+	<span class="s0">def </span><span class="s1">format(self</span><span class="s0">, </span><span class="s1">record):</span>
+		<span class="s0">if </span><span class="s1">self.custom_formats:</span>
+			<span class="s1">fmt = self.custom_formats.get(record.levelno</span><span class="s0">, </span><span class="s1">self.default_format)</span>
+			<span class="s0">if </span><span class="s1">self._fmt != fmt:</span>
+				<span class="s1">self._fmt = fmt</span>
+				<span class="s2"># for python &gt;= 3.2, _style needs to be set if _fmt changes</span>
+				<span class="s0">if </span><span class="s1">PercentStyle:</span>
+					<span class="s1">self._style = PercentStyle(fmt)</span>
+		<span class="s0">return </span><span class="s1">super(LevelFormatter</span><span class="s0">, </span><span class="s1">self).format(record)</span>
+
+
+<span class="s0">def </span><span class="s1">configLogger(**kwargs):</span>
+	<span class="s4">&quot;&quot;&quot;A more sophisticated logging system configuation manager. 
+ 
+    This is more or less the same as :py:func:`logging.basicConfig`, 
+    with some additional options and defaults. 
+ 
+    The default behaviour is to create a ``StreamHandler`` which writes to 
+    sys.stderr, set a formatter using the ``DEFAULT_FORMATS`` strings, and add 
+    the handler to the top-level library logger (&quot;fontTools&quot;). 
+ 
+    A number of optional keyword arguments may be specified, which can alter 
+    the default behaviour. 
+ 
+    Args: 
+ 
+        logger: Specifies the logger name or a Logger instance to be 
+            configured. (Defaults to &quot;fontTools&quot; logger). Unlike ``basicConfig``, 
+            this function can be called multiple times to reconfigure a logger. 
+            If the logger or any of its children already exists before the call is 
+            made, they will be reset before the new configuration is applied. 
+        filename: Specifies that a ``FileHandler`` be created, using the 
+            specified filename, rather than a ``StreamHandler``. 
+        filemode: Specifies the mode to open the file, if filename is 
+            specified. (If filemode is unspecified, it defaults to ``a``). 
+        format: Use the specified format string for the handler. This 
+            argument also accepts a dictionary of format strings keyed by 
+            level name, to allow customising the records appearance for 
+            specific levels. The special ``'*'`` key is for 'any other' level. 
+        datefmt: Use the specified date/time format. 
+        level: Set the logger level to the specified level. 
+        stream: Use the specified stream to initialize the StreamHandler. Note 
+            that this argument is incompatible with ``filename`` - if both 
+            are present, ``stream`` is ignored. 
+        handlers: If specified, this should be an iterable of already created 
+            handlers, which will be added to the logger. Any handler in the 
+            list which does not have a formatter assigned will be assigned the 
+            formatter created in this function. 
+        filters: If specified, this should be an iterable of already created 
+            filters. If the ``handlers`` do not already have filters assigned, 
+            these filters will be added to them. 
+        propagate: All loggers have a ``propagate`` attribute which determines 
+            whether to continue searching for handlers up the logging hierarchy. 
+            If not provided, the &quot;propagate&quot; attribute will be set to ``False``. 
+    &quot;&quot;&quot;</span>
+	<span class="s2"># using kwargs to enforce keyword-only arguments in py2.</span>
+	<span class="s1">handlers = kwargs.pop(</span><span class="s3">&quot;handlers&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+	<span class="s0">if </span><span class="s1">handlers </span><span class="s0">is None</span><span class="s1">:</span>
+		<span class="s0">if </span><span class="s3">&quot;stream&quot; </span><span class="s0">in </span><span class="s1">kwargs </span><span class="s0">and </span><span class="s3">&quot;filename&quot; </span><span class="s0">in </span><span class="s1">kwargs:</span>
+			<span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;'stream' and 'filename' should not be &quot;</span>
+							 <span class="s3">&quot;specified together&quot;</span><span class="s1">)</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s0">if </span><span class="s3">&quot;stream&quot; </span><span class="s0">in </span><span class="s1">kwargs </span><span class="s0">or </span><span class="s3">&quot;filename&quot; </span><span class="s0">in </span><span class="s1">kwargs:</span>
+			<span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;'stream' or 'filename' should not be &quot;</span>
+							 <span class="s3">&quot;specified together with 'handlers'&quot;</span><span class="s1">)</span>
+	<span class="s0">if </span><span class="s1">handlers </span><span class="s0">is None</span><span class="s1">:</span>
+		<span class="s1">filename = kwargs.pop(</span><span class="s3">&quot;filename&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+		<span class="s1">mode = kwargs.pop(</span><span class="s3">&quot;filemode&quot;</span><span class="s0">, </span><span class="s3">'a'</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">filename:</span>
+			<span class="s1">h = logging.FileHandler(filename</span><span class="s0">, </span><span class="s1">mode)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">stream = kwargs.pop(</span><span class="s3">&quot;stream&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+			<span class="s1">h = logging.StreamHandler(stream)</span>
+		<span class="s1">handlers = [h]</span>
+	<span class="s2"># By default, the top-level library logger is configured.</span>
+	<span class="s1">logger = kwargs.pop(</span><span class="s3">&quot;logger&quot;</span><span class="s0">, </span><span class="s3">&quot;fontTools&quot;</span><span class="s1">)</span>
+	<span class="s0">if not </span><span class="s1">logger </span><span class="s0">or </span><span class="s1">isinstance(logger</span><span class="s0">, </span><span class="s1">str):</span>
+		<span class="s2"># empty &quot;&quot; or None means the 'root' logger</span>
+		<span class="s1">logger = logging.getLogger(logger)</span>
+	<span class="s2"># before (re)configuring, reset named logger and its children (if exist)</span>
+	<span class="s1">_resetExistingLoggers(parent=logger.name)</span>
+	<span class="s2"># use DEFAULT_FORMATS if 'format' is None</span>
+	<span class="s1">fs = kwargs.pop(</span><span class="s3">&quot;format&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+	<span class="s1">dfs = kwargs.pop(</span><span class="s3">&quot;datefmt&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+	<span class="s2"># XXX: '%' is the only format style supported on both py2 and 3</span>
+	<span class="s1">style = kwargs.pop(</span><span class="s3">&quot;style&quot;</span><span class="s0">, </span><span class="s3">'%'</span><span class="s1">)</span>
+	<span class="s1">fmt = LevelFormatter(fs</span><span class="s0">, </span><span class="s1">dfs</span><span class="s0">, </span><span class="s1">style)</span>
+	<span class="s1">filters = kwargs.pop(</span><span class="s3">&quot;filters&quot;</span><span class="s0">, </span><span class="s1">[])</span>
+	<span class="s0">for </span><span class="s1">h </span><span class="s0">in </span><span class="s1">handlers:</span>
+		<span class="s0">if </span><span class="s1">h.formatter </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">h.setFormatter(fmt)</span>
+		<span class="s0">if not </span><span class="s1">h.filters:</span>
+			<span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">filters:</span>
+				<span class="s1">h.addFilter(f)</span>
+		<span class="s1">logger.addHandler(h)</span>
+	<span class="s0">if </span><span class="s1">logger.name != </span><span class="s3">&quot;root&quot;</span><span class="s1">:</span>
+		<span class="s2"># stop searching up the hierarchy for handlers</span>
+		<span class="s1">logger.propagate = kwargs.pop(</span><span class="s3">&quot;propagate&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+	<span class="s2"># set a custom severity level</span>
+	<span class="s1">level = kwargs.pop(</span><span class="s3">&quot;level&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+	<span class="s0">if </span><span class="s1">level </span><span class="s0">is not None</span><span class="s1">:</span>
+		<span class="s1">logger.setLevel(level)</span>
+	<span class="s0">if </span><span class="s1">kwargs:</span>
+		<span class="s1">keys = </span><span class="s3">', '</span><span class="s1">.join(kwargs.keys())</span>
+		<span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">'Unrecognised argument(s): %s' </span><span class="s1">% keys)</span>
+
+
+<span class="s0">def </span><span class="s1">_resetExistingLoggers(parent=</span><span class="s3">&quot;root&quot;</span><span class="s1">):</span>
+	<span class="s4">&quot;&quot;&quot; Reset the logger named 'parent' and all its children to their initial 
+    state, if they already exist in the current configuration. 
+    &quot;&quot;&quot;</span>
+	<span class="s1">root = logging.root</span>
+	<span class="s2"># get sorted list of all existing loggers</span>
+	<span class="s1">existing = sorted(root.manager.loggerDict.keys())</span>
+	<span class="s0">if </span><span class="s1">parent == </span><span class="s3">&quot;root&quot;</span><span class="s1">:</span>
+		<span class="s2"># all the existing loggers are children of 'root'</span>
+		<span class="s1">loggers_to_reset = [parent] + existing</span>
+	<span class="s0">elif </span><span class="s1">parent </span><span class="s0">not in </span><span class="s1">existing:</span>
+		<span class="s2"># nothing to do</span>
+		<span class="s0">return</span>
+	<span class="s0">elif </span><span class="s1">parent </span><span class="s0">in </span><span class="s1">existing:</span>
+		<span class="s1">loggers_to_reset = [parent]</span>
+		<span class="s2"># collect children, starting with the entry after parent name</span>
+		<span class="s1">i = existing.index(parent) + </span><span class="s5">1</span>
+		<span class="s1">prefixed = parent + </span><span class="s3">&quot;.&quot;</span>
+		<span class="s1">pflen = len(prefixed)</span>
+		<span class="s1">num_existing = len(existing)</span>
+		<span class="s0">while </span><span class="s1">i &lt; num_existing:</span>
+			<span class="s0">if </span><span class="s1">existing[i][:pflen] == prefixed:</span>
+				<span class="s1">loggers_to_reset.append(existing[i])</span>
+			<span class="s1">i += </span><span class="s5">1</span>
+	<span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">loggers_to_reset:</span>
+		<span class="s0">if </span><span class="s1">name == </span><span class="s3">&quot;root&quot;</span><span class="s1">:</span>
+			<span class="s1">root.setLevel(logging.WARNING)</span>
+			<span class="s0">for </span><span class="s1">h </span><span class="s0">in </span><span class="s1">root.handlers[:]:</span>
+				<span class="s1">root.removeHandler(h)</span>
+			<span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">root.filters[:]:</span>
+				<span class="s1">root.removeFilters(f)</span>
+			<span class="s1">root.disabled = </span><span class="s0">False</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">logger = root.manager.loggerDict[name]</span>
+			<span class="s1">logger.level = logging.NOTSET</span>
+			<span class="s1">logger.handlers = []</span>
+			<span class="s1">logger.filters = []</span>
+			<span class="s1">logger.propagate = </span><span class="s0">True</span>
+			<span class="s1">logger.disabled = </span><span class="s0">False</span>
+
+
+<span class="s0">class </span><span class="s1">Timer(object):</span>
+	<span class="s4">&quot;&quot;&quot; Keeps track of overall time and split/lap times. 
+ 
+    &gt;&gt;&gt; import time 
+    &gt;&gt;&gt; timer = Timer() 
+    &gt;&gt;&gt; time.sleep(0.01) 
+    &gt;&gt;&gt; print(&quot;First lap:&quot;, timer.split()) 
+    First lap: ... 
+    &gt;&gt;&gt; time.sleep(0.02) 
+    &gt;&gt;&gt; print(&quot;Second lap:&quot;, timer.split()) 
+    Second lap: ... 
+    &gt;&gt;&gt; print(&quot;Overall time:&quot;, timer.time()) 
+    Overall time: ... 
+ 
+    Can be used as a context manager inside with-statements. 
+ 
+    &gt;&gt;&gt; with Timer() as t: 
+    ...     time.sleep(0.01) 
+    &gt;&gt;&gt; print(&quot;%0.3f seconds&quot; % t.elapsed) 
+    0... seconds 
+ 
+    If initialised with a logger, it can log the elapsed time automatically 
+    upon exiting the with-statement. 
+ 
+    &gt;&gt;&gt; import logging 
+    &gt;&gt;&gt; log = logging.getLogger(&quot;my-fancy-timer-logger&quot;) 
+    &gt;&gt;&gt; configLogger(logger=log, level=&quot;DEBUG&quot;, format=&quot;%(message)s&quot;, stream=sys.stdout) 
+    &gt;&gt;&gt; with Timer(log, 'do something'): 
+    ...     time.sleep(0.01) 
+    Took ... to do something 
+ 
+    The same Timer instance, holding a reference to a logger, can be reused 
+    in multiple with-statements, optionally with different messages or levels. 
+ 
+    &gt;&gt;&gt; timer = Timer(log) 
+    &gt;&gt;&gt; with timer(): 
+    ...     time.sleep(0.01) 
+    elapsed time: ...s 
+    &gt;&gt;&gt; with timer('redo it', level=logging.INFO): 
+    ...     time.sleep(0.02) 
+    Took ... to redo it 
+ 
+    It can also be used as a function decorator to log the time elapsed to run 
+    the decorated function. 
+ 
+    &gt;&gt;&gt; @timer() 
+    ... def test1(): 
+    ...    time.sleep(0.01) 
+    &gt;&gt;&gt; @timer('run test 2', level=logging.INFO) 
+    ... def test2(): 
+    ...    time.sleep(0.02) 
+    &gt;&gt;&gt; test1() 
+    Took ... to run 'test1' 
+    &gt;&gt;&gt; test2() 
+    Took ... to run test 2 
+    &quot;&quot;&quot;</span>
+
+	<span class="s2"># timeit.default_timer choses the most accurate clock for each platform</span>
+	<span class="s1">_time = timeit.default_timer</span>
+	<span class="s1">default_msg = </span><span class="s3">&quot;elapsed time: %(time).3fs&quot;</span>
+	<span class="s1">default_format = </span><span class="s3">&quot;Took %(time).3fs to %(msg)s&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">logger=</span><span class="s0">None, </span><span class="s1">msg=</span><span class="s0">None, </span><span class="s1">level=</span><span class="s0">None, </span><span class="s1">start=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.reset(start)</span>
+		<span class="s0">if </span><span class="s1">logger </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">arg </span><span class="s0">in </span><span class="s1">(</span><span class="s3">'msg'</span><span class="s0">, </span><span class="s3">'level'</span><span class="s1">):</span>
+				<span class="s0">if </span><span class="s1">locals().get(arg) </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">ValueError(</span>
+						<span class="s3">&quot;'%s' can't be specified without a 'logger'&quot; </span><span class="s1">% arg)</span>
+		<span class="s1">self.logger = logger</span>
+		<span class="s1">self.level = level </span><span class="s0">if </span><span class="s1">level </span><span class="s0">is not None else </span><span class="s1">TIME_LEVEL</span>
+		<span class="s1">self.msg = msg</span>
+
+	<span class="s0">def </span><span class="s1">reset(self</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s4">&quot;&quot;&quot; Reset timer to 'start_time' or the current time. &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">self.start = self._time()</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.start = start</span>
+		<span class="s1">self.last = self.start</span>
+		<span class="s1">self.elapsed = </span><span class="s5">0.0</span>
+
+	<span class="s0">def </span><span class="s1">time(self):</span>
+		<span class="s4">&quot;&quot;&quot; Return the overall time (in seconds) since the timer started. &quot;&quot;&quot;</span>
+		<span class="s0">return </span><span class="s1">self._time() - self.start</span>
+
+	<span class="s0">def </span><span class="s1">split(self):</span>
+		<span class="s4">&quot;&quot;&quot; Split and return the lap time (in seconds) in between splits. &quot;&quot;&quot;</span>
+		<span class="s1">current = self._time()</span>
+		<span class="s1">self.elapsed = current - self.last</span>
+		<span class="s1">self.last = current</span>
+		<span class="s0">return </span><span class="s1">self.elapsed</span>
+
+	<span class="s0">def </span><span class="s1">formatTime(self</span><span class="s0">, </span><span class="s1">msg</span><span class="s0">, </span><span class="s1">time):</span>
+		<span class="s4">&quot;&quot;&quot; Format 'time' value in 'msg' and return formatted string. 
+        If 'msg' contains a '%(time)' format string, try to use that. 
+        Otherwise, use the predefined 'default_format'. 
+        If 'msg' is empty or None, fall back to 'default_msg'. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if not </span><span class="s1">msg:</span>
+			<span class="s1">msg = self.default_msg</span>
+		<span class="s0">if </span><span class="s1">msg.find(</span><span class="s3">&quot;%(time)&quot;</span><span class="s1">) &lt; </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s1">msg = self.default_format % {</span><span class="s3">&quot;msg&quot;</span><span class="s1">: msg</span><span class="s0">, </span><span class="s3">&quot;time&quot;</span><span class="s1">: time}</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">try</span><span class="s1">:</span>
+				<span class="s1">msg = msg % {</span><span class="s3">&quot;time&quot;</span><span class="s1">: time}</span>
+			<span class="s0">except </span><span class="s1">(KeyError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+				<span class="s0">pass  </span><span class="s2"># skip if the format string is malformed</span>
+		<span class="s0">return </span><span class="s1">msg</span>
+
+	<span class="s0">def </span><span class="s1">__enter__(self):</span>
+		<span class="s4">&quot;&quot;&quot; Start a new lap &quot;&quot;&quot;</span>
+		<span class="s1">self.last = self._time()</span>
+		<span class="s1">self.elapsed = </span><span class="s5">0.0</span>
+		<span class="s0">return </span><span class="s1">self</span>
+
+	<span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">exc_type</span><span class="s0">, </span><span class="s1">exc_value</span><span class="s0">, </span><span class="s1">traceback):</span>
+		<span class="s4">&quot;&quot;&quot; End the current lap. If timer has a logger, log the time elapsed, 
+        using the format string in self.msg (or the default one). 
+        &quot;&quot;&quot;</span>
+		<span class="s1">time = self.split()</span>
+		<span class="s0">if </span><span class="s1">self.logger </span><span class="s0">is None or </span><span class="s1">exc_type:</span>
+			<span class="s2"># if there's no logger attached, or if any exception occurred in</span>
+			<span class="s2"># the with-statement, exit without logging the time</span>
+			<span class="s0">return</span>
+		<span class="s1">message = self.formatTime(self.msg</span><span class="s0">, </span><span class="s1">time)</span>
+		<span class="s2"># Allow log handlers to see the individual parts to facilitate things</span>
+		<span class="s2"># like a server accumulating aggregate stats.</span>
+		<span class="s1">msg_parts = { </span><span class="s3">'msg'</span><span class="s1">: self.msg</span><span class="s0">, </span><span class="s3">'time'</span><span class="s1">: time }</span>
+		<span class="s1">self.logger.log(self.level</span><span class="s0">, </span><span class="s1">message</span><span class="s0">, </span><span class="s1">msg_parts)</span>
+
+	<span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">func_or_msg=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+		<span class="s4">&quot;&quot;&quot; If the first argument is a function, return a decorator which runs 
+        the wrapped function inside Timer's context manager. 
+        Otherwise, treat the first argument as a 'msg' string and return an updated 
+        Timer instance, referencing the same logger. 
+        A 'level' keyword can also be passed to override self.level. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">isinstance(func_or_msg</span><span class="s0">, </span><span class="s1">Callable):</span>
+			<span class="s1">func = func_or_msg</span>
+			<span class="s2"># use the function name when no explicit 'msg' is provided</span>
+			<span class="s0">if not </span><span class="s1">self.msg:</span>
+				<span class="s1">self.msg = </span><span class="s3">&quot;run '%s'&quot; </span><span class="s1">% func.__name__</span>
+
+			<span class="s1">@wraps(func)</span>
+			<span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">**kwds):</span>
+				<span class="s0">with </span><span class="s1">self:</span>
+					<span class="s0">return </span><span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwds)</span>
+			<span class="s0">return </span><span class="s1">wrapper</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">msg = func_or_msg </span><span class="s0">or </span><span class="s1">kwargs.get(</span><span class="s3">&quot;msg&quot;</span><span class="s1">)</span>
+			<span class="s1">level = kwargs.get(</span><span class="s3">&quot;level&quot;</span><span class="s0">, </span><span class="s1">self.level)</span>
+			<span class="s0">return </span><span class="s1">self.__class__(self.logger</span><span class="s0">, </span><span class="s1">msg</span><span class="s0">, </span><span class="s1">level)</span>
+
+	<span class="s0">def </span><span class="s1">__float__(self):</span>
+		<span class="s0">return </span><span class="s1">self.elapsed</span>
+
+	<span class="s0">def </span><span class="s1">__int__(self):</span>
+		<span class="s0">return </span><span class="s1">int(self.elapsed)</span>
+
+	<span class="s0">def </span><span class="s1">__str__(self):</span>
+		<span class="s0">return </span><span class="s3">&quot;%.3f&quot; </span><span class="s1">% self.elapsed</span>
+
+
+<span class="s0">class </span><span class="s1">ChannelsFilter(logging.Filter):</span>
+	<span class="s4">&quot;&quot;&quot;Provides a hierarchical filter for log entries based on channel names. 
+ 
+    Filters out records emitted from a list of enabled channel names, 
+    including their children. It works the same as the ``logging.Filter`` 
+    class, but allows the user to specify multiple channel names. 
+ 
+    &gt;&gt;&gt; import sys 
+    &gt;&gt;&gt; handler = logging.StreamHandler(sys.stdout) 
+    &gt;&gt;&gt; handler.setFormatter(logging.Formatter(&quot;%(message)s&quot;)) 
+    &gt;&gt;&gt; filter = ChannelsFilter(&quot;A.B&quot;, &quot;C.D&quot;) 
+    &gt;&gt;&gt; handler.addFilter(filter) 
+    &gt;&gt;&gt; root = logging.getLogger() 
+    &gt;&gt;&gt; root.addHandler(handler) 
+    &gt;&gt;&gt; root.setLevel(level=logging.DEBUG) 
+    &gt;&gt;&gt; logging.getLogger('A.B').debug('this record passes through') 
+    this record passes through 
+    &gt;&gt;&gt; logging.getLogger('A.B.C').debug('records from children also pass') 
+    records from children also pass 
+    &gt;&gt;&gt; logging.getLogger('C.D').debug('this one as well') 
+    this one as well 
+    &gt;&gt;&gt; logging.getLogger('A.B.').debug('also this one') 
+    also this one 
+    &gt;&gt;&gt; logging.getLogger('A.F').debug('but this one does not!') 
+    &gt;&gt;&gt; logging.getLogger('C.DE').debug('neither this one!') 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">*names):</span>
+		<span class="s1">self.names = names</span>
+		<span class="s1">self.num = len(names)</span>
+		<span class="s1">self.lengths = {n: len(n) </span><span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">names}</span>
+
+	<span class="s0">def </span><span class="s1">filter(self</span><span class="s0">, </span><span class="s1">record):</span>
+		<span class="s0">if </span><span class="s1">self.num == </span><span class="s5">0</span><span class="s1">:</span>
+			<span class="s0">return True</span>
+		<span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">self.names:</span>
+			<span class="s1">nlen = self.lengths[name]</span>
+			<span class="s0">if </span><span class="s1">name == record.name:</span>
+				<span class="s0">return True</span>
+			<span class="s0">elif </span><span class="s1">(record.name.find(name</span><span class="s0">, </span><span class="s5">0</span><span class="s0">, </span><span class="s1">nlen) == </span><span class="s5">0</span>
+					<span class="s0">and </span><span class="s1">record.name[nlen] == </span><span class="s3">&quot;.&quot;</span><span class="s1">):</span>
+				<span class="s0">return True</span>
+		<span class="s0">return False</span>
+
+
+<span class="s0">class </span><span class="s1">CapturingLogHandler(logging.Handler):</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">logger</span><span class="s0">, </span><span class="s1">level):</span>
+		<span class="s1">super(CapturingLogHandler</span><span class="s0">, </span><span class="s1">self).__init__(level=level)</span>
+		<span class="s1">self.records = []</span>
+		<span class="s0">if </span><span class="s1">isinstance(logger</span><span class="s0">, </span><span class="s1">str):</span>
+			<span class="s1">self.logger = logging.getLogger(logger)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.logger = logger</span>
+
+	<span class="s0">def </span><span class="s1">__enter__(self):</span>
+		<span class="s1">self.original_disabled = self.logger.disabled</span>
+		<span class="s1">self.original_level = self.logger.level</span>
+		<span class="s1">self.original_propagate = self.logger.propagate</span>
+
+		<span class="s1">self.logger.addHandler(self)</span>
+		<span class="s1">self.logger.setLevel(self.level)</span>
+		<span class="s1">self.logger.disabled = </span><span class="s0">False</span>
+		<span class="s1">self.logger.propagate = </span><span class="s0">False</span>
+
+		<span class="s0">return </span><span class="s1">self</span>
+
+	<span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">type</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">traceback):</span>
+		<span class="s1">self.logger.removeHandler(self)</span>
+		<span class="s1">self.logger.setLevel(self.original_level)</span>
+		<span class="s1">self.logger.disabled = self.original_disabled</span>
+		<span class="s1">self.logger.propagate = self.original_propagate</span>
+
+		<span class="s0">return </span><span class="s1">self</span>
+
+	<span class="s0">def </span><span class="s1">emit(self</span><span class="s0">, </span><span class="s1">record):</span>
+		<span class="s1">self.records.append(record)</span>
+
+	<span class="s0">def </span><span class="s1">assertRegex(self</span><span class="s0">, </span><span class="s1">regexp</span><span class="s0">, </span><span class="s1">msg=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">import </span><span class="s1">re</span>
+		<span class="s1">pattern = re.compile(regexp)</span>
+		<span class="s0">for </span><span class="s1">r </span><span class="s0">in </span><span class="s1">self.records:</span>
+			<span class="s0">if </span><span class="s1">pattern.search(r.getMessage()):</span>
+				<span class="s0">return True</span>
+		<span class="s0">if </span><span class="s1">msg </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">msg = </span><span class="s3">&quot;Pattern '%s' not found in logger records&quot; </span><span class="s1">% regexp</span>
+		<span class="s0">assert </span><span class="s5">0</span><span class="s0">, </span><span class="s1">msg</span>
+
+
+<span class="s0">class </span><span class="s1">LogMixin(object):</span>
+	<span class="s4">&quot;&quot;&quot; Mixin class that adds logging functionality to another class. 
+ 
+    You can define a new class that subclasses from ``LogMixin`` as well as 
+    other base classes through multiple inheritance. 
+    All instances of that class will have a ``log`` property that returns 
+    a ``logging.Logger`` named after their respective ``&lt;module&gt;.&lt;class&gt;``. 
+ 
+    For example: 
+ 
+    &gt;&gt;&gt; class BaseClass(object): 
+    ...     pass 
+    &gt;&gt;&gt; class MyClass(LogMixin, BaseClass): 
+    ...     pass 
+    &gt;&gt;&gt; a = MyClass() 
+    &gt;&gt;&gt; isinstance(a.log, logging.Logger) 
+    True 
+    &gt;&gt;&gt; print(a.log.name) 
+    fontTools.misc.loggingTools.MyClass 
+    &gt;&gt;&gt; class AnotherClass(MyClass): 
+    ...     pass 
+    &gt;&gt;&gt; b = AnotherClass() 
+    &gt;&gt;&gt; isinstance(b.log, logging.Logger) 
+    True 
+    &gt;&gt;&gt; print(b.log.name) 
+    fontTools.misc.loggingTools.AnotherClass 
+    &quot;&quot;&quot;</span>
+
+	<span class="s1">@property</span>
+	<span class="s0">def </span><span class="s1">log(self):</span>
+		<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;_log&quot;</span><span class="s1">):</span>
+			<span class="s1">name = </span><span class="s3">&quot;.&quot;</span><span class="s1">.join(</span>
+				<span class="s1">(self.__class__.__module__</span><span class="s0">, </span><span class="s1">self.__class__.__name__)</span>
+			<span class="s1">)</span>
+			<span class="s1">self._log = logging.getLogger(name)</span>
+		<span class="s0">return </span><span class="s1">self._log</span>
+
+
+<span class="s0">def </span><span class="s1">deprecateArgument(name</span><span class="s0">, </span><span class="s1">msg</span><span class="s0">, </span><span class="s1">category=UserWarning):</span>
+	<span class="s4">&quot;&quot;&quot; Raise a warning about deprecated function argument 'name'. &quot;&quot;&quot;</span>
+	<span class="s1">warnings.warn(</span>
+		<span class="s3">&quot;%r is deprecated; %s&quot; </span><span class="s1">% (name</span><span class="s0">, </span><span class="s1">msg)</span><span class="s0">, </span><span class="s1">category=category</span><span class="s0">, </span><span class="s1">stacklevel=</span><span class="s5">3</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">deprecateFunction(msg</span><span class="s0">, </span><span class="s1">category=UserWarning):</span>
+	<span class="s4">&quot;&quot;&quot; Decorator to raise a warning when a deprecated function is called. &quot;&quot;&quot;</span>
+	<span class="s0">def </span><span class="s1">decorator(func):</span>
+		<span class="s1">@wraps(func)</span>
+		<span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+			<span class="s1">warnings.warn(</span>
+				<span class="s3">&quot;%r is deprecated; %s&quot; </span><span class="s1">% (func.__name__</span><span class="s0">, </span><span class="s1">msg)</span><span class="s0">,</span>
+				<span class="s1">category=category</span><span class="s0">, </span><span class="s1">stacklevel=</span><span class="s5">2</span><span class="s1">)</span>
+			<span class="s0">return </span><span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+		<span class="s0">return </span><span class="s1">wrapper</span>
+	<span class="s0">return </span><span class="s1">decorator</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s0">import </span><span class="s1">doctest</span>
+	<span class="s1">sys.exit(doctest.testmod(optionflags=doctest.ELLIPSIS).failed)</span>
+</pre>
+</body>
+</html>

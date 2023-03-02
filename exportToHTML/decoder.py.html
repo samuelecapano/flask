@@ -1,0 +1,1052 @@
+<html>
+<head>
+<title>decoder.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+decoder.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Protocol Buffers - Google's data interchange format</span>
+<span class="s0"># Copyright 2008 Google Inc.  All rights reserved.</span>
+<span class="s0"># https://developers.google.com/protocol-buffers/</span>
+<span class="s0">#</span>
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are</span>
+<span class="s0"># met:</span>
+<span class="s0">#</span>
+<span class="s0">#     * Redistributions of source code must retain the above copyright</span>
+<span class="s0"># notice, this list of conditions and the following disclaimer.</span>
+<span class="s0">#     * Redistributions in binary form must reproduce the above</span>
+<span class="s0"># copyright notice, this list of conditions and the following disclaimer</span>
+<span class="s0"># in the documentation and/or other materials provided with the</span>
+<span class="s0"># distribution.</span>
+<span class="s0">#     * Neither the name of Google Inc. nor the names of its</span>
+<span class="s0"># contributors may be used to endorse or promote products derived from</span>
+<span class="s0"># this software without specific prior written permission.</span>
+<span class="s0">#</span>
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</span>
+<span class="s0"># &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</span>
+<span class="s0"># A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</span>
+<span class="s0"># OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</span>
+<span class="s0"># SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</span>
+<span class="s0"># LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</span>
+<span class="s0"># DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</span>
+<span class="s0"># THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</span>
+<span class="s0"># (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</span>
+<span class="s0"># OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</span>
+
+<span class="s2">&quot;&quot;&quot;Code for decoding protocol buffer primitives. 
+ 
+This code is very similar to encoder.py -- read the docs for that module first. 
+ 
+A &quot;decoder&quot; is a function with the signature: 
+  Decode(buffer, pos, end, message, field_dict) 
+The arguments are: 
+  buffer:     The string containing the encoded message. 
+  pos:        The current position in the string. 
+  end:        The position in the string where the current message ends.  May be 
+              less than len(buffer) if we're reading a sub-message. 
+  message:    The message object into which we're parsing. 
+  field_dict: message._fields (avoids a hashtable lookup). 
+The decoder reads the field and stores it into field_dict, returning the new 
+buffer position.  A decoder for a repeated field may proactively decode all of 
+the elements of that field, if they appear consecutively. 
+ 
+Note that decoders may throw any of the following: 
+  IndexError:  Indicates a truncated message. 
+  struct.error:  Unpacking of a fixed-width field failed. 
+  message.DecodeError:  Other errors. 
+ 
+Decoders are expected to raise an exception if they are called with pos &gt; end. 
+This allows callers to be lax about bounds checking:  it's fineto read past 
+&quot;end&quot; as long as you are sure that someone else will notice and throw an 
+exception later on. 
+ 
+Something up the call stack is expected to catch IndexError and struct.error 
+and convert them to message.DecodeError. 
+ 
+Decoders are constructed using decoder constructors with the signature: 
+  MakeDecoder(field_number, is_repeated, is_packed, key, new_default) 
+The arguments are: 
+  field_number:  The field number of the field we want to decode. 
+  is_repeated:   Is the field a repeated field? (bool) 
+  is_packed:     Is the field a packed field? (bool) 
+  key:           The key to use when looking up the field within field_dict. 
+                 (This is actually the FieldDescriptor but nothing in this 
+                 file should depend on that.) 
+  new_default:   A function which takes a message object as a parameter and 
+                 returns a new instance of the default value for this field. 
+                 (This is called for repeated fields and sub-messages, when an 
+                 instance does not already exist.) 
+ 
+As with encoders, we define a decoder constructor for every type of field. 
+Then, for every field of every message class we construct an actual decoder. 
+That decoder goes into a dict indexed by tag, so when we decode a message 
+we repeatedly read a tag, look up the corresponding decoder, and invoke it. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">__author__ = </span><span class="s3">'kenton@google.com (Kenton Varda)'</span>
+
+<span class="s4">import </span><span class="s1">math</span>
+<span class="s4">import </span><span class="s1">struct</span>
+
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">containers</span>
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">encoder</span>
+<span class="s4">from </span><span class="s1">google.protobuf.internal </span><span class="s4">import </span><span class="s1">wire_format</span>
+<span class="s4">from </span><span class="s1">google.protobuf </span><span class="s4">import </span><span class="s1">message</span>
+
+
+<span class="s0"># This is not for optimization, but rather to avoid conflicts with local</span>
+<span class="s0"># variables named &quot;message&quot;.</span>
+<span class="s1">_DecodeError = message.DecodeError</span>
+
+
+<span class="s4">def </span><span class="s1">_VarintDecoder(mask</span><span class="s4">, </span><span class="s1">result_type):</span>
+  <span class="s2">&quot;&quot;&quot;Return an encoder for a basic varint value (does not include tag). 
+ 
+  Decoded values will be bitwise-anded with the given mask before being 
+  returned, e.g. to limit them to 32 bits.  The returned decoder does not 
+  take the usual &quot;end&quot; parameter -- the caller is expected to do bounds checking 
+  after the fact (often the caller can defer such checking until later).  The 
+  decoder returns a (value, new_pos) pair. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+    <span class="s1">result = </span><span class="s5">0</span>
+    <span class="s1">shift = </span><span class="s5">0</span>
+    <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">b = buffer[pos]</span>
+      <span class="s1">result |= ((b &amp; </span><span class="s5">0x7f</span><span class="s1">) &lt;&lt; shift)</span>
+      <span class="s1">pos += </span><span class="s5">1</span>
+      <span class="s4">if not </span><span class="s1">(b &amp; </span><span class="s5">0x80</span><span class="s1">):</span>
+        <span class="s1">result &amp;= mask</span>
+        <span class="s1">result = result_type(result)</span>
+        <span class="s4">return </span><span class="s1">(result</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">shift += </span><span class="s5">7</span>
+      <span class="s4">if </span><span class="s1">shift &gt;= </span><span class="s5">64</span><span class="s1">:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Too many bytes when decoding varint.'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">DecodeVarint</span>
+
+
+<span class="s4">def </span><span class="s1">_SignedVarintDecoder(bits</span><span class="s4">, </span><span class="s1">result_type):</span>
+  <span class="s2">&quot;&quot;&quot;Like _VarintDecoder() but decodes signed values.&quot;&quot;&quot;</span>
+
+  <span class="s1">signbit = </span><span class="s5">1 </span><span class="s1">&lt;&lt; (bits - </span><span class="s5">1</span><span class="s1">)</span>
+  <span class="s1">mask = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; bits) - </span><span class="s5">1</span>
+
+  <span class="s4">def </span><span class="s1">DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+    <span class="s1">result = </span><span class="s5">0</span>
+    <span class="s1">shift = </span><span class="s5">0</span>
+    <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">b = buffer[pos]</span>
+      <span class="s1">result |= ((b &amp; </span><span class="s5">0x7f</span><span class="s1">) &lt;&lt; shift)</span>
+      <span class="s1">pos += </span><span class="s5">1</span>
+      <span class="s4">if not </span><span class="s1">(b &amp; </span><span class="s5">0x80</span><span class="s1">):</span>
+        <span class="s1">result &amp;= mask</span>
+        <span class="s1">result = (result ^ signbit) - signbit</span>
+        <span class="s1">result = result_type(result)</span>
+        <span class="s4">return </span><span class="s1">(result</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">shift += </span><span class="s5">7</span>
+      <span class="s4">if </span><span class="s1">shift &gt;= </span><span class="s5">64</span><span class="s1">:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Too many bytes when decoding varint.'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">DecodeVarint</span>
+
+<span class="s0"># All 32-bit and 64-bit values are represented as int.</span>
+<span class="s1">_DecodeVarint = _VarintDecoder((</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">64</span><span class="s1">) - </span><span class="s5">1</span><span class="s4">, </span><span class="s1">int)</span>
+<span class="s1">_DecodeSignedVarint = _SignedVarintDecoder(</span><span class="s5">64</span><span class="s4">, </span><span class="s1">int)</span>
+
+<span class="s0"># Use these versions for values which must be limited to 32 bits.</span>
+<span class="s1">_DecodeVarint32 = _VarintDecoder((</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">32</span><span class="s1">) - </span><span class="s5">1</span><span class="s4">, </span><span class="s1">int)</span>
+<span class="s1">_DecodeSignedVarint32 = _SignedVarintDecoder(</span><span class="s5">32</span><span class="s4">, </span><span class="s1">int)</span>
+
+
+<span class="s4">def </span><span class="s1">ReadTag(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+  <span class="s2">&quot;&quot;&quot;Read a tag from the memoryview, and return a (tag_bytes, new_pos) tuple. 
+ 
+  We return the raw bytes of the tag rather than decoding them.  The raw 
+  bytes can then be used to look up the proper decoder.  This effectively allows 
+  us to trade some work that would be done in pure-python (decoding a varint) 
+  for work that is done in C (searching for a byte string in a hash table). 
+  In a low-level language it would be much cheaper to decode the varint and 
+  use that, but not in Python. 
+ 
+  Args: 
+    buffer: memoryview object of the encoded bytes 
+    pos: int of the current position to start from 
+ 
+  Returns: 
+    Tuple[bytes, int] of the tag data and new position. 
+  &quot;&quot;&quot;</span>
+  <span class="s1">start = pos</span>
+  <span class="s4">while </span><span class="s1">buffer[pos] &amp; </span><span class="s5">0x80</span><span class="s1">:</span>
+    <span class="s1">pos += </span><span class="s5">1</span>
+  <span class="s1">pos += </span><span class="s5">1</span>
+
+  <span class="s1">tag_bytes = buffer[start:pos].tobytes()</span>
+  <span class="s4">return </span><span class="s1">tag_bytes</span><span class="s4">, </span><span class="s1">pos</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+
+
+<span class="s4">def </span><span class="s1">_SimpleDecoder(wire_type</span><span class="s4">, </span><span class="s1">decode_value):</span>
+  <span class="s2">&quot;&quot;&quot;Return a constructor for a decoder for fields of a particular type. 
+ 
+  Args: 
+      wire_type:  The field's wire type. 
+      decode_value:  A function which decodes an individual value, e.g. 
+        _DecodeVarint() 
+  &quot;&quot;&quot;</span>
+
+  <span class="s4">def </span><span class="s1">SpecificDecoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">new_default</span><span class="s4">,</span>
+                      <span class="s1">clear_if_default=</span><span class="s4">False</span><span class="s1">):</span>
+    <span class="s4">if </span><span class="s1">is_packed:</span>
+      <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+      <span class="s4">def </span><span class="s1">DecodePackedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+        <span class="s1">value = field_dict.get(key)</span>
+        <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+        <span class="s1">(endpoint</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s1">endpoint += pos</span>
+        <span class="s4">if </span><span class="s1">endpoint &gt; end:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+        <span class="s4">while </span><span class="s1">pos &lt; endpoint:</span>
+          <span class="s1">(element</span><span class="s4">, </span><span class="s1">pos) = decode_value(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+          <span class="s1">value.append(element)</span>
+        <span class="s4">if </span><span class="s1">pos &gt; endpoint:</span>
+          <span class="s4">del </span><span class="s1">value[-</span><span class="s5">1</span><span class="s1">]   </span><span class="s0"># Discard corrupt value.</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Packed element was truncated.'</span><span class="s1">)</span>
+        <span class="s4">return </span><span class="s1">pos</span>
+      <span class="s4">return </span><span class="s1">DecodePackedField</span>
+    <span class="s4">elif </span><span class="s1">is_repeated:</span>
+      <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_type)</span>
+      <span class="s1">tag_len = len(tag_bytes)</span>
+      <span class="s4">def </span><span class="s1">DecodeRepeatedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+        <span class="s1">value = field_dict.get(key)</span>
+        <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+        <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+          <span class="s1">(element</span><span class="s4">, </span><span class="s1">new_pos) = decode_value(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+          <span class="s1">value.append(element)</span>
+          <span class="s0"># Predict that the next tag is another copy of the same repeated</span>
+          <span class="s0"># field.</span>
+          <span class="s1">pos = new_pos + tag_len</span>
+          <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos &gt;= end:</span>
+            <span class="s0"># Prediction failed.  Return.</span>
+            <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+              <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+            <span class="s4">return </span><span class="s1">new_pos</span>
+      <span class="s4">return </span><span class="s1">DecodeRepeatedField</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">def </span><span class="s1">DecodeField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+        <span class="s1">(new_value</span><span class="s4">, </span><span class="s1">pos) = decode_value(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">clear_if_default </span><span class="s4">and not </span><span class="s1">new_value:</span>
+          <span class="s1">field_dict.pop(key</span><span class="s4">, None</span><span class="s1">)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s1">field_dict[key] = new_value</span>
+        <span class="s4">return </span><span class="s1">pos</span>
+      <span class="s4">return </span><span class="s1">DecodeField</span>
+
+  <span class="s4">return </span><span class="s1">SpecificDecoder</span>
+
+
+<span class="s4">def </span><span class="s1">_ModifiedDecoder(wire_type</span><span class="s4">, </span><span class="s1">decode_value</span><span class="s4">, </span><span class="s1">modify_value):</span>
+  <span class="s2">&quot;&quot;&quot;Like SimpleDecoder but additionally invokes modify_value on every value 
+  before storing it.  Usually modify_value is ZigZagDecode. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s0"># Reusing _SimpleDecoder is slightly slower than copying a bunch of code, but</span>
+  <span class="s0"># not enough to make a significant difference.</span>
+
+  <span class="s4">def </span><span class="s1">InnerDecode(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+    <span class="s1">(result</span><span class="s4">, </span><span class="s1">new_pos) = decode_value(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+    <span class="s4">return </span><span class="s1">(modify_value(result)</span><span class="s4">, </span><span class="s1">new_pos)</span>
+  <span class="s4">return </span><span class="s1">_SimpleDecoder(wire_type</span><span class="s4">, </span><span class="s1">InnerDecode)</span>
+
+
+<span class="s4">def </span><span class="s1">_StructPackDecoder(wire_type</span><span class="s4">, </span><span class="s1">format):</span>
+  <span class="s2">&quot;&quot;&quot;Return a constructor for a decoder for a fixed-width field. 
+ 
+  Args: 
+      wire_type:  The field's wire type. 
+      format:  The format string to pass to struct.unpack(). 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">value_size = struct.calcsize(format)</span>
+  <span class="s1">local_unpack = struct.unpack</span>
+
+  <span class="s0"># Reusing _SimpleDecoder is slightly slower than copying a bunch of code, but</span>
+  <span class="s0"># not enough to make a significant difference.</span>
+
+  <span class="s0"># Note that we expect someone up-stack to catch struct.error and convert</span>
+  <span class="s0"># it to _DecodeError -- this way we don't have to set up exception-</span>
+  <span class="s0"># handling blocks every time we parse one value.</span>
+
+  <span class="s4">def </span><span class="s1">InnerDecode(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+    <span class="s1">new_pos = pos + value_size</span>
+    <span class="s1">result = local_unpack(format</span><span class="s4">, </span><span class="s1">buffer[pos:new_pos])[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s4">return </span><span class="s1">(result</span><span class="s4">, </span><span class="s1">new_pos)</span>
+  <span class="s4">return </span><span class="s1">_SimpleDecoder(wire_type</span><span class="s4">, </span><span class="s1">InnerDecode)</span>
+
+
+<span class="s4">def </span><span class="s1">_FloatDecoder():</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a float field. 
+ 
+  This code works around a bug in struct.unpack for non-finite 32-bit 
+  floating-point values. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">local_unpack = struct.unpack</span>
+
+  <span class="s4">def </span><span class="s1">InnerDecode(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+    <span class="s2">&quot;&quot;&quot;Decode serialized float to a float and new position. 
+ 
+    Args: 
+      buffer: memoryview of the serialized bytes 
+      pos: int, position in the memory view to start at. 
+ 
+    Returns: 
+      Tuple[float, int] of the deserialized float value and new position 
+      in the serialized data. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># We expect a 32-bit value in little-endian byte order.  Bit 1 is the sign</span>
+    <span class="s0"># bit, bits 2-9 represent the exponent, and bits 10-32 are the significand.</span>
+    <span class="s1">new_pos = pos + </span><span class="s5">4</span>
+    <span class="s1">float_bytes = buffer[pos:new_pos].tobytes()</span>
+
+    <span class="s0"># If this value has all its exponent bits set, then it's non-finite.</span>
+    <span class="s0"># In Python 2.4, struct.unpack will convert it to a finite 64-bit value.</span>
+    <span class="s0"># To avoid that, we parse it specially.</span>
+    <span class="s4">if </span><span class="s1">(float_bytes[</span><span class="s5">3</span><span class="s1">:</span><span class="s5">4</span><span class="s1">] </span><span class="s4">in </span><span class="s6">b'</span><span class="s4">\x7F\xFF</span><span class="s6">' </span><span class="s4">and </span><span class="s1">float_bytes[</span><span class="s5">2</span><span class="s1">:</span><span class="s5">3</span><span class="s1">] &gt;= </span><span class="s6">b'</span><span class="s4">\x80</span><span class="s6">'</span><span class="s1">):</span>
+      <span class="s0"># If at least one significand bit is set...</span>
+      <span class="s4">if </span><span class="s1">float_bytes[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">3</span><span class="s1">] != </span><span class="s6">b'</span><span class="s4">\x00\x00\x80</span><span class="s6">'</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">(math.nan</span><span class="s4">, </span><span class="s1">new_pos)</span>
+      <span class="s0"># If sign bit is set...</span>
+      <span class="s4">if </span><span class="s1">float_bytes[</span><span class="s5">3</span><span class="s1">:</span><span class="s5">4</span><span class="s1">] == </span><span class="s6">b'</span><span class="s4">\xFF</span><span class="s6">'</span><span class="s1">:</span>
+        <span class="s4">return </span><span class="s1">(-math.inf</span><span class="s4">, </span><span class="s1">new_pos)</span>
+      <span class="s4">return </span><span class="s1">(math.inf</span><span class="s4">, </span><span class="s1">new_pos)</span>
+
+    <span class="s0"># Note that we expect someone up-stack to catch struct.error and convert</span>
+    <span class="s0"># it to _DecodeError -- this way we don't have to set up exception-</span>
+    <span class="s0"># handling blocks every time we parse one value.</span>
+    <span class="s1">result = local_unpack(</span><span class="s3">'&lt;f'</span><span class="s4">, </span><span class="s1">float_bytes)[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s4">return </span><span class="s1">(result</span><span class="s4">, </span><span class="s1">new_pos)</span>
+  <span class="s4">return </span><span class="s1">_SimpleDecoder(wire_format.WIRETYPE_FIXED32</span><span class="s4">, </span><span class="s1">InnerDecode)</span>
+
+
+<span class="s4">def </span><span class="s1">_DoubleDecoder():</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a double field. 
+ 
+  This code works around a bug in struct.unpack for not-a-number. 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">local_unpack = struct.unpack</span>
+
+  <span class="s4">def </span><span class="s1">InnerDecode(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+    <span class="s2">&quot;&quot;&quot;Decode serialized double to a double and new position. 
+ 
+    Args: 
+      buffer: memoryview of the serialized bytes. 
+      pos: int, position in the memory view to start at. 
+ 
+    Returns: 
+      Tuple[float, int] of the decoded double value and new position 
+      in the serialized data. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># We expect a 64-bit value in little-endian byte order.  Bit 1 is the sign</span>
+    <span class="s0"># bit, bits 2-12 represent the exponent, and bits 13-64 are the significand.</span>
+    <span class="s1">new_pos = pos + </span><span class="s5">8</span>
+    <span class="s1">double_bytes = buffer[pos:new_pos].tobytes()</span>
+
+    <span class="s0"># If this value has all its exponent bits set and at least one significand</span>
+    <span class="s0"># bit set, it's not a number.  In Python 2.4, struct.unpack will treat it</span>
+    <span class="s0"># as inf or -inf.  To avoid that, we treat it specially.</span>
+    <span class="s4">if </span><span class="s1">((double_bytes[</span><span class="s5">7</span><span class="s1">:</span><span class="s5">8</span><span class="s1">] </span><span class="s4">in </span><span class="s6">b'</span><span class="s4">\x7F\xFF</span><span class="s6">'</span><span class="s1">)</span>
+        <span class="s4">and </span><span class="s1">(double_bytes[</span><span class="s5">6</span><span class="s1">:</span><span class="s5">7</span><span class="s1">] &gt;= </span><span class="s6">b'</span><span class="s4">\xF0</span><span class="s6">'</span><span class="s1">)</span>
+        <span class="s4">and </span><span class="s1">(double_bytes[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">7</span><span class="s1">] != </span><span class="s6">b'</span><span class="s4">\x00\x00\x00\x00\x00\x00\xF0</span><span class="s6">'</span><span class="s1">)):</span>
+      <span class="s4">return </span><span class="s1">(math.nan</span><span class="s4">, </span><span class="s1">new_pos)</span>
+
+    <span class="s0"># Note that we expect someone up-stack to catch struct.error and convert</span>
+    <span class="s0"># it to _DecodeError -- this way we don't have to set up exception-</span>
+    <span class="s0"># handling blocks every time we parse one value.</span>
+    <span class="s1">result = local_unpack(</span><span class="s3">'&lt;d'</span><span class="s4">, </span><span class="s1">double_bytes)[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s4">return </span><span class="s1">(result</span><span class="s4">, </span><span class="s1">new_pos)</span>
+  <span class="s4">return </span><span class="s1">_SimpleDecoder(wire_format.WIRETYPE_FIXED64</span><span class="s4">, </span><span class="s1">InnerDecode)</span>
+
+
+<span class="s4">def </span><span class="s1">EnumDecoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">new_default</span><span class="s4">,</span>
+                <span class="s1">clear_if_default=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for enum field.&quot;&quot;&quot;</span>
+  <span class="s1">enum_type = key.enum_type</span>
+  <span class="s4">if </span><span class="s1">is_packed:</span>
+    <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+    <span class="s4">def </span><span class="s1">DecodePackedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s2">&quot;&quot;&quot;Decode serialized packed enum to its value and a new position. 
+ 
+      Args: 
+        buffer: memoryview of the serialized bytes. 
+        pos: int, position in the memory view to start at. 
+        end: int, end position of serialized data 
+        message: Message object to store unknown fields in 
+        field_dict: Map[Descriptor, Any] to store decoded values in. 
+ 
+      Returns: 
+        int, new position in serialized data. 
+      &quot;&quot;&quot;</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s1">(endpoint</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">endpoint += pos</span>
+      <span class="s4">if </span><span class="s1">endpoint &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+      <span class="s4">while </span><span class="s1">pos &lt; endpoint:</span>
+        <span class="s1">value_start_pos = pos</span>
+        <span class="s1">(element</span><span class="s4">, </span><span class="s1">pos) = _DecodeSignedVarint32(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s0"># pylint: disable=protected-access</span>
+        <span class="s4">if </span><span class="s1">element </span><span class="s4">in </span><span class="s1">enum_type.values_by_number:</span>
+          <span class="s1">value.append(element)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">if not </span><span class="s1">message._unknown_fields:</span>
+            <span class="s1">message._unknown_fields = []</span>
+          <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                       <span class="s1">wire_format.WIRETYPE_VARINT)</span>
+
+          <span class="s1">message._unknown_fields.append(</span>
+              <span class="s1">(tag_bytes</span><span class="s4">, </span><span class="s1">buffer[value_start_pos:pos].tobytes()))</span>
+          <span class="s4">if </span><span class="s1">message._unknown_field_set </span><span class="s4">is None</span><span class="s1">:</span>
+            <span class="s1">message._unknown_field_set = containers.UnknownFieldSet()</span>
+          <span class="s1">message._unknown_field_set._add(</span>
+              <span class="s1">field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">element)</span>
+          <span class="s0"># pylint: enable=protected-access</span>
+      <span class="s4">if </span><span class="s1">pos &gt; endpoint:</span>
+        <span class="s4">if </span><span class="s1">element </span><span class="s4">in </span><span class="s1">enum_type.values_by_number:</span>
+          <span class="s4">del </span><span class="s1">value[-</span><span class="s5">1</span><span class="s1">]   </span><span class="s0"># Discard corrupt value.</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">del </span><span class="s1">message._unknown_fields[-</span><span class="s5">1</span><span class="s1">]</span>
+          <span class="s0"># pylint: disable=protected-access</span>
+          <span class="s4">del </span><span class="s1">message._unknown_field_set._values[-</span><span class="s5">1</span><span class="s1">]</span>
+          <span class="s0"># pylint: enable=protected-access</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Packed element was truncated.'</span><span class="s1">)</span>
+      <span class="s4">return </span><span class="s1">pos</span>
+    <span class="s4">return </span><span class="s1">DecodePackedField</span>
+  <span class="s4">elif </span><span class="s1">is_repeated:</span>
+    <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT)</span>
+    <span class="s1">tag_len = len(tag_bytes)</span>
+    <span class="s4">def </span><span class="s1">DecodeRepeatedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s2">&quot;&quot;&quot;Decode serialized repeated enum to its value and a new position. 
+ 
+      Args: 
+        buffer: memoryview of the serialized bytes. 
+        pos: int, position in the memory view to start at. 
+        end: int, end position of serialized data 
+        message: Message object to store unknown fields in 
+        field_dict: Map[Descriptor, Any] to store decoded values in. 
+ 
+      Returns: 
+        int, new position in serialized data. 
+      &quot;&quot;&quot;</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">(element</span><span class="s4">, </span><span class="s1">new_pos) = _DecodeSignedVarint32(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s0"># pylint: disable=protected-access</span>
+        <span class="s4">if </span><span class="s1">element </span><span class="s4">in </span><span class="s1">enum_type.values_by_number:</span>
+          <span class="s1">value.append(element)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+          <span class="s4">if not </span><span class="s1">message._unknown_fields:</span>
+            <span class="s1">message._unknown_fields = []</span>
+          <span class="s1">message._unknown_fields.append(</span>
+              <span class="s1">(tag_bytes</span><span class="s4">, </span><span class="s1">buffer[pos:new_pos].tobytes()))</span>
+          <span class="s4">if </span><span class="s1">message._unknown_field_set </span><span class="s4">is None</span><span class="s1">:</span>
+            <span class="s1">message._unknown_field_set = containers.UnknownFieldSet()</span>
+          <span class="s1">message._unknown_field_set._add(</span>
+              <span class="s1">field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">element)</span>
+        <span class="s0"># pylint: enable=protected-access</span>
+        <span class="s0"># Predict that the next tag is another copy of the same repeated</span>
+        <span class="s0"># field.</span>
+        <span class="s1">pos = new_pos + tag_len</span>
+        <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos &gt;= end:</span>
+          <span class="s0"># Prediction failed.  Return.</span>
+          <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+            <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+          <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">DecodeField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s2">&quot;&quot;&quot;Decode serialized repeated enum to its value and a new position. 
+ 
+      Args: 
+        buffer: memoryview of the serialized bytes. 
+        pos: int, position in the memory view to start at. 
+        end: int, end position of serialized data 
+        message: Message object to store unknown fields in 
+        field_dict: Map[Descriptor, Any] to store decoded values in. 
+ 
+      Returns: 
+        int, new position in serialized data. 
+      &quot;&quot;&quot;</span>
+      <span class="s1">value_start_pos = pos</span>
+      <span class="s1">(enum_value</span><span class="s4">, </span><span class="s1">pos) = _DecodeSignedVarint32(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">clear_if_default </span><span class="s4">and not </span><span class="s1">enum_value:</span>
+        <span class="s1">field_dict.pop(key</span><span class="s4">, None</span><span class="s1">)</span>
+        <span class="s4">return </span><span class="s1">pos</span>
+      <span class="s0"># pylint: disable=protected-access</span>
+      <span class="s4">if </span><span class="s1">enum_value </span><span class="s4">in </span><span class="s1">enum_type.values_by_number:</span>
+        <span class="s1">field_dict[key] = enum_value</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s4">if not </span><span class="s1">message._unknown_fields:</span>
+          <span class="s1">message._unknown_fields = []</span>
+        <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                     <span class="s1">wire_format.WIRETYPE_VARINT)</span>
+        <span class="s1">message._unknown_fields.append(</span>
+            <span class="s1">(tag_bytes</span><span class="s4">, </span><span class="s1">buffer[value_start_pos:pos].tobytes()))</span>
+        <span class="s4">if </span><span class="s1">message._unknown_field_set </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s1">message._unknown_field_set = containers.UnknownFieldSet()</span>
+        <span class="s1">message._unknown_field_set._add(</span>
+            <span class="s1">field_number</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">enum_value)</span>
+        <span class="s0"># pylint: enable=protected-access</span>
+      <span class="s4">return </span><span class="s1">pos</span>
+    <span class="s4">return </span><span class="s1">DecodeField</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+
+
+<span class="s1">Int32Decoder = _SimpleDecoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeSignedVarint32)</span>
+
+<span class="s1">Int64Decoder = _SimpleDecoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeSignedVarint)</span>
+
+<span class="s1">UInt32Decoder = _SimpleDecoder(wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeVarint32)</span>
+<span class="s1">UInt64Decoder = _SimpleDecoder(wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeVarint)</span>
+
+<span class="s1">SInt32Decoder = _ModifiedDecoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeVarint32</span><span class="s4">, </span><span class="s1">wire_format.ZigZagDecode)</span>
+<span class="s1">SInt64Decoder = _ModifiedDecoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeVarint</span><span class="s4">, </span><span class="s1">wire_format.ZigZagDecode)</span>
+
+<span class="s0"># Note that Python conveniently guarantees that when using the '&lt;' prefix on</span>
+<span class="s0"># formats, they will also have the same size across all platforms (as opposed</span>
+<span class="s0"># to without the prefix, where their sizes depend on the C compiler's basic</span>
+<span class="s0"># type sizes).</span>
+<span class="s1">Fixed32Decoder  = _StructPackDecoder(wire_format.WIRETYPE_FIXED32</span><span class="s4">, </span><span class="s3">'&lt;I'</span><span class="s1">)</span>
+<span class="s1">Fixed64Decoder  = _StructPackDecoder(wire_format.WIRETYPE_FIXED64</span><span class="s4">, </span><span class="s3">'&lt;Q'</span><span class="s1">)</span>
+<span class="s1">SFixed32Decoder = _StructPackDecoder(wire_format.WIRETYPE_FIXED32</span><span class="s4">, </span><span class="s3">'&lt;i'</span><span class="s1">)</span>
+<span class="s1">SFixed64Decoder = _StructPackDecoder(wire_format.WIRETYPE_FIXED64</span><span class="s4">, </span><span class="s3">'&lt;q'</span><span class="s1">)</span>
+<span class="s1">FloatDecoder = _FloatDecoder()</span>
+<span class="s1">DoubleDecoder = _DoubleDecoder()</span>
+
+<span class="s1">BoolDecoder = _ModifiedDecoder(</span>
+    <span class="s1">wire_format.WIRETYPE_VARINT</span><span class="s4">, </span><span class="s1">_DecodeVarint</span><span class="s4">, </span><span class="s1">bool)</span>
+
+
+<span class="s4">def </span><span class="s1">StringDecoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">new_default</span><span class="s4">,</span>
+                  <span class="s1">clear_if_default=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a string field.&quot;&quot;&quot;</span>
+
+  <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+
+  <span class="s4">def </span><span class="s1">_ConvertToUnicode(memview):</span>
+    <span class="s2">&quot;&quot;&quot;Convert byte to unicode.&quot;&quot;&quot;</span>
+    <span class="s1">byte_str = memview.tobytes()</span>
+    <span class="s4">try</span><span class="s1">:</span>
+      <span class="s1">value = str(byte_str</span><span class="s4">, </span><span class="s3">'utf-8'</span><span class="s1">)</span>
+    <span class="s4">except </span><span class="s1">UnicodeDecodeError </span><span class="s4">as </span><span class="s1">e:</span>
+      <span class="s0"># add more information to the error message and re-raise it.</span>
+      <span class="s1">e.reason = </span><span class="s3">'%s in field: %s' </span><span class="s1">% (e</span><span class="s4">, </span><span class="s1">key.full_name)</span>
+      <span class="s4">raise</span>
+
+    <span class="s4">return </span><span class="s1">value</span>
+
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                 <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+    <span class="s1">tag_len = len(tag_bytes)</span>
+    <span class="s4">def </span><span class="s1">DecodeRepeatedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s1">new_pos = pos + size</span>
+        <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated string.'</span><span class="s1">)</span>
+        <span class="s1">value.append(_ConvertToUnicode(buffer[pos:new_pos]))</span>
+        <span class="s0"># Predict that the next tag is another copy of the same repeated field.</span>
+        <span class="s1">pos = new_pos + tag_len</span>
+        <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos == end:</span>
+          <span class="s0"># Prediction failed.  Return.</span>
+          <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">DecodeField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">new_pos = pos + size</span>
+      <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated string.'</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">clear_if_default </span><span class="s4">and not </span><span class="s1">size:</span>
+        <span class="s1">field_dict.pop(key</span><span class="s4">, None</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">field_dict[key] = _ConvertToUnicode(buffer[pos:new_pos])</span>
+      <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeField</span>
+
+
+<span class="s4">def </span><span class="s1">BytesDecoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">new_default</span><span class="s4">,</span>
+                 <span class="s1">clear_if_default=</span><span class="s4">False</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a bytes field.&quot;&quot;&quot;</span>
+
+  <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                 <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+    <span class="s1">tag_len = len(tag_bytes)</span>
+    <span class="s4">def </span><span class="s1">DecodeRepeatedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s1">new_pos = pos + size</span>
+        <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated string.'</span><span class="s1">)</span>
+        <span class="s1">value.append(buffer[pos:new_pos].tobytes())</span>
+        <span class="s0"># Predict that the next tag is another copy of the same repeated field.</span>
+        <span class="s1">pos = new_pos + tag_len</span>
+        <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos == end:</span>
+          <span class="s0"># Prediction failed.  Return.</span>
+          <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">DecodeField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">new_pos = pos + size</span>
+      <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated string.'</span><span class="s1">)</span>
+      <span class="s4">if </span><span class="s1">clear_if_default </span><span class="s4">and not </span><span class="s1">size:</span>
+        <span class="s1">field_dict.pop(key</span><span class="s4">, None</span><span class="s1">)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">field_dict[key] = buffer[pos:new_pos].tobytes()</span>
+      <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeField</span>
+
+
+<span class="s4">def </span><span class="s1">GroupDecoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">new_default):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a group field.&quot;&quot;&quot;</span>
+
+  <span class="s1">end_tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                   <span class="s1">wire_format.WIRETYPE_END_GROUP)</span>
+  <span class="s1">end_tag_len = len(end_tag_bytes)</span>
+
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                 <span class="s1">wire_format.WIRETYPE_START_GROUP)</span>
+    <span class="s1">tag_len = len(tag_bytes)</span>
+    <span class="s4">def </span><span class="s1">DecodeRepeatedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.get(key)</span>
+        <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+          <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+        <span class="s0"># Read sub-message.</span>
+        <span class="s1">pos = value.add()._InternalParse(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end)</span>
+        <span class="s0"># Read end tag.</span>
+        <span class="s1">new_pos = pos+end_tag_len</span>
+        <span class="s4">if </span><span class="s1">buffer[pos:new_pos] != end_tag_bytes </span><span class="s4">or </span><span class="s1">new_pos &gt; end:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Missing group end tag.'</span><span class="s1">)</span>
+        <span class="s0"># Predict that the next tag is another copy of the same repeated field.</span>
+        <span class="s1">pos = new_pos + tag_len</span>
+        <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos == end:</span>
+          <span class="s0"># Prediction failed.  Return.</span>
+          <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">DecodeField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s0"># Read sub-message.</span>
+      <span class="s1">pos = value._InternalParse(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end)</span>
+      <span class="s0"># Read end tag.</span>
+      <span class="s1">new_pos = pos+end_tag_len</span>
+      <span class="s4">if </span><span class="s1">buffer[pos:new_pos] != end_tag_bytes </span><span class="s4">or </span><span class="s1">new_pos &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Missing group end tag.'</span><span class="s1">)</span>
+      <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeField</span>
+
+
+<span class="s4">def </span><span class="s1">MessageDecoder(field_number</span><span class="s4">, </span><span class="s1">is_repeated</span><span class="s4">, </span><span class="s1">is_packed</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">new_default):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a message field.&quot;&quot;&quot;</span>
+
+  <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+
+  <span class="s4">assert not </span><span class="s1">is_packed</span>
+  <span class="s4">if </span><span class="s1">is_repeated:</span>
+    <span class="s1">tag_bytes = encoder.TagBytes(field_number</span><span class="s4">,</span>
+                                 <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+    <span class="s1">tag_len = len(tag_bytes)</span>
+    <span class="s4">def </span><span class="s1">DecodeRepeatedField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s0"># Read length.</span>
+        <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s1">new_pos = pos + size</span>
+        <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+        <span class="s0"># Read sub-message.</span>
+        <span class="s4">if </span><span class="s1">value.add()._InternalParse(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">new_pos) != new_pos:</span>
+          <span class="s0"># The only reason _InternalParse would return early is if it</span>
+          <span class="s0"># encountered an end-group tag.</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Unexpected end-group tag.'</span><span class="s1">)</span>
+        <span class="s0"># Predict that the next tag is another copy of the same repeated field.</span>
+        <span class="s1">pos = new_pos + tag_len</span>
+        <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos == end:</span>
+          <span class="s0"># Prediction failed.  Return.</span>
+          <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeRepeatedField</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">def </span><span class="s1">DecodeField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+      <span class="s1">value = field_dict.get(key)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+      <span class="s0"># Read length.</span>
+      <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">new_pos = pos + size</span>
+      <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+      <span class="s0"># Read sub-message.</span>
+      <span class="s4">if </span><span class="s1">value._InternalParse(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">new_pos) != new_pos:</span>
+        <span class="s0"># The only reason _InternalParse would return early is if it encountered</span>
+        <span class="s0"># an end-group tag.</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Unexpected end-group tag.'</span><span class="s1">)</span>
+      <span class="s4">return </span><span class="s1">new_pos</span>
+    <span class="s4">return </span><span class="s1">DecodeField</span>
+
+
+<span class="s0"># --------------------------------------------------------------------</span>
+
+<span class="s1">MESSAGE_SET_ITEM_TAG = encoder.TagBytes(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_START_GROUP)</span>
+
+<span class="s4">def </span><span class="s1">MessageSetItemDecoder(descriptor):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a MessageSet item. 
+ 
+  The parameter is the message Descriptor. 
+ 
+  The message set message looks like this: 
+    message MessageSet { 
+      repeated group Item = 1 { 
+        required int32 type_id = 2; 
+        required string message = 3; 
+      } 
+    } 
+  &quot;&quot;&quot;</span>
+
+  <span class="s1">type_id_tag_bytes = encoder.TagBytes(</span><span class="s5">2</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_VARINT)</span>
+  <span class="s1">message_tag_bytes = encoder.TagBytes(</span><span class="s5">3</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+  <span class="s1">item_end_tag_bytes = encoder.TagBytes(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">wire_format.WIRETYPE_END_GROUP)</span>
+
+  <span class="s1">local_ReadTag = ReadTag</span>
+  <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+  <span class="s1">local_SkipField = SkipField</span>
+
+  <span class="s4">def </span><span class="s1">DecodeItem(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+    <span class="s2">&quot;&quot;&quot;Decode serialized message set to its value and new position. 
+ 
+    Args: 
+      buffer: memoryview of the serialized bytes. 
+      pos: int, position in the memory view to start at. 
+      end: int, end position of serialized data 
+      message: Message object to store unknown fields in 
+      field_dict: Map[Descriptor, Any] to store decoded values in. 
+ 
+    Returns: 
+      int, new position in serialized data. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">message_set_item_start = pos</span>
+    <span class="s1">type_id = -</span><span class="s5">1</span>
+    <span class="s1">message_start = -</span><span class="s5">1</span>
+    <span class="s1">message_end = -</span><span class="s5">1</span>
+
+    <span class="s0"># Technically, type_id and message can appear in any order, so we need</span>
+    <span class="s0"># a little loop here.</span>
+    <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s1">(tag_bytes</span><span class="s4">, </span><span class="s1">pos) = local_ReadTag(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s4">if </span><span class="s1">tag_bytes == type_id_tag_bytes:</span>
+        <span class="s1">(type_id</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s4">elif </span><span class="s1">tag_bytes == message_tag_bytes:</span>
+        <span class="s1">(size</span><span class="s4">, </span><span class="s1">message_start) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+        <span class="s1">pos = message_end = message_start + size</span>
+      <span class="s4">elif </span><span class="s1">tag_bytes == item_end_tag_bytes:</span>
+        <span class="s4">break</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">pos = SkipField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">tag_bytes)</span>
+        <span class="s4">if </span><span class="s1">pos == -</span><span class="s5">1</span><span class="s1">:</span>
+          <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Missing group end tag.'</span><span class="s1">)</span>
+
+    <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+      <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+
+    <span class="s4">if </span><span class="s1">type_id == -</span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'MessageSet item missing type_id.'</span><span class="s1">)</span>
+    <span class="s4">if </span><span class="s1">message_start == -</span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'MessageSet item missing message.'</span><span class="s1">)</span>
+
+    <span class="s1">extension = message.Extensions._FindExtensionByNumber(type_id)</span>
+    <span class="s0"># pylint: disable=protected-access</span>
+    <span class="s4">if </span><span class="s1">extension </span><span class="s4">is not None</span><span class="s1">:</span>
+      <span class="s1">value = field_dict.get(extension)</span>
+      <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">message_type = extension.message_type</span>
+        <span class="s4">if not </span><span class="s1">hasattr(message_type</span><span class="s4">, </span><span class="s3">'_concrete_class'</span><span class="s1">):</span>
+          <span class="s0"># pylint: disable=protected-access</span>
+          <span class="s1">message._FACTORY.GetPrototype(message_type)</span>
+        <span class="s1">value = field_dict.setdefault(</span>
+            <span class="s1">extension</span><span class="s4">, </span><span class="s1">message_type._concrete_class())</span>
+      <span class="s4">if </span><span class="s1">value._InternalParse(buffer</span><span class="s4">, </span><span class="s1">message_start</span><span class="s4">,</span><span class="s1">message_end) != message_end:</span>
+        <span class="s0"># The only reason _InternalParse would return early is if it encountered</span>
+        <span class="s0"># an end-group tag.</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Unexpected end-group tag.'</span><span class="s1">)</span>
+    <span class="s4">else</span><span class="s1">:</span>
+      <span class="s4">if not </span><span class="s1">message._unknown_fields:</span>
+        <span class="s1">message._unknown_fields = []</span>
+      <span class="s1">message._unknown_fields.append(</span>
+          <span class="s1">(MESSAGE_SET_ITEM_TAG</span><span class="s4">, </span><span class="s1">buffer[message_set_item_start:pos].tobytes()))</span>
+      <span class="s4">if </span><span class="s1">message._unknown_field_set </span><span class="s4">is None</span><span class="s1">:</span>
+        <span class="s1">message._unknown_field_set = containers.UnknownFieldSet()</span>
+      <span class="s1">message._unknown_field_set._add(</span>
+          <span class="s1">type_id</span><span class="s4">,</span>
+          <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED</span><span class="s4">,</span>
+          <span class="s1">buffer[message_start:message_end].tobytes())</span>
+      <span class="s0"># pylint: enable=protected-access</span>
+
+    <span class="s4">return </span><span class="s1">pos</span>
+
+  <span class="s4">return </span><span class="s1">DecodeItem</span>
+
+<span class="s0"># --------------------------------------------------------------------</span>
+
+<span class="s4">def </span><span class="s1">MapDecoder(field_descriptor</span><span class="s4">, </span><span class="s1">new_default</span><span class="s4">, </span><span class="s1">is_message_map):</span>
+  <span class="s2">&quot;&quot;&quot;Returns a decoder for a map field.&quot;&quot;&quot;</span>
+
+  <span class="s1">key = field_descriptor</span>
+  <span class="s1">tag_bytes = encoder.TagBytes(field_descriptor.number</span><span class="s4">,</span>
+                               <span class="s1">wire_format.WIRETYPE_LENGTH_DELIMITED)</span>
+  <span class="s1">tag_len = len(tag_bytes)</span>
+  <span class="s1">local_DecodeVarint = _DecodeVarint</span>
+  <span class="s0"># Can't read _concrete_class yet; might not be initialized.</span>
+  <span class="s1">message_type = field_descriptor.message_type</span>
+
+  <span class="s4">def </span><span class="s1">DecodeMap(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">field_dict):</span>
+    <span class="s1">submsg = message_type._concrete_class()</span>
+    <span class="s1">value = field_dict.get(key)</span>
+    <span class="s4">if </span><span class="s1">value </span><span class="s4">is None</span><span class="s1">:</span>
+      <span class="s1">value = field_dict.setdefault(key</span><span class="s4">, </span><span class="s1">new_default(message))</span>
+    <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s0"># Read length.</span>
+      <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = local_DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+      <span class="s1">new_pos = pos + size</span>
+      <span class="s4">if </span><span class="s1">new_pos &gt; end:</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+      <span class="s0"># Read sub-message.</span>
+      <span class="s1">submsg.Clear()</span>
+      <span class="s4">if </span><span class="s1">submsg._InternalParse(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">new_pos) != new_pos:</span>
+        <span class="s0"># The only reason _InternalParse would return early is if it</span>
+        <span class="s0"># encountered an end-group tag.</span>
+        <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Unexpected end-group tag.'</span><span class="s1">)</span>
+
+      <span class="s4">if </span><span class="s1">is_message_map:</span>
+        <span class="s1">value[submsg.key].CopyFrom(submsg.value)</span>
+      <span class="s4">else</span><span class="s1">:</span>
+        <span class="s1">value[submsg.key] = submsg.value</span>
+
+      <span class="s0"># Predict that the next tag is another copy of the same repeated field.</span>
+      <span class="s1">pos = new_pos + tag_len</span>
+      <span class="s4">if </span><span class="s1">buffer[new_pos:pos] != tag_bytes </span><span class="s4">or </span><span class="s1">new_pos == end:</span>
+        <span class="s0"># Prediction failed.  Return.</span>
+        <span class="s4">return </span><span class="s1">new_pos</span>
+
+  <span class="s4">return </span><span class="s1">DecodeMap</span>
+
+<span class="s0"># --------------------------------------------------------------------</span>
+<span class="s0"># Optimization is not as heavy here because calls to SkipField() are rare,</span>
+<span class="s0"># except for handling end-group tags.</span>
+
+<span class="s4">def </span><span class="s1">_SkipVarint(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skip a varint value.  Returns the new position.&quot;&quot;&quot;</span>
+  <span class="s0"># Previously ord(buffer[pos]) raised IndexError when pos is out of range.</span>
+  <span class="s0"># With this code, ord(b'') raises TypeError.  Both are handled in</span>
+  <span class="s0"># python_message.py to generate a 'Truncated message' error.</span>
+  <span class="s4">while </span><span class="s1">ord(buffer[pos:pos+</span><span class="s5">1</span><span class="s1">].tobytes()) &amp; </span><span class="s5">0x80</span><span class="s1">:</span>
+    <span class="s1">pos += </span><span class="s5">1</span>
+  <span class="s1">pos += </span><span class="s5">1</span>
+  <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+    <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">pos</span>
+
+<span class="s4">def </span><span class="s1">_SkipFixed64(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skip a fixed64 value.  Returns the new position.&quot;&quot;&quot;</span>
+
+  <span class="s1">pos += </span><span class="s5">8</span>
+  <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+    <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">pos</span>
+
+
+<span class="s4">def </span><span class="s1">_DecodeFixed64(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+  <span class="s2">&quot;&quot;&quot;Decode a fixed64.&quot;&quot;&quot;</span>
+  <span class="s1">new_pos = pos + </span><span class="s5">8</span>
+  <span class="s4">return </span><span class="s1">(struct.unpack(</span><span class="s3">'&lt;Q'</span><span class="s4">, </span><span class="s1">buffer[pos:new_pos])[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">new_pos)</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipLengthDelimited(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skip a length-delimited value.  Returns the new position.&quot;&quot;&quot;</span>
+
+  <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = _DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+  <span class="s1">pos += size</span>
+  <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+    <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">pos</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipGroup(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skip sub-group.  Returns the new position.&quot;&quot;&quot;</span>
+
+  <span class="s4">while </span><span class="s5">1</span><span class="s1">:</span>
+    <span class="s1">(tag_bytes</span><span class="s4">, </span><span class="s1">pos) = ReadTag(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+    <span class="s1">new_pos = SkipField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">tag_bytes)</span>
+    <span class="s4">if </span><span class="s1">new_pos == -</span><span class="s5">1</span><span class="s1">:</span>
+      <span class="s4">return </span><span class="s1">pos</span>
+    <span class="s1">pos = new_pos</span>
+
+
+<span class="s4">def </span><span class="s1">_DecodeUnknownFieldSet(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end_pos=</span><span class="s4">None</span><span class="s1">):</span>
+  <span class="s2">&quot;&quot;&quot;Decode UnknownFieldSet.  Returns the UnknownFieldSet and new position.&quot;&quot;&quot;</span>
+
+  <span class="s1">unknown_field_set = containers.UnknownFieldSet()</span>
+  <span class="s4">while </span><span class="s1">end_pos </span><span class="s4">is None or </span><span class="s1">pos &lt; end_pos:</span>
+    <span class="s1">(tag_bytes</span><span class="s4">, </span><span class="s1">pos) = ReadTag(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+    <span class="s1">(tag</span><span class="s4">, </span><span class="s1">_) = _DecodeVarint(tag_bytes</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">field_number</span><span class="s4">, </span><span class="s1">wire_type = wire_format.UnpackTag(tag)</span>
+    <span class="s4">if </span><span class="s1">wire_type == wire_format.WIRETYPE_END_GROUP:</span>
+      <span class="s4">break</span>
+    <span class="s1">(data</span><span class="s4">, </span><span class="s1">pos) = _DecodeUnknownField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">wire_type)</span>
+    <span class="s0"># pylint: disable=protected-access</span>
+    <span class="s1">unknown_field_set._add(field_number</span><span class="s4">, </span><span class="s1">wire_type</span><span class="s4">, </span><span class="s1">data)</span>
+
+  <span class="s4">return </span><span class="s1">(unknown_field_set</span><span class="s4">, </span><span class="s1">pos)</span>
+
+
+<span class="s4">def </span><span class="s1">_DecodeUnknownField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">wire_type):</span>
+  <span class="s2">&quot;&quot;&quot;Decode a unknown field.  Returns the UnknownField and new position.&quot;&quot;&quot;</span>
+
+  <span class="s4">if </span><span class="s1">wire_type == wire_format.WIRETYPE_VARINT:</span>
+    <span class="s1">(data</span><span class="s4">, </span><span class="s1">pos) = _DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+  <span class="s4">elif </span><span class="s1">wire_type == wire_format.WIRETYPE_FIXED64:</span>
+    <span class="s1">(data</span><span class="s4">, </span><span class="s1">pos) = _DecodeFixed64(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+  <span class="s4">elif </span><span class="s1">wire_type == wire_format.WIRETYPE_FIXED32:</span>
+    <span class="s1">(data</span><span class="s4">, </span><span class="s1">pos) = _DecodeFixed32(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+  <span class="s4">elif </span><span class="s1">wire_type == wire_format.WIRETYPE_LENGTH_DELIMITED:</span>
+    <span class="s1">(size</span><span class="s4">, </span><span class="s1">pos) = _DecodeVarint(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+    <span class="s1">data = buffer[pos:pos+size].tobytes()</span>
+    <span class="s1">pos += size</span>
+  <span class="s4">elif </span><span class="s1">wire_type == wire_format.WIRETYPE_START_GROUP:</span>
+    <span class="s1">(data</span><span class="s4">, </span><span class="s1">pos) = _DecodeUnknownFieldSet(buffer</span><span class="s4">, </span><span class="s1">pos)</span>
+  <span class="s4">elif </span><span class="s1">wire_type == wire_format.WIRETYPE_END_GROUP:</span>
+    <span class="s4">return </span><span class="s1">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">)</span>
+  <span class="s4">else</span><span class="s1">:</span>
+    <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Wrong wire type in tag.'</span><span class="s1">)</span>
+
+  <span class="s4">return </span><span class="s1">(data</span><span class="s4">, </span><span class="s1">pos)</span>
+
+
+<span class="s4">def </span><span class="s1">_EndGroup(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skipping an END_GROUP tag returns -1 to tell the parent loop to break.&quot;&quot;&quot;</span>
+
+  <span class="s4">return </span><span class="s1">-</span><span class="s5">1</span>
+
+
+<span class="s4">def </span><span class="s1">_SkipFixed32(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skip a fixed32 value.  Returns the new position.&quot;&quot;&quot;</span>
+
+  <span class="s1">pos += </span><span class="s5">4</span>
+  <span class="s4">if </span><span class="s1">pos &gt; end:</span>
+    <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Truncated message.'</span><span class="s1">)</span>
+  <span class="s4">return </span><span class="s1">pos</span>
+
+
+<span class="s4">def </span><span class="s1">_DecodeFixed32(buffer</span><span class="s4">, </span><span class="s1">pos):</span>
+  <span class="s2">&quot;&quot;&quot;Decode a fixed32.&quot;&quot;&quot;</span>
+
+  <span class="s1">new_pos = pos + </span><span class="s5">4</span>
+  <span class="s4">return </span><span class="s1">(struct.unpack(</span><span class="s3">'&lt;I'</span><span class="s4">, </span><span class="s1">buffer[pos:new_pos])[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">new_pos)</span>
+
+
+<span class="s4">def </span><span class="s1">_RaiseInvalidWireType(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end):</span>
+  <span class="s2">&quot;&quot;&quot;Skip function for unknown wire types.  Raises an exception.&quot;&quot;&quot;</span>
+
+  <span class="s4">raise </span><span class="s1">_DecodeError(</span><span class="s3">'Tag had invalid wire type.'</span><span class="s1">)</span>
+
+<span class="s4">def </span><span class="s1">_FieldSkipper():</span>
+  <span class="s2">&quot;&quot;&quot;Constructs the SkipField function.&quot;&quot;&quot;</span>
+
+  <span class="s1">WIRETYPE_TO_SKIPPER = [</span>
+      <span class="s1">_SkipVarint</span><span class="s4">,</span>
+      <span class="s1">_SkipFixed64</span><span class="s4">,</span>
+      <span class="s1">_SkipLengthDelimited</span><span class="s4">,</span>
+      <span class="s1">_SkipGroup</span><span class="s4">,</span>
+      <span class="s1">_EndGroup</span><span class="s4">,</span>
+      <span class="s1">_SkipFixed32</span><span class="s4">,</span>
+      <span class="s1">_RaiseInvalidWireType</span><span class="s4">,</span>
+      <span class="s1">_RaiseInvalidWireType</span><span class="s4">,</span>
+      <span class="s1">]</span>
+
+  <span class="s1">wiretype_mask = wire_format.TAG_TYPE_MASK</span>
+
+  <span class="s4">def </span><span class="s1">SkipField(buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end</span><span class="s4">, </span><span class="s1">tag_bytes):</span>
+    <span class="s2">&quot;&quot;&quot;Skips a field with the specified tag. 
+ 
+    |pos| should point to the byte immediately after the tag. 
+ 
+    Returns: 
+        The new position (after the tag value), or -1 if the tag is an end-group 
+        tag (in which case the calling loop should break). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># The wire type is always in the first byte since varints are little-endian.</span>
+    <span class="s1">wire_type = ord(tag_bytes[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">1</span><span class="s1">]) &amp; wiretype_mask</span>
+    <span class="s4">return </span><span class="s1">WIRETYPE_TO_SKIPPER[wire_type](buffer</span><span class="s4">, </span><span class="s1">pos</span><span class="s4">, </span><span class="s1">end)</span>
+
+  <span class="s4">return </span><span class="s1">SkipField</span>
+
+<span class="s1">SkipField = _FieldSkipper()</span>
+</pre>
+</body>
+</html>

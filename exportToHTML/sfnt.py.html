@@ -1,0 +1,647 @@
+<html>
+<head>
+<title>sfnt.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+sfnt.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;ttLib/sfnt.py -- low-level module to deal with the sfnt file format. 
+ 
+Defines two public classes: 
+    SFNTReader 
+    SFNTWriter 
+ 
+(Normally you don't have to use these classes explicitly; they are 
+used automatically by ttLib.TTFont.) 
+ 
+The reading and writing of sfnt files is separated in two distinct 
+classes, since whenever the number of tables changes or whenever 
+a table's length changes you need to rewrite the whole file anyway. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">BytesIO</span>
+<span class="s2">from </span><span class="s1">types </span><span class="s2">import </span><span class="s1">SimpleNamespace</span>
+<span class="s2">from </span><span class="s1">fontTools.misc.textTools </span><span class="s2">import </span><span class="s1">Tag</span>
+<span class="s2">from </span><span class="s1">fontTools.misc </span><span class="s2">import </span><span class="s1">sstruct</span>
+<span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">TTLibError</span>
+<span class="s2">import </span><span class="s1">struct</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">OrderedDict</span>
+<span class="s2">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+
+<span class="s2">class </span><span class="s1">SFNTReader(object):</span>
+
+	<span class="s2">def </span><span class="s1">__new__(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+		<span class="s0">&quot;&quot;&quot; Return an instance of the SFNTReader sub-class which is compatible 
+        with the input file type. 
+        &quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">args </span><span class="s2">and </span><span class="s1">cls </span><span class="s2">is </span><span class="s1">SFNTReader:</span>
+			<span class="s1">infile = args[</span><span class="s3">0</span><span class="s1">]</span>
+			<span class="s1">infile.seek(</span><span class="s3">0</span><span class="s1">)</span>
+			<span class="s1">sfntVersion = Tag(infile.read(</span><span class="s3">4</span><span class="s1">))</span>
+			<span class="s1">infile.seek(</span><span class="s3">0</span><span class="s1">)</span>
+			<span class="s2">if </span><span class="s1">sfntVersion == </span><span class="s4">&quot;wOF2&quot;</span><span class="s1">:</span>
+				<span class="s5"># return new WOFF2Reader object</span>
+				<span class="s2">from </span><span class="s1">fontTools.ttLib.woff2 </span><span class="s2">import </span><span class="s1">WOFF2Reader</span>
+				<span class="s2">return </span><span class="s1">object.__new__(WOFF2Reader)</span>
+		<span class="s5"># return default object</span>
+		<span class="s2">return </span><span class="s1">object.__new__(cls)</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">file</span><span class="s2">, </span><span class="s1">checkChecksums=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">fontNumber=-</span><span class="s3">1</span><span class="s1">):</span>
+		<span class="s1">self.file = file</span>
+		<span class="s1">self.checkChecksums = checkChecksums</span>
+
+		<span class="s1">self.flavor = </span><span class="s2">None</span>
+		<span class="s1">self.flavorData = </span><span class="s2">None</span>
+		<span class="s1">self.DirectoryEntry = SFNTDirectoryEntry</span>
+		<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s1">)</span>
+		<span class="s1">self.sfntVersion = self.file.read(</span><span class="s3">4</span><span class="s1">)</span>
+		<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s1">)</span>
+		<span class="s2">if </span><span class="s1">self.sfntVersion == </span><span class="s6">b&quot;ttcf&quot;</span><span class="s1">:</span>
+			<span class="s1">header = readTTCHeader(self.file)</span>
+			<span class="s1">numFonts = header.numFonts</span>
+			<span class="s2">if not </span><span class="s3">0 </span><span class="s1">&lt;= fontNumber &lt; numFonts:</span>
+				<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;specify a font number between 0 and %d (inclusive)&quot; </span><span class="s1">% (numFonts - </span><span class="s3">1</span><span class="s1">))</span>
+			<span class="s1">self.numFonts = numFonts</span>
+			<span class="s1">self.file.seek(header.offsetTable[fontNumber])</span>
+			<span class="s1">data = self.file.read(sfntDirectorySize)</span>
+			<span class="s2">if </span><span class="s1">len(data) != sfntDirectorySize:</span>
+				<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;Not a Font Collection (not enough data)&quot;</span><span class="s1">)</span>
+			<span class="s1">sstruct.unpack(sfntDirectoryFormat</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">self)</span>
+		<span class="s2">elif </span><span class="s1">self.sfntVersion == </span><span class="s6">b&quot;wOFF&quot;</span><span class="s1">:</span>
+			<span class="s1">self.flavor = </span><span class="s4">&quot;woff&quot;</span>
+			<span class="s1">self.DirectoryEntry = WOFFDirectoryEntry</span>
+			<span class="s1">data = self.file.read(woffDirectorySize)</span>
+			<span class="s2">if </span><span class="s1">len(data) != woffDirectorySize:</span>
+				<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;Not a WOFF font (not enough data)&quot;</span><span class="s1">)</span>
+			<span class="s1">sstruct.unpack(woffDirectoryFormat</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">self)</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">data = self.file.read(sfntDirectorySize)</span>
+			<span class="s2">if </span><span class="s1">len(data) != sfntDirectorySize:</span>
+				<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;Not a TrueType or OpenType font (not enough data)&quot;</span><span class="s1">)</span>
+			<span class="s1">sstruct.unpack(sfntDirectoryFormat</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">self)</span>
+		<span class="s1">self.sfntVersion = Tag(self.sfntVersion)</span>
+
+		<span class="s2">if </span><span class="s1">self.sfntVersion </span><span class="s2">not in </span><span class="s1">(</span><span class="s4">&quot;</span><span class="s2">\x00\x01\x00\x00</span><span class="s4">&quot;</span><span class="s2">, </span><span class="s4">&quot;OTTO&quot;</span><span class="s2">, </span><span class="s4">&quot;true&quot;</span><span class="s1">):</span>
+			<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;Not a TrueType or OpenType font (bad sfntVersion)&quot;</span><span class="s1">)</span>
+		<span class="s1">tables = {}</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.numTables):</span>
+			<span class="s1">entry = self.DirectoryEntry()</span>
+			<span class="s1">entry.fromFile(self.file)</span>
+			<span class="s1">tag = Tag(entry.tag)</span>
+			<span class="s1">tables[tag] = entry</span>
+		<span class="s1">self.tables = OrderedDict(sorted(tables.items()</span><span class="s2">, </span><span class="s1">key=</span><span class="s2">lambda </span><span class="s1">i: i[</span><span class="s3">1</span><span class="s1">].offset))</span>
+
+		<span class="s5"># Load flavor data if any</span>
+		<span class="s2">if </span><span class="s1">self.flavor == </span><span class="s4">&quot;woff&quot;</span><span class="s1">:</span>
+			<span class="s1">self.flavorData = WOFFFlavorData(self)</span>
+
+	<span class="s2">def </span><span class="s1">has_key(self</span><span class="s2">, </span><span class="s1">tag):</span>
+		<span class="s2">return </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">self.tables</span>
+
+	<span class="s1">__contains__ = has_key</span>
+
+	<span class="s2">def </span><span class="s1">keys(self):</span>
+		<span class="s2">return </span><span class="s1">self.tables.keys()</span>
+
+	<span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">tag):</span>
+		<span class="s0">&quot;&quot;&quot;Fetch the raw table data.&quot;&quot;&quot;</span>
+		<span class="s1">entry = self.tables[Tag(tag)]</span>
+		<span class="s1">data = entry.loadData (self.file)</span>
+		<span class="s2">if </span><span class="s1">self.checkChecksums:</span>
+			<span class="s2">if </span><span class="s1">tag == </span><span class="s4">'head'</span><span class="s1">:</span>
+				<span class="s5"># Beh: we have to special-case the 'head' table.</span>
+				<span class="s1">checksum = calcChecksum(data[:</span><span class="s3">8</span><span class="s1">] + </span><span class="s6">b'</span><span class="s2">\0\0\0\0</span><span class="s6">' </span><span class="s1">+ data[</span><span class="s3">12</span><span class="s1">:])</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">checksum = calcChecksum(data)</span>
+			<span class="s2">if </span><span class="s1">self.checkChecksums &gt; </span><span class="s3">1</span><span class="s1">:</span>
+				<span class="s5"># Be obnoxious, and barf when it's wrong</span>
+				<span class="s2">assert </span><span class="s1">checksum == entry.checkSum</span><span class="s2">, </span><span class="s4">&quot;bad checksum for '%s' table&quot; </span><span class="s1">% tag</span>
+			<span class="s2">elif </span><span class="s1">checksum != entry.checkSum:</span>
+				<span class="s5"># Be friendly, and just log a warning.</span>
+				<span class="s1">log.warning(</span><span class="s4">&quot;bad checksum for '%s' table&quot;</span><span class="s2">, </span><span class="s1">tag)</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">__delitem__(self</span><span class="s2">, </span><span class="s1">tag):</span>
+		<span class="s2">del </span><span class="s1">self.tables[Tag(tag)]</span>
+
+	<span class="s2">def </span><span class="s1">close(self):</span>
+		<span class="s1">self.file.close()</span>
+
+	<span class="s5"># We define custom __getstate__ and __setstate__ to make SFNTReader pickle-able</span>
+	<span class="s5"># and deepcopy-able. When a TTFont is loaded as lazy=True, SFNTReader holds a</span>
+	<span class="s5"># reference to an external file object which is not pickleable. So in __getstate__</span>
+	<span class="s5"># we store the file name and current position, and in __setstate__ we reopen the</span>
+	<span class="s5"># same named file after unpickling.</span>
+
+	<span class="s2">def </span><span class="s1">__getstate__(self):</span>
+		<span class="s2">if </span><span class="s1">isinstance(self.file</span><span class="s2">, </span><span class="s1">BytesIO):</span>
+			<span class="s5"># BytesIO is already pickleable, return the state unmodified</span>
+			<span class="s2">return </span><span class="s1">self.__dict__</span>
+
+		<span class="s5"># remove unpickleable file attribute, and only store its name and pos</span>
+		<span class="s1">state = self.__dict__.copy()</span>
+		<span class="s2">del </span><span class="s1">state[</span><span class="s4">&quot;file&quot;</span><span class="s1">]</span>
+		<span class="s1">state[</span><span class="s4">&quot;_filename&quot;</span><span class="s1">] = self.file.name</span>
+		<span class="s1">state[</span><span class="s4">&quot;_filepos&quot;</span><span class="s1">] = self.file.tell()</span>
+		<span class="s2">return </span><span class="s1">state</span>
+
+	<span class="s2">def </span><span class="s1">__setstate__(self</span><span class="s2">, </span><span class="s1">state):</span>
+		<span class="s2">if </span><span class="s4">&quot;file&quot; </span><span class="s2">not in </span><span class="s1">state:</span>
+			<span class="s1">self.file = open(state.pop(</span><span class="s4">&quot;_filename&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">)</span>
+			<span class="s1">self.file.seek(state.pop(</span><span class="s4">&quot;_filepos&quot;</span><span class="s1">))</span>
+		<span class="s1">self.__dict__.update(state)</span>
+
+
+<span class="s5"># default compression level for WOFF 1.0 tables and metadata</span>
+<span class="s1">ZLIB_COMPRESSION_LEVEL = </span><span class="s3">6</span>
+
+<span class="s5"># if set to True, use zopfli instead of zlib for compressing WOFF 1.0.</span>
+<span class="s5"># The Python bindings are available at https://pypi.python.org/pypi/zopfli</span>
+<span class="s1">USE_ZOPFLI = </span><span class="s2">False</span>
+
+<span class="s5"># mapping between zlib's compression levels and zopfli's 'numiterations'.</span>
+<span class="s5"># Use lower values for files over several MB in size or it will be too slow</span>
+<span class="s1">ZOPFLI_LEVELS = {</span>
+	<span class="s5"># 0: 0,  # can't do 0 iterations...</span>
+	<span class="s3">1</span><span class="s1">: </span><span class="s3">1</span><span class="s2">,</span>
+	<span class="s3">2</span><span class="s1">: </span><span class="s3">3</span><span class="s2">,</span>
+	<span class="s3">3</span><span class="s1">: </span><span class="s3">5</span><span class="s2">,</span>
+	<span class="s3">4</span><span class="s1">: </span><span class="s3">8</span><span class="s2">,</span>
+	<span class="s3">5</span><span class="s1">: </span><span class="s3">10</span><span class="s2">,</span>
+	<span class="s3">6</span><span class="s1">: </span><span class="s3">15</span><span class="s2">,</span>
+	<span class="s3">7</span><span class="s1">: </span><span class="s3">25</span><span class="s2">,</span>
+	<span class="s3">8</span><span class="s1">: </span><span class="s3">50</span><span class="s2">,</span>
+	<span class="s3">9</span><span class="s1">: </span><span class="s3">100</span><span class="s2">,</span>
+<span class="s1">}</span>
+
+
+<span class="s2">def </span><span class="s1">compress(data</span><span class="s2">, </span><span class="s1">level=ZLIB_COMPRESSION_LEVEL):</span>
+	<span class="s0">&quot;&quot;&quot; Compress 'data' to Zlib format. If 'USE_ZOPFLI' variable is True, 
+    zopfli is used instead of the zlib module. 
+    The compression 'level' must be between 0 and 9. 1 gives best speed, 
+    9 gives best compression (0 gives no compression at all). 
+    The default value is a compromise between speed and compression (6). 
+    &quot;&quot;&quot;</span>
+	<span class="s2">if not </span><span class="s1">(</span><span class="s3">0 </span><span class="s1">&lt;= level &lt;= </span><span class="s3">9</span><span class="s1">):</span>
+		<span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Bad compression level: %s' </span><span class="s1">% level)</span>
+	<span class="s2">if not </span><span class="s1">USE_ZOPFLI </span><span class="s2">or </span><span class="s1">level == </span><span class="s3">0</span><span class="s1">:</span>
+		<span class="s2">from </span><span class="s1">zlib </span><span class="s2">import </span><span class="s1">compress</span>
+		<span class="s2">return </span><span class="s1">compress(data</span><span class="s2">, </span><span class="s1">level)</span>
+	<span class="s2">else</span><span class="s1">:</span>
+		<span class="s2">from </span><span class="s1">zopfli.zlib </span><span class="s2">import </span><span class="s1">compress</span>
+		<span class="s2">return </span><span class="s1">compress(data</span><span class="s2">, </span><span class="s1">numiterations=ZOPFLI_LEVELS[level])</span>
+
+
+<span class="s2">class </span><span class="s1">SFNTWriter(object):</span>
+
+	<span class="s2">def </span><span class="s1">__new__(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+		<span class="s0">&quot;&quot;&quot; Return an instance of the SFNTWriter sub-class which is compatible 
+        with the specified 'flavor'. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">flavor = </span><span class="s2">None</span>
+		<span class="s2">if </span><span class="s1">kwargs </span><span class="s2">and </span><span class="s4">'flavor' </span><span class="s2">in </span><span class="s1">kwargs:</span>
+			<span class="s1">flavor = kwargs[</span><span class="s4">'flavor'</span><span class="s1">]</span>
+		<span class="s2">elif </span><span class="s1">args </span><span class="s2">and </span><span class="s1">len(args) &gt; </span><span class="s3">3</span><span class="s1">:</span>
+			<span class="s1">flavor = args[</span><span class="s3">3</span><span class="s1">]</span>
+		<span class="s2">if </span><span class="s1">cls </span><span class="s2">is </span><span class="s1">SFNTWriter:</span>
+			<span class="s2">if </span><span class="s1">flavor == </span><span class="s4">&quot;woff2&quot;</span><span class="s1">:</span>
+				<span class="s5"># return new WOFF2Writer object</span>
+				<span class="s2">from </span><span class="s1">fontTools.ttLib.woff2 </span><span class="s2">import </span><span class="s1">WOFF2Writer</span>
+				<span class="s2">return </span><span class="s1">object.__new__(WOFF2Writer)</span>
+		<span class="s5"># return default object</span>
+		<span class="s2">return </span><span class="s1">object.__new__(cls)</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">file</span><span class="s2">, </span><span class="s1">numTables</span><span class="s2">, </span><span class="s1">sfntVersion=</span><span class="s4">&quot;</span><span class="s2">\000\001\000\000</span><span class="s4">&quot;</span><span class="s2">,</span>
+			<span class="s1">flavor=</span><span class="s2">None, </span><span class="s1">flavorData=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s1">self.file = file</span>
+		<span class="s1">self.numTables = numTables</span>
+		<span class="s1">self.sfntVersion = Tag(sfntVersion)</span>
+		<span class="s1">self.flavor = flavor</span>
+		<span class="s1">self.flavorData = flavorData</span>
+
+		<span class="s2">if </span><span class="s1">self.flavor == </span><span class="s4">&quot;woff&quot;</span><span class="s1">:</span>
+			<span class="s1">self.directoryFormat = woffDirectoryFormat</span>
+			<span class="s1">self.directorySize = woffDirectorySize</span>
+			<span class="s1">self.DirectoryEntry = WOFFDirectoryEntry</span>
+
+			<span class="s1">self.signature = </span><span class="s4">&quot;wOFF&quot;</span>
+
+			<span class="s5"># to calculate WOFF checksum adjustment, we also need the original SFNT offsets</span>
+			<span class="s1">self.origNextTableOffset = sfntDirectorySize + numTables * sfntDirectoryEntrySize</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">assert not </span><span class="s1">self.flavor</span><span class="s2">, </span><span class="s4">&quot;Unknown flavor '%s'&quot; </span><span class="s1">% self.flavor</span>
+			<span class="s1">self.directoryFormat = sfntDirectoryFormat</span>
+			<span class="s1">self.directorySize = sfntDirectorySize</span>
+			<span class="s1">self.DirectoryEntry = SFNTDirectoryEntry</span>
+
+			<span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">getSearchRange</span>
+			<span class="s1">self.searchRange</span><span class="s2">, </span><span class="s1">self.entrySelector</span><span class="s2">, </span><span class="s1">self.rangeShift = getSearchRange(numTables</span><span class="s2">, </span><span class="s3">16</span><span class="s1">)</span>
+
+		<span class="s1">self.directoryOffset = self.file.tell()</span>
+		<span class="s1">self.nextTableOffset = self.directoryOffset + self.directorySize + numTables * self.DirectoryEntry.formatSize</span>
+		<span class="s5"># clear out directory area</span>
+		<span class="s1">self.file.seek(self.nextTableOffset)</span>
+		<span class="s5"># make sure we're actually where we want to be. (old cStringIO bug)</span>
+		<span class="s1">self.file.write(</span><span class="s6">b'</span><span class="s2">\0</span><span class="s6">' </span><span class="s1">* (self.nextTableOffset - self.file.tell()))</span>
+		<span class="s1">self.tables = OrderedDict()</span>
+
+	<span class="s2">def </span><span class="s1">setEntry(self</span><span class="s2">, </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">entry):</span>
+		<span class="s2">if </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">self.tables:</span>
+			<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;cannot rewrite '%s' table&quot; </span><span class="s1">% tag)</span>
+
+		<span class="s1">self.tables[tag] = entry</span>
+
+	<span class="s2">def </span><span class="s1">__setitem__(self</span><span class="s2">, </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">data):</span>
+		<span class="s0">&quot;&quot;&quot;Write raw table data to disk.&quot;&quot;&quot;</span>
+		<span class="s2">if </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">self.tables:</span>
+			<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;cannot rewrite '%s' table&quot; </span><span class="s1">% tag)</span>
+
+		<span class="s1">entry = self.DirectoryEntry()</span>
+		<span class="s1">entry.tag = tag</span>
+		<span class="s1">entry.offset = self.nextTableOffset</span>
+		<span class="s2">if </span><span class="s1">tag == </span><span class="s4">'head'</span><span class="s1">:</span>
+			<span class="s1">entry.checkSum = calcChecksum(data[:</span><span class="s3">8</span><span class="s1">] + </span><span class="s6">b'</span><span class="s2">\0\0\0\0</span><span class="s6">' </span><span class="s1">+ data[</span><span class="s3">12</span><span class="s1">:])</span>
+			<span class="s1">self.headTable = data</span>
+			<span class="s1">entry.uncompressed = </span><span class="s2">True</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">entry.checkSum = calcChecksum(data)</span>
+		<span class="s1">entry.saveData(self.file</span><span class="s2">, </span><span class="s1">data)</span>
+
+		<span class="s2">if </span><span class="s1">self.flavor == </span><span class="s4">&quot;woff&quot;</span><span class="s1">:</span>
+			<span class="s1">entry.origOffset = self.origNextTableOffset</span>
+			<span class="s1">self.origNextTableOffset += (entry.origLength + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span>
+
+		<span class="s1">self.nextTableOffset = self.nextTableOffset + ((entry.length + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span><span class="s1">)</span>
+		<span class="s5"># Add NUL bytes to pad the table data to a 4-byte boundary.</span>
+		<span class="s5"># Don't depend on f.seek() as we need to add the padding even if no</span>
+		<span class="s5"># subsequent write follows (seek is lazy), ie. after the final table</span>
+		<span class="s5"># in the font.</span>
+		<span class="s1">self.file.write(</span><span class="s6">b'</span><span class="s2">\0</span><span class="s6">' </span><span class="s1">* (self.nextTableOffset - self.file.tell()))</span>
+		<span class="s2">assert </span><span class="s1">self.nextTableOffset == self.file.tell()</span>
+
+		<span class="s1">self.setEntry(tag</span><span class="s2">, </span><span class="s1">entry)</span>
+
+	<span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">tag):</span>
+		<span class="s2">return </span><span class="s1">self.tables[tag]</span>
+
+	<span class="s2">def </span><span class="s1">close(self):</span>
+		<span class="s0">&quot;&quot;&quot;All tables must have been written to disk. Now write the 
+        directory. 
+        &quot;&quot;&quot;</span>
+		<span class="s1">tables = sorted(self.tables.items())</span>
+		<span class="s2">if </span><span class="s1">len(tables) != self.numTables:</span>
+			<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;wrong number of tables; expected %d, found %d&quot; </span><span class="s1">% (self.numTables</span><span class="s2">, </span><span class="s1">len(tables)))</span>
+
+		<span class="s2">if </span><span class="s1">self.flavor == </span><span class="s4">&quot;woff&quot;</span><span class="s1">:</span>
+			<span class="s1">self.signature = </span><span class="s6">b&quot;wOFF&quot;</span>
+			<span class="s1">self.reserved = </span><span class="s3">0</span>
+
+			<span class="s1">self.totalSfntSize = </span><span class="s3">12</span>
+			<span class="s1">self.totalSfntSize += </span><span class="s3">16 </span><span class="s1">* len(tables)</span>
+			<span class="s2">for </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">tables:</span>
+				<span class="s1">self.totalSfntSize += (entry.origLength + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span>
+
+			<span class="s1">data = self.flavorData </span><span class="s2">if </span><span class="s1">self.flavorData </span><span class="s2">else </span><span class="s1">WOFFFlavorData()</span>
+			<span class="s2">if </span><span class="s1">data.majorVersion </span><span class="s2">is not None and </span><span class="s1">data.minorVersion </span><span class="s2">is not None</span><span class="s1">:</span>
+				<span class="s1">self.majorVersion = data.majorVersion</span>
+				<span class="s1">self.minorVersion = data.minorVersion</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">'headTable'</span><span class="s1">):</span>
+					<span class="s1">self.majorVersion</span><span class="s2">, </span><span class="s1">self.minorVersion = struct.unpack(</span><span class="s4">&quot;&gt;HH&quot;</span><span class="s2">, </span><span class="s1">self.headTable[</span><span class="s3">4</span><span class="s1">:</span><span class="s3">8</span><span class="s1">])</span>
+				<span class="s2">else</span><span class="s1">:</span>
+					<span class="s1">self.majorVersion = self.minorVersion = </span><span class="s3">0</span>
+			<span class="s2">if </span><span class="s1">data.metaData:</span>
+				<span class="s1">self.metaOrigLength = len(data.metaData)</span>
+				<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s2">,</span><span class="s3">2</span><span class="s1">)</span>
+				<span class="s1">self.metaOffset = self.file.tell()</span>
+				<span class="s1">compressedMetaData = compress(data.metaData)</span>
+				<span class="s1">self.metaLength = len(compressedMetaData)</span>
+				<span class="s1">self.file.write(compressedMetaData)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">self.metaOffset = self.metaLength = self.metaOrigLength = </span><span class="s3">0</span>
+			<span class="s2">if </span><span class="s1">data.privData:</span>
+				<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s2">,</span><span class="s3">2</span><span class="s1">)</span>
+				<span class="s1">off = self.file.tell()</span>
+				<span class="s1">paddedOff = (off + </span><span class="s3">3</span><span class="s1">) &amp; ~</span><span class="s3">3</span>
+				<span class="s1">self.file.write(</span><span class="s4">'</span><span class="s2">\0</span><span class="s4">' </span><span class="s1">* (paddedOff - off))</span>
+				<span class="s1">self.privOffset = self.file.tell()</span>
+				<span class="s1">self.privLength = len(data.privData)</span>
+				<span class="s1">self.file.write(data.privData)</span>
+			<span class="s2">else</span><span class="s1">:</span>
+				<span class="s1">self.privOffset = self.privLength = </span><span class="s3">0</span>
+
+			<span class="s1">self.file.seek(</span><span class="s3">0</span><span class="s2">,</span><span class="s3">2</span><span class="s1">)</span>
+			<span class="s1">self.length = self.file.tell()</span>
+
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">assert not </span><span class="s1">self.flavor</span><span class="s2">, </span><span class="s4">&quot;Unknown flavor '%s'&quot; </span><span class="s1">% self.flavor</span>
+			<span class="s2">pass</span>
+
+		<span class="s1">directory = sstruct.pack(self.directoryFormat</span><span class="s2">, </span><span class="s1">self)</span>
+
+		<span class="s1">self.file.seek(self.directoryOffset + self.directorySize)</span>
+		<span class="s1">seenHead = </span><span class="s3">0</span>
+		<span class="s2">for </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">tables:</span>
+			<span class="s2">if </span><span class="s1">tag == </span><span class="s4">&quot;head&quot;</span><span class="s1">:</span>
+				<span class="s1">seenHead = </span><span class="s3">1</span>
+			<span class="s1">directory = directory + entry.toString()</span>
+		<span class="s2">if </span><span class="s1">seenHead:</span>
+			<span class="s1">self.writeMasterChecksum(directory)</span>
+		<span class="s1">self.file.seek(self.directoryOffset)</span>
+		<span class="s1">self.file.write(directory)</span>
+
+	<span class="s2">def </span><span class="s1">_calcMasterChecksum(self</span><span class="s2">, </span><span class="s1">directory):</span>
+		<span class="s5"># calculate checkSumAdjustment</span>
+		<span class="s1">tags = list(self.tables.keys())</span>
+		<span class="s1">checksums = []</span>
+		<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(tags)):</span>
+			<span class="s1">checksums.append(self.tables[tags[i]].checkSum)</span>
+
+		<span class="s2">if </span><span class="s1">self.DirectoryEntry != SFNTDirectoryEntry:</span>
+			<span class="s5"># Create a SFNT directory for checksum calculation purposes</span>
+			<span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">getSearchRange</span>
+			<span class="s1">self.searchRange</span><span class="s2">, </span><span class="s1">self.entrySelector</span><span class="s2">, </span><span class="s1">self.rangeShift = getSearchRange(self.numTables</span><span class="s2">, </span><span class="s3">16</span><span class="s1">)</span>
+			<span class="s1">directory = sstruct.pack(sfntDirectoryFormat</span><span class="s2">, </span><span class="s1">self)</span>
+			<span class="s1">tables = sorted(self.tables.items())</span>
+			<span class="s2">for </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">tables:</span>
+				<span class="s1">sfntEntry = SFNTDirectoryEntry()</span>
+				<span class="s1">sfntEntry.tag = entry.tag</span>
+				<span class="s1">sfntEntry.checkSum = entry.checkSum</span>
+				<span class="s1">sfntEntry.offset = entry.origOffset</span>
+				<span class="s1">sfntEntry.length = entry.origLength</span>
+				<span class="s1">directory = directory + sfntEntry.toString()</span>
+
+		<span class="s1">directory_end = sfntDirectorySize + len(self.tables) * sfntDirectoryEntrySize</span>
+		<span class="s2">assert </span><span class="s1">directory_end == len(directory)</span>
+
+		<span class="s1">checksums.append(calcChecksum(directory))</span>
+		<span class="s1">checksum = sum(checksums) &amp; </span><span class="s3">0xffffffff</span>
+		<span class="s5"># BiboAfba!</span>
+		<span class="s1">checksumadjustment = (</span><span class="s3">0xB1B0AFBA </span><span class="s1">- checksum) &amp; </span><span class="s3">0xffffffff</span>
+		<span class="s2">return </span><span class="s1">checksumadjustment</span>
+
+	<span class="s2">def </span><span class="s1">writeMasterChecksum(self</span><span class="s2">, </span><span class="s1">directory):</span>
+		<span class="s1">checksumadjustment = self._calcMasterChecksum(directory)</span>
+		<span class="s5"># write the checksum to the file</span>
+		<span class="s1">self.file.seek(self.tables[</span><span class="s4">'head'</span><span class="s1">].offset + </span><span class="s3">8</span><span class="s1">)</span>
+		<span class="s1">self.file.write(struct.pack(</span><span class="s4">&quot;&gt;L&quot;</span><span class="s2">, </span><span class="s1">checksumadjustment))</span>
+
+	<span class="s2">def </span><span class="s1">reordersTables(self):</span>
+		<span class="s2">return False</span>
+
+
+<span class="s5"># -- sfnt directory helpers and cruft</span>
+
+<span class="s1">ttcHeaderFormat = </span><span class="s4">&quot;&quot;&quot; 
+        &gt; # big endian 
+        TTCTag:                  4s # &quot;ttcf&quot; 
+        Version:                 L  # 0x00010000 or 0x00020000 
+        numFonts:                L  # number of fonts 
+        # OffsetTable[numFonts]: L  # array with offsets from beginning of file 
+        # ulDsigTag:             L  # version 2.0 only 
+        # ulDsigLength:          L  # version 2.0 only 
+        # ulDsigOffset:          L  # version 2.0 only 
+&quot;&quot;&quot;</span>
+
+<span class="s1">ttcHeaderSize = sstruct.calcsize(ttcHeaderFormat)</span>
+
+<span class="s1">sfntDirectoryFormat = </span><span class="s4">&quot;&quot;&quot; 
+        &gt; # big endian 
+        sfntVersion:    4s 
+        numTables:      H    # number of tables 
+        searchRange:    H    # (max2 &lt;= numTables)*16 
+        entrySelector:  H    # log2(max2 &lt;= numTables) 
+        rangeShift:     H    # numTables*16-searchRange 
+&quot;&quot;&quot;</span>
+
+<span class="s1">sfntDirectorySize = sstruct.calcsize(sfntDirectoryFormat)</span>
+
+<span class="s1">sfntDirectoryEntryFormat = </span><span class="s4">&quot;&quot;&quot; 
+        &gt; # big endian 
+        tag:            4s 
+        checkSum:       L 
+        offset:         L 
+        length:         L 
+&quot;&quot;&quot;</span>
+
+<span class="s1">sfntDirectoryEntrySize = sstruct.calcsize(sfntDirectoryEntryFormat)</span>
+
+<span class="s1">woffDirectoryFormat = </span><span class="s4">&quot;&quot;&quot; 
+        &gt; # big endian 
+        signature:      4s   # &quot;wOFF&quot; 
+        sfntVersion:    4s 
+        length:         L    # total woff file size 
+        numTables:      H    # number of tables 
+        reserved:       H    # set to 0 
+        totalSfntSize:  L    # uncompressed size 
+        majorVersion:   H    # major version of WOFF file 
+        minorVersion:   H    # minor version of WOFF file 
+        metaOffset:     L    # offset to metadata block 
+        metaLength:     L    # length of compressed metadata 
+        metaOrigLength: L    # length of uncompressed metadata 
+        privOffset:     L    # offset to private data block 
+        privLength:     L    # length of private data block 
+&quot;&quot;&quot;</span>
+
+<span class="s1">woffDirectorySize = sstruct.calcsize(woffDirectoryFormat)</span>
+
+<span class="s1">woffDirectoryEntryFormat = </span><span class="s4">&quot;&quot;&quot; 
+        &gt; # big endian 
+        tag:            4s 
+        offset:         L 
+        length:         L    # compressed length 
+        origLength:     L    # original length 
+        checkSum:       L    # original checksum 
+&quot;&quot;&quot;</span>
+
+<span class="s1">woffDirectoryEntrySize = sstruct.calcsize(woffDirectoryEntryFormat)</span>
+
+
+<span class="s2">class </span><span class="s1">DirectoryEntry(object):</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">self.uncompressed = </span><span class="s2">False </span><span class="s5"># if True, always embed entry raw</span>
+
+	<span class="s2">def </span><span class="s1">fromFile(self</span><span class="s2">, </span><span class="s1">file):</span>
+		<span class="s1">sstruct.unpack(self.format</span><span class="s2">, </span><span class="s1">file.read(self.formatSize)</span><span class="s2">, </span><span class="s1">self)</span>
+
+	<span class="s2">def </span><span class="s1">fromString(self</span><span class="s2">, </span><span class="s1">str):</span>
+		<span class="s1">sstruct.unpack(self.format</span><span class="s2">, </span><span class="s1">str</span><span class="s2">, </span><span class="s1">self)</span>
+
+	<span class="s2">def </span><span class="s1">toString(self):</span>
+		<span class="s2">return </span><span class="s1">sstruct.pack(self.format</span><span class="s2">, </span><span class="s1">self)</span>
+
+	<span class="s2">def </span><span class="s1">__repr__(self):</span>
+		<span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">&quot;tag&quot;</span><span class="s1">):</span>
+			<span class="s2">return </span><span class="s4">&quot;&lt;%s '%s' at %x&gt;&quot; </span><span class="s1">% (self.__class__.__name__</span><span class="s2">, </span><span class="s1">self.tag</span><span class="s2">, </span><span class="s1">id(self))</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s4">&quot;&lt;%s at %x&gt;&quot; </span><span class="s1">% (self.__class__.__name__</span><span class="s2">, </span><span class="s1">id(self))</span>
+
+	<span class="s2">def </span><span class="s1">loadData(self</span><span class="s2">, </span><span class="s1">file):</span>
+		<span class="s1">file.seek(self.offset)</span>
+		<span class="s1">data = file.read(self.length)</span>
+		<span class="s2">assert </span><span class="s1">len(data) == self.length</span>
+		<span class="s2">if </span><span class="s1">hasattr(self.__class__</span><span class="s2">, </span><span class="s4">'decodeData'</span><span class="s1">):</span>
+			<span class="s1">data = self.decodeData(data)</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">saveData(self</span><span class="s2">, </span><span class="s1">file</span><span class="s2">, </span><span class="s1">data):</span>
+		<span class="s2">if </span><span class="s1">hasattr(self.__class__</span><span class="s2">, </span><span class="s4">'encodeData'</span><span class="s1">):</span>
+			<span class="s1">data = self.encodeData(data)</span>
+		<span class="s1">self.length = len(data)</span>
+		<span class="s1">file.seek(self.offset)</span>
+		<span class="s1">file.write(data)</span>
+
+	<span class="s2">def </span><span class="s1">decodeData(self</span><span class="s2">, </span><span class="s1">rawData):</span>
+		<span class="s2">return </span><span class="s1">rawData</span>
+
+	<span class="s2">def </span><span class="s1">encodeData(self</span><span class="s2">, </span><span class="s1">data):</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+<span class="s2">class </span><span class="s1">SFNTDirectoryEntry(DirectoryEntry):</span>
+
+	<span class="s1">format = sfntDirectoryEntryFormat</span>
+	<span class="s1">formatSize = sfntDirectoryEntrySize</span>
+
+<span class="s2">class </span><span class="s1">WOFFDirectoryEntry(DirectoryEntry):</span>
+
+	<span class="s1">format = woffDirectoryEntryFormat</span>
+	<span class="s1">formatSize = woffDirectoryEntrySize</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self):</span>
+		<span class="s1">super(WOFFDirectoryEntry</span><span class="s2">, </span><span class="s1">self).__init__()</span>
+		<span class="s5"># With fonttools&lt;=3.1.2, the only way to set a different zlib</span>
+		<span class="s5"># compression level for WOFF directory entries was to set the class</span>
+		<span class="s5"># attribute 'zlibCompressionLevel'. This is now replaced by a globally</span>
+		<span class="s5"># defined `ZLIB_COMPRESSION_LEVEL`, which is also applied when</span>
+		<span class="s5"># compressing the metadata. For backward compatibility, we still</span>
+		<span class="s5"># use the class attribute if it was already set.</span>
+		<span class="s2">if not </span><span class="s1">hasattr(WOFFDirectoryEntry</span><span class="s2">, </span><span class="s4">'zlibCompressionLevel'</span><span class="s1">):</span>
+			<span class="s1">self.zlibCompressionLevel = ZLIB_COMPRESSION_LEVEL</span>
+
+	<span class="s2">def </span><span class="s1">decodeData(self</span><span class="s2">, </span><span class="s1">rawData):</span>
+		<span class="s2">import </span><span class="s1">zlib</span>
+		<span class="s2">if </span><span class="s1">self.length == self.origLength:</span>
+			<span class="s1">data = rawData</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s2">assert </span><span class="s1">self.length &lt; self.origLength</span>
+			<span class="s1">data = zlib.decompress(rawData)</span>
+			<span class="s2">assert </span><span class="s1">len(data) == self.origLength</span>
+		<span class="s2">return </span><span class="s1">data</span>
+
+	<span class="s2">def </span><span class="s1">encodeData(self</span><span class="s2">, </span><span class="s1">data):</span>
+		<span class="s1">self.origLength = len(data)</span>
+		<span class="s2">if not </span><span class="s1">self.uncompressed:</span>
+			<span class="s1">compressedData = compress(data</span><span class="s2">, </span><span class="s1">self.zlibCompressionLevel)</span>
+		<span class="s2">if </span><span class="s1">self.uncompressed </span><span class="s2">or </span><span class="s1">len(compressedData) &gt;= self.origLength:</span>
+			<span class="s5"># Encode uncompressed</span>
+			<span class="s1">rawData = data</span>
+			<span class="s1">self.length = self.origLength</span>
+		<span class="s2">else</span><span class="s1">:</span>
+			<span class="s1">rawData = compressedData</span>
+			<span class="s1">self.length = len(rawData)</span>
+		<span class="s2">return </span><span class="s1">rawData</span>
+
+<span class="s2">class </span><span class="s1">WOFFFlavorData():</span>
+
+	<span class="s1">Flavor = </span><span class="s4">'woff'</span>
+
+	<span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">reader=</span><span class="s2">None</span><span class="s1">):</span>
+		<span class="s1">self.majorVersion = </span><span class="s2">None</span>
+		<span class="s1">self.minorVersion = </span><span class="s2">None</span>
+		<span class="s1">self.metaData = </span><span class="s2">None</span>
+		<span class="s1">self.privData = </span><span class="s2">None</span>
+		<span class="s2">if </span><span class="s1">reader:</span>
+			<span class="s1">self.majorVersion = reader.majorVersion</span>
+			<span class="s1">self.minorVersion = reader.minorVersion</span>
+			<span class="s2">if </span><span class="s1">reader.metaLength:</span>
+				<span class="s1">reader.file.seek(reader.metaOffset)</span>
+				<span class="s1">rawData = reader.file.read(reader.metaLength)</span>
+				<span class="s2">assert </span><span class="s1">len(rawData) == reader.metaLength</span>
+				<span class="s1">data = self._decompress(rawData)</span>
+				<span class="s2">assert </span><span class="s1">len(data) == reader.metaOrigLength</span>
+				<span class="s1">self.metaData = data</span>
+			<span class="s2">if </span><span class="s1">reader.privLength:</span>
+				<span class="s1">reader.file.seek(reader.privOffset)</span>
+				<span class="s1">data = reader.file.read(reader.privLength)</span>
+				<span class="s2">assert </span><span class="s1">len(data) == reader.privLength</span>
+				<span class="s1">self.privData = data</span>
+
+	<span class="s2">def </span><span class="s1">_decompress(self</span><span class="s2">, </span><span class="s1">rawData):</span>
+		<span class="s2">import </span><span class="s1">zlib</span>
+		<span class="s2">return </span><span class="s1">zlib.decompress(rawData)</span>
+
+
+<span class="s2">def </span><span class="s1">calcChecksum(data):</span>
+	<span class="s0">&quot;&quot;&quot;Calculate the checksum for an arbitrary block of data. 
+ 
+    If the data length is not a multiple of four, it assumes 
+    it is to be padded with null byte. 
+ 
+        &gt;&gt;&gt; print(calcChecksum(b&quot;abcd&quot;)) 
+        1633837924 
+        &gt;&gt;&gt; print(calcChecksum(b&quot;abcdxyz&quot;)) 
+        3655064932 
+    &quot;&quot;&quot;</span>
+	<span class="s1">remainder = len(data) % </span><span class="s3">4</span>
+	<span class="s2">if </span><span class="s1">remainder:</span>
+		<span class="s1">data += </span><span class="s6">b&quot;</span><span class="s2">\0</span><span class="s6">&quot; </span><span class="s1">* (</span><span class="s3">4 </span><span class="s1">- remainder)</span>
+	<span class="s1">value = </span><span class="s3">0</span>
+	<span class="s1">blockSize = </span><span class="s3">4096</span>
+	<span class="s2">assert </span><span class="s1">blockSize % </span><span class="s3">4 </span><span class="s1">== </span><span class="s3">0</span>
+	<span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">len(data)</span><span class="s2">, </span><span class="s1">blockSize):</span>
+		<span class="s1">block = data[i:i+blockSize]</span>
+		<span class="s1">longs = struct.unpack(</span><span class="s4">&quot;&gt;%dL&quot; </span><span class="s1">% (len(block) // </span><span class="s3">4</span><span class="s1">)</span><span class="s2">, </span><span class="s1">block)</span>
+		<span class="s1">value = (value + sum(longs)) &amp; </span><span class="s3">0xffffffff</span>
+	<span class="s2">return </span><span class="s1">value</span>
+
+<span class="s2">def </span><span class="s1">readTTCHeader(file):</span>
+	<span class="s1">file.seek(</span><span class="s3">0</span><span class="s1">)</span>
+	<span class="s1">data = file.read(ttcHeaderSize)</span>
+	<span class="s2">if </span><span class="s1">len(data) != ttcHeaderSize:</span>
+		<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;Not a Font Collection (not enough data)&quot;</span><span class="s1">)</span>
+	<span class="s1">self = SimpleNamespace()</span>
+	<span class="s1">sstruct.unpack(ttcHeaderFormat</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">self)</span>
+	<span class="s2">if </span><span class="s1">self.TTCTag != </span><span class="s4">&quot;ttcf&quot;</span><span class="s1">:</span>
+		<span class="s2">raise </span><span class="s1">TTLibError(</span><span class="s4">&quot;Not a Font Collection&quot;</span><span class="s1">)</span>
+	<span class="s2">assert </span><span class="s1">self.Version == </span><span class="s3">0x00010000 </span><span class="s2">or </span><span class="s1">self.Version == </span><span class="s3">0x00020000</span><span class="s2">, </span><span class="s4">&quot;unrecognized TTC version 0x%08x&quot; </span><span class="s1">% self.Version</span>
+	<span class="s1">self.offsetTable = struct.unpack(</span><span class="s4">&quot;&gt;%dL&quot; </span><span class="s1">% self.numFonts</span><span class="s2">, </span><span class="s1">file.read(self.numFonts * </span><span class="s3">4</span><span class="s1">))</span>
+	<span class="s2">if </span><span class="s1">self.Version == </span><span class="s3">0x00020000</span><span class="s1">:</span>
+		<span class="s2">pass </span><span class="s5"># ignoring version 2.0 signatures</span>
+	<span class="s2">return </span><span class="s1">self</span>
+
+<span class="s2">def </span><span class="s1">writeTTCHeader(file</span><span class="s2">, </span><span class="s1">numFonts):</span>
+	<span class="s1">self = SimpleNamespace()</span>
+	<span class="s1">self.TTCTag = </span><span class="s4">'ttcf'</span>
+	<span class="s1">self.Version = </span><span class="s3">0x00010000</span>
+	<span class="s1">self.numFonts = numFonts</span>
+	<span class="s1">file.seek(</span><span class="s3">0</span><span class="s1">)</span>
+	<span class="s1">file.write(sstruct.pack(ttcHeaderFormat</span><span class="s2">, </span><span class="s1">self))</span>
+	<span class="s1">offset = file.tell()</span>
+	<span class="s1">file.write(struct.pack(</span><span class="s4">&quot;&gt;%dL&quot; </span><span class="s1">% self.numFonts</span><span class="s2">, </span><span class="s1">*([</span><span class="s3">0</span><span class="s1">] * self.numFonts)))</span>
+	<span class="s2">return </span><span class="s1">offset</span>
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s4">&quot;__main__&quot;</span><span class="s1">:</span>
+	<span class="s2">import </span><span class="s1">sys</span>
+	<span class="s2">import </span><span class="s1">doctest</span>
+	<span class="s1">sys.exit(doctest.testmod().failed)</span>
+</pre>
+</body>
+</html>

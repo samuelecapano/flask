@@ -1,0 +1,555 @@
+<html>
+<head>
+<title>_afm.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #a5c261;}
+.s6 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_afm.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A python interface to Adobe Font Metrics Files. 
+ 
+Although a number of other Python implementations exist, and may be more 
+complete than this, it was decided not to go with them because they were 
+either: 
+ 
+1) copyrighted or used a non-BSD compatible license 
+2) had too many dependencies and a free standing lib was needed 
+3) did more than needed and it was easier to write afresh rather than 
+   figure out how to get just what was needed. 
+ 
+It is pretty easy to use, and has no external dependencies: 
+ 
+&gt;&gt;&gt; import matplotlib as mpl 
+&gt;&gt;&gt; from pathlib import Path 
+&gt;&gt;&gt; afm_path = Path(mpl.get_data_path(), 'fonts', 'afm', 'ptmr8a.afm') 
+&gt;&gt;&gt; 
+&gt;&gt;&gt; from matplotlib.afm import AFM 
+&gt;&gt;&gt; with afm_path.open('rb') as fh: 
+...     afm = AFM(fh) 
+&gt;&gt;&gt; afm.string_width_height('What the heck?') 
+(6220.0, 694) 
+&gt;&gt;&gt; afm.get_fontname() 
+'Times-Roman' 
+&gt;&gt;&gt; afm.get_kern_dist('A', 'f') 
+0 
+&gt;&gt;&gt; afm.get_kern_dist('A', 'y') 
+-92.0 
+&gt;&gt;&gt; afm.get_bbox_char('!') 
+[130, -9, 238, 676] 
+ 
+As in the Adobe Font Metrics File Format Specification, all dimensions 
+are given in units of 1/1000 of the scale factor (point size) of the font 
+being used. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">re</span>
+
+<span class="s2">from </span><span class="s1">._mathtext_data </span><span class="s2">import </span><span class="s1">uni2type1</span>
+
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+
+<span class="s2">def </span><span class="s1">_to_int(x):</span>
+    <span class="s3"># Some AFM files have floats where we are expecting ints -- there is</span>
+    <span class="s3"># probably a better way to handle this (support floats, round rather than</span>
+    <span class="s3"># truncate).  But I don't know what the best approach is now and this</span>
+    <span class="s3"># change to _to_int should at least prevent Matplotlib from crashing on</span>
+    <span class="s3"># these.  JDH (2009-11-06)</span>
+    <span class="s2">return </span><span class="s1">int(float(x))</span>
+
+
+<span class="s2">def </span><span class="s1">_to_float(x):</span>
+    <span class="s3"># Some AFM files use &quot;,&quot; instead of &quot;.&quot; as decimal separator -- this</span>
+    <span class="s3"># shouldn't be ambiguous (unless someone is wicked enough to use &quot;,&quot; as</span>
+    <span class="s3"># thousands separator...).</span>
+    <span class="s2">if </span><span class="s1">isinstance(x</span><span class="s2">, </span><span class="s1">bytes):</span>
+        <span class="s3"># Encoding doesn't really matter -- if we have codepoints &gt;127 the call</span>
+        <span class="s3"># to float() will error anyways.</span>
+        <span class="s1">x = x.decode(</span><span class="s4">'latin-1'</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">float(x.replace(</span><span class="s4">','</span><span class="s2">, </span><span class="s4">'.'</span><span class="s1">))</span>
+
+
+<span class="s2">def </span><span class="s1">_to_str(x):</span>
+    <span class="s2">return </span><span class="s1">x.decode(</span><span class="s4">'utf8'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_to_list_of_ints(s):</span>
+    <span class="s1">s = s.replace(</span><span class="s5">b','</span><span class="s2">, </span><span class="s5">b' '</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">[_to_int(val) </span><span class="s2">for </span><span class="s1">val </span><span class="s2">in </span><span class="s1">s.split()]</span>
+
+
+<span class="s2">def </span><span class="s1">_to_list_of_floats(s):</span>
+    <span class="s2">return </span><span class="s1">[_to_float(val) </span><span class="s2">for </span><span class="s1">val </span><span class="s2">in </span><span class="s1">s.split()]</span>
+
+
+<span class="s2">def </span><span class="s1">_to_bool(s):</span>
+    <span class="s2">if </span><span class="s1">s.lower().strip() </span><span class="s2">in </span><span class="s1">(</span><span class="s5">b'false'</span><span class="s2">, </span><span class="s5">b'0'</span><span class="s2">, </span><span class="s5">b'no'</span><span class="s1">):</span>
+        <span class="s2">return False</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_header(fh):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Read the font metrics header (up to the char metrics) and returns 
+    a dictionary mapping *key* to *val*.  *val* will be converted to the 
+    appropriate python type as necessary; e.g.: 
+ 
+        * 'False'-&gt;False 
+        * '0'-&gt;0 
+        * '-168 -218 1000 898'-&gt; [-168, -218, 1000, 898] 
+ 
+    Dictionary keys are 
+ 
+      StartFontMetrics, FontName, FullName, FamilyName, Weight, 
+      ItalicAngle, IsFixedPitch, FontBBox, UnderlinePosition, 
+      UnderlineThickness, Version, Notice, EncodingScheme, CapHeight, 
+      XHeight, Ascender, Descender, StartCharMetrics 
+    &quot;&quot;&quot;</span>
+    <span class="s1">header_converters = {</span>
+        <span class="s5">b'StartFontMetrics'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'FontName'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s5">b'FullName'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s5">b'FamilyName'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s5">b'Weight'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s5">b'ItalicAngle'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'IsFixedPitch'</span><span class="s1">: _to_bool</span><span class="s2">,</span>
+        <span class="s5">b'FontBBox'</span><span class="s1">: _to_list_of_ints</span><span class="s2">,</span>
+        <span class="s5">b'UnderlinePosition'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'UnderlineThickness'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'Version'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s3"># Some AFM files have non-ASCII characters (which are not allowed by</span>
+        <span class="s3"># the spec).  Given that there is actually no public API to even access</span>
+        <span class="s3"># this field, just return it as straight bytes.</span>
+        <span class="s5">b'Notice'</span><span class="s1">: </span><span class="s2">lambda </span><span class="s1">x: x</span><span class="s2">,</span>
+        <span class="s5">b'EncodingScheme'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s5">b'CapHeight'</span><span class="s1">: _to_float</span><span class="s2">,  </span><span class="s3"># Is the second version a mistake, or</span>
+        <span class="s5">b'Capheight'</span><span class="s1">: _to_float</span><span class="s2">,  </span><span class="s3"># do some AFM files contain 'Capheight'? -JKS</span>
+        <span class="s5">b'XHeight'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'Ascender'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'Descender'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'StdHW'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'StdVW'</span><span class="s1">: _to_float</span><span class="s2">,</span>
+        <span class="s5">b'StartCharMetrics'</span><span class="s1">: _to_int</span><span class="s2">,</span>
+        <span class="s5">b'CharacterSet'</span><span class="s1">: _to_str</span><span class="s2">,</span>
+        <span class="s5">b'Characters'</span><span class="s1">: _to_int</span><span class="s2">,</span>
+    <span class="s1">}</span>
+    <span class="s1">d = {}</span>
+    <span class="s1">first_line = </span><span class="s2">True</span>
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">fh:</span>
+        <span class="s1">line = line.rstrip()</span>
+        <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s5">b'Comment'</span><span class="s1">):</span>
+            <span class="s2">continue</span>
+        <span class="s1">lst = line.split(</span><span class="s5">b' '</span><span class="s2">, </span><span class="s6">1</span><span class="s1">)</span>
+        <span class="s1">key = lst[</span><span class="s6">0</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">first_line:</span>
+            <span class="s3"># AFM spec, Section 4: The StartFontMetrics keyword</span>
+            <span class="s3"># [followed by a version number] must be the first line in</span>
+            <span class="s3"># the file, and the EndFontMetrics keyword must be the</span>
+            <span class="s3"># last non-empty line in the file.  We just check the</span>
+            <span class="s3"># first header entry.</span>
+            <span class="s2">if </span><span class="s1">key != </span><span class="s5">b'StartFontMetrics'</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Not an AFM file'</span><span class="s1">)</span>
+            <span class="s1">first_line = </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">len(lst) == </span><span class="s6">2</span><span class="s1">:</span>
+            <span class="s1">val = lst[</span><span class="s6">1</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">val = </span><span class="s5">b''</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">converter = header_converters[key]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s1">_log.error(</span><span class="s4">'Found an unknown keyword in AFM header (was %r)' </span><span class="s1">% key)</span>
+            <span class="s2">continue</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">d[key] = converter(val)</span>
+        <span class="s2">except </span><span class="s1">ValueError:</span>
+            <span class="s1">_log.error(</span><span class="s4">'Value error parsing header in AFM: %s, %s'</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">val)</span>
+            <span class="s2">continue</span>
+        <span class="s2">if </span><span class="s1">key == </span><span class="s5">b'StartCharMetrics'</span><span class="s1">:</span>
+            <span class="s2">break</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad parse'</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">d</span>
+
+
+<span class="s1">CharMetrics = namedtuple(</span><span class="s4">'CharMetrics'</span><span class="s2">, </span><span class="s4">'width, name, bbox'</span><span class="s1">)</span>
+<span class="s1">CharMetrics.__doc__ = </span><span class="s4">&quot;&quot;&quot; 
+    Represents the character metrics of a single character. 
+ 
+    Notes 
+    ----- 
+    The fields do currently only describe a subset of character metrics 
+    information defined in the AFM standard. 
+    &quot;&quot;&quot;</span>
+<span class="s1">CharMetrics.width.__doc__ = </span><span class="s4">&quot;&quot;&quot;The character width (WX).&quot;&quot;&quot;</span>
+<span class="s1">CharMetrics.name.__doc__ = </span><span class="s4">&quot;&quot;&quot;The character name (N).&quot;&quot;&quot;</span>
+<span class="s1">CharMetrics.bbox.__doc__ = </span><span class="s4">&quot;&quot;&quot; 
+    The bbox of the character (B) as a tuple (*llx*, *lly*, *urx*, *ury*).&quot;&quot;&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_char_metrics(fh):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parse the given filehandle for character metrics information and return 
+    the information as dicts. 
+ 
+    It is assumed that the file cursor is on the line behind 
+    'StartCharMetrics'. 
+ 
+    Returns 
+    ------- 
+    ascii_d : dict 
+         A mapping &quot;ASCII num of the character&quot; to `.CharMetrics`. 
+    name_d : dict 
+         A mapping &quot;character name&quot; to `.CharMetrics`. 
+ 
+    Notes 
+    ----- 
+    This function is incomplete per the standard, but thus far parses 
+    all the sample afm files tried. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">required_keys = {</span><span class="s4">'C'</span><span class="s2">, </span><span class="s4">'WX'</span><span class="s2">, </span><span class="s4">'N'</span><span class="s2">, </span><span class="s4">'B'</span><span class="s1">}</span>
+
+    <span class="s1">ascii_d = {}</span>
+    <span class="s1">name_d = {}</span>
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">fh:</span>
+        <span class="s3"># We are defensively letting values be utf8. The spec requires</span>
+        <span class="s3"># ascii, but there are non-compliant fonts in circulation</span>
+        <span class="s1">line = _to_str(line.rstrip())  </span><span class="s3"># Convert from byte-literal</span>
+        <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s4">'EndCharMetrics'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">ascii_d</span><span class="s2">, </span><span class="s1">name_d</span>
+        <span class="s3"># Split the metric line into a dictionary, keyed by metric identifiers</span>
+        <span class="s1">vals = dict(s.strip().split(</span><span class="s4">' '</span><span class="s2">, </span><span class="s6">1</span><span class="s1">) </span><span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">line.split(</span><span class="s4">';'</span><span class="s1">) </span><span class="s2">if </span><span class="s1">s)</span>
+        <span class="s3"># There may be other metrics present, but only these are needed</span>
+        <span class="s2">if not </span><span class="s1">required_keys.issubset(vals):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad char metrics line: %s' </span><span class="s1">% line)</span>
+        <span class="s1">num = _to_int(vals[</span><span class="s4">'C'</span><span class="s1">])</span>
+        <span class="s1">wx = _to_float(vals[</span><span class="s4">'WX'</span><span class="s1">])</span>
+        <span class="s1">name = vals[</span><span class="s4">'N'</span><span class="s1">]</span>
+        <span class="s1">bbox = _to_list_of_floats(vals[</span><span class="s4">'B'</span><span class="s1">])</span>
+        <span class="s1">bbox = list(map(int</span><span class="s2">, </span><span class="s1">bbox))</span>
+        <span class="s1">metrics = CharMetrics(wx</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">bbox)</span>
+        <span class="s3"># Workaround: If the character name is 'Euro', give it the</span>
+        <span class="s3"># corresponding character code, according to WinAnsiEncoding (see PDF</span>
+        <span class="s3"># Reference).</span>
+        <span class="s2">if </span><span class="s1">name == </span><span class="s4">'Euro'</span><span class="s1">:</span>
+            <span class="s1">num = </span><span class="s6">128</span>
+        <span class="s2">elif </span><span class="s1">name == </span><span class="s4">'minus'</span><span class="s1">:</span>
+            <span class="s1">num = ord(</span><span class="s4">&quot;</span><span class="s2">\N{MINUS SIGN}</span><span class="s4">&quot;</span><span class="s1">)  </span><span class="s3"># 0x2212</span>
+        <span class="s2">if </span><span class="s1">num != -</span><span class="s6">1</span><span class="s1">:</span>
+            <span class="s1">ascii_d[num] = metrics</span>
+        <span class="s1">name_d[name] = metrics</span>
+    <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad parse'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_kern_pairs(fh):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return a kern pairs dictionary; keys are (*char1*, *char2*) tuples and 
+    values are the kern pair value.  For example, a kern pairs line like 
+    ``KPX A y -50`` 
+ 
+    will be represented as:: 
+ 
+      d[ ('A', 'y') ] = -50 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">line = next(fh)</span>
+    <span class="s2">if not </span><span class="s1">line.startswith(</span><span class="s5">b'StartKernPairs'</span><span class="s1">):</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad start of kern pairs data: %s' </span><span class="s1">% line)</span>
+
+    <span class="s1">d = {}</span>
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">fh:</span>
+        <span class="s1">line = line.rstrip()</span>
+        <span class="s2">if not </span><span class="s1">line:</span>
+            <span class="s2">continue</span>
+        <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s5">b'EndKernPairs'</span><span class="s1">):</span>
+            <span class="s1">next(fh)  </span><span class="s3"># EndKernData</span>
+            <span class="s2">return </span><span class="s1">d</span>
+        <span class="s1">vals = line.split()</span>
+        <span class="s2">if </span><span class="s1">len(vals) != </span><span class="s6">4 </span><span class="s2">or </span><span class="s1">vals[</span><span class="s6">0</span><span class="s1">] != </span><span class="s5">b'KPX'</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad kern pairs line: %s' </span><span class="s1">% line)</span>
+        <span class="s1">c1</span><span class="s2">, </span><span class="s1">c2</span><span class="s2">, </span><span class="s1">val = _to_str(vals[</span><span class="s6">1</span><span class="s1">])</span><span class="s2">, </span><span class="s1">_to_str(vals[</span><span class="s6">2</span><span class="s1">])</span><span class="s2">, </span><span class="s1">_to_float(vals[</span><span class="s6">3</span><span class="s1">])</span>
+        <span class="s1">d[(c1</span><span class="s2">, </span><span class="s1">c2)] = val</span>
+    <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad kern pairs parse'</span><span class="s1">)</span>
+
+
+<span class="s1">CompositePart = namedtuple(</span><span class="s4">'CompositePart'</span><span class="s2">, </span><span class="s4">'name, dx, dy'</span><span class="s1">)</span>
+<span class="s1">CompositePart.__doc__ = </span><span class="s4">&quot;&quot;&quot; 
+    Represents the information on a composite element of a composite char.&quot;&quot;&quot;</span>
+<span class="s1">CompositePart.name.__doc__ = </span><span class="s4">&quot;&quot;&quot;Name of the part, e.g. 'acute'.&quot;&quot;&quot;</span>
+<span class="s1">CompositePart.dx.__doc__ = </span><span class="s4">&quot;&quot;&quot;x-displacement of the part from the origin.&quot;&quot;&quot;</span>
+<span class="s1">CompositePart.dy.__doc__ = </span><span class="s4">&quot;&quot;&quot;y-displacement of the part from the origin.&quot;&quot;&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_composites(fh):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parse the given filehandle for composites information return them as a 
+    dict. 
+ 
+    It is assumed that the file cursor is on the line behind 'StartComposites'. 
+ 
+    Returns 
+    ------- 
+    dict 
+        A dict mapping composite character names to a parts list. The parts 
+        list is a list of `.CompositePart` entries describing the parts of 
+        the composite. 
+ 
+    Examples 
+    -------- 
+    A composite definition line:: 
+ 
+      CC Aacute 2 ; PCC A 0 0 ; PCC acute 160 170 ; 
+ 
+    will be represented as:: 
+ 
+      composites['Aacute'] = [CompositePart(name='A', dx=0, dy=0), 
+                              CompositePart(name='acute', dx=160, dy=170)] 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">composites = {}</span>
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">fh:</span>
+        <span class="s1">line = line.rstrip()</span>
+        <span class="s2">if not </span><span class="s1">line:</span>
+            <span class="s2">continue</span>
+        <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s5">b'EndComposites'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">composites</span>
+        <span class="s1">vals = line.split(</span><span class="s5">b';'</span><span class="s1">)</span>
+        <span class="s1">cc = vals[</span><span class="s6">0</span><span class="s1">].split()</span>
+        <span class="s1">name</span><span class="s2">, </span><span class="s1">_num_parts = cc[</span><span class="s6">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">_to_int(cc[</span><span class="s6">2</span><span class="s1">])</span>
+        <span class="s1">pccParts = []</span>
+        <span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">vals[</span><span class="s6">1</span><span class="s1">:-</span><span class="s6">1</span><span class="s1">]:</span>
+            <span class="s1">pcc = s.split()</span>
+            <span class="s1">part = CompositePart(pcc[</span><span class="s6">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">_to_float(pcc[</span><span class="s6">2</span><span class="s1">])</span><span class="s2">, </span><span class="s1">_to_float(pcc[</span><span class="s6">3</span><span class="s1">]))</span>
+            <span class="s1">pccParts.append(part)</span>
+        <span class="s1">composites[name] = pccParts</span>
+
+    <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">'Bad composites parse'</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_optional(fh):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parse the optional fields for kern pair data and composites. 
+ 
+    Returns 
+    ------- 
+    kern_data : dict 
+        A dict containing kerning information. May be empty. 
+        See `._parse_kern_pairs`. 
+    composites : dict 
+        A dict containing composite information. May be empty. 
+        See `._parse_composites`. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">optional = {</span>
+        <span class="s5">b'StartKernData'</span><span class="s1">: _parse_kern_pairs</span><span class="s2">,</span>
+        <span class="s5">b'StartComposites'</span><span class="s1">:  _parse_composites</span><span class="s2">,</span>
+        <span class="s1">}</span>
+
+    <span class="s1">d = {</span><span class="s5">b'StartKernData'</span><span class="s1">: {}</span><span class="s2">,</span>
+         <span class="s5">b'StartComposites'</span><span class="s1">: {}}</span>
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">fh:</span>
+        <span class="s1">line = line.rstrip()</span>
+        <span class="s2">if not </span><span class="s1">line:</span>
+            <span class="s2">continue</span>
+        <span class="s1">key = line.split()[</span><span class="s6">0</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">optional:</span>
+            <span class="s1">d[key] = optional[key](fh)</span>
+
+    <span class="s2">return </span><span class="s1">d[</span><span class="s5">b'StartKernData'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">d[</span><span class="s5">b'StartComposites'</span><span class="s1">]</span>
+
+
+<span class="s2">class </span><span class="s1">AFM:</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fh):</span>
+        <span class="s0">&quot;&quot;&quot;Parse the AFM file in file object *fh*.&quot;&quot;&quot;</span>
+        <span class="s1">self._header = _parse_header(fh)</span>
+        <span class="s1">self._metrics</span><span class="s2">, </span><span class="s1">self._metrics_by_name = _parse_char_metrics(fh)</span>
+        <span class="s1">self._kern</span><span class="s2">, </span><span class="s1">self._composite = _parse_optional(fh)</span>
+
+    <span class="s2">def </span><span class="s1">get_bbox_char(self</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">isord=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s2">if not </span><span class="s1">isord:</span>
+            <span class="s1">c = ord(c)</span>
+        <span class="s2">return </span><span class="s1">self._metrics[c].bbox</span>
+
+    <span class="s2">def </span><span class="s1">string_width_height(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the string width (including kerning) and string height 
+        as a (*w*, *h*) tuple. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">len(s):</span>
+            <span class="s2">return </span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span>
+        <span class="s1">total_width = </span><span class="s6">0</span>
+        <span class="s1">namelast = </span><span class="s2">None</span>
+        <span class="s1">miny = </span><span class="s6">1e9</span>
+        <span class="s1">maxy = </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">s:</span>
+            <span class="s2">if </span><span class="s1">c == </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s1">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">wx</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">bbox = self._metrics[ord(c)]</span>
+
+            <span class="s1">total_width += wx + self._kern.get((namelast</span><span class="s2">, </span><span class="s1">name)</span><span class="s2">, </span><span class="s6">0</span><span class="s1">)</span>
+            <span class="s1">l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h = bbox</span>
+            <span class="s1">miny = min(miny</span><span class="s2">, </span><span class="s1">b)</span>
+            <span class="s1">maxy = max(maxy</span><span class="s2">, </span><span class="s1">b + h)</span>
+
+            <span class="s1">namelast = name</span>
+
+        <span class="s2">return </span><span class="s1">total_width</span><span class="s2">, </span><span class="s1">maxy - miny</span>
+
+    <span class="s2">def </span><span class="s1">get_str_bbox_and_descent(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s0">&quot;&quot;&quot;Return the string bounding box and the maximal descent.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">len(s):</span>
+            <span class="s2">return </span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span>
+        <span class="s1">total_width = </span><span class="s6">0</span>
+        <span class="s1">namelast = </span><span class="s2">None</span>
+        <span class="s1">miny = </span><span class="s6">1e9</span>
+        <span class="s1">maxy = </span><span class="s6">0</span>
+        <span class="s1">left = </span><span class="s6">0</span>
+        <span class="s2">if not </span><span class="s1">isinstance(s</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">s = _to_str(s)</span>
+        <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">s:</span>
+            <span class="s2">if </span><span class="s1">c == </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s1">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">name = uni2type1.get(ord(c)</span><span class="s2">, </span><span class="s4">f&quot;uni</span><span class="s2">{</span><span class="s1">ord(c)</span><span class="s2">:</span><span class="s4">04X</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">wx</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">bbox = self._metrics_by_name[name]</span>
+            <span class="s2">except </span><span class="s1">KeyError:</span>
+                <span class="s1">name = </span><span class="s4">'question'</span>
+                <span class="s1">wx</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">bbox = self._metrics_by_name[name]</span>
+            <span class="s1">total_width += wx + self._kern.get((namelast</span><span class="s2">, </span><span class="s1">name)</span><span class="s2">, </span><span class="s6">0</span><span class="s1">)</span>
+            <span class="s1">l</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h = bbox</span>
+            <span class="s1">left = min(left</span><span class="s2">, </span><span class="s1">l)</span>
+            <span class="s1">miny = min(miny</span><span class="s2">, </span><span class="s1">b)</span>
+            <span class="s1">maxy = max(maxy</span><span class="s2">, </span><span class="s1">b + h)</span>
+
+            <span class="s1">namelast = name</span>
+
+        <span class="s2">return </span><span class="s1">left</span><span class="s2">, </span><span class="s1">miny</span><span class="s2">, </span><span class="s1">total_width</span><span class="s2">, </span><span class="s1">maxy - miny</span><span class="s2">, </span><span class="s1">-miny</span>
+
+    <span class="s2">def </span><span class="s1">get_str_bbox(self</span><span class="s2">, </span><span class="s1">s):</span>
+        <span class="s0">&quot;&quot;&quot;Return the string bounding box.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.get_str_bbox_and_descent(s)[:</span><span class="s6">4</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_name_char(self</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">isord=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Get the name of the character, i.e., ';' is 'semicolon'.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">isord:</span>
+            <span class="s1">c = ord(c)</span>
+        <span class="s2">return </span><span class="s1">self._metrics[c].name</span>
+
+    <span class="s2">def </span><span class="s1">get_width_char(self</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">isord=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get the width of the character from the character metric WX field. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">isord:</span>
+            <span class="s1">c = ord(c)</span>
+        <span class="s2">return </span><span class="s1">self._metrics[c].width</span>
+
+    <span class="s2">def </span><span class="s1">get_width_from_char_name(self</span><span class="s2">, </span><span class="s1">name):</span>
+        <span class="s0">&quot;&quot;&quot;Get the width of the character from a type1 character name.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._metrics_by_name[name].width</span>
+
+    <span class="s2">def </span><span class="s1">get_height_char(self</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">isord=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Get the bounding box (ink) height of character *c* (space is 0).&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">isord:</span>
+            <span class="s1">c = ord(c)</span>
+        <span class="s2">return </span><span class="s1">self._metrics[c].bbox[-</span><span class="s6">1</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_kern_dist(self</span><span class="s2">, </span><span class="s1">c1</span><span class="s2">, </span><span class="s1">c2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the kerning pair distance (possibly 0) for chars *c1* and *c2*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">name1</span><span class="s2">, </span><span class="s1">name2 = self.get_name_char(c1)</span><span class="s2">, </span><span class="s1">self.get_name_char(c2)</span>
+        <span class="s2">return </span><span class="s1">self.get_kern_dist_from_name(name1</span><span class="s2">, </span><span class="s1">name2)</span>
+
+    <span class="s2">def </span><span class="s1">get_kern_dist_from_name(self</span><span class="s2">, </span><span class="s1">name1</span><span class="s2">, </span><span class="s1">name2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the kerning pair distance (possibly 0) for chars 
+        *name1* and *name2*. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._kern.get((name1</span><span class="s2">, </span><span class="s1">name2)</span><span class="s2">, </span><span class="s6">0</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_fontname(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the font name, e.g., 'Times-Roman'.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header[</span><span class="s5">b'FontName'</span><span class="s1">]</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">postscript_name(self):  </span><span class="s3"># For consistency with FT2Font.</span>
+        <span class="s2">return </span><span class="s1">self.get_fontname()</span>
+
+    <span class="s2">def </span><span class="s1">get_fullname(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the font full name, e.g., 'Times-Roman'.&quot;&quot;&quot;</span>
+        <span class="s1">name = self._header.get(</span><span class="s5">b'FullName'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s1">:  </span><span class="s3"># use FontName as a substitute</span>
+            <span class="s1">name = self._header[</span><span class="s5">b'FontName'</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">name</span>
+
+    <span class="s2">def </span><span class="s1">get_familyname(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the font family name, e.g., 'Times'.&quot;&quot;&quot;</span>
+        <span class="s1">name = self._header.get(</span><span class="s5">b'FamilyName'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">name</span>
+
+        <span class="s3"># FamilyName not specified so we'll make a guess</span>
+        <span class="s1">name = self.get_fullname()</span>
+        <span class="s1">extras = (</span><span class="s4">r'(?i)([ -](regular|plain|italic|oblique|bold|semibold|'</span>
+                  <span class="s4">r'light|ultralight|extra|condensed))+$'</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">re.sub(extras</span><span class="s2">, </span><span class="s4">''</span><span class="s2">, </span><span class="s1">name)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">family_name(self):</span>
+        <span class="s0">&quot;&quot;&quot;The font family name, e.g., 'Times'.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.get_familyname()</span>
+
+    <span class="s2">def </span><span class="s1">get_weight(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the font weight, e.g., 'Bold' or 'Roman'.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header[</span><span class="s5">b'Weight'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_angle(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the fontangle as float.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header[</span><span class="s5">b'ItalicAngle'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_capheight(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the cap height as float.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header[</span><span class="s5">b'CapHeight'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_xheight(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the xheight as float.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header[</span><span class="s5">b'XHeight'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_underline_thickness(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the underline thickness as float.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header[</span><span class="s5">b'UnderlineThickness'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_horizontal_stem_width(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the standard horizontal stem width as float, or *None* if 
+        not specified in AFM file. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header.get(</span><span class="s5">b'StdHW'</span><span class="s2">, None</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_vertical_stem_width(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the standard vertical stem width as float, or *None* if 
+        not specified in AFM file. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._header.get(</span><span class="s5">b'StdVW'</span><span class="s2">, None</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

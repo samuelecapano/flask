@@ -1,0 +1,1102 @@
+<html>
+<head>
+<title>path.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+path.py</font>
+</center></td></tr></table>
+<pre><span class="s0">r&quot;&quot;&quot; 
+A module for dealing with the polylines used throughout Matplotlib. 
+ 
+The primary class for polyline handling in Matplotlib is `Path`.  Almost all 
+vector drawing makes use of `Path`\s somewhere in the drawing pipeline. 
+ 
+Whilst a `Path` instance itself cannot be drawn, some `.Artist` subclasses, 
+such as `.PathPatch` and `.PathCollection`, can be used for convenient `Path` 
+visualisation. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">copy</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">lru_cache</span>
+<span class="s2">from </span><span class="s1">weakref </span><span class="s2">import </span><span class="s1">WeakValueDictionary</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">_path</span>
+<span class="s2">from </span><span class="s1">.cbook </span><span class="s2">import </span><span class="s1">_to_unmasked_float_array</span><span class="s2">, </span><span class="s1">simple_linear_interpolation</span>
+<span class="s2">from </span><span class="s1">.bezier </span><span class="s2">import </span><span class="s1">BezierSegment</span>
+
+
+<span class="s2">class </span><span class="s1">Path:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A series of possibly disconnected, possibly closed, line and curve 
+    segments. 
+ 
+    The underlying storage is made up of two parallel numpy arrays: 
+ 
+    - *vertices*: an Nx2 float array of vertices 
+    - *codes*: an N-length uint8 array of path codes, or None 
+ 
+    These two arrays always have the same length in the first 
+    dimension.  For example, to represent a cubic curve, you must 
+    provide three vertices and three ``CURVE4`` codes. 
+ 
+    The code types are: 
+ 
+    - ``STOP``   :  1 vertex (ignored) 
+        A marker for the end of the entire path (currently not required and 
+        ignored) 
+ 
+    - ``MOVETO`` :  1 vertex 
+        Pick up the pen and move to the given vertex. 
+ 
+    - ``LINETO`` :  1 vertex 
+        Draw a line from the current position to the given vertex. 
+ 
+    - ``CURVE3`` :  1 control point, 1 endpoint 
+        Draw a quadratic Bézier curve from the current position, with the given 
+        control point, to the given end point. 
+ 
+    - ``CURVE4`` :  2 control points, 1 endpoint 
+        Draw a cubic Bézier curve from the current position, with the given 
+        control points, to the given end point. 
+ 
+    - ``CLOSEPOLY`` : 1 vertex (ignored) 
+        Draw a line segment to the start point of the current polyline. 
+ 
+    If *codes* is None, it is interpreted as a ``MOVETO`` followed by a series 
+    of ``LINETO``. 
+ 
+    Users of Path objects should not access the vertices and codes arrays 
+    directly.  Instead, they should use `iter_segments` or `cleaned` to get the 
+    vertex/code pairs.  This helps, in particular, to consistently handle the 
+    case of *codes* being None. 
+ 
+    Some behavior of Path objects can be controlled by rcParams. See the 
+    rcParams whose keys start with 'path.'. 
+ 
+    .. note:: 
+ 
+        The vertices and codes arrays should be treated as 
+        immutable -- there are a number of optimizations and assumptions 
+        made up front in the constructor that will not change when the 
+        data changes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">code_type = np.uint8</span>
+
+    <span class="s3"># Path codes</span>
+    <span class="s1">STOP = code_type(</span><span class="s4">0</span><span class="s1">)         </span><span class="s3"># 1 vertex</span>
+    <span class="s1">MOVETO = code_type(</span><span class="s4">1</span><span class="s1">)       </span><span class="s3"># 1 vertex</span>
+    <span class="s1">LINETO = code_type(</span><span class="s4">2</span><span class="s1">)       </span><span class="s3"># 1 vertex</span>
+    <span class="s1">CURVE3 = code_type(</span><span class="s4">3</span><span class="s1">)       </span><span class="s3"># 2 vertices</span>
+    <span class="s1">CURVE4 = code_type(</span><span class="s4">4</span><span class="s1">)       </span><span class="s3"># 3 vertices</span>
+    <span class="s1">CLOSEPOLY = code_type(</span><span class="s4">79</span><span class="s1">)   </span><span class="s3"># 1 vertex</span>
+
+    <span class="s3">#: A dictionary mapping Path codes to the number of vertices that the</span>
+    <span class="s3">#: code expects.</span>
+    <span class="s1">NUM_VERTICES_FOR_CODE = {STOP: </span><span class="s4">1</span><span class="s2">,</span>
+                             <span class="s1">MOVETO: </span><span class="s4">1</span><span class="s2">,</span>
+                             <span class="s1">LINETO: </span><span class="s4">1</span><span class="s2">,</span>
+                             <span class="s1">CURVE3: </span><span class="s4">2</span><span class="s2">,</span>
+                             <span class="s1">CURVE4: </span><span class="s4">3</span><span class="s2">,</span>
+                             <span class="s1">CLOSEPOLY: </span><span class="s4">1</span><span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">vertices</span><span class="s2">, </span><span class="s1">codes=</span><span class="s2">None, </span><span class="s1">_interpolation_steps=</span><span class="s4">1</span><span class="s2">,</span>
+                 <span class="s1">closed=</span><span class="s2">False, </span><span class="s1">readonly=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create a new path with the given vertices and codes. 
+ 
+        Parameters 
+        ---------- 
+        vertices : (N, 2) array-like 
+            The path vertices, as an array, masked array or sequence of pairs. 
+            Masked values, if any, will be converted to NaNs, which are then 
+            handled correctly by the Agg PathIterator and other consumers of 
+            path data, such as :meth:`iter_segments`. 
+        codes : array-like or None, optional 
+            N-length array of integers representing the codes of the path. 
+            If not None, codes must be the same length as vertices. 
+            If None, *vertices* will be treated as a series of line segments. 
+        _interpolation_steps : int, optional 
+            Used as a hint to certain projections, such as Polar, that this 
+            path should be linearly interpolated immediately before drawing. 
+            This attribute is primarily an implementation detail and is not 
+            intended for public use. 
+        closed : bool, optional 
+            If *codes* is None and closed is True, vertices will be treated as 
+            line segments of a closed polygon.  Note that the last vertex will 
+            then be ignored (as the corresponding code will be set to 
+            CLOSEPOLY). 
+        readonly : bool, optional 
+            Makes the path behave in an immutable way and sets the vertices 
+            and codes as read-only arrays. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">vertices = _to_unmasked_float_array(vertices)</span>
+        <span class="s1">_api.check_shape((</span><span class="s2">None, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">vertices=vertices)</span>
+
+        <span class="s2">if </span><span class="s1">codes </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">codes = np.asarray(codes</span><span class="s2">, </span><span class="s1">self.code_type)</span>
+            <span class="s2">if </span><span class="s1">codes.ndim != </span><span class="s4">1 </span><span class="s2">or </span><span class="s1">len(codes) != len(vertices):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;'codes' must be a 1D list or array with the &quot;</span>
+                                 <span class="s5">&quot;same length of 'vertices'. &quot;</span>
+                                 <span class="s5">f&quot;Your vertices have shape </span><span class="s2">{</span><span class="s1">vertices.shape</span><span class="s2">} </span><span class="s5">&quot;</span>
+                                 <span class="s5">f&quot;but your codes have shape </span><span class="s2">{</span><span class="s1">codes.shape</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">len(codes) </span><span class="s2">and </span><span class="s1">codes[</span><span class="s4">0</span><span class="s1">] != self.MOVETO:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;The first element of 'code' must be equal &quot;</span>
+                                 <span class="s5">f&quot;to 'MOVETO' (</span><span class="s2">{</span><span class="s1">self.MOVETO</span><span class="s2">}</span><span class="s5">).  &quot;</span>
+                                 <span class="s5">f&quot;Your first code is </span><span class="s2">{</span><span class="s1">codes[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">closed </span><span class="s2">and </span><span class="s1">len(vertices):</span>
+            <span class="s1">codes = np.empty(len(vertices)</span><span class="s2">, </span><span class="s1">dtype=self.code_type)</span>
+            <span class="s1">codes[</span><span class="s4">0</span><span class="s1">] = self.MOVETO</span>
+            <span class="s1">codes[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">] = self.LINETO</span>
+            <span class="s1">codes[-</span><span class="s4">1</span><span class="s1">] = self.CLOSEPOLY</span>
+
+        <span class="s1">self._vertices = vertices</span>
+        <span class="s1">self._codes = codes</span>
+        <span class="s1">self._interpolation_steps = _interpolation_steps</span>
+        <span class="s1">self._update_values()</span>
+
+        <span class="s2">if </span><span class="s1">readonly:</span>
+            <span class="s1">self._vertices.flags.writeable = </span><span class="s2">False</span>
+            <span class="s2">if </span><span class="s1">self._codes </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">self._codes.flags.writeable = </span><span class="s2">False</span>
+            <span class="s1">self._readonly = </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._readonly = </span><span class="s2">False</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_fast_from_codes_and_verts(cls</span><span class="s2">, </span><span class="s1">verts</span><span class="s2">, </span><span class="s1">codes</span><span class="s2">, </span><span class="s1">internals_from=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create a Path instance without the expense of calling the constructor. 
+ 
+        Parameters 
+        ---------- 
+        verts : numpy array 
+        codes : numpy array 
+        internals_from : Path or None 
+            If not None, another `Path` from which the attributes 
+            ``should_simplify``, ``simplify_threshold``, and 
+            ``interpolation_steps`` will be copied.  Note that ``readonly`` is 
+            never copied, and always set to ``False`` by this constructor. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">pth = cls.__new__(cls)</span>
+        <span class="s1">pth._vertices = _to_unmasked_float_array(verts)</span>
+        <span class="s1">pth._codes = codes</span>
+        <span class="s1">pth._readonly = </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">internals_from </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">pth._should_simplify = internals_from._should_simplify</span>
+            <span class="s1">pth._simplify_threshold = internals_from._simplify_threshold</span>
+            <span class="s1">pth._interpolation_steps = internals_from._interpolation_steps</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">pth._should_simplify = </span><span class="s2">True</span>
+            <span class="s1">pth._simplify_threshold = mpl.rcParams[</span><span class="s5">'path.simplify_threshold'</span><span class="s1">]</span>
+            <span class="s1">pth._interpolation_steps = </span><span class="s4">1</span>
+        <span class="s2">return </span><span class="s1">pth</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_create_closed(cls</span><span class="s2">, </span><span class="s1">vertices):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create a closed polygonal path going through *vertices*. 
+ 
+        Unlike ``Path(..., closed=True)``, *vertices* should **not** end with 
+        an entry for the CLOSEPATH; this entry is added by `._create_closed`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">v = _to_unmasked_float_array(vertices)</span>
+        <span class="s2">return </span><span class="s1">cls(np.concatenate([v</span><span class="s2">, </span><span class="s1">v[:</span><span class="s4">1</span><span class="s1">]])</span><span class="s2">, </span><span class="s1">closed=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_update_values(self):</span>
+        <span class="s1">self._simplify_threshold = mpl.rcParams[</span><span class="s5">'path.simplify_threshold'</span><span class="s1">]</span>
+        <span class="s1">self._should_simplify = (</span>
+            <span class="s1">self._simplify_threshold &gt; </span><span class="s4">0 </span><span class="s2">and</span>
+            <span class="s1">mpl.rcParams[</span><span class="s5">'path.simplify'</span><span class="s1">] </span><span class="s2">and</span>
+            <span class="s1">len(self._vertices) &gt;= </span><span class="s4">128 </span><span class="s2">and</span>
+            <span class="s1">(self._codes </span><span class="s2">is None or </span><span class="s1">np.all(self._codes &lt;= Path.LINETO))</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">vertices(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The list of vertices in the `Path` as an Nx2 numpy array. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._vertices</span>
+
+    <span class="s1">@vertices.setter</span>
+    <span class="s2">def </span><span class="s1">vertices(self</span><span class="s2">, </span><span class="s1">vertices):</span>
+        <span class="s2">if </span><span class="s1">self._readonly:</span>
+            <span class="s2">raise </span><span class="s1">AttributeError(</span><span class="s5">&quot;Can't set vertices on a readonly Path&quot;</span><span class="s1">)</span>
+        <span class="s1">self._vertices = vertices</span>
+        <span class="s1">self._update_values()</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">codes(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The list of codes in the `Path` as a 1D numpy array.  Each 
+        code is one of `STOP`, `MOVETO`, `LINETO`, `CURVE3`, `CURVE4` 
+        or `CLOSEPOLY`.  For codes that correspond to more than one 
+        vertex (`CURVE3` and `CURVE4`), that code will be repeated so 
+        that the length of `vertices` and `codes` is always 
+        the same. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._codes</span>
+
+    <span class="s1">@codes.setter</span>
+    <span class="s2">def </span><span class="s1">codes(self</span><span class="s2">, </span><span class="s1">codes):</span>
+        <span class="s2">if </span><span class="s1">self._readonly:</span>
+            <span class="s2">raise </span><span class="s1">AttributeError(</span><span class="s5">&quot;Can't set codes on a readonly Path&quot;</span><span class="s1">)</span>
+        <span class="s1">self._codes = codes</span>
+        <span class="s1">self._update_values()</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">simplify_threshold(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The fraction of a pixel difference below which vertices will 
+        be simplified out. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._simplify_threshold</span>
+
+    <span class="s1">@simplify_threshold.setter</span>
+    <span class="s2">def </span><span class="s1">simplify_threshold(self</span><span class="s2">, </span><span class="s1">threshold):</span>
+        <span class="s1">self._simplify_threshold = threshold</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">should_simplify(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        `True` if the vertices array should be simplified. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._should_simplify</span>
+
+    <span class="s1">@should_simplify.setter</span>
+    <span class="s2">def </span><span class="s1">should_simplify(self</span><span class="s2">, </span><span class="s1">should_simplify):</span>
+        <span class="s1">self._should_simplify = should_simplify</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">readonly(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        `True` if the `Path` is read-only. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._readonly</span>
+
+    <span class="s2">def </span><span class="s1">copy(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a shallow copy of the `Path`, which will share the 
+        vertices and codes with the source `Path`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">copy.copy(self)</span>
+
+    <span class="s2">def </span><span class="s1">__deepcopy__(self</span><span class="s2">, </span><span class="s1">memo=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a deepcopy of the `Path`.  The `Path` will not be 
+        readonly, even if the source `Path` is. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Deepcopying arrays (vertices, codes) strips the writeable=False flag.</span>
+        <span class="s1">p = copy.deepcopy(super()</span><span class="s2">, </span><span class="s1">memo)</span>
+        <span class="s1">p._readonly = </span><span class="s2">False</span>
+        <span class="s2">return </span><span class="s1">p</span>
+
+    <span class="s1">deepcopy = __deepcopy__</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">make_compound_path_from_polys(cls</span><span class="s2">, </span><span class="s1">XY):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Make a compound `Path` object to draw a number of polygons with equal 
+        numbers of sides. 
+ 
+        .. plot:: gallery/misc/histogram_path.py 
+ 
+        Parameters 
+        ---------- 
+        XY : (numpolys, numsides, 2) array 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># for each poly: 1 for the MOVETO, (numsides-1) for the LINETO, 1 for</span>
+        <span class="s3"># the CLOSEPOLY; the vert for the closepoly is ignored but we still</span>
+        <span class="s3"># need it to keep the codes aligned with the vertices</span>
+        <span class="s1">numpolys</span><span class="s2">, </span><span class="s1">numsides</span><span class="s2">, </span><span class="s1">two = XY.shape</span>
+        <span class="s2">if </span><span class="s1">two != </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;The third dimension of 'XY' must be 2&quot;</span><span class="s1">)</span>
+        <span class="s1">stride = numsides + </span><span class="s4">1</span>
+        <span class="s1">nverts = numpolys * stride</span>
+        <span class="s1">verts = np.zeros((nverts</span><span class="s2">, </span><span class="s4">2</span><span class="s1">))</span>
+        <span class="s1">codes = np.full(nverts</span><span class="s2">, </span><span class="s1">cls.LINETO</span><span class="s2">, </span><span class="s1">dtype=cls.code_type)</span>
+        <span class="s1">codes[</span><span class="s4">0</span><span class="s1">::stride] = cls.MOVETO</span>
+        <span class="s1">codes[numsides::stride] = cls.CLOSEPOLY</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(numsides):</span>
+            <span class="s1">verts[i::stride] = XY[:</span><span class="s2">, </span><span class="s1">i]</span>
+        <span class="s2">return </span><span class="s1">cls(verts</span><span class="s2">, </span><span class="s1">codes)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">make_compound_path(cls</span><span class="s2">, </span><span class="s1">*args):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Make a compound path from a list of `Path` objects. Blindly removes 
+        all `Path.STOP` control points. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Handle an empty list in args (i.e. no args).</span>
+        <span class="s2">if not </span><span class="s1">args:</span>
+            <span class="s2">return </span><span class="s1">Path(np.empty([</span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float32))</span>
+        <span class="s1">vertices = np.concatenate([x.vertices </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">args])</span>
+        <span class="s1">codes = np.empty(len(vertices)</span><span class="s2">, </span><span class="s1">dtype=cls.code_type)</span>
+        <span class="s1">i = </span><span class="s4">0</span>
+        <span class="s2">for </span><span class="s1">path </span><span class="s2">in </span><span class="s1">args:</span>
+            <span class="s2">if </span><span class="s1">path.codes </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">codes[i] = cls.MOVETO</span>
+                <span class="s1">codes[i + </span><span class="s4">1</span><span class="s1">:i + len(path.vertices)] = cls.LINETO</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">codes[i:i + len(path.codes)] = path.codes</span>
+            <span class="s1">i += len(path.vertices)</span>
+        <span class="s3"># remove STOP's, since internal STOPs are a bug</span>
+        <span class="s1">not_stop_mask = codes != cls.STOP</span>
+        <span class="s1">vertices = vertices[not_stop_mask</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">codes = codes[not_stop_mask]</span>
+
+        <span class="s2">return </span><span class="s1">cls(vertices</span><span class="s2">, </span><span class="s1">codes)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__(self):</span>
+        <span class="s2">return </span><span class="s5">&quot;Path(%r, %r)&quot; </span><span class="s1">% (self.vertices</span><span class="s2">, </span><span class="s1">self.codes)</span>
+
+    <span class="s2">def </span><span class="s1">__len__(self):</span>
+        <span class="s2">return </span><span class="s1">len(self.vertices)</span>
+
+    <span class="s2">def </span><span class="s1">iter_segments(self</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None, </span><span class="s1">remove_nans=</span><span class="s2">True, </span><span class="s1">clip=</span><span class="s2">None,</span>
+                      <span class="s1">snap=</span><span class="s2">False, </span><span class="s1">stroke_width=</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">simplify=</span><span class="s2">None,</span>
+                      <span class="s1">curves=</span><span class="s2">True, </span><span class="s1">sketch=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Iterate over all curve segments in the path. 
+ 
+        Each iteration returns a pair ``(vertices, code)``, where ``vertices`` 
+        is a sequence of 1-3 coordinate pairs, and ``code`` is a `Path` code. 
+ 
+        Additionally, this method can provide a number of standard cleanups and 
+        conversions to the path. 
+ 
+        Parameters 
+        ---------- 
+        transform : None or :class:`~matplotlib.transforms.Transform` 
+            If not None, the given affine transformation will be applied to the 
+            path. 
+        remove_nans : bool, optional 
+            Whether to remove all NaNs from the path and skip over them using 
+            MOVETO commands. 
+        clip : None or (float, float, float, float), optional 
+            If not None, must be a four-tuple (x1, y1, x2, y2) 
+            defining a rectangle in which to clip the path. 
+        snap : None or bool, optional 
+            If True, snap all nodes to pixels; if False, don't snap them. 
+            If None, snap if the path contains only segments 
+            parallel to the x or y axes, and no more than 1024 of them. 
+        stroke_width : float, optional 
+            The width of the stroke being drawn (used for path snapping). 
+        simplify : None or bool, optional 
+            Whether to simplify the path by removing vertices 
+            that do not affect its appearance.  If None, use the 
+            :attr:`should_simplify` attribute.  See also :rc:`path.simplify` 
+            and :rc:`path.simplify_threshold`. 
+        curves : bool, optional 
+            If True, curve segments will be returned as curve segments. 
+            If False, all curves will be converted to line segments. 
+        sketch : None or sequence, optional 
+            If not None, must be a 3-tuple of the form 
+            (scale, length, randomness), representing the sketch parameters. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">len(self):</span>
+            <span class="s2">return</span>
+
+        <span class="s1">cleaned = self.cleaned(transform=transform</span><span class="s2">,</span>
+                               <span class="s1">remove_nans=remove_nans</span><span class="s2">, </span><span class="s1">clip=clip</span><span class="s2">,</span>
+                               <span class="s1">snap=snap</span><span class="s2">, </span><span class="s1">stroke_width=stroke_width</span><span class="s2">,</span>
+                               <span class="s1">simplify=simplify</span><span class="s2">, </span><span class="s1">curves=curves</span><span class="s2">,</span>
+                               <span class="s1">sketch=sketch)</span>
+
+        <span class="s3"># Cache these object lookups for performance in the loop.</span>
+        <span class="s1">NUM_VERTICES_FOR_CODE = self.NUM_VERTICES_FOR_CODE</span>
+        <span class="s1">STOP = self.STOP</span>
+
+        <span class="s1">vertices = iter(cleaned.vertices)</span>
+        <span class="s1">codes = iter(cleaned.codes)</span>
+        <span class="s2">for </span><span class="s1">curr_vertices</span><span class="s2">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">zip(vertices</span><span class="s2">, </span><span class="s1">codes):</span>
+            <span class="s2">if </span><span class="s1">code == STOP:</span>
+                <span class="s2">break</span>
+            <span class="s1">extra_vertices = NUM_VERTICES_FOR_CODE[code] - </span><span class="s4">1</span>
+            <span class="s2">if </span><span class="s1">extra_vertices:</span>
+                <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(extra_vertices):</span>
+                    <span class="s1">next(codes)</span>
+                    <span class="s1">curr_vertices = np.append(curr_vertices</span><span class="s2">, </span><span class="s1">next(vertices))</span>
+            <span class="s2">yield </span><span class="s1">curr_vertices</span><span class="s2">, </span><span class="s1">code</span>
+
+    <span class="s2">def </span><span class="s1">iter_bezier(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Iterate over each Bézier curve (lines included) in a Path. 
+ 
+        Parameters 
+        ---------- 
+        **kwargs 
+            Forwarded to `.iter_segments`. 
+ 
+        Yields 
+        ------ 
+        B : matplotlib.bezier.BezierSegment 
+            The Bézier curves that make up the current path. Note in particular 
+            that freestanding points are Bézier curves of order 0, and lines 
+            are Bézier curves of order 1 (with two control points). 
+        code : Path.code_type 
+            The code describing what kind of curve is being returned. 
+            Path.MOVETO, Path.LINETO, Path.CURVE3, Path.CURVE4 correspond to 
+            Bézier curves with 1, 2, 3, and 4 control points (respectively). 
+            Path.CLOSEPOLY is a Path.LINETO with the control points correctly 
+            chosen based on the start/end points of the current stroke. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">first_vert = </span><span class="s2">None</span>
+        <span class="s1">prev_vert = </span><span class="s2">None</span>
+        <span class="s2">for </span><span class="s1">verts</span><span class="s2">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">self.iter_segments(**kwargs):</span>
+            <span class="s2">if </span><span class="s1">first_vert </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">code != Path.MOVETO:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Malformed path, must start with MOVETO.&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">code == Path.MOVETO:  </span><span class="s3"># a point is like &quot;CURVE1&quot;</span>
+                <span class="s1">first_vert = verts</span>
+                <span class="s2">yield </span><span class="s1">BezierSegment(np.array([first_vert]))</span><span class="s2">, </span><span class="s1">code</span>
+            <span class="s2">elif </span><span class="s1">code == Path.LINETO:  </span><span class="s3"># &quot;CURVE2&quot;</span>
+                <span class="s2">yield </span><span class="s1">BezierSegment(np.array([prev_vert</span><span class="s2">, </span><span class="s1">verts]))</span><span class="s2">, </span><span class="s1">code</span>
+            <span class="s2">elif </span><span class="s1">code == Path.CURVE3:</span>
+                <span class="s2">yield </span><span class="s1">BezierSegment(np.array([prev_vert</span><span class="s2">, </span><span class="s1">verts[:</span><span class="s4">2</span><span class="s1">]</span><span class="s2">,</span>
+                                              <span class="s1">verts[</span><span class="s4">2</span><span class="s1">:]]))</span><span class="s2">, </span><span class="s1">code</span>
+            <span class="s2">elif </span><span class="s1">code == Path.CURVE4:</span>
+                <span class="s2">yield </span><span class="s1">BezierSegment(np.array([prev_vert</span><span class="s2">, </span><span class="s1">verts[:</span><span class="s4">2</span><span class="s1">]</span><span class="s2">,</span>
+                                              <span class="s1">verts[</span><span class="s4">2</span><span class="s1">:</span><span class="s4">4</span><span class="s1">]</span><span class="s2">, </span><span class="s1">verts[</span><span class="s4">4</span><span class="s1">:]]))</span><span class="s2">, </span><span class="s1">code</span>
+            <span class="s2">elif </span><span class="s1">code == Path.CLOSEPOLY:</span>
+                <span class="s2">yield </span><span class="s1">BezierSegment(np.array([prev_vert</span><span class="s2">, </span><span class="s1">first_vert]))</span><span class="s2">, </span><span class="s1">code</span>
+            <span class="s2">elif </span><span class="s1">code == Path.STOP:</span>
+                <span class="s2">return</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">f&quot;Invalid Path.code_type: </span><span class="s2">{</span><span class="s1">code</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s1">)</span>
+            <span class="s1">prev_vert = verts[-</span><span class="s4">2</span><span class="s1">:]</span>
+
+    <span class="s2">def </span><span class="s1">cleaned(self</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None, </span><span class="s1">remove_nans=</span><span class="s2">False, </span><span class="s1">clip=</span><span class="s2">None,</span>
+                <span class="s1">*</span><span class="s2">, </span><span class="s1">simplify=</span><span class="s2">False, </span><span class="s1">curves=</span><span class="s2">False,</span>
+                <span class="s1">stroke_width=</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">snap=</span><span class="s2">False, </span><span class="s1">sketch=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a new Path with vertices and codes cleaned according to the 
+        parameters. 
+ 
+        See Also 
+        -------- 
+        Path.iter_segments : for details of the keyword arguments. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">vertices</span><span class="s2">, </span><span class="s1">codes = _path.cleanup_path(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">remove_nans</span><span class="s2">, </span><span class="s1">clip</span><span class="s2">, </span><span class="s1">snap</span><span class="s2">, </span><span class="s1">stroke_width</span><span class="s2">, </span><span class="s1">simplify</span><span class="s2">,</span>
+            <span class="s1">curves</span><span class="s2">, </span><span class="s1">sketch)</span>
+        <span class="s1">pth = Path._fast_from_codes_and_verts(vertices</span><span class="s2">, </span><span class="s1">codes</span><span class="s2">, </span><span class="s1">self)</span>
+        <span class="s2">if not </span><span class="s1">simplify:</span>
+            <span class="s1">pth._should_simplify = </span><span class="s2">False</span>
+        <span class="s2">return </span><span class="s1">pth</span>
+
+    <span class="s2">def </span><span class="s1">transformed(self</span><span class="s2">, </span><span class="s1">transform):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a transformed copy of the path. 
+ 
+        See Also 
+        -------- 
+        matplotlib.transforms.TransformedPath 
+            A specialized path class that will cache the transformed result and 
+            automatically update when the transform changes. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">Path(transform.transform(self.vertices)</span><span class="s2">, </span><span class="s1">self.codes</span><span class="s2">,</span>
+                    <span class="s1">self._interpolation_steps)</span>
+
+    <span class="s2">def </span><span class="s1">contains_point(self</span><span class="s2">, </span><span class="s1">point</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None, </span><span class="s1">radius=</span><span class="s4">0.0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return whether the area enclosed by the path contains the given point. 
+ 
+        The path is always treated as closed; i.e. if the last code is not 
+        CLOSEPOLY an implicit segment connecting the last vertex to the first 
+        vertex is assumed. 
+ 
+        Parameters 
+        ---------- 
+        point : (float, float) 
+            The point (x, y) to check. 
+        transform : `matplotlib.transforms.Transform`, optional 
+            If not ``None``, *point* will be compared to ``self`` transformed 
+            by *transform*; i.e. for a correct check, *transform* should 
+            transform the path into the coordinate system of *point*. 
+        radius : float, default: 0 
+            Additional margin on the path in coordinates of *point*. 
+            The path is extended tangentially by *radius/2*; i.e. if you would 
+            draw the path with a linewidth of *radius*, all points on the line 
+            would still be considered to be contained in the area. Conversely, 
+            negative values shrink the area: Points on the imaginary line 
+            will be considered outside the area. 
+ 
+        Returns 
+        ------- 
+        bool 
+ 
+        Notes 
+        ----- 
+        The current algorithm has some limitations: 
+ 
+        - The result is undefined for points exactly at the boundary 
+          (i.e. at the path shifted by *radius/2*). 
+        - The result is undefined if there is no enclosed area, i.e. all 
+          vertices are on a straight line. 
+        - If bounding lines start to cross each other due to *radius* shift, 
+          the result is not guaranteed to be correct. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">transform = transform.frozen()</span>
+        <span class="s3"># `point_in_path` does not handle nonlinear transforms, so we</span>
+        <span class="s3"># transform the path ourselves.  If *transform* is affine, letting</span>
+        <span class="s3"># `point_in_path` handle the transform avoids allocating an extra</span>
+        <span class="s3"># buffer.</span>
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">and not </span><span class="s1">transform.is_affine:</span>
+            <span class="s1">self = transform.transform_path(self)</span>
+            <span class="s1">transform = </span><span class="s2">None</span>
+        <span class="s2">return </span><span class="s1">_path.point_in_path(point[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">point[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">radius</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">transform)</span>
+
+    <span class="s2">def </span><span class="s1">contains_points(self</span><span class="s2">, </span><span class="s1">points</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None, </span><span class="s1">radius=</span><span class="s4">0.0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return whether the area enclosed by the path contains the given points. 
+ 
+        The path is always treated as closed; i.e. if the last code is not 
+        CLOSEPOLY an implicit segment connecting the last vertex to the first 
+        vertex is assumed. 
+ 
+        Parameters 
+        ---------- 
+        points : (N, 2) array 
+            The points to check. Columns contain x and y values. 
+        transform : `matplotlib.transforms.Transform`, optional 
+            If not ``None``, *points* will be compared to ``self`` transformed 
+            by *transform*; i.e. for a correct check, *transform* should 
+            transform the path into the coordinate system of *points*. 
+        radius : float, default: 0 
+            Additional margin on the path in coordinates of *points*. 
+            The path is extended tangentially by *radius/2*; i.e. if you would 
+            draw the path with a linewidth of *radius*, all points on the line 
+            would still be considered to be contained in the area. Conversely, 
+            negative values shrink the area: Points on the imaginary line 
+            will be considered outside the area. 
+ 
+        Returns 
+        ------- 
+        length-N bool array 
+ 
+        Notes 
+        ----- 
+        The current algorithm has some limitations: 
+ 
+        - The result is undefined for points exactly at the boundary 
+          (i.e. at the path shifted by *radius/2*). 
+        - The result is undefined if there is no enclosed area, i.e. all 
+          vertices are on a straight line. 
+        - If bounding lines start to cross each other due to *radius* shift, 
+          the result is not guaranteed to be correct. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">transform = transform.frozen()</span>
+        <span class="s1">result = _path.points_in_path(points</span><span class="s2">, </span><span class="s1">radius</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">transform)</span>
+        <span class="s2">return </span><span class="s1">result.astype(</span><span class="s5">'bool'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">contains_path(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return whether this (closed) path completely contains the given path. 
+ 
+        If *transform* is not ``None``, the path will be transformed before 
+        checking for containment. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">transform = transform.frozen()</span>
+        <span class="s2">return </span><span class="s1">_path.path_in_path(self</span><span class="s2">, None, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform)</span>
+
+    <span class="s2">def </span><span class="s1">get_extents(self</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get Bbox of the path. 
+ 
+        Parameters 
+        ---------- 
+        transform : matplotlib.transforms.Transform, optional 
+            Transform to apply to path before computing extents, if any. 
+        **kwargs 
+            Forwarded to `.iter_bezier`. 
+ 
+        Returns 
+        ------- 
+        matplotlib.transforms.Bbox 
+            The extents of the path Bbox([[xmin, ymin], [xmax, ymax]]) 
+        &quot;&quot;&quot;</span>
+        <span class="s2">from </span><span class="s1">.transforms </span><span class="s2">import </span><span class="s1">Bbox</span>
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self = transform.transform_path(self)</span>
+        <span class="s2">if </span><span class="s1">self.codes </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">xys = self.vertices</span>
+        <span class="s2">elif </span><span class="s1">len(np.intersect1d(self.codes</span><span class="s2">, </span><span class="s1">[Path.CURVE3</span><span class="s2">, </span><span class="s1">Path.CURVE4])) == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3"># Optimization for the straight line case.</span>
+            <span class="s3"># Instead of iterating through each curve, consider</span>
+            <span class="s3"># each line segment's end-points</span>
+            <span class="s3"># (recall that STOP and CLOSEPOLY vertices are ignored)</span>
+            <span class="s1">xys = self.vertices[np.isin(self.codes</span><span class="s2">,</span>
+                                        <span class="s1">[Path.MOVETO</span><span class="s2">, </span><span class="s1">Path.LINETO])]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">xys = []</span>
+            <span class="s2">for </span><span class="s1">curve</span><span class="s2">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">self.iter_bezier(**kwargs):</span>
+                <span class="s3"># places where the derivative is zero can be extrema</span>
+                <span class="s1">_</span><span class="s2">, </span><span class="s1">dzeros = curve.axis_aligned_extrema()</span>
+                <span class="s3"># as can the ends of the curve</span>
+                <span class="s1">xys.append(curve([</span><span class="s4">0</span><span class="s2">, </span><span class="s1">*dzeros</span><span class="s2">, </span><span class="s4">1</span><span class="s1">]))</span>
+            <span class="s1">xys = np.concatenate(xys)</span>
+        <span class="s2">if </span><span class="s1">len(xys):</span>
+            <span class="s2">return </span><span class="s1">Bbox([xys.min(axis=</span><span class="s4">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">xys.max(axis=</span><span class="s4">0</span><span class="s1">)])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">Bbox.null()</span>
+
+    <span class="s2">def </span><span class="s1">intersects_path(self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">, </span><span class="s1">filled=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return whether if this path intersects another given path. 
+ 
+        If *filled* is True, then this also returns True if one path completely 
+        encloses the other (i.e., the paths are treated as filled). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">_path.path_intersects_path(self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">, </span><span class="s1">filled)</span>
+
+    <span class="s2">def </span><span class="s1">intersects_bbox(self</span><span class="s2">, </span><span class="s1">bbox</span><span class="s2">, </span><span class="s1">filled=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return whether this path intersects a given `~.transforms.Bbox`. 
+ 
+        If *filled* is True, then this also returns True if the path completely 
+        encloses the `.Bbox` (i.e., the path is treated as filled). 
+ 
+        The bounding box is always considered filled. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">_path.path_intersects_rectangle(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">bbox.x0</span><span class="s2">, </span><span class="s1">bbox.y0</span><span class="s2">, </span><span class="s1">bbox.x1</span><span class="s2">, </span><span class="s1">bbox.y1</span><span class="s2">, </span><span class="s1">filled)</span>
+
+    <span class="s2">def </span><span class="s1">interpolated(self</span><span class="s2">, </span><span class="s1">steps):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a new path resampled to length N x steps. 
+ 
+        Codes other than LINETO are not handled correctly. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">steps == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self</span>
+
+        <span class="s1">vertices = simple_linear_interpolation(self.vertices</span><span class="s2">, </span><span class="s1">steps)</span>
+        <span class="s1">codes = self.codes</span>
+        <span class="s2">if </span><span class="s1">codes </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">new_codes = np.full((len(codes) - </span><span class="s4">1</span><span class="s1">) * steps + </span><span class="s4">1</span><span class="s2">, </span><span class="s1">Path.LINETO</span><span class="s2">,</span>
+                                <span class="s1">dtype=self.code_type)</span>
+            <span class="s1">new_codes[</span><span class="s4">0</span><span class="s1">::steps] = codes</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">new_codes = </span><span class="s2">None</span>
+        <span class="s2">return </span><span class="s1">Path(vertices</span><span class="s2">, </span><span class="s1">new_codes)</span>
+
+    <span class="s2">def </span><span class="s1">to_polygons(self</span><span class="s2">, </span><span class="s1">transform=</span><span class="s2">None, </span><span class="s1">width=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">height=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">closed_only=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Convert this path to a list of polygons or polylines.  Each 
+        polygon/polyline is an Nx2 array of vertices.  In other words, 
+        each polygon has no ``MOVETO`` instructions or curves.  This 
+        is useful for displaying in backends that do not support 
+        compound paths or Bézier curves. 
+ 
+        If *width* and *height* are both non-zero then the lines will 
+        be simplified so that vertices outside of (0, 0), (width, 
+        height) will be clipped. 
+ 
+        If *closed_only* is `True` (default), only closed polygons, 
+        with the last point being the same as the first point, will be 
+        returned.  Any unclosed polylines in the path will be 
+        explicitly closed.  If *closed_only* is `False`, any unclosed 
+        polygons in the path will be returned as unclosed polygons, 
+        and the closed polygons will be returned explicitly closed by 
+        setting the last point to the same as the first point. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">len(self.vertices) == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">[]</span>
+
+        <span class="s2">if </span><span class="s1">transform </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">transform = transform.frozen()</span>
+
+        <span class="s2">if </span><span class="s1">self.codes </span><span class="s2">is None and </span><span class="s1">(width == </span><span class="s4">0 </span><span class="s2">or </span><span class="s1">height == </span><span class="s4">0</span><span class="s1">):</span>
+            <span class="s1">vertices = self.vertices</span>
+            <span class="s2">if </span><span class="s1">closed_only:</span>
+                <span class="s2">if </span><span class="s1">len(vertices) &lt; </span><span class="s4">3</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">[]</span>
+                <span class="s2">elif </span><span class="s1">np.any(vertices[</span><span class="s4">0</span><span class="s1">] != vertices[-</span><span class="s4">1</span><span class="s1">]):</span>
+                    <span class="s1">vertices = [*vertices</span><span class="s2">, </span><span class="s1">vertices[</span><span class="s4">0</span><span class="s1">]]</span>
+
+            <span class="s2">if </span><span class="s1">transform </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">[vertices]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">[transform.transform(vertices)]</span>
+
+        <span class="s3"># Deal with the case where there are curves and/or multiple</span>
+        <span class="s3"># subpaths (using extension code)</span>
+        <span class="s2">return </span><span class="s1">_path.convert_path_to_polygons(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">closed_only)</span>
+
+    <span class="s1">_unit_rectangle = </span><span class="s2">None</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">unit_rectangle(cls):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a `Path` instance of the unit rectangle from (0, 0) to (1, 1). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">cls._unit_rectangle </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">cls._unit_rectangle = cls([[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]]</span><span class="s2">,</span>
+                                      <span class="s1">closed=</span><span class="s2">True, </span><span class="s1">readonly=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">cls._unit_rectangle</span>
+
+    <span class="s1">_unit_regular_polygons = WeakValueDictionary()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">unit_regular_polygon(cls</span><span class="s2">, </span><span class="s1">numVertices):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a :class:`Path` instance for a unit regular polygon with the 
+        given *numVertices* such that the circumscribing circle has radius 1.0, 
+        centered at (0, 0). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">numVertices &lt;= </span><span class="s4">16</span><span class="s1">:</span>
+            <span class="s1">path = cls._unit_regular_polygons.get(numVertices)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">path = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">path </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">theta = ((</span><span class="s4">2 </span><span class="s1">* np.pi / numVertices) * np.arange(numVertices + </span><span class="s4">1</span><span class="s1">)</span>
+                     <span class="s3"># This initial rotation is to make sure the polygon always</span>
+                     <span class="s3"># &quot;points-up&quot;.</span>
+                     <span class="s1">+ np.pi / </span><span class="s4">2</span><span class="s1">)</span>
+            <span class="s1">verts = np.column_stack((np.cos(theta)</span><span class="s2">, </span><span class="s1">np.sin(theta)))</span>
+            <span class="s1">path = cls(verts</span><span class="s2">, </span><span class="s1">closed=</span><span class="s2">True, </span><span class="s1">readonly=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">numVertices &lt;= </span><span class="s4">16</span><span class="s1">:</span>
+                <span class="s1">cls._unit_regular_polygons[numVertices] = path</span>
+        <span class="s2">return </span><span class="s1">path</span>
+
+    <span class="s1">_unit_regular_stars = WeakValueDictionary()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">unit_regular_star(cls</span><span class="s2">, </span><span class="s1">numVertices</span><span class="s2">, </span><span class="s1">innerCircle=</span><span class="s4">0.5</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a :class:`Path` for a unit regular star with the given 
+        numVertices and radius of 1.0, centered at (0, 0). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">numVertices &lt;= </span><span class="s4">16</span><span class="s1">:</span>
+            <span class="s1">path = cls._unit_regular_stars.get((numVertices</span><span class="s2">, </span><span class="s1">innerCircle))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">path = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">path </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">ns2 = numVertices * </span><span class="s4">2</span>
+            <span class="s1">theta = (</span><span class="s4">2</span><span class="s1">*np.pi/ns2 * np.arange(ns2 + </span><span class="s4">1</span><span class="s1">))</span>
+            <span class="s3"># This initial rotation is to make sure the polygon always</span>
+            <span class="s3"># &quot;points-up&quot;</span>
+            <span class="s1">theta += np.pi / </span><span class="s4">2.0</span>
+            <span class="s1">r = np.ones(ns2 + </span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">r[</span><span class="s4">1</span><span class="s1">::</span><span class="s4">2</span><span class="s1">] = innerCircle</span>
+            <span class="s1">verts = (r * np.vstack((np.cos(theta)</span><span class="s2">, </span><span class="s1">np.sin(theta)))).T</span>
+            <span class="s1">path = cls(verts</span><span class="s2">, </span><span class="s1">closed=</span><span class="s2">True, </span><span class="s1">readonly=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">numVertices &lt;= </span><span class="s4">16</span><span class="s1">:</span>
+                <span class="s1">cls._unit_regular_stars[(numVertices</span><span class="s2">, </span><span class="s1">innerCircle)] = path</span>
+        <span class="s2">return </span><span class="s1">path</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">unit_regular_asterisk(cls</span><span class="s2">, </span><span class="s1">numVertices):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a :class:`Path` for a unit regular asterisk with the given 
+        numVertices and radius of 1.0, centered at (0, 0). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">cls.unit_regular_star(numVertices</span><span class="s2">, </span><span class="s4">0.0</span><span class="s1">)</span>
+
+    <span class="s1">_unit_circle = </span><span class="s2">None</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">unit_circle(cls):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the readonly :class:`Path` of the unit circle. 
+ 
+        For most cases, :func:`Path.circle` will be what you want. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">cls._unit_circle </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">cls._unit_circle = cls.circle(center=(</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">radius=</span><span class="s4">1</span><span class="s2">,</span>
+                                          <span class="s1">readonly=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">cls._unit_circle</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">circle(cls</span><span class="s2">, </span><span class="s1">center=(</span><span class="s4">0.</span><span class="s2">, </span><span class="s4">0.</span><span class="s1">)</span><span class="s2">, </span><span class="s1">radius=</span><span class="s4">1.</span><span class="s2">, </span><span class="s1">readonly=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a `Path` representing a circle of a given radius and center. 
+ 
+        Parameters 
+        ---------- 
+        center : (float, float), default: (0, 0) 
+            The center of the circle. 
+        radius : float, default: 1 
+            The radius of the circle. 
+        readonly : bool 
+            Whether the created path should have the &quot;readonly&quot; argument 
+            set when creating the Path instance. 
+ 
+        Notes 
+        ----- 
+        The circle is approximated using 8 cubic Bézier curves, as described in 
+ 
+          Lancaster, Don.  `Approximating a Circle or an Ellipse Using Four 
+          Bezier Cubic Splines &lt;https://www.tinaja.com/glib/ellipse4.pdf&gt;`_. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">MAGIC = </span><span class="s4">0.2652031</span>
+        <span class="s1">SQRTHALF = np.sqrt(</span><span class="s4">0.5</span><span class="s1">)</span>
+        <span class="s1">MAGIC45 = SQRTHALF * MAGIC</span>
+
+        <span class="s1">vertices = np.array([[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                             <span class="s1">[MAGIC</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">[SQRTHALF-MAGIC45</span><span class="s2">, </span><span class="s1">-SQRTHALF-MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[SQRTHALF</span><span class="s2">, </span><span class="s1">-SQRTHALF]</span><span class="s2">,</span>
+
+                             <span class="s1">[SQRTHALF+MAGIC45</span><span class="s2">, </span><span class="s1">-SQRTHALF+MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">-MAGIC]</span><span class="s2">,</span>
+                             <span class="s1">[</span><span class="s4">1.0</span><span class="s2">, </span><span class="s4">0.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                             <span class="s1">[</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">MAGIC]</span><span class="s2">,</span>
+                             <span class="s1">[SQRTHALF+MAGIC45</span><span class="s2">, </span><span class="s1">SQRTHALF-MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[SQRTHALF</span><span class="s2">, </span><span class="s1">SQRTHALF]</span><span class="s2">,</span>
+
+                             <span class="s1">[SQRTHALF-MAGIC45</span><span class="s2">, </span><span class="s1">SQRTHALF+MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[MAGIC</span><span class="s2">, </span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                             <span class="s1">[-MAGIC</span><span class="s2">, </span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">[-SQRTHALF+MAGIC45</span><span class="s2">, </span><span class="s1">SQRTHALF+MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[-SQRTHALF</span><span class="s2">, </span><span class="s1">SQRTHALF]</span><span class="s2">,</span>
+
+                             <span class="s1">[-SQRTHALF-MAGIC45</span><span class="s2">, </span><span class="s1">SQRTHALF-MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[-</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">MAGIC]</span><span class="s2">,</span>
+                             <span class="s1">[-</span><span class="s4">1.0</span><span class="s2">, </span><span class="s4">0.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                             <span class="s1">[-</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">-MAGIC]</span><span class="s2">,</span>
+                             <span class="s1">[-SQRTHALF-MAGIC45</span><span class="s2">, </span><span class="s1">-SQRTHALF+MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[-SQRTHALF</span><span class="s2">, </span><span class="s1">-SQRTHALF]</span><span class="s2">,</span>
+
+                             <span class="s1">[-SQRTHALF+MAGIC45</span><span class="s2">, </span><span class="s1">-SQRTHALF-MAGIC45]</span><span class="s2">,</span>
+                             <span class="s1">[-MAGIC</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+                             <span class="s1">[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                             <span class="s1">[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]]</span><span class="s2">,</span>
+                            <span class="s1">dtype=float)</span>
+
+        <span class="s1">codes = [cls.CURVE4] * </span><span class="s4">26</span>
+        <span class="s1">codes[</span><span class="s4">0</span><span class="s1">] = cls.MOVETO</span>
+        <span class="s1">codes[-</span><span class="s4">1</span><span class="s1">] = cls.CLOSEPOLY</span>
+        <span class="s2">return </span><span class="s1">Path(vertices * radius + center</span><span class="s2">, </span><span class="s1">codes</span><span class="s2">, </span><span class="s1">readonly=readonly)</span>
+
+    <span class="s1">_unit_circle_righthalf = </span><span class="s2">None</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">unit_circle_righthalf(cls):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a `Path` of the right half of a unit circle. 
+ 
+        See `Path.circle` for the reference on the approximation used. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">cls._unit_circle_righthalf </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">MAGIC = </span><span class="s4">0.2652031</span>
+            <span class="s1">SQRTHALF = np.sqrt(</span><span class="s4">0.5</span><span class="s1">)</span>
+            <span class="s1">MAGIC45 = SQRTHALF * MAGIC</span>
+
+            <span class="s1">vertices = np.array(</span>
+                <span class="s1">[[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                 <span class="s1">[MAGIC</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s1">[SQRTHALF-MAGIC45</span><span class="s2">, </span><span class="s1">-SQRTHALF-MAGIC45]</span><span class="s2">,</span>
+                 <span class="s1">[SQRTHALF</span><span class="s2">, </span><span class="s1">-SQRTHALF]</span><span class="s2">,</span>
+
+                 <span class="s1">[SQRTHALF+MAGIC45</span><span class="s2">, </span><span class="s1">-SQRTHALF+MAGIC45]</span><span class="s2">,</span>
+                 <span class="s1">[</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">-MAGIC]</span><span class="s2">,</span>
+                 <span class="s1">[</span><span class="s4">1.0</span><span class="s2">, </span><span class="s4">0.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                 <span class="s1">[</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">MAGIC]</span><span class="s2">,</span>
+                 <span class="s1">[SQRTHALF+MAGIC45</span><span class="s2">, </span><span class="s1">SQRTHALF-MAGIC45]</span><span class="s2">,</span>
+                 <span class="s1">[SQRTHALF</span><span class="s2">, </span><span class="s1">SQRTHALF]</span><span class="s2">,</span>
+
+                 <span class="s1">[SQRTHALF-MAGIC45</span><span class="s2">, </span><span class="s1">SQRTHALF+MAGIC45]</span><span class="s2">,</span>
+                 <span class="s1">[MAGIC</span><span class="s2">, </span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s1">[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s4">1.0</span><span class="s1">]</span><span class="s2">,</span>
+
+                 <span class="s1">[</span><span class="s4">0.0</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0</span><span class="s1">]]</span><span class="s2">,</span>
+
+                <span class="s1">float)</span>
+
+            <span class="s1">codes = np.full(</span><span class="s4">14</span><span class="s2">, </span><span class="s1">cls.CURVE4</span><span class="s2">, </span><span class="s1">dtype=cls.code_type)</span>
+            <span class="s1">codes[</span><span class="s4">0</span><span class="s1">] = cls.MOVETO</span>
+            <span class="s1">codes[-</span><span class="s4">1</span><span class="s1">] = cls.CLOSEPOLY</span>
+
+            <span class="s1">cls._unit_circle_righthalf = cls(vertices</span><span class="s2">, </span><span class="s1">codes</span><span class="s2">, </span><span class="s1">readonly=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">cls._unit_circle_righthalf</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">arc(cls</span><span class="s2">, </span><span class="s1">theta1</span><span class="s2">, </span><span class="s1">theta2</span><span class="s2">, </span><span class="s1">n=</span><span class="s2">None, </span><span class="s1">is_wedge=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a `Path` for the unit circle arc from angles *theta1* to 
+        *theta2* (in degrees). 
+ 
+        *theta2* is unwrapped to produce the shortest arc within 360 degrees. 
+        That is, if *theta2* &gt; *theta1* + 360, the arc will be from *theta1* to 
+        *theta2* - 360 and not a full circle plus some extra overlap. 
+ 
+        If *n* is provided, it is the number of spline segments to make. 
+        If *n* is not provided, the number of spline segments is 
+        determined based on the delta between *theta1* and *theta2*. 
+ 
+           Masionobe, L.  2003.  `Drawing an elliptical arc using 
+           polylines, quadratic or cubic Bezier curves 
+           &lt;https://web.archive.org/web/20190318044212/http://www.spaceroots.org/documents/ellipse/index.html&gt;`_. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">halfpi = np.pi * </span><span class="s4">0.5</span>
+
+        <span class="s1">eta1 = theta1</span>
+        <span class="s1">eta2 = theta2 - </span><span class="s4">360 </span><span class="s1">* np.floor((theta2 - theta1) / </span><span class="s4">360</span><span class="s1">)</span>
+        <span class="s3"># Ensure 2pi range is not flattened to 0 due to floating-point errors,</span>
+        <span class="s3"># but don't try to expand existing 0 range.</span>
+        <span class="s2">if </span><span class="s1">theta2 != theta1 </span><span class="s2">and </span><span class="s1">eta2 &lt;= eta1:</span>
+            <span class="s1">eta2 += </span><span class="s4">360</span>
+        <span class="s1">eta1</span><span class="s2">, </span><span class="s1">eta2 = np.deg2rad([eta1</span><span class="s2">, </span><span class="s1">eta2])</span>
+
+        <span class="s3"># number of curve segments to make</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">n = int(</span><span class="s4">2 </span><span class="s1">** np.ceil((eta2 - eta1) / halfpi))</span>
+        <span class="s2">if </span><span class="s1">n &lt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;n must be &gt;= 1 or None&quot;</span><span class="s1">)</span>
+
+        <span class="s1">deta = (eta2 - eta1) / n</span>
+        <span class="s1">t = np.tan(</span><span class="s4">0.5 </span><span class="s1">* deta)</span>
+        <span class="s1">alpha = np.sin(deta) * (np.sqrt(</span><span class="s4">4.0 </span><span class="s1">+ </span><span class="s4">3.0 </span><span class="s1">* t * t) - </span><span class="s4">1</span><span class="s1">) / </span><span class="s4">3.0</span>
+
+        <span class="s1">steps = np.linspace(eta1</span><span class="s2">, </span><span class="s1">eta2</span><span class="s2">, </span><span class="s1">n + </span><span class="s4">1</span><span class="s2">, True</span><span class="s1">)</span>
+        <span class="s1">cos_eta = np.cos(steps)</span>
+        <span class="s1">sin_eta = np.sin(steps)</span>
+
+        <span class="s1">xA = cos_eta[:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">yA = sin_eta[:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">xA_dot = -yA</span>
+        <span class="s1">yA_dot = xA</span>
+
+        <span class="s1">xB = cos_eta[</span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">yB = sin_eta[</span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">xB_dot = -yB</span>
+        <span class="s1">yB_dot = xB</span>
+
+        <span class="s2">if </span><span class="s1">is_wedge:</span>
+            <span class="s1">length = n * </span><span class="s4">3 </span><span class="s1">+ </span><span class="s4">4</span>
+            <span class="s1">vertices = np.zeros((length</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">float)</span>
+            <span class="s1">codes = np.full(length</span><span class="s2">, </span><span class="s1">cls.CURVE4</span><span class="s2">, </span><span class="s1">dtype=cls.code_type)</span>
+            <span class="s1">vertices[</span><span class="s4">1</span><span class="s1">] = [xA[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">yA[</span><span class="s4">0</span><span class="s1">]]</span>
+            <span class="s1">codes[</span><span class="s4">0</span><span class="s1">:</span><span class="s4">2</span><span class="s1">] = [cls.MOVETO</span><span class="s2">, </span><span class="s1">cls.LINETO]</span>
+            <span class="s1">codes[-</span><span class="s4">2</span><span class="s1">:] = [cls.LINETO</span><span class="s2">, </span><span class="s1">cls.CLOSEPOLY]</span>
+            <span class="s1">vertex_offset = </span><span class="s4">2</span>
+            <span class="s1">end = length - </span><span class="s4">2</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">length = n * </span><span class="s4">3 </span><span class="s1">+ </span><span class="s4">1</span>
+            <span class="s1">vertices = np.empty((length</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">float)</span>
+            <span class="s1">codes = np.full(length</span><span class="s2">, </span><span class="s1">cls.CURVE4</span><span class="s2">, </span><span class="s1">dtype=cls.code_type)</span>
+            <span class="s1">vertices[</span><span class="s4">0</span><span class="s1">] = [xA[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">yA[</span><span class="s4">0</span><span class="s1">]]</span>
+            <span class="s1">codes[</span><span class="s4">0</span><span class="s1">] = cls.MOVETO</span>
+            <span class="s1">vertex_offset = </span><span class="s4">1</span>
+            <span class="s1">end = length</span>
+
+        <span class="s1">vertices[vertex_offset:end:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = xA + alpha * xA_dot</span>
+        <span class="s1">vertices[vertex_offset:end:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">1</span><span class="s1">] = yA + alpha * yA_dot</span>
+        <span class="s1">vertices[vertex_offset+</span><span class="s4">1</span><span class="s1">:end:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = xB - alpha * xB_dot</span>
+        <span class="s1">vertices[vertex_offset+</span><span class="s4">1</span><span class="s1">:end:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">1</span><span class="s1">] = yB - alpha * yB_dot</span>
+        <span class="s1">vertices[vertex_offset+</span><span class="s4">2</span><span class="s1">:end:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = xB</span>
+        <span class="s1">vertices[vertex_offset+</span><span class="s4">2</span><span class="s1">:end:</span><span class="s4">3</span><span class="s2">, </span><span class="s4">1</span><span class="s1">] = yB</span>
+
+        <span class="s2">return </span><span class="s1">cls(vertices</span><span class="s2">, </span><span class="s1">codes</span><span class="s2">, </span><span class="s1">readonly=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">wedge(cls</span><span class="s2">, </span><span class="s1">theta1</span><span class="s2">, </span><span class="s1">theta2</span><span class="s2">, </span><span class="s1">n=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a `Path` for the unit circle wedge from angles *theta1* to 
+        *theta2* (in degrees). 
+ 
+        *theta2* is unwrapped to produce the shortest wedge within 360 degrees. 
+        That is, if *theta2* &gt; *theta1* + 360, the wedge will be from *theta1* 
+        to *theta2* - 360 and not a full circle plus some extra overlap. 
+ 
+        If *n* is provided, it is the number of spline segments to make. 
+        If *n* is not provided, the number of spline segments is 
+        determined based on the delta between *theta1* and *theta2*. 
+ 
+        See `Path.arc` for the reference on the approximation used. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">cls.arc(theta1</span><span class="s2">, </span><span class="s1">theta2</span><span class="s2">, </span><span class="s1">n</span><span class="s2">, True</span><span class="s1">)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s1">@lru_cache(</span><span class="s4">8</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">hatch(hatchpattern</span><span class="s2">, </span><span class="s1">density=</span><span class="s4">6</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Given a hatch specifier, *hatchpattern*, generates a Path that 
+        can be used in a repeated hatching pattern.  *density* is the 
+        number of lines per unit square. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">from </span><span class="s1">matplotlib.hatch </span><span class="s2">import </span><span class="s1">get_path</span>
+        <span class="s2">return </span><span class="s1">(get_path(hatchpattern</span><span class="s2">, </span><span class="s1">density)</span>
+                <span class="s2">if </span><span class="s1">hatchpattern </span><span class="s2">is not None else None</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">clip_to_bbox(self</span><span class="s2">, </span><span class="s1">bbox</span><span class="s2">, </span><span class="s1">inside=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Clip the path to the given bounding box. 
+ 
+        The path must be made up of one or more closed polygons.  This 
+        algorithm will not behave correctly for unclosed paths. 
+ 
+        If *inside* is `True`, clip to the inside of the box, otherwise 
+        to the outside of the box. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">verts = _path.clip_path_to_rect(self</span><span class="s2">, </span><span class="s1">bbox</span><span class="s2">, </span><span class="s1">inside)</span>
+        <span class="s1">paths = [Path(poly) </span><span class="s2">for </span><span class="s1">poly </span><span class="s2">in </span><span class="s1">verts]</span>
+        <span class="s2">return </span><span class="s1">self.make_compound_path(*paths)</span>
+
+
+<span class="s2">def </span><span class="s1">get_path_collection_extents(</span>
+        <span class="s1">master_transform</span><span class="s2">, </span><span class="s1">paths</span><span class="s2">, </span><span class="s1">transforms</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">offset_transform):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Given a sequence of `Path`\s, `.Transform`\s objects, and offsets, as 
+    found in a `.PathCollection`, returns the bounding box that encapsulates 
+    all of them. 
+ 
+    Parameters 
+    ---------- 
+    master_transform : `.Transform` 
+        Global transformation applied to all paths. 
+    paths : list of `Path` 
+    transforms : list of `.Affine2D` 
+    offsets : (N, 2) array-like 
+    offset_transform : `.Affine2D` 
+        Transform applied to the offsets before offsetting the path. 
+ 
+    Notes 
+    ----- 
+    The way that *paths*, *transforms* and *offsets* are combined 
+    follows the same method as for collections:  Each is iterated over 
+    independently, so if you have 3 paths, 2 transforms and 1 offset, 
+    their combinations are as follows: 
+ 
+        (A, A, A), (B, B, A), (C, A, A) 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">.transforms </span><span class="s2">import </span><span class="s1">Bbox</span>
+    <span class="s2">if </span><span class="s1">len(paths) == </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;No paths provided&quot;</span><span class="s1">)</span>
+    <span class="s1">extents</span><span class="s2">, </span><span class="s1">minpos = _path.get_path_collection_extents(</span>
+        <span class="s1">master_transform</span><span class="s2">, </span><span class="s1">paths</span><span class="s2">, </span><span class="s1">np.atleast_3d(transforms)</span><span class="s2">,</span>
+        <span class="s1">offsets</span><span class="s2">, </span><span class="s1">offset_transform)</span>
+    <span class="s2">return </span><span class="s1">Bbox.from_extents(*extents</span><span class="s2">, </span><span class="s1">minpos=minpos)</span>
+</pre>
+</body>
+</html>

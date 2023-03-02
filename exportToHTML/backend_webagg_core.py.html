@@ -1,0 +1,539 @@
+<html>
+<head>
+<title>backend_webagg_core.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_webagg_core.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Displays Agg images in the browser, with interactivity 
+&quot;&quot;&quot;</span>
+<span class="s2"># The WebAgg backend is divided into two modules:</span>
+<span class="s2">#</span>
+<span class="s2"># - `backend_webagg_core.py` contains code necessary to embed a WebAgg</span>
+<span class="s2">#   plot inside of a web application, and communicate in an abstract</span>
+<span class="s2">#   way over a web socket.</span>
+<span class="s2">#</span>
+<span class="s2"># - `backend_webagg.py` contains a concrete implementation of a basic</span>
+<span class="s2">#   application, implemented with asyncio.</span>
+
+<span class="s3">import </span><span class="s1">asyncio</span>
+<span class="s3">import </span><span class="s1">datetime</span>
+<span class="s3">from </span><span class="s1">io </span><span class="s3">import </span><span class="s1">BytesIO</span><span class="s3">, </span><span class="s1">StringIO</span>
+<span class="s3">import </span><span class="s1">json</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">from </span><span class="s1">pathlib </span><span class="s3">import </span><span class="s1">Path</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">PIL </span><span class="s3">import </span><span class="s1">Image</span>
+
+<span class="s3">from </span><span class="s1">matplotlib </span><span class="s3">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">backend_bases</span><span class="s3">, </span><span class="s1">backend_tools</span>
+<span class="s3">from </span><span class="s1">matplotlib.backends </span><span class="s3">import </span><span class="s1">backend_agg</span>
+<span class="s3">from </span><span class="s1">matplotlib.backend_bases </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s3">, </span><span class="s1">KeyEvent</span><span class="s3">, </span><span class="s1">LocationEvent</span><span class="s3">, </span><span class="s1">MouseEvent</span><span class="s3">, </span><span class="s1">ResizeEvent)</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+<span class="s1">_SPECIAL_KEYS_LUT = {</span><span class="s4">'Alt'</span><span class="s1">: </span><span class="s4">'alt'</span><span class="s3">,</span>
+                     <span class="s4">'AltGraph'</span><span class="s1">: </span><span class="s4">'alt'</span><span class="s3">,</span>
+                     <span class="s4">'CapsLock'</span><span class="s1">: </span><span class="s4">'caps_lock'</span><span class="s3">,</span>
+                     <span class="s4">'Control'</span><span class="s1">: </span><span class="s4">'control'</span><span class="s3">,</span>
+                     <span class="s4">'Meta'</span><span class="s1">: </span><span class="s4">'meta'</span><span class="s3">,</span>
+                     <span class="s4">'NumLock'</span><span class="s1">: </span><span class="s4">'num_lock'</span><span class="s3">,</span>
+                     <span class="s4">'ScrollLock'</span><span class="s1">: </span><span class="s4">'scroll_lock'</span><span class="s3">,</span>
+                     <span class="s4">'Shift'</span><span class="s1">: </span><span class="s4">'shift'</span><span class="s3">,</span>
+                     <span class="s4">'Super'</span><span class="s1">: </span><span class="s4">'super'</span><span class="s3">,</span>
+                     <span class="s4">'Enter'</span><span class="s1">: </span><span class="s4">'enter'</span><span class="s3">,</span>
+                     <span class="s4">'Tab'</span><span class="s1">: </span><span class="s4">'tab'</span><span class="s3">,</span>
+                     <span class="s4">'ArrowDown'</span><span class="s1">: </span><span class="s4">'down'</span><span class="s3">,</span>
+                     <span class="s4">'ArrowLeft'</span><span class="s1">: </span><span class="s4">'left'</span><span class="s3">,</span>
+                     <span class="s4">'ArrowRight'</span><span class="s1">: </span><span class="s4">'right'</span><span class="s3">,</span>
+                     <span class="s4">'ArrowUp'</span><span class="s1">: </span><span class="s4">'up'</span><span class="s3">,</span>
+                     <span class="s4">'End'</span><span class="s1">: </span><span class="s4">'end'</span><span class="s3">,</span>
+                     <span class="s4">'Home'</span><span class="s1">: </span><span class="s4">'home'</span><span class="s3">,</span>
+                     <span class="s4">'PageDown'</span><span class="s1">: </span><span class="s4">'pagedown'</span><span class="s3">,</span>
+                     <span class="s4">'PageUp'</span><span class="s1">: </span><span class="s4">'pageup'</span><span class="s3">,</span>
+                     <span class="s4">'Backspace'</span><span class="s1">: </span><span class="s4">'backspace'</span><span class="s3">,</span>
+                     <span class="s4">'Delete'</span><span class="s1">: </span><span class="s4">'delete'</span><span class="s3">,</span>
+                     <span class="s4">'Insert'</span><span class="s1">: </span><span class="s4">'insert'</span><span class="s3">,</span>
+                     <span class="s4">'Escape'</span><span class="s1">: </span><span class="s4">'escape'</span><span class="s3">,</span>
+                     <span class="s4">'Pause'</span><span class="s1">: </span><span class="s4">'pause'</span><span class="s3">,</span>
+                     <span class="s4">'Select'</span><span class="s1">: </span><span class="s4">'select'</span><span class="s3">,</span>
+                     <span class="s4">'Dead'</span><span class="s1">: </span><span class="s4">'dead'</span><span class="s3">,</span>
+                     <span class="s4">'F1'</span><span class="s1">: </span><span class="s4">'f1'</span><span class="s3">,</span>
+                     <span class="s4">'F2'</span><span class="s1">: </span><span class="s4">'f2'</span><span class="s3">,</span>
+                     <span class="s4">'F3'</span><span class="s1">: </span><span class="s4">'f3'</span><span class="s3">,</span>
+                     <span class="s4">'F4'</span><span class="s1">: </span><span class="s4">'f4'</span><span class="s3">,</span>
+                     <span class="s4">'F5'</span><span class="s1">: </span><span class="s4">'f5'</span><span class="s3">,</span>
+                     <span class="s4">'F6'</span><span class="s1">: </span><span class="s4">'f6'</span><span class="s3">,</span>
+                     <span class="s4">'F7'</span><span class="s1">: </span><span class="s4">'f7'</span><span class="s3">,</span>
+                     <span class="s4">'F8'</span><span class="s1">: </span><span class="s4">'f8'</span><span class="s3">,</span>
+                     <span class="s4">'F9'</span><span class="s1">: </span><span class="s4">'f9'</span><span class="s3">,</span>
+                     <span class="s4">'F10'</span><span class="s1">: </span><span class="s4">'f10'</span><span class="s3">,</span>
+                     <span class="s4">'F11'</span><span class="s1">: </span><span class="s4">'f11'</span><span class="s3">,</span>
+                     <span class="s4">'F12'</span><span class="s1">: </span><span class="s4">'f12'</span><span class="s1">}</span>
+
+
+<span class="s3">def </span><span class="s1">_handle_key(key):</span>
+    <span class="s0">&quot;&quot;&quot;Handle key values&quot;&quot;&quot;</span>
+    <span class="s1">value = key[key.index(</span><span class="s4">'k'</span><span class="s1">) + </span><span class="s5">1</span><span class="s1">:]</span>
+    <span class="s3">if </span><span class="s4">'shift+' </span><span class="s3">in </span><span class="s1">key:</span>
+        <span class="s3">if </span><span class="s1">len(value) == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">key = key.replace(</span><span class="s4">'shift+'</span><span class="s3">, </span><span class="s4">''</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">value </span><span class="s3">in </span><span class="s1">_SPECIAL_KEYS_LUT:</span>
+        <span class="s1">value = _SPECIAL_KEYS_LUT[value]</span>
+    <span class="s1">key = key[:key.index(</span><span class="s4">'k'</span><span class="s1">)] + value</span>
+    <span class="s3">return </span><span class="s1">key</span>
+
+
+<span class="s3">class </span><span class="s1">TimerTornado(backend_bases.TimerBase):</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._timer = </span><span class="s3">None</span>
+        <span class="s1">super().__init__(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s3">def </span><span class="s1">_timer_start(self):</span>
+        <span class="s3">import </span><span class="s1">tornado</span>
+
+        <span class="s1">self._timer_stop()</span>
+        <span class="s3">if </span><span class="s1">self._single:</span>
+            <span class="s1">ioloop = tornado.ioloop.IOLoop.instance()</span>
+            <span class="s1">self._timer = ioloop.add_timeout(</span>
+                <span class="s1">datetime.timedelta(milliseconds=self.interval)</span><span class="s3">,</span>
+                <span class="s1">self._on_timer)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self._timer = tornado.ioloop.PeriodicCallback(</span>
+                <span class="s1">self._on_timer</span><span class="s3">,</span>
+                <span class="s1">max(self.interval</span><span class="s3">, </span><span class="s5">1e-6</span><span class="s1">))</span>
+            <span class="s1">self._timer.start()</span>
+
+    <span class="s3">def </span><span class="s1">_timer_stop(self):</span>
+        <span class="s3">import </span><span class="s1">tornado</span>
+
+        <span class="s3">if </span><span class="s1">self._timer </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">return</span>
+        <span class="s3">elif </span><span class="s1">self._single:</span>
+            <span class="s1">ioloop = tornado.ioloop.IOLoop.instance()</span>
+            <span class="s1">ioloop.remove_timeout(self._timer)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self._timer.stop()</span>
+        <span class="s1">self._timer = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">_timer_set_interval(self):</span>
+        <span class="s2"># Only stop and restart it if the timer has already been started</span>
+        <span class="s3">if </span><span class="s1">self._timer </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self._timer_stop()</span>
+            <span class="s1">self._timer_start()</span>
+
+
+<span class="s3">class </span><span class="s1">TimerAsyncio(backend_bases.TimerBase):</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._task = </span><span class="s3">None</span>
+        <span class="s1">super().__init__(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s3">async def </span><span class="s1">_timer_task(self</span><span class="s3">, </span><span class="s1">interval):</span>
+        <span class="s3">while True</span><span class="s1">:</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s3">await </span><span class="s1">asyncio.sleep(interval)</span>
+                <span class="s1">self._on_timer()</span>
+
+                <span class="s3">if </span><span class="s1">self._single:</span>
+                    <span class="s3">break</span>
+            <span class="s3">except </span><span class="s1">asyncio.CancelledError:</span>
+                <span class="s3">break</span>
+
+    <span class="s3">def </span><span class="s1">_timer_start(self):</span>
+        <span class="s1">self._timer_stop()</span>
+
+        <span class="s1">self._task = asyncio.ensure_future(</span>
+            <span class="s1">self._timer_task(max(self.interval / </span><span class="s5">1_000.</span><span class="s3">, </span><span class="s5">1e-6</span><span class="s1">))</span>
+        <span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">_timer_stop(self):</span>
+        <span class="s3">if </span><span class="s1">self._task </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self._task.cancel()</span>
+        <span class="s1">self._task = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">_timer_set_interval(self):</span>
+        <span class="s2"># Only stop and restart it if the timer has already been started</span>
+        <span class="s3">if </span><span class="s1">self._task </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self._timer_stop()</span>
+            <span class="s1">self._timer_start()</span>
+
+
+<span class="s3">class </span><span class="s1">FigureCanvasWebAggCore(backend_agg.FigureCanvasAgg):</span>
+    <span class="s1">manager_class = _api.classproperty(</span><span class="s3">lambda </span><span class="s1">cls: FigureManagerWebAgg)</span>
+    <span class="s1">_timer_cls = TimerAsyncio</span>
+    <span class="s2"># Webagg and friends having the right methods, but still</span>
+    <span class="s2"># having bugs in practice.  Do not advertise that it works until</span>
+    <span class="s2"># we can debug this.</span>
+    <span class="s1">supports_blit = </span><span class="s3">False</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s2"># Set to True when the renderer contains data that is newer</span>
+        <span class="s2"># than the PNG buffer.</span>
+        <span class="s1">self._png_is_old = </span><span class="s3">True</span>
+        <span class="s2"># Set to True by the `refresh` message so that the next frame</span>
+        <span class="s2"># sent to the clients will be a full frame.</span>
+        <span class="s1">self._force_full = </span><span class="s3">True</span>
+        <span class="s2"># The last buffer, for diff mode.</span>
+        <span class="s1">self._last_buff = np.empty((</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s1">))</span>
+        <span class="s2"># Store the current image mode so that at any point, clients can</span>
+        <span class="s2"># request the information. This should be changed by calling</span>
+        <span class="s2"># self.set_image_mode(mode) so that the notification can be given</span>
+        <span class="s2"># to the connected clients.</span>
+        <span class="s1">self._current_image_mode = </span><span class="s4">'full'</span>
+        <span class="s2"># Track mouse events to fill in the x, y position of key events.</span>
+        <span class="s1">self._last_mouse_xy = (</span><span class="s3">None, None</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">show(self):</span>
+        <span class="s2"># show the figure window</span>
+        <span class="s3">from </span><span class="s1">matplotlib.pyplot </span><span class="s3">import </span><span class="s1">show</span>
+        <span class="s1">show()</span>
+
+    <span class="s3">def </span><span class="s1">draw(self):</span>
+        <span class="s1">self._png_is_old = </span><span class="s3">True</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">super().draw()</span>
+        <span class="s3">finally</span><span class="s1">:</span>
+            <span class="s1">self.manager.refresh_all()  </span><span class="s2"># Swap the frames.</span>
+
+    <span class="s3">def </span><span class="s1">blit(self</span><span class="s3">, </span><span class="s1">bbox=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">self._png_is_old = </span><span class="s3">True</span>
+        <span class="s1">self.manager.refresh_all()</span>
+
+    <span class="s3">def </span><span class="s1">draw_idle(self):</span>
+        <span class="s1">self.send_event(</span><span class="s4">&quot;draw&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_cursor(self</span><span class="s3">, </span><span class="s1">cursor):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s1">cursor = _api.check_getitem({</span>
+            <span class="s1">backend_tools.Cursors.HAND: </span><span class="s4">'pointer'</span><span class="s3">,</span>
+            <span class="s1">backend_tools.Cursors.POINTER: </span><span class="s4">'default'</span><span class="s3">,</span>
+            <span class="s1">backend_tools.Cursors.SELECT_REGION: </span><span class="s4">'crosshair'</span><span class="s3">,</span>
+            <span class="s1">backend_tools.Cursors.MOVE: </span><span class="s4">'move'</span><span class="s3">,</span>
+            <span class="s1">backend_tools.Cursors.WAIT: </span><span class="s4">'wait'</span><span class="s3">,</span>
+            <span class="s1">backend_tools.Cursors.RESIZE_HORIZONTAL: </span><span class="s4">'ew-resize'</span><span class="s3">,</span>
+            <span class="s1">backend_tools.Cursors.RESIZE_VERTICAL: </span><span class="s4">'ns-resize'</span><span class="s3">,</span>
+        <span class="s1">}</span><span class="s3">, </span><span class="s1">cursor=cursor)</span>
+        <span class="s1">self.send_event(</span><span class="s4">'cursor'</span><span class="s3">, </span><span class="s1">cursor=cursor)</span>
+
+    <span class="s3">def </span><span class="s1">set_image_mode(self</span><span class="s3">, </span><span class="s1">mode):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the image mode for any subsequent images which will be sent 
+        to the clients. The modes may currently be either 'full' or 'diff'. 
+ 
+        Note: diff images may not contain transparency, therefore upon 
+        draw this mode may be changed if the resulting image has any 
+        transparent component. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_api.check_in_list([</span><span class="s4">'full'</span><span class="s3">, </span><span class="s4">'diff'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">mode=mode)</span>
+        <span class="s3">if </span><span class="s1">self._current_image_mode != mode:</span>
+            <span class="s1">self._current_image_mode = mode</span>
+            <span class="s1">self.handle_send_image_mode(</span><span class="s3">None</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_diff_image(self):</span>
+        <span class="s3">if </span><span class="s1">self._png_is_old:</span>
+            <span class="s1">renderer = self.get_renderer()</span>
+
+            <span class="s1">pixels = np.asarray(renderer.buffer_rgba())</span>
+            <span class="s2"># The buffer is created as type uint32 so that entire</span>
+            <span class="s2"># pixels can be compared in one numpy call, rather than</span>
+            <span class="s2"># needing to compare each plane separately.</span>
+            <span class="s1">buff = pixels.view(np.uint32).squeeze(</span><span class="s5">2</span><span class="s1">)</span>
+
+            <span class="s3">if </span><span class="s1">(self._force_full</span>
+                    <span class="s2"># If the buffer has changed size we need to do a full draw.</span>
+                    <span class="s3">or </span><span class="s1">buff.shape != self._last_buff.shape</span>
+                    <span class="s2"># If any pixels have transparency, we need to force a full</span>
+                    <span class="s2"># draw as we cannot overlay new on top of old.</span>
+                    <span class="s3">or </span><span class="s1">(pixels[:</span><span class="s3">, </span><span class="s1">:</span><span class="s3">, </span><span class="s5">3</span><span class="s1">] != </span><span class="s5">255</span><span class="s1">).any()):</span>
+                <span class="s1">self.set_image_mode(</span><span class="s4">'full'</span><span class="s1">)</span>
+                <span class="s1">output = buff</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">self.set_image_mode(</span><span class="s4">'diff'</span><span class="s1">)</span>
+                <span class="s1">diff = buff != self._last_buff</span>
+                <span class="s1">output = np.where(diff</span><span class="s3">, </span><span class="s1">buff</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span>
+
+            <span class="s2"># Store the current buffer so we can compute the next diff.</span>
+            <span class="s1">self._last_buff = buff.copy()</span>
+            <span class="s1">self._force_full = </span><span class="s3">False</span>
+            <span class="s1">self._png_is_old = </span><span class="s3">False</span>
+
+            <span class="s1">data = output.view(dtype=np.uint8).reshape((*output.shape</span><span class="s3">, </span><span class="s5">4</span><span class="s1">))</span>
+            <span class="s3">with </span><span class="s1">BytesIO() </span><span class="s3">as </span><span class="s1">png:</span>
+                <span class="s1">Image.fromarray(data).save(png</span><span class="s3">, </span><span class="s1">format=</span><span class="s4">&quot;png&quot;</span><span class="s1">)</span>
+                <span class="s3">return </span><span class="s1">png.getvalue()</span>
+
+    <span class="s3">def </span><span class="s1">handle_event(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">e_type = event[</span><span class="s4">'type'</span><span class="s1">]</span>
+        <span class="s1">handler = getattr(self</span><span class="s3">, </span><span class="s4">'handle_{0}'</span><span class="s1">.format(e_type)</span><span class="s3">,</span>
+                          <span class="s1">self.handle_unknown_event)</span>
+        <span class="s3">return </span><span class="s1">handler(event)</span>
+
+    <span class="s3">def </span><span class="s1">handle_unknown_event(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">_log.warning(</span><span class="s4">'Unhandled message type {0}. {1}'</span><span class="s1">.format(</span>
+                     <span class="s1">event[</span><span class="s4">'type'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">event))</span>
+
+    <span class="s3">def </span><span class="s1">handle_ack(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s2"># Network latency tends to decrease if traffic is flowing</span>
+        <span class="s2"># in both directions.  Therefore, the browser sends back</span>
+        <span class="s2"># an &quot;ack&quot; message after each image frame is received.</span>
+        <span class="s2"># This could also be used as a simple sanity check in the</span>
+        <span class="s2"># future, but for now the performance increase is enough</span>
+        <span class="s2"># to justify it, even if the server does nothing with it.</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">handle_draw(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">self.draw()</span>
+
+    <span class="s3">def </span><span class="s1">_handle_mouse(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">x = event[</span><span class="s4">'x'</span><span class="s1">]</span>
+        <span class="s1">y = event[</span><span class="s4">'y'</span><span class="s1">]</span>
+        <span class="s1">y = self.get_renderer().height - y</span>
+        <span class="s1">self._last_mouse_xy = x</span><span class="s3">, </span><span class="s1">y</span>
+        <span class="s2"># JavaScript button numbers and Matplotlib button numbers are off by 1.</span>
+        <span class="s1">button = event[</span><span class="s4">'button'</span><span class="s1">] + </span><span class="s5">1</span>
+
+        <span class="s1">e_type = event[</span><span class="s4">'type'</span><span class="s1">]</span>
+        <span class="s1">modifiers = event[</span><span class="s4">'modifiers'</span><span class="s1">]</span>
+        <span class="s1">guiEvent = event.get(</span><span class="s4">'guiEvent'</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">e_type </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'button_press'</span><span class="s3">, </span><span class="s4">'button_release'</span><span class="s1">]:</span>
+            <span class="s1">MouseEvent(e_type + </span><span class="s4">'_event'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">button</span><span class="s3">,</span>
+                       <span class="s1">modifiers=modifiers</span><span class="s3">, </span><span class="s1">guiEvent=guiEvent)._process()</span>
+        <span class="s3">elif </span><span class="s1">e_type == </span><span class="s4">'dblclick'</span><span class="s1">:</span>
+            <span class="s1">MouseEvent(</span><span class="s4">'button_press_event'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">button</span><span class="s3">, </span><span class="s1">dblclick=</span><span class="s3">True,</span>
+                       <span class="s1">modifiers=modifiers</span><span class="s3">, </span><span class="s1">guiEvent=guiEvent)._process()</span>
+        <span class="s3">elif </span><span class="s1">e_type == </span><span class="s4">'scroll'</span><span class="s1">:</span>
+            <span class="s1">MouseEvent(</span><span class="s4">'scroll_event'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">step=event[</span><span class="s4">'step'</span><span class="s1">]</span><span class="s3">,</span>
+                       <span class="s1">modifiers=modifiers</span><span class="s3">, </span><span class="s1">guiEvent=guiEvent)._process()</span>
+        <span class="s3">elif </span><span class="s1">e_type == </span><span class="s4">'motion_notify'</span><span class="s1">:</span>
+            <span class="s1">MouseEvent(e_type + </span><span class="s4">'_event'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">,</span>
+                       <span class="s1">modifiers=modifiers</span><span class="s3">, </span><span class="s1">guiEvent=guiEvent)._process()</span>
+        <span class="s3">elif </span><span class="s1">e_type </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'figure_enter'</span><span class="s3">, </span><span class="s4">'figure_leave'</span><span class="s1">]:</span>
+            <span class="s1">LocationEvent(e_type + </span><span class="s4">'_event'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">,</span>
+                          <span class="s1">modifiers=modifiers</span><span class="s3">, </span><span class="s1">guiEvent=guiEvent)._process()</span>
+    <span class="s1">handle_button_press = handle_button_release = handle_dblclick = \</span>
+        <span class="s1">handle_figure_enter = handle_figure_leave = handle_motion_notify = \</span>
+        <span class="s1">handle_scroll = _handle_mouse</span>
+
+    <span class="s3">def </span><span class="s1">_handle_key(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">KeyEvent(event[</span><span class="s4">'type'</span><span class="s1">] + </span><span class="s4">'_event'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">,</span>
+                 <span class="s1">_handle_key(event[</span><span class="s4">'key'</span><span class="s1">])</span><span class="s3">, </span><span class="s1">*self._last_mouse_xy</span><span class="s3">,</span>
+                 <span class="s1">guiEvent=event.get(</span><span class="s4">'guiEvent'</span><span class="s1">))._process()</span>
+    <span class="s1">handle_key_press = handle_key_release = _handle_key</span>
+
+    <span class="s3">def </span><span class="s1">handle_toolbar_button(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s2"># TODO: Be more suspicious of the input</span>
+        <span class="s1">getattr(self.toolbar</span><span class="s3">, </span><span class="s1">event[</span><span class="s4">'name'</span><span class="s1">])()</span>
+
+    <span class="s3">def </span><span class="s1">handle_refresh(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">figure_label = self.figure.get_label()</span>
+        <span class="s3">if not </span><span class="s1">figure_label:</span>
+            <span class="s1">figure_label = </span><span class="s4">&quot;Figure {0}&quot;</span><span class="s1">.format(self.manager.num)</span>
+        <span class="s1">self.send_event(</span><span class="s4">'figure_label'</span><span class="s3">, </span><span class="s1">label=figure_label)</span>
+        <span class="s1">self._force_full = </span><span class="s3">True</span>
+        <span class="s3">if </span><span class="s1">self.toolbar:</span>
+            <span class="s2"># Normal toolbar init would refresh this, but it happens before the</span>
+            <span class="s2"># browser canvas is set up.</span>
+            <span class="s1">self.toolbar.set_history_buttons()</span>
+        <span class="s1">self.draw_idle()</span>
+
+    <span class="s3">def </span><span class="s1">handle_resize(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">x = int(event.get(</span><span class="s4">'width'</span><span class="s3">, </span><span class="s5">800</span><span class="s1">)) * self.device_pixel_ratio</span>
+        <span class="s1">y = int(event.get(</span><span class="s4">'height'</span><span class="s3">, </span><span class="s5">800</span><span class="s1">)) * self.device_pixel_ratio</span>
+        <span class="s1">fig = self.figure</span>
+        <span class="s2"># An attempt at approximating the figure size in pixels.</span>
+        <span class="s1">fig.set_size_inches(x / fig.dpi</span><span class="s3">, </span><span class="s1">y / fig.dpi</span><span class="s3">, </span><span class="s1">forward=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s2"># Acknowledge the resize, and force the viewer to update the</span>
+        <span class="s2"># canvas size to the figure's new size (which is hopefully</span>
+        <span class="s2"># identical or within a pixel or so).</span>
+        <span class="s1">self._png_is_old = </span><span class="s3">True</span>
+        <span class="s1">self.manager.resize(*fig.bbox.size</span><span class="s3">, </span><span class="s1">forward=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s1">ResizeEvent(</span><span class="s4">'resize_event'</span><span class="s3">, </span><span class="s1">self)._process()</span>
+        <span class="s1">self.draw_idle()</span>
+
+    <span class="s3">def </span><span class="s1">handle_send_image_mode(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s2"># The client requests notification of what the current image mode is.</span>
+        <span class="s1">self.send_event(</span><span class="s4">'image_mode'</span><span class="s3">, </span><span class="s1">mode=self._current_image_mode)</span>
+
+    <span class="s3">def </span><span class="s1">handle_set_device_pixel_ratio(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s1">self._handle_set_device_pixel_ratio(event.get(</span><span class="s4">'device_pixel_ratio'</span><span class="s3">, </span><span class="s5">1</span><span class="s1">))</span>
+
+    <span class="s3">def </span><span class="s1">handle_set_dpi_ratio(self</span><span class="s3">, </span><span class="s1">event):</span>
+        <span class="s2"># This handler is for backwards-compatibility with older ipympl.</span>
+        <span class="s1">self._handle_set_device_pixel_ratio(event.get(</span><span class="s4">'dpi_ratio'</span><span class="s3">, </span><span class="s5">1</span><span class="s1">))</span>
+
+    <span class="s3">def </span><span class="s1">_handle_set_device_pixel_ratio(self</span><span class="s3">, </span><span class="s1">device_pixel_ratio):</span>
+        <span class="s3">if </span><span class="s1">self._set_device_pixel_ratio(device_pixel_ratio):</span>
+            <span class="s1">self._force_full = </span><span class="s3">True</span>
+            <span class="s1">self.draw_idle()</span>
+
+    <span class="s3">def </span><span class="s1">send_event(self</span><span class="s3">, </span><span class="s1">event_type</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">if </span><span class="s1">self.manager:</span>
+            <span class="s1">self.manager._send_event(event_type</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s1">_ALLOWED_TOOL_ITEMS = {</span>
+    <span class="s4">'home'</span><span class="s3">,</span>
+    <span class="s4">'back'</span><span class="s3">,</span>
+    <span class="s4">'forward'</span><span class="s3">,</span>
+    <span class="s4">'pan'</span><span class="s3">,</span>
+    <span class="s4">'zoom'</span><span class="s3">,</span>
+    <span class="s4">'download'</span><span class="s3">,</span>
+    <span class="s3">None,</span>
+<span class="s1">}</span>
+
+
+<span class="s3">class </span><span class="s1">NavigationToolbar2WebAgg(backend_bases.NavigationToolbar2):</span>
+
+    <span class="s2"># Use the standard toolbar items + download button</span>
+    <span class="s1">toolitems = [</span>
+        <span class="s1">(text</span><span class="s3">, </span><span class="s1">tooltip_text</span><span class="s3">, </span><span class="s1">image_file</span><span class="s3">, </span><span class="s1">name_of_method)</span>
+        <span class="s3">for </span><span class="s1">text</span><span class="s3">, </span><span class="s1">tooltip_text</span><span class="s3">, </span><span class="s1">image_file</span><span class="s3">, </span><span class="s1">name_of_method</span>
+        <span class="s3">in </span><span class="s1">(*backend_bases.NavigationToolbar2.toolitems</span><span class="s3">,</span>
+            <span class="s1">(</span><span class="s4">'Download'</span><span class="s3">, </span><span class="s4">'Download plot'</span><span class="s3">, </span><span class="s4">'filesave'</span><span class="s3">, </span><span class="s4">'download'</span><span class="s1">))</span>
+        <span class="s3">if </span><span class="s1">name_of_method </span><span class="s3">in </span><span class="s1">_ALLOWED_TOOL_ITEMS</span>
+    <span class="s1">]</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">canvas):</span>
+        <span class="s1">self.message = </span><span class="s4">''</span>
+        <span class="s1">super().__init__(canvas)</span>
+
+    <span class="s3">def </span><span class="s1">set_message(self</span><span class="s3">, </span><span class="s1">message):</span>
+        <span class="s3">if </span><span class="s1">message != self.message:</span>
+            <span class="s1">self.canvas.send_event(</span><span class="s4">&quot;message&quot;</span><span class="s3">, </span><span class="s1">message=message)</span>
+        <span class="s1">self.message = message</span>
+
+    <span class="s3">def </span><span class="s1">draw_rubberband(self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">y0</span><span class="s3">, </span><span class="s1">x1</span><span class="s3">, </span><span class="s1">y1):</span>
+        <span class="s1">self.canvas.send_event(</span><span class="s4">&quot;rubberband&quot;</span><span class="s3">, </span><span class="s1">x0=x0</span><span class="s3">, </span><span class="s1">y0=y0</span><span class="s3">, </span><span class="s1">x1=x1</span><span class="s3">, </span><span class="s1">y1=y1)</span>
+
+    <span class="s3">def </span><span class="s1">remove_rubberband(self):</span>
+        <span class="s1">self.canvas.send_event(</span><span class="s4">&quot;rubberband&quot;</span><span class="s3">, </span><span class="s1">x0=-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">y0=-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">x1=-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">y1=-</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">save_figure(self</span><span class="s3">, </span><span class="s1">*args):</span>
+        <span class="s0">&quot;&quot;&quot;Save the current figure&quot;&quot;&quot;</span>
+        <span class="s1">self.canvas.send_event(</span><span class="s4">'save'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">pan(self):</span>
+        <span class="s1">super().pan()</span>
+        <span class="s1">self.canvas.send_event(</span><span class="s4">'navigate_mode'</span><span class="s3">, </span><span class="s1">mode=self.mode.name)</span>
+
+    <span class="s3">def </span><span class="s1">zoom(self):</span>
+        <span class="s1">super().zoom()</span>
+        <span class="s1">self.canvas.send_event(</span><span class="s4">'navigate_mode'</span><span class="s3">, </span><span class="s1">mode=self.mode.name)</span>
+
+    <span class="s3">def </span><span class="s1">set_history_buttons(self):</span>
+        <span class="s1">can_backward = self._nav_stack._pos &gt; </span><span class="s5">0</span>
+        <span class="s1">can_forward = self._nav_stack._pos &lt; len(self._nav_stack._elements) - </span><span class="s5">1</span>
+        <span class="s1">self.canvas.send_event(</span><span class="s4">'history_buttons'</span><span class="s3">,</span>
+                               <span class="s1">Back=can_backward</span><span class="s3">, </span><span class="s1">Forward=can_forward)</span>
+
+
+<span class="s3">class </span><span class="s1">FigureManagerWebAgg(backend_bases.FigureManagerBase):</span>
+    <span class="s2"># This must be None to not break ipympl</span>
+    <span class="s1">_toolbar2_class = </span><span class="s3">None</span>
+    <span class="s1">ToolbarCls = NavigationToolbar2WebAgg</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">canvas</span><span class="s3">, </span><span class="s1">num):</span>
+        <span class="s1">self.web_sockets = set()</span>
+        <span class="s1">super().__init__(canvas</span><span class="s3">, </span><span class="s1">num)</span>
+
+    <span class="s3">def </span><span class="s1">show(self):</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">resize(self</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">forward=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s1">self._send_event(</span>
+            <span class="s4">'resize'</span><span class="s3">,</span>
+            <span class="s1">size=(w / self.canvas.device_pixel_ratio</span><span class="s3">,</span>
+                  <span class="s1">h / self.canvas.device_pixel_ratio)</span><span class="s3">,</span>
+            <span class="s1">forward=forward)</span>
+
+    <span class="s3">def </span><span class="s1">set_window_title(self</span><span class="s3">, </span><span class="s1">title):</span>
+        <span class="s1">self._send_event(</span><span class="s4">'figure_label'</span><span class="s3">, </span><span class="s1">label=title)</span>
+
+    <span class="s2"># The following methods are specific to FigureManagerWebAgg</span>
+
+    <span class="s3">def </span><span class="s1">add_web_socket(self</span><span class="s3">, </span><span class="s1">web_socket):</span>
+        <span class="s3">assert </span><span class="s1">hasattr(web_socket</span><span class="s3">, </span><span class="s4">'send_binary'</span><span class="s1">)</span>
+        <span class="s3">assert </span><span class="s1">hasattr(web_socket</span><span class="s3">, </span><span class="s4">'send_json'</span><span class="s1">)</span>
+        <span class="s1">self.web_sockets.add(web_socket)</span>
+        <span class="s1">self.resize(*self.canvas.figure.bbox.size)</span>
+        <span class="s1">self._send_event(</span><span class="s4">'refresh'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">remove_web_socket(self</span><span class="s3">, </span><span class="s1">web_socket):</span>
+        <span class="s1">self.web_sockets.remove(web_socket)</span>
+
+    <span class="s3">def </span><span class="s1">handle_json(self</span><span class="s3">, </span><span class="s1">content):</span>
+        <span class="s1">self.canvas.handle_event(content)</span>
+
+    <span class="s3">def </span><span class="s1">refresh_all(self):</span>
+        <span class="s3">if </span><span class="s1">self.web_sockets:</span>
+            <span class="s1">diff = self.canvas.get_diff_image()</span>
+            <span class="s3">if </span><span class="s1">diff </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">self.web_sockets:</span>
+                    <span class="s1">s.send_binary(diff)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">get_javascript(cls</span><span class="s3">, </span><span class="s1">stream=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">stream </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">output = StringIO()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">output = stream</span>
+
+        <span class="s1">output.write((Path(__file__).parent / </span><span class="s4">&quot;web_backend/js/mpl.js&quot;</span><span class="s1">)</span>
+                     <span class="s1">.read_text(encoding=</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">))</span>
+
+        <span class="s1">toolitems = []</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">tooltip</span><span class="s3">, </span><span class="s1">image</span><span class="s3">, </span><span class="s1">method </span><span class="s3">in </span><span class="s1">cls.ToolbarCls.toolitems:</span>
+            <span class="s3">if </span><span class="s1">name </span><span class="s3">is None</span><span class="s1">:</span>
+                <span class="s1">toolitems.append([</span><span class="s4">''</span><span class="s3">, </span><span class="s4">''</span><span class="s3">, </span><span class="s4">''</span><span class="s3">, </span><span class="s4">''</span><span class="s1">])</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">toolitems.append([name</span><span class="s3">, </span><span class="s1">tooltip</span><span class="s3">, </span><span class="s1">image</span><span class="s3">, </span><span class="s1">method])</span>
+        <span class="s1">output.write(</span><span class="s4">&quot;mpl.toolbar_items = {0};</span><span class="s3">\n\n</span><span class="s4">&quot;</span><span class="s1">.format(</span>
+            <span class="s1">json.dumps(toolitems)))</span>
+
+        <span class="s1">extensions = []</span>
+        <span class="s3">for </span><span class="s1">filetype</span><span class="s3">, </span><span class="s1">ext </span><span class="s3">in </span><span class="s1">sorted(FigureCanvasWebAggCore.</span>
+                                    <span class="s1">get_supported_filetypes_grouped().</span>
+                                    <span class="s1">items()):</span>
+            <span class="s1">extensions.append(ext[</span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s1">output.write(</span><span class="s4">&quot;mpl.extensions = {0};</span><span class="s3">\n\n</span><span class="s4">&quot;</span><span class="s1">.format(</span>
+            <span class="s1">json.dumps(extensions)))</span>
+
+        <span class="s1">output.write(</span><span class="s4">&quot;mpl.default_extension = {0};&quot;</span><span class="s1">.format(</span>
+            <span class="s1">json.dumps(FigureCanvasWebAggCore.get_default_filetype())))</span>
+
+        <span class="s3">if </span><span class="s1">stream </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">output.getvalue()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">get_static_file_path(cls):</span>
+        <span class="s3">return </span><span class="s1">os.path.join(os.path.dirname(__file__)</span><span class="s3">, </span><span class="s4">'web_backend'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">_send_event(self</span><span class="s3">, </span><span class="s1">event_type</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">payload = {</span><span class="s4">'type'</span><span class="s1">: event_type</span><span class="s3">, </span><span class="s1">**kwargs}</span>
+        <span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">self.web_sockets:</span>
+            <span class="s1">s.send_json(payload)</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s3">class </span><span class="s1">_BackendWebAggCoreAgg(_Backend):</span>
+    <span class="s1">FigureCanvas = FigureCanvasWebAggCore</span>
+    <span class="s1">FigureManager = FigureManagerWebAgg</span>
+</pre>
+</body>
+</html>

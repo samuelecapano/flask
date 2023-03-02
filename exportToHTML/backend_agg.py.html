@@ -1,0 +1,578 @@
+<html>
+<head>
+<title>backend_agg.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_agg.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+An `Anti-Grain Geometry`_ (AGG) backend. 
+ 
+Features that are implemented: 
+ 
+* capstyles and join styles 
+* dashes 
+* linewidth 
+* lines, rectangles, ellipses 
+* clipping to a rectangle 
+* output to RGBA and Pillow-supported image formats 
+* alpha blending 
+* DPI scaling properly - everything scales properly (dashes, linewidths, etc) 
+* draw polygon 
+* freetype2 w/ ft2font 
+ 
+Still TODO: 
+ 
+* integrate screen dpi w/ ppi and text 
+ 
+.. _Anti-Grain Geometry: http://agg.sourceforge.net/antigrain.com 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">nullcontext</span>
+<span class="s2">from </span><span class="s1">math </span><span class="s2">import </span><span class="s1">radians</span><span class="s2">, </span><span class="s1">cos</span><span class="s2">, </span><span class="s1">sin</span>
+<span class="s2">import </span><span class="s1">threading</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s2">, </span><span class="s1">cbook</span>
+<span class="s2">from </span><span class="s1">matplotlib.backend_bases </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">_Backend</span><span class="s2">, </span><span class="s1">FigureCanvasBase</span><span class="s2">, </span><span class="s1">FigureManagerBase</span><span class="s2">, </span><span class="s1">RendererBase)</span>
+<span class="s2">from </span><span class="s1">matplotlib.font_manager </span><span class="s2">import </span><span class="s1">fontManager </span><span class="s2">as </span><span class="s1">_fontManager</span><span class="s2">, </span><span class="s1">get_font</span>
+<span class="s2">from </span><span class="s1">matplotlib.ft2font </span><span class="s2">import </span><span class="s1">(LOAD_FORCE_AUTOHINT</span><span class="s2">, </span><span class="s1">LOAD_NO_HINTING</span><span class="s2">,</span>
+                                <span class="s1">LOAD_DEFAULT</span><span class="s2">, </span><span class="s1">LOAD_NO_AUTOHINT)</span>
+<span class="s2">from </span><span class="s1">matplotlib.mathtext </span><span class="s2">import </span><span class="s1">MathTextParser</span>
+<span class="s2">from </span><span class="s1">matplotlib.path </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">from </span><span class="s1">matplotlib.transforms </span><span class="s2">import </span><span class="s1">Bbox</span><span class="s2">, </span><span class="s1">BboxBase</span>
+<span class="s2">from </span><span class="s1">matplotlib.backends._backend_agg </span><span class="s2">import </span><span class="s1">RendererAgg </span><span class="s2">as </span><span class="s1">_RendererAgg</span>
+
+
+<span class="s2">def </span><span class="s1">get_hinting_flag():</span>
+    <span class="s1">mapping = {</span>
+        <span class="s3">'default'</span><span class="s1">: LOAD_DEFAULT</span><span class="s2">,</span>
+        <span class="s3">'no_autohint'</span><span class="s1">: LOAD_NO_AUTOHINT</span><span class="s2">,</span>
+        <span class="s3">'force_autohint'</span><span class="s1">: LOAD_FORCE_AUTOHINT</span><span class="s2">,</span>
+        <span class="s3">'no_hinting'</span><span class="s1">: LOAD_NO_HINTING</span><span class="s2">,</span>
+        <span class="s2">True</span><span class="s1">: LOAD_FORCE_AUTOHINT</span><span class="s2">,</span>
+        <span class="s2">False</span><span class="s1">: LOAD_NO_HINTING</span><span class="s2">,</span>
+        <span class="s3">'either'</span><span class="s1">: LOAD_DEFAULT</span><span class="s2">,</span>
+        <span class="s3">'native'</span><span class="s1">: LOAD_NO_AUTOHINT</span><span class="s2">,</span>
+        <span class="s3">'auto'</span><span class="s1">: LOAD_FORCE_AUTOHINT</span><span class="s2">,</span>
+        <span class="s3">'none'</span><span class="s1">: LOAD_NO_HINTING</span><span class="s2">,</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mapping[mpl.rcParams[</span><span class="s3">'text.hinting'</span><span class="s1">]]</span>
+
+
+<span class="s2">class </span><span class="s1">RendererAgg(RendererBase):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The renderer handles all the drawing primitives using a graphics 
+    context instance that controls the colors/styles 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># we want to cache the fonts at the class level so that when</span>
+    <span class="s4"># multiple figures are created we can reuse them.  This helps with</span>
+    <span class="s4"># a bug on windows where the creation of too many figures leads to</span>
+    <span class="s4"># too many open file handles.  However, storing them at the class</span>
+    <span class="s4"># level is not thread safe.  The solution here is to let the</span>
+    <span class="s4"># FigureCanvas acquire a lock on the fontd at the start of the</span>
+    <span class="s4"># draw, and release it when it is done.  This allows multiple</span>
+    <span class="s4"># renderers to share the cached fonts, but only one figure can</span>
+    <span class="s4"># draw at time and so the font cache is used by only one</span>
+    <span class="s4"># renderer at a time.</span>
+
+    <span class="s1">lock = threading.RLock()</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">dpi):</span>
+        <span class="s1">super().__init__()</span>
+
+        <span class="s1">self.dpi = dpi</span>
+        <span class="s1">self.width = width</span>
+        <span class="s1">self.height = height</span>
+        <span class="s1">self._renderer = _RendererAgg(int(width)</span><span class="s2">, </span><span class="s1">int(height)</span><span class="s2">, </span><span class="s1">dpi)</span>
+        <span class="s1">self._filter_renderers = []</span>
+
+        <span class="s1">self._update_methods()</span>
+        <span class="s1">self.mathtext_parser = MathTextParser(</span><span class="s3">'Agg'</span><span class="s1">)</span>
+
+        <span class="s1">self.bbox = Bbox.from_bounds(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">self.width</span><span class="s2">, </span><span class="s1">self.height)</span>
+
+    <span class="s2">def </span><span class="s1">__getstate__(self):</span>
+        <span class="s4"># We only want to preserve the init keywords of the Renderer.</span>
+        <span class="s4"># Anything else can be re-created.</span>
+        <span class="s2">return </span><span class="s1">{</span><span class="s3">'width'</span><span class="s1">: self.width</span><span class="s2">, </span><span class="s3">'height'</span><span class="s1">: self.height</span><span class="s2">, </span><span class="s3">'dpi'</span><span class="s1">: self.dpi}</span>
+
+    <span class="s2">def </span><span class="s1">__setstate__(self</span><span class="s2">, </span><span class="s1">state):</span>
+        <span class="s1">self.__init__(state[</span><span class="s3">'width'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">state[</span><span class="s3">'height'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">state[</span><span class="s3">'dpi'</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">_update_methods(self):</span>
+        <span class="s1">self.draw_gouraud_triangle = self._renderer.draw_gouraud_triangle</span>
+        <span class="s1">self.draw_gouraud_triangles = self._renderer.draw_gouraud_triangles</span>
+        <span class="s1">self.draw_image = self._renderer.draw_image</span>
+        <span class="s1">self.draw_markers = self._renderer.draw_markers</span>
+        <span class="s1">self.draw_path_collection = self._renderer.draw_path_collection</span>
+        <span class="s1">self.draw_quad_mesh = self._renderer.draw_quad_mesh</span>
+        <span class="s1">self.copy_from_bbox = self._renderer.copy_from_bbox</span>
+
+    <span class="s2">def </span><span class="s1">draw_path(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">rgbFace=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s1">nmax = mpl.rcParams[</span><span class="s3">'agg.path.chunksize'</span><span class="s1">]  </span><span class="s4"># here at least for testing</span>
+        <span class="s1">npts = path.vertices.shape[</span><span class="s5">0</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">(npts &gt; nmax &gt; </span><span class="s5">100 </span><span class="s2">and </span><span class="s1">path.should_simplify </span><span class="s2">and</span>
+                <span class="s1">rgbFace </span><span class="s2">is None and </span><span class="s1">gc.get_hatch() </span><span class="s2">is None</span><span class="s1">):</span>
+            <span class="s1">nch = np.ceil(npts / nmax)</span>
+            <span class="s1">chsize = int(np.ceil(npts / nch))</span>
+            <span class="s1">i0 = np.arange(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">npts</span><span class="s2">, </span><span class="s1">chsize)</span>
+            <span class="s1">i1 = np.zeros_like(i0)</span>
+            <span class="s1">i1[:-</span><span class="s5">1</span><span class="s1">] = i0[</span><span class="s5">1</span><span class="s1">:] - </span><span class="s5">1</span>
+            <span class="s1">i1[-</span><span class="s5">1</span><span class="s1">] = npts</span>
+            <span class="s2">for </span><span class="s1">ii0</span><span class="s2">, </span><span class="s1">ii1 </span><span class="s2">in </span><span class="s1">zip(i0</span><span class="s2">, </span><span class="s1">i1):</span>
+                <span class="s1">v = path.vertices[ii0:ii1</span><span class="s2">, </span><span class="s1">:]</span>
+                <span class="s1">c = path.codes</span>
+                <span class="s2">if </span><span class="s1">c </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">c = c[ii0:ii1]</span>
+                    <span class="s1">c[</span><span class="s5">0</span><span class="s1">] = Path.MOVETO  </span><span class="s4"># move to end of last chunk</span>
+                <span class="s1">p = Path(v</span><span class="s2">, </span><span class="s1">c)</span>
+                <span class="s1">p.simplify_threshold = path.simplify_threshold</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    <span class="s1">self._renderer.draw_path(gc</span><span class="s2">, </span><span class="s1">p</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">rgbFace)</span>
+                <span class="s2">except </span><span class="s1">OverflowError:</span>
+                    <span class="s1">msg = (</span>
+                        <span class="s3">&quot;Exceeded cell block limit in Agg.</span><span class="s2">\n\n</span><span class="s3">&quot;</span>
+                        <span class="s3">&quot;Please reduce the value of &quot;</span>
+                        <span class="s3">f&quot;rcParams['agg.path.chunksize'] (currently </span><span class="s2">{</span><span class="s1">nmax</span><span class="s2">}</span><span class="s3">) &quot;</span>
+                        <span class="s3">&quot;or increase the path simplification threshold&quot;</span>
+                        <span class="s3">&quot;(rcParams['path.simplify_threshold'] = &quot;</span>
+                        <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">mpl.rcParams[</span><span class="s3">'path.simplify_threshold'</span><span class="s1">]</span><span class="s2">:</span><span class="s3">.2f</span><span class="s2">} </span><span class="s3">by &quot;</span>
+                        <span class="s3">&quot;default and path.simplify_threshold = &quot;</span>
+                        <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">path.simplify_threshold</span><span class="s2">:</span><span class="s3">.2f</span><span class="s2">} </span><span class="s3">on the input).&quot;</span>
+                    <span class="s1">)</span>
+                    <span class="s2">raise </span><span class="s1">OverflowError(msg) </span><span class="s2">from None</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">self._renderer.draw_path(gc</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">, </span><span class="s1">rgbFace)</span>
+            <span class="s2">except </span><span class="s1">OverflowError:</span>
+                <span class="s1">cant_chunk = </span><span class="s3">''</span>
+                <span class="s2">if </span><span class="s1">rgbFace </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">cant_chunk += </span><span class="s3">&quot;- can not split filled path</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                <span class="s2">if </span><span class="s1">gc.get_hatch() </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">cant_chunk += </span><span class="s3">&quot;- can not split hatched path</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                <span class="s2">if not </span><span class="s1">path.should_simplify:</span>
+                    <span class="s1">cant_chunk += </span><span class="s3">&quot;- path.should_simplify is False</span><span class="s2">\n</span><span class="s3">&quot;</span>
+                <span class="s2">if </span><span class="s1">len(cant_chunk):</span>
+                    <span class="s1">msg = (</span>
+                        <span class="s3">&quot;Exceeded cell block limit in Agg, however for the &quot;</span>
+                        <span class="s3">&quot;following reasons:</span><span class="s2">\n\n</span><span class="s3">&quot;</span>
+                        <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">cant_chunk</span><span class="s2">}\n</span><span class="s3">&quot;</span>
+                        <span class="s3">&quot;we can not automatically split up this path to draw.&quot;</span>
+                        <span class="s3">&quot;</span><span class="s2">\n\n</span><span class="s3">Please manually simplify your path.&quot;</span>
+                    <span class="s1">)</span>
+
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">inc_threshold = (</span>
+                        <span class="s3">&quot;or increase the path simplification threshold&quot;</span>
+                        <span class="s3">&quot;(rcParams['path.simplify_threshold'] = &quot;</span>
+                        <span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">mpl.rcParams[</span><span class="s3">'path.simplify_threshold'</span><span class="s1">]</span><span class="s2">} </span><span class="s3">&quot;</span>
+                        <span class="s3">&quot;by default and path.simplify_threshold &quot;</span>
+                        <span class="s3">f&quot;= </span><span class="s2">{</span><span class="s1">path.simplify_threshold</span><span class="s2">} </span><span class="s3">&quot;</span>
+                        <span class="s3">&quot;on the input).&quot;</span>
+                        <span class="s1">)</span>
+                    <span class="s2">if </span><span class="s1">nmax &gt; </span><span class="s5">100</span><span class="s1">:</span>
+                        <span class="s1">msg = (</span>
+                            <span class="s3">&quot;Exceeded cell block limit in Agg.  Please reduce &quot;</span>
+                            <span class="s3">&quot;the value of rcParams['agg.path.chunksize'] &quot;</span>
+                            <span class="s3">f&quot;(currently </span><span class="s2">{</span><span class="s1">nmax</span><span class="s2">}</span><span class="s3">) </span><span class="s2">{</span><span class="s1">inc_threshold</span><span class="s2">}</span><span class="s3">&quot;</span>
+                        <span class="s1">)</span>
+                    <span class="s2">else</span><span class="s1">:</span>
+                        <span class="s1">msg = (</span>
+                            <span class="s3">&quot;Exceeded cell block limit in Agg.  Please set &quot;</span>
+                            <span class="s3">&quot;the value of rcParams['agg.path.chunksize'], &quot;</span>
+                            <span class="s3">f&quot;(currently </span><span class="s2">{</span><span class="s1">nmax</span><span class="s2">}</span><span class="s3">) to be greater than 100 &quot;</span>
+                            <span class="s1">+ inc_threshold</span>
+                        <span class="s1">)</span>
+
+                <span class="s2">raise </span><span class="s1">OverflowError(msg) </span><span class="s2">from None</span>
+
+    <span class="s2">def </span><span class="s1">draw_mathtext(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle):</span>
+        <span class="s0">&quot;&quot;&quot;Draw mathtext using :mod:`matplotlib.mathtext`.&quot;&quot;&quot;</span>
+        <span class="s1">ox</span><span class="s2">, </span><span class="s1">oy</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span><span class="s2">, </span><span class="s1">font_image = \</span>
+            <span class="s1">self.mathtext_parser.parse(s</span><span class="s2">, </span><span class="s1">self.dpi</span><span class="s2">, </span><span class="s1">prop)</span>
+
+        <span class="s1">xd = descent * sin(radians(angle))</span>
+        <span class="s1">yd = descent * cos(radians(angle))</span>
+        <span class="s1">x = round(x + ox + xd)</span>
+        <span class="s1">y = round(y - oy + yd)</span>
+        <span class="s1">self._renderer.draw_text_image(font_image</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">gc)</span>
+
+    <span class="s2">def </span><span class="s1">draw_text(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">ismath=</span><span class="s2">False, </span><span class="s1">mtext=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s2">return </span><span class="s1">self.draw_mathtext(gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle)</span>
+        <span class="s1">font = self._prepare_font(prop)</span>
+        <span class="s4"># We pass '0' for angle here, since it will be rotated (in raster</span>
+        <span class="s4"># space) in the following call to draw_text_image).</span>
+        <span class="s1">font.set_text(s</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">flags=get_hinting_flag())</span>
+        <span class="s1">font.draw_glyphs_to_bitmap(</span>
+            <span class="s1">antialiased=mpl.rcParams[</span><span class="s3">'text.antialiased'</span><span class="s1">])</span>
+        <span class="s1">d = font.get_descent() / </span><span class="s5">64.0</span>
+        <span class="s4"># The descent needs to be adjusted for the angle.</span>
+        <span class="s1">xo</span><span class="s2">, </span><span class="s1">yo = font.get_bitmap_offset()</span>
+        <span class="s1">xo /= </span><span class="s5">64.0</span>
+        <span class="s1">yo /= </span><span class="s5">64.0</span>
+        <span class="s1">xd = d * sin(radians(angle))</span>
+        <span class="s1">yd = d * cos(radians(angle))</span>
+        <span class="s1">x = round(x + xo + xd)</span>
+        <span class="s1">y = round(y + yo + yd)</span>
+        <span class="s1">self._renderer.draw_text_image(font</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">gc)</span>
+
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent(self</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s1">_api.check_in_list([</span><span class="s3">&quot;TeX&quot;</span><span class="s2">, True, False</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ismath=ismath)</span>
+        <span class="s2">if </span><span class="s1">ismath == </span><span class="s3">&quot;TeX&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">super().get_text_width_height_descent(s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath)</span>
+
+        <span class="s2">if </span><span class="s1">ismath:</span>
+            <span class="s1">ox</span><span class="s2">, </span><span class="s1">oy</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span><span class="s2">, </span><span class="s1">font_image = \</span>
+                <span class="s1">self.mathtext_parser.parse(s</span><span class="s2">, </span><span class="s1">self.dpi</span><span class="s2">, </span><span class="s1">prop)</span>
+            <span class="s2">return </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">descent</span>
+
+        <span class="s1">font = self._prepare_font(prop)</span>
+        <span class="s1">font.set_text(s</span><span class="s2">, </span><span class="s5">0.0</span><span class="s2">, </span><span class="s1">flags=get_hinting_flag())</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h = font.get_width_height()  </span><span class="s4"># width and height of unrotated string</span>
+        <span class="s1">d = font.get_descent()</span>
+        <span class="s1">w /= </span><span class="s5">64.0  </span><span class="s4"># convert from subpixels</span>
+        <span class="s1">h /= </span><span class="s5">64.0</span>
+        <span class="s1">d /= </span><span class="s5">64.0</span>
+        <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">d</span>
+
+    <span class="s2">def </span><span class="s1">draw_tex(self</span><span class="s2">, </span><span class="s1">gc</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">mtext=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s4"># todo, handle props, angle, origins</span>
+        <span class="s1">size = prop.get_size_in_points()</span>
+
+        <span class="s1">texmanager = self.get_texmanager()</span>
+
+        <span class="s1">Z = texmanager.get_grey(s</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">self.dpi)</span>
+        <span class="s1">Z = np.array(Z * </span><span class="s5">255.0</span><span class="s2">, </span><span class="s1">np.uint8)</span>
+
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">d = self.get_text_width_height_descent(s</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">, </span><span class="s1">ismath=</span><span class="s3">&quot;TeX&quot;</span><span class="s1">)</span>
+        <span class="s1">xd = d * sin(radians(angle))</span>
+        <span class="s1">yd = d * cos(radians(angle))</span>
+        <span class="s1">x = round(x + xd)</span>
+        <span class="s1">y = round(y + yd)</span>
+        <span class="s1">self._renderer.draw_text_image(Z</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">angle</span><span class="s2">, </span><span class="s1">gc)</span>
+
+    <span class="s2">def </span><span class="s1">get_canvas_width_height(self):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">self.width</span><span class="s2">, </span><span class="s1">self.height</span>
+
+    <span class="s2">def </span><span class="s1">_prepare_font(self</span><span class="s2">, </span><span class="s1">font_prop):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get the `.FT2Font` for *font_prop*, clear its buffer, and set its size. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">font = get_font(_fontManager._find_fonts_by_props(font_prop))</span>
+        <span class="s1">font.clear()</span>
+        <span class="s1">size = font_prop.get_size_in_points()</span>
+        <span class="s1">font.set_size(size</span><span class="s2">, </span><span class="s1">self.dpi)</span>
+        <span class="s2">return </span><span class="s1">font</span>
+
+    <span class="s2">def </span><span class="s1">points_to_pixels(self</span><span class="s2">, </span><span class="s1">points):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">points * self.dpi / </span><span class="s5">72</span>
+
+    <span class="s2">def </span><span class="s1">buffer_rgba(self):</span>
+        <span class="s2">return </span><span class="s1">memoryview(self._renderer)</span>
+
+    <span class="s2">def </span><span class="s1">tostring_argb(self):</span>
+        <span class="s2">return </span><span class="s1">np.asarray(self._renderer).take([</span><span class="s5">3</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">).tobytes()</span>
+
+    <span class="s2">def </span><span class="s1">tostring_rgb(self):</span>
+        <span class="s2">return </span><span class="s1">np.asarray(self._renderer).take([</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">2</span><span class="s1">).tobytes()</span>
+
+    <span class="s2">def </span><span class="s1">clear(self):</span>
+        <span class="s1">self._renderer.clear()</span>
+
+    <span class="s2">def </span><span class="s1">option_image_nocomposite(self):</span>
+        <span class="s4"># docstring inherited</span>
+
+        <span class="s4"># It is generally faster to composite each image directly to</span>
+        <span class="s4"># the Figure, and there's no file size benefit to compositing</span>
+        <span class="s4"># with the Agg backend</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">option_scale_image(self):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">restore_region(self</span><span class="s2">, </span><span class="s1">region</span><span class="s2">, </span><span class="s1">bbox=</span><span class="s2">None, </span><span class="s1">xy=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Restore the saved region. If bbox (instance of BboxBase, or 
+        its extents) is given, only the region specified by the bbox 
+        will be restored. *xy* (a pair of floats) optionally 
+        specifies the new position (the LLC of the original region, 
+        not the LLC of the bbox) where the region will be restored. 
+ 
+        &gt;&gt;&gt; region = renderer.copy_from_bbox() 
+        &gt;&gt;&gt; x1, y1, x2, y2 = region.get_extents() 
+        &gt;&gt;&gt; renderer.restore_region(region, bbox=(x1+dx, y1, x2, y2), 
+        ...                         xy=(x1-dx, y1)) 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">bbox </span><span class="s2">is not None or </span><span class="s1">xy </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">bbox </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2 = region.get_extents()</span>
+            <span class="s2">elif </span><span class="s1">isinstance(bbox</span><span class="s2">, </span><span class="s1">BboxBase):</span>
+                <span class="s1">x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2 = bbox.extents</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">x1</span><span class="s2">, </span><span class="s1">y1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">y2 = bbox</span>
+
+            <span class="s2">if </span><span class="s1">xy </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">ox</span><span class="s2">, </span><span class="s1">oy = x1</span><span class="s2">, </span><span class="s1">y1</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">ox</span><span class="s2">, </span><span class="s1">oy = xy</span>
+
+            <span class="s4"># The incoming data is float, but the _renderer type-checking wants</span>
+            <span class="s4"># to see integers.</span>
+            <span class="s1">self._renderer.restore_region(region</span><span class="s2">, </span><span class="s1">int(x1)</span><span class="s2">, </span><span class="s1">int(y1)</span><span class="s2">,</span>
+                                          <span class="s1">int(x2)</span><span class="s2">, </span><span class="s1">int(y2)</span><span class="s2">, </span><span class="s1">int(ox)</span><span class="s2">, </span><span class="s1">int(oy))</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._renderer.restore_region(region)</span>
+
+    <span class="s2">def </span><span class="s1">start_filter(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Start filtering. It simply creates a new canvas (the old one is saved). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._filter_renderers.append(self._renderer)</span>
+        <span class="s1">self._renderer = _RendererAgg(int(self.width)</span><span class="s2">, </span><span class="s1">int(self.height)</span><span class="s2">,</span>
+                                      <span class="s1">self.dpi)</span>
+        <span class="s1">self._update_methods()</span>
+
+    <span class="s2">def </span><span class="s1">stop_filter(self</span><span class="s2">, </span><span class="s1">post_processing):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Save the plot in the current canvas as an image and apply 
+        the *post_processing* function. 
+ 
+           def post_processing(image, dpi): 
+             # ny, nx, depth = image.shape 
+             # image (numpy array) has RGBA channels and has a depth of 4. 
+             ... 
+             # create a new_image (numpy array of 4 channels, size can be 
+             # different). The resulting image may have offsets from 
+             # lower-left corner of the original image 
+             return new_image, offset_x, offset_y 
+ 
+        The saved renderer is restored and the returned image from 
+        post_processing is plotted (using draw_image) on it. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">orig_img = np.asarray(self.buffer_rgba())</span>
+        <span class="s1">slice_y</span><span class="s2">, </span><span class="s1">slice_x = cbook._get_nonzero_slices(orig_img[...</span><span class="s2">, </span><span class="s5">3</span><span class="s1">])</span>
+        <span class="s1">cropped_img = orig_img[slice_y</span><span class="s2">, </span><span class="s1">slice_x]</span>
+
+        <span class="s1">self._renderer = self._filter_renderers.pop()</span>
+        <span class="s1">self._update_methods()</span>
+
+        <span class="s2">if </span><span class="s1">cropped_img.size:</span>
+            <span class="s1">img</span><span class="s2">, </span><span class="s1">ox</span><span class="s2">, </span><span class="s1">oy = post_processing(cropped_img / </span><span class="s5">255</span><span class="s2">, </span><span class="s1">self.dpi)</span>
+            <span class="s1">gc = self.new_gc()</span>
+            <span class="s2">if </span><span class="s1">img.dtype.kind == </span><span class="s3">'f'</span><span class="s1">:</span>
+                <span class="s1">img = np.asarray(img * </span><span class="s5">255.</span><span class="s2">, </span><span class="s1">np.uint8)</span>
+            <span class="s1">self._renderer.draw_image(</span>
+                <span class="s1">gc</span><span class="s2">, </span><span class="s1">slice_x.start + ox</span><span class="s2">, </span><span class="s1">int(self.height) - slice_y.stop + oy</span><span class="s2">,</span>
+                <span class="s1">img[::-</span><span class="s5">1</span><span class="s1">])</span>
+
+
+<span class="s2">class </span><span class="s1">FigureCanvasAgg(FigureCanvasBase):</span>
+    <span class="s4"># docstring inherited</span>
+
+    <span class="s1">_lastKey = </span><span class="s2">None  </span><span class="s4"># Overwritten per-instance on the first draw.</span>
+
+    <span class="s2">def </span><span class="s1">copy_from_bbox(self</span><span class="s2">, </span><span class="s1">bbox):</span>
+        <span class="s1">renderer = self.get_renderer()</span>
+        <span class="s2">return </span><span class="s1">renderer.copy_from_bbox(bbox)</span>
+
+    <span class="s2">def </span><span class="s1">restore_region(self</span><span class="s2">, </span><span class="s1">region</span><span class="s2">, </span><span class="s1">bbox=</span><span class="s2">None, </span><span class="s1">xy=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">renderer = self.get_renderer()</span>
+        <span class="s2">return </span><span class="s1">renderer.restore_region(region</span><span class="s2">, </span><span class="s1">bbox</span><span class="s2">, </span><span class="s1">xy)</span>
+
+    <span class="s2">def </span><span class="s1">draw(self):</span>
+        <span class="s4"># docstring inherited</span>
+        <span class="s1">self.renderer = self.get_renderer()</span>
+        <span class="s1">self.renderer.clear()</span>
+        <span class="s4"># Acquire a lock on the shared font cache.</span>
+        <span class="s2">with </span><span class="s1">RendererAgg.lock</span><span class="s2">, </span><span class="s1">\</span>
+             <span class="s1">(self.toolbar._wait_cursor_for_draw_cm() </span><span class="s2">if </span><span class="s1">self.toolbar</span>
+              <span class="s2">else </span><span class="s1">nullcontext()):</span>
+            <span class="s1">self.figure.draw(self.renderer)</span>
+            <span class="s4"># A GUI class may be need to update a window using this draw, so</span>
+            <span class="s4"># don't forget to call the superclass.</span>
+            <span class="s1">super().draw()</span>
+
+    <span class="s1">@_api.delete_parameter(</span><span class="s3">&quot;3.6&quot;</span><span class="s2">, </span><span class="s3">&quot;cleared&quot;</span><span class="s2">, </span><span class="s1">alternative=</span><span class="s3">&quot;renderer.clear()&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">get_renderer(self</span><span class="s2">, </span><span class="s1">cleared=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h = self.figure.bbox.size</span>
+        <span class="s1">key = w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">self.figure.dpi</span>
+        <span class="s1">reuse_renderer = (self._lastKey == key)</span>
+        <span class="s2">if not </span><span class="s1">reuse_renderer:</span>
+            <span class="s1">self.renderer = RendererAgg(w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">self.figure.dpi)</span>
+            <span class="s1">self._lastKey = key</span>
+        <span class="s2">elif </span><span class="s1">cleared:</span>
+            <span class="s1">self.renderer.clear()</span>
+        <span class="s2">return </span><span class="s1">self.renderer</span>
+
+    <span class="s2">def </span><span class="s1">tostring_rgb(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get the image as RGB `bytes`. 
+ 
+        `draw` must be called at least once before this function will work and 
+        to update the renderer for any subsequent changes to the Figure. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.renderer.tostring_rgb()</span>
+
+    <span class="s2">def </span><span class="s1">tostring_argb(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get the image as ARGB `bytes`. 
+ 
+        `draw` must be called at least once before this function will work and 
+        to update the renderer for any subsequent changes to the Figure. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.renderer.tostring_argb()</span>
+
+    <span class="s2">def </span><span class="s1">buffer_rgba(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get the image as a `memoryview` to the renderer's buffer. 
+ 
+        `draw` must be called at least once before this function will work and 
+        to update the renderer for any subsequent changes to the Figure. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.renderer.buffer_rgba()</span>
+
+    <span class="s2">def </span><span class="s1">print_raw(self</span><span class="s2">, </span><span class="s1">filename_or_obj):</span>
+        <span class="s1">FigureCanvasAgg.draw(self)</span>
+        <span class="s1">renderer = self.get_renderer()</span>
+        <span class="s2">with </span><span class="s1">cbook.open_file_cm(filename_or_obj</span><span class="s2">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">fh:</span>
+            <span class="s1">fh.write(renderer.buffer_rgba())</span>
+
+    <span class="s1">print_rgba = print_raw</span>
+
+    <span class="s2">def </span><span class="s1">_print_pil(self</span><span class="s2">, </span><span class="s1">filename_or_obj</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, </span><span class="s1">pil_kwargs</span><span class="s2">, </span><span class="s1">metadata=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Draw the canvas, then save it using `.image.imsave` (to which 
+        *pil_kwargs* and *metadata* are forwarded). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">FigureCanvasAgg.draw(self)</span>
+        <span class="s1">mpl.image.imsave(</span>
+            <span class="s1">filename_or_obj</span><span class="s2">, </span><span class="s1">self.buffer_rgba()</span><span class="s2">, </span><span class="s1">format=fmt</span><span class="s2">, </span><span class="s1">origin=</span><span class="s3">&quot;upper&quot;</span><span class="s2">,</span>
+            <span class="s1">dpi=self.figure.dpi</span><span class="s2">, </span><span class="s1">metadata=metadata</span><span class="s2">, </span><span class="s1">pil_kwargs=pil_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">print_png(self</span><span class="s2">, </span><span class="s1">filename_or_obj</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">metadata=</span><span class="s2">None, </span><span class="s1">pil_kwargs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Write the figure to a PNG file. 
+ 
+        Parameters 
+        ---------- 
+        filename_or_obj : str or path-like or file-like 
+            The file to write to. 
+ 
+        metadata : dict, optional 
+            Metadata in the PNG file as key-value pairs of bytes or latin-1 
+            encodable strings. 
+            According to the PNG specification, keys must be shorter than 79 
+            chars. 
+ 
+            The `PNG specification`_ defines some common keywords that may be 
+            used as appropriate: 
+ 
+            - Title: Short (one line) title or caption for image. 
+            - Author: Name of image's creator. 
+            - Description: Description of image (possibly long). 
+            - Copyright: Copyright notice. 
+            - Creation Time: Time of original image creation 
+              (usually RFC 1123 format). 
+            - Software: Software used to create the image. 
+            - Disclaimer: Legal disclaimer. 
+            - Warning: Warning of nature of content. 
+            - Source: Device used to create the image. 
+            - Comment: Miscellaneous comment; 
+              conversion from other image format. 
+ 
+            Other keywords may be invented for other purposes. 
+ 
+            If 'Software' is not given, an autogenerated value for Matplotlib 
+            will be used.  This can be removed by setting it to *None*. 
+ 
+            For more details see the `PNG specification`_. 
+ 
+            .. _PNG specification: \ 
+                https://www.w3.org/TR/2003/REC-PNG-20031110/#11keywords 
+ 
+        pil_kwargs : dict, optional 
+            Keyword arguments passed to `PIL.Image.Image.save`. 
+ 
+            If the 'pnginfo' key is present, it completely overrides 
+            *metadata*, including the default 'Software' key. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._print_pil(filename_or_obj</span><span class="s2">, </span><span class="s3">&quot;png&quot;</span><span class="s2">, </span><span class="s1">pil_kwargs</span><span class="s2">, </span><span class="s1">metadata)</span>
+
+    <span class="s2">def </span><span class="s1">print_to_buffer(self):</span>
+        <span class="s1">FigureCanvasAgg.draw(self)</span>
+        <span class="s1">renderer = self.get_renderer()</span>
+        <span class="s2">return </span><span class="s1">(bytes(renderer.buffer_rgba())</span><span class="s2">,</span>
+                <span class="s1">(int(renderer.width)</span><span class="s2">, </span><span class="s1">int(renderer.height)))</span>
+
+    <span class="s4"># Note that these methods should typically be called via savefig() and</span>
+    <span class="s4"># print_figure(), and the latter ensures that `self.figure.dpi` already</span>
+    <span class="s4"># matches the dpi kwarg (if any).</span>
+
+    <span class="s2">def </span><span class="s1">print_jpg(self</span><span class="s2">, </span><span class="s1">filename_or_obj</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">pil_kwargs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># savefig() has already applied savefig.facecolor; we now set it to</span>
+        <span class="s4"># white to make imsave() blend semi-transparent figures against an</span>
+        <span class="s4"># assumed white background.</span>
+        <span class="s2">with </span><span class="s1">mpl.rc_context({</span><span class="s3">&quot;savefig.facecolor&quot;</span><span class="s1">: </span><span class="s3">&quot;white&quot;</span><span class="s1">}):</span>
+            <span class="s1">self._print_pil(filename_or_obj</span><span class="s2">, </span><span class="s3">&quot;jpeg&quot;</span><span class="s2">, </span><span class="s1">pil_kwargs)</span>
+
+    <span class="s1">print_jpeg = print_jpg</span>
+
+    <span class="s2">def </span><span class="s1">print_tif(self</span><span class="s2">, </span><span class="s1">filename_or_obj</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">pil_kwargs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self._print_pil(filename_or_obj</span><span class="s2">, </span><span class="s3">&quot;tiff&quot;</span><span class="s2">, </span><span class="s1">pil_kwargs)</span>
+
+    <span class="s1">print_tiff = print_tif</span>
+
+    <span class="s2">def </span><span class="s1">print_webp(self</span><span class="s2">, </span><span class="s1">filename_or_obj</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">pil_kwargs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self._print_pil(filename_or_obj</span><span class="s2">, </span><span class="s3">&quot;webp&quot;</span><span class="s2">, </span><span class="s1">pil_kwargs)</span>
+
+    <span class="s1">print_jpg.__doc__</span><span class="s2">, </span><span class="s1">print_tif.__doc__</span><span class="s2">, </span><span class="s1">print_webp.__doc__ = map(</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Write the figure to a {} file. 
+ 
+        Parameters 
+        ---------- 
+        filename_or_obj : str or path-like or file-like 
+            The file to write to. 
+        pil_kwargs : dict, optional 
+            Additional keyword arguments that are passed to 
+            `PIL.Image.Image.save` when saving the figure. 
+        &quot;&quot;&quot;</span><span class="s1">.format</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;JPEG&quot;</span><span class="s2">, </span><span class="s3">&quot;TIFF&quot;</span><span class="s2">, </span><span class="s3">&quot;WebP&quot;</span><span class="s1">])</span>
+
+
+<span class="s1">@_Backend.export</span>
+<span class="s2">class </span><span class="s1">_BackendAgg(_Backend):</span>
+    <span class="s1">backend_version = </span><span class="s3">'v2.2'</span>
+    <span class="s1">FigureCanvas = FigureCanvasAgg</span>
+    <span class="s1">FigureManager = FigureManagerBase</span>
+</pre>
+</body>
+</html>

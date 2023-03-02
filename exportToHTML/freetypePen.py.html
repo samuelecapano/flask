@@ -1,0 +1,480 @@
+<html>
+<head>
+<title>freetypePen.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+freetypePen.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+
+<span class="s2">&quot;&quot;&quot;Pen to rasterize paths with FreeType.&quot;&quot;&quot;</span>
+
+<span class="s1">__all__ = [</span><span class="s3">&quot;FreeTypePen&quot;</span><span class="s1">]</span>
+
+<span class="s4">import </span><span class="s1">os</span>
+<span class="s4">import </span><span class="s1">ctypes</span>
+<span class="s4">import </span><span class="s1">platform</span>
+<span class="s4">import </span><span class="s1">subprocess</span>
+<span class="s4">import </span><span class="s1">collections</span>
+<span class="s4">import </span><span class="s1">math</span>
+
+<span class="s4">import </span><span class="s1">freetype</span>
+<span class="s4">from </span><span class="s1">freetype.raw </span><span class="s4">import </span><span class="s1">FT_Outline_Get_Bitmap</span><span class="s4">, </span><span class="s1">FT_Outline_Get_BBox</span><span class="s4">, </span><span class="s1">FT_Outline_Get_CBox</span>
+<span class="s4">from </span><span class="s1">freetype.ft_types </span><span class="s4">import </span><span class="s1">FT_Pos</span>
+<span class="s4">from </span><span class="s1">freetype.ft_structs </span><span class="s4">import </span><span class="s1">FT_Vector</span><span class="s4">, </span><span class="s1">FT_BBox</span><span class="s4">, </span><span class="s1">FT_Bitmap</span><span class="s4">, </span><span class="s1">FT_Outline</span>
+<span class="s4">from </span><span class="s1">freetype.ft_enums </span><span class="s4">import </span><span class="s1">(</span>
+    <span class="s1">FT_OUTLINE_NONE</span><span class="s4">,</span>
+    <span class="s1">FT_OUTLINE_EVEN_ODD_FILL</span><span class="s4">,</span>
+    <span class="s1">FT_PIXEL_MODE_GRAY</span><span class="s4">,</span>
+    <span class="s1">FT_CURVE_TAG_ON</span><span class="s4">,</span>
+    <span class="s1">FT_CURVE_TAG_CONIC</span><span class="s4">,</span>
+    <span class="s1">FT_CURVE_TAG_CUBIC</span><span class="s4">,</span>
+<span class="s1">)</span>
+<span class="s4">from </span><span class="s1">freetype.ft_errors </span><span class="s4">import </span><span class="s1">FT_Exception</span>
+
+<span class="s4">from </span><span class="s1">fontTools.pens.basePen </span><span class="s4">import </span><span class="s1">BasePen</span><span class="s4">, </span><span class="s1">PenError</span>
+<span class="s4">from </span><span class="s1">fontTools.misc.roundTools </span><span class="s4">import </span><span class="s1">otRound</span>
+<span class="s4">from </span><span class="s1">fontTools.misc.transform </span><span class="s4">import </span><span class="s1">Transform</span>
+
+<span class="s1">Contour = collections.namedtuple(</span><span class="s3">&quot;Contour&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s3">&quot;points&quot;</span><span class="s4">, </span><span class="s3">&quot;tags&quot;</span><span class="s1">))</span>
+
+
+<span class="s4">class </span><span class="s1">FreeTypePen(BasePen):</span>
+    <span class="s2">&quot;&quot;&quot;Pen to rasterize paths with FreeType. Requires `freetype-py` module. 
+ 
+    Constructs ``FT_Outline`` from the paths, and renders it within a bitmap 
+    buffer. 
+ 
+    For ``array()`` and ``show()``, `numpy` and `matplotlib` must be installed. 
+    For ``image()``, `Pillow` is required. Each module is lazily loaded when the 
+    corresponding method is called. 
+ 
+    Args: 
+        glyphSet: a dictionary of drawable glyph objects keyed by name 
+            used to resolve component references in composite glyphs. 
+ 
+    :Examples: 
+        If `numpy` and `matplotlib` is available, the following code will 
+        show the glyph image of `fi` in a new window:: 
+ 
+            from fontTools.ttLib import TTFont 
+            from fontTools.pens.freetypePen import FreeTypePen 
+            from fontTools.misc.transform import Offset 
+            pen = FreeTypePen(None) 
+            font = TTFont('SourceSansPro-Regular.otf') 
+            glyph = font.getGlyphSet()['fi'] 
+            glyph.draw(pen) 
+            width, ascender, descender = glyph.width, font['OS/2'].usWinAscent, -font['OS/2'].usWinDescent 
+            height = ascender - descender 
+            pen.show(width=width, height=height, transform=Offset(0, -descender)) 
+ 
+        Combining with `uharfbuzz`, you can typeset a chunk of glyphs in a pen:: 
+ 
+            import uharfbuzz as hb 
+            from fontTools.pens.freetypePen import FreeTypePen 
+            from fontTools.pens.transformPen import TransformPen 
+            from fontTools.misc.transform import Offset 
+ 
+            en1, en2, ar, ja = 'Typesetting', 'Jeff', 'صف الحروف', 'たいぷせっと' 
+            for text, font_path, direction, typo_ascender, typo_descender, vhea_ascender, vhea_descender, contain, features in ( 
+                (en1, 'NotoSans-Regular.ttf',       'ltr', 2189, -600, None, None, False, {&quot;kern&quot;: True, &quot;liga&quot;: True}), 
+                (en2, 'NotoSans-Regular.ttf',       'ltr', 2189, -600, None, None, True,  {&quot;kern&quot;: True, &quot;liga&quot;: True}), 
+                (ar,  'NotoSansArabic-Regular.ttf', 'rtl', 1374, -738, None, None, False, {&quot;kern&quot;: True, &quot;liga&quot;: True}), 
+                (ja,  'NotoSansJP-Regular.otf',     'ltr', 880,  -120, 500,  -500, False, {&quot;palt&quot;: True, &quot;kern&quot;: True}), 
+                (ja,  'NotoSansJP-Regular.otf',     'ttb', 880,  -120, 500,  -500, False, {&quot;vert&quot;: True, &quot;vpal&quot;: True, &quot;vkrn&quot;: True}) 
+            ): 
+                blob = hb.Blob.from_file_path(font_path) 
+                face = hb.Face(blob) 
+                font = hb.Font(face) 
+                buf = hb.Buffer() 
+                buf.direction = direction 
+                buf.add_str(text) 
+                buf.guess_segment_properties() 
+                hb.shape(font, buf, features) 
+ 
+                x, y = 0, 0 
+                pen = FreeTypePen(None) 
+                for info, pos in zip(buf.glyph_infos, buf.glyph_positions): 
+                    gid = info.codepoint 
+                    transformed = TransformPen(pen, Offset(x + pos.x_offset, y + pos.y_offset)) 
+                    font.draw_glyph_with_pen(gid, transformed) 
+                    x += pos.x_advance 
+                    y += pos.y_advance 
+ 
+                offset, width, height = None, None, None 
+                if direction in ('ltr', 'rtl'): 
+                    offset = (0, -typo_descender) 
+                    width  = x 
+                    height = typo_ascender - typo_descender 
+                else: 
+                    offset = (-vhea_descender, -y) 
+                    width  = vhea_ascender - vhea_descender 
+                    height = -y 
+                pen.show(width=width, height=height, transform=Offset(*offset), contain=contain) 
+ 
+        For Jupyter Notebook, the rendered image will be displayed in a cell if 
+        you replace ``show()`` with ``image()`` in the examples. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">glyphSet):</span>
+        <span class="s1">BasePen.__init__(self</span><span class="s4">, </span><span class="s1">glyphSet)</span>
+        <span class="s1">self.contours = []</span>
+
+    <span class="s4">def </span><span class="s1">outline(self</span><span class="s4">, </span><span class="s1">transform=</span><span class="s4">None, </span><span class="s1">evenOdd=</span><span class="s4">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Converts the current contours to ``FT_Outline``. 
+ 
+        Args: 
+            transform: An optional 6-tuple containing an affine transformation, 
+                or a ``Transform`` object from the ``fontTools.misc.transform`` 
+                module. 
+            evenOdd: Pass ``True`` for even-odd fill instead of non-zero. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">transform = transform </span><span class="s4">or </span><span class="s1">Transform()</span>
+        <span class="s4">if not </span><span class="s1">hasattr(transform</span><span class="s4">, </span><span class="s3">&quot;transformPoint&quot;</span><span class="s1">):</span>
+            <span class="s1">transform = Transform(*transform)</span>
+        <span class="s1">n_contours = len(self.contours)</span>
+        <span class="s1">n_points = sum((len(contour.points) </span><span class="s4">for </span><span class="s1">contour </span><span class="s4">in </span><span class="s1">self.contours))</span>
+        <span class="s1">points = []</span>
+        <span class="s4">for </span><span class="s1">contour </span><span class="s4">in </span><span class="s1">self.contours:</span>
+            <span class="s4">for </span><span class="s1">point </span><span class="s4">in </span><span class="s1">contour.points:</span>
+                <span class="s1">point = transform.transformPoint(point)</span>
+                <span class="s1">points.append(</span>
+                    <span class="s1">FT_Vector(</span>
+                        <span class="s1">FT_Pos(otRound(point[</span><span class="s5">0</span><span class="s1">] * </span><span class="s5">64</span><span class="s1">))</span><span class="s4">, </span><span class="s1">FT_Pos(otRound(point[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">64</span><span class="s1">))</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+        <span class="s1">tags = []</span>
+        <span class="s4">for </span><span class="s1">contour </span><span class="s4">in </span><span class="s1">self.contours:</span>
+            <span class="s4">for </span><span class="s1">tag </span><span class="s4">in </span><span class="s1">contour.tags:</span>
+                <span class="s1">tags.append(tag)</span>
+        <span class="s1">contours = []</span>
+        <span class="s1">contours_sum = </span><span class="s5">0</span>
+        <span class="s4">for </span><span class="s1">contour </span><span class="s4">in </span><span class="s1">self.contours:</span>
+            <span class="s1">contours_sum += len(contour.points)</span>
+            <span class="s1">contours.append(contours_sum - </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">flags = FT_OUTLINE_EVEN_ODD_FILL </span><span class="s4">if </span><span class="s1">evenOdd </span><span class="s4">else </span><span class="s1">FT_OUTLINE_NONE</span>
+        <span class="s4">return </span><span class="s1">FT_Outline(</span>
+            <span class="s1">(ctypes.c_short)(n_contours)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_short)(n_points)</span><span class="s4">,</span>
+            <span class="s1">(FT_Vector * n_points)(*points)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_ubyte * n_points)(*tags)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_short * n_contours)(*contours)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_int)(flags)</span><span class="s4">,</span>
+        <span class="s1">)</span>
+
+    <span class="s4">def </span><span class="s1">buffer(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">width=</span><span class="s4">None, </span><span class="s1">height=</span><span class="s4">None, </span><span class="s1">transform=</span><span class="s4">None, </span><span class="s1">contain=</span><span class="s4">False, </span><span class="s1">evenOdd=</span><span class="s4">False</span>
+    <span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Renders the current contours within a bitmap buffer. 
+ 
+        Args: 
+            width: Image width of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            height: Image height of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            transform: An optional 6-tuple containing an affine transformation, 
+                or a ``Transform`` object from the ``fontTools.misc.transform`` 
+                module. The bitmap size is not affected by this matrix. 
+            contain: If ``True``, the image size will be automatically expanded 
+                so that it fits to the bounding box of the paths. Useful for 
+                rendering glyphs with negative sidebearings without clipping. 
+            evenOdd: Pass ``True`` for even-odd fill instead of non-zero. 
+ 
+        Returns: 
+            A tuple of ``(buffer, size)``, where ``buffer`` is a ``bytes`` 
+            object of the resulted bitmap and ``size`` is a 2-tuple of its 
+            dimension. 
+ 
+        :Notes: 
+            The image size should always be given explicitly if you need to get 
+            a proper glyph image. When ``width`` and ``height`` are omitted, it 
+            forcifully fits to the bounding box and the side bearings get 
+            cropped. If you pass ``0`` to both ``width`` and ``height`` and set 
+            ``contain`` to ``True``, it expands to the bounding box while 
+            maintaining the origin of the contours, meaning that LSB will be 
+            maintained but RSB won’t. The difference between the two becomes 
+            more obvious when rotate or skew transformation is applied. 
+ 
+        :Example: 
+            .. code-block:: 
+ 
+                &gt;&gt; pen = FreeTypePen(None) 
+                &gt;&gt; glyph.draw(pen) 
+                &gt;&gt; buf, size = pen.buffer(width=500, height=1000) 
+                &gt;&gt; type(buf), len(buf), size 
+                (&lt;class 'bytes'&gt;, 500000, (500, 1000)) 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">transform = transform </span><span class="s4">or </span><span class="s1">Transform()</span>
+        <span class="s4">if not </span><span class="s1">hasattr(transform</span><span class="s4">, </span><span class="s3">&quot;transformPoint&quot;</span><span class="s1">):</span>
+            <span class="s1">transform = Transform(*transform)</span>
+        <span class="s1">contain_x</span><span class="s4">, </span><span class="s1">contain_y = contain </span><span class="s4">or </span><span class="s1">width </span><span class="s4">is None, </span><span class="s1">contain </span><span class="s4">or </span><span class="s1">height </span><span class="s4">is None</span>
+        <span class="s4">if </span><span class="s1">contain_x </span><span class="s4">or </span><span class="s1">contain_y:</span>
+            <span class="s1">dx</span><span class="s4">, </span><span class="s1">dy = transform.dx</span><span class="s4">, </span><span class="s1">transform.dy</span>
+            <span class="s1">bbox = self.bbox</span>
+            <span class="s1">p1</span><span class="s4">, </span><span class="s1">p2</span><span class="s4">, </span><span class="s1">p3</span><span class="s4">, </span><span class="s1">p4 = (</span>
+                <span class="s1">transform.transformPoint((bbox[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">bbox[</span><span class="s5">1</span><span class="s1">]))</span><span class="s4">,</span>
+                <span class="s1">transform.transformPoint((bbox[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">, </span><span class="s1">bbox[</span><span class="s5">1</span><span class="s1">]))</span><span class="s4">,</span>
+                <span class="s1">transform.transformPoint((bbox[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">bbox[</span><span class="s5">3</span><span class="s1">]))</span><span class="s4">,</span>
+                <span class="s1">transform.transformPoint((bbox[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">, </span><span class="s1">bbox[</span><span class="s5">3</span><span class="s1">]))</span><span class="s4">,</span>
+            <span class="s1">)</span>
+            <span class="s1">px</span><span class="s4">, </span><span class="s1">py = (p1[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">p2[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">p3[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, </span><span class="s1">p4[</span><span class="s5">0</span><span class="s1">])</span><span class="s4">, </span><span class="s1">(p1[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, </span><span class="s1">p2[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, </span><span class="s1">p3[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, </span><span class="s1">p4[</span><span class="s5">1</span><span class="s1">])</span>
+            <span class="s4">if </span><span class="s1">contain_x:</span>
+                <span class="s4">if </span><span class="s1">width </span><span class="s4">is None</span><span class="s1">:</span>
+                    <span class="s1">dx = dx - min(*px)</span>
+                    <span class="s1">width = max(*px) - min(*px)</span>
+                <span class="s4">else</span><span class="s1">:</span>
+                    <span class="s1">dx = dx - min(min(*px)</span><span class="s4">, </span><span class="s5">0.0</span><span class="s1">)</span>
+                    <span class="s1">width = max(width</span><span class="s4">, </span><span class="s1">max(*px) - min(min(*px)</span><span class="s4">, </span><span class="s5">0.0</span><span class="s1">))</span>
+            <span class="s4">if </span><span class="s1">contain_y:</span>
+                <span class="s4">if </span><span class="s1">height </span><span class="s4">is None</span><span class="s1">:</span>
+                    <span class="s1">dy = dy - min(*py)</span>
+                    <span class="s1">height = max(*py) - min(*py)</span>
+                <span class="s4">else</span><span class="s1">:</span>
+                    <span class="s1">dy = dy - min(min(*py)</span><span class="s4">, </span><span class="s5">0.0</span><span class="s1">)</span>
+                    <span class="s1">height = max(height</span><span class="s4">, </span><span class="s1">max(*py) - min(min(*py)</span><span class="s4">, </span><span class="s5">0.0</span><span class="s1">))</span>
+            <span class="s1">transform = Transform(*transform[:</span><span class="s5">4</span><span class="s1">]</span><span class="s4">, </span><span class="s1">dx</span><span class="s4">, </span><span class="s1">dy)</span>
+        <span class="s1">width</span><span class="s4">, </span><span class="s1">height = math.ceil(width)</span><span class="s4">, </span><span class="s1">math.ceil(height)</span>
+        <span class="s1">buf = ctypes.create_string_buffer(width * height)</span>
+        <span class="s1">bitmap = FT_Bitmap(</span>
+            <span class="s1">(ctypes.c_int)(height)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_int)(width)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_int)(width)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.POINTER(ctypes.c_ubyte))(buf)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_short)(</span><span class="s5">256</span><span class="s1">)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_ubyte)(FT_PIXEL_MODE_GRAY)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_char)(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+            <span class="s1">(ctypes.c_void_p)(</span><span class="s4">None</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">)</span>
+        <span class="s1">outline = self.outline(transform=transform</span><span class="s4">, </span><span class="s1">evenOdd=evenOdd)</span>
+        <span class="s1">err = FT_Outline_Get_Bitmap(</span>
+            <span class="s1">freetype.get_handle()</span><span class="s4">, </span><span class="s1">ctypes.byref(outline)</span><span class="s4">, </span><span class="s1">ctypes.byref(bitmap)</span>
+        <span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">err != </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s4">raise </span><span class="s1">FT_Exception(err)</span>
+        <span class="s4">return </span><span class="s1">buf.raw</span><span class="s4">, </span><span class="s1">(width</span><span class="s4">, </span><span class="s1">height)</span>
+
+    <span class="s4">def </span><span class="s1">array(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">width=</span><span class="s4">None, </span><span class="s1">height=</span><span class="s4">None, </span><span class="s1">transform=</span><span class="s4">None, </span><span class="s1">contain=</span><span class="s4">False, </span><span class="s1">evenOdd=</span><span class="s4">False</span>
+    <span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Returns the rendered contours as a numpy array. Requires `numpy`. 
+ 
+        Args: 
+            width: Image width of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            height: Image height of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            transform: An optional 6-tuple containing an affine transformation, 
+                or a ``Transform`` object from the ``fontTools.misc.transform`` 
+                module. The bitmap size is not affected by this matrix. 
+            contain: If ``True``, the image size will be automatically expanded 
+                so that it fits to the bounding box of the paths. Useful for 
+                rendering glyphs with negative sidebearings without clipping. 
+            evenOdd: Pass ``True`` for even-odd fill instead of non-zero. 
+ 
+        Returns: 
+            A ``numpy.ndarray`` object with a shape of ``(height, width)``. 
+            Each element takes a value in the range of ``[0.0, 1.0]``. 
+ 
+        :Notes: 
+            The image size should always be given explicitly if you need to get 
+            a proper glyph image. When ``width`` and ``height`` are omitted, it 
+            forcifully fits to the bounding box and the side bearings get 
+            cropped. If you pass ``0`` to both ``width`` and ``height`` and set 
+            ``contain`` to ``True``, it expands to the bounding box while 
+            maintaining the origin of the contours, meaning that LSB will be 
+            maintained but RSB won’t. The difference between the two becomes 
+            more obvious when rotate or skew transformation is applied. 
+ 
+        :Example: 
+            .. code-block:: 
+ 
+                &gt;&gt; pen = FreeTypePen(None) 
+                &gt;&gt; glyph.draw(pen) 
+                &gt;&gt; arr = pen.array(width=500, height=1000) 
+                &gt;&gt; type(a), a.shape 
+                (&lt;class 'numpy.ndarray'&gt;, (1000, 500)) 
+        &quot;&quot;&quot;</span>
+        <span class="s4">import </span><span class="s1">numpy </span><span class="s4">as </span><span class="s1">np</span>
+
+        <span class="s1">buf</span><span class="s4">, </span><span class="s1">size = self.buffer(</span>
+            <span class="s1">width=width</span><span class="s4">,</span>
+            <span class="s1">height=height</span><span class="s4">,</span>
+            <span class="s1">transform=transform</span><span class="s4">,</span>
+            <span class="s1">contain=contain</span><span class="s4">,</span>
+            <span class="s1">evenOdd=evenOdd</span><span class="s4">,</span>
+        <span class="s1">)</span>
+        <span class="s4">return </span><span class="s1">np.frombuffer(buf</span><span class="s4">, </span><span class="s3">&quot;B&quot;</span><span class="s1">).reshape((size[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, </span><span class="s1">size[</span><span class="s5">0</span><span class="s1">])) / </span><span class="s5">255.0</span>
+
+    <span class="s4">def </span><span class="s1">show(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">width=</span><span class="s4">None, </span><span class="s1">height=</span><span class="s4">None, </span><span class="s1">transform=</span><span class="s4">None, </span><span class="s1">contain=</span><span class="s4">False, </span><span class="s1">evenOdd=</span><span class="s4">False</span>
+    <span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Plots the rendered contours with `pyplot`. Requires `numpy` and 
+        `matplotlib`. 
+ 
+        Args: 
+            width: Image width of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            height: Image height of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            transform: An optional 6-tuple containing an affine transformation, 
+                or a ``Transform`` object from the ``fontTools.misc.transform`` 
+                module. The bitmap size is not affected by this matrix. 
+            contain: If ``True``, the image size will be automatically expanded 
+                so that it fits to the bounding box of the paths. Useful for 
+                rendering glyphs with negative sidebearings without clipping. 
+            evenOdd: Pass ``True`` for even-odd fill instead of non-zero. 
+ 
+        :Notes: 
+            The image size should always be given explicitly if you need to get 
+            a proper glyph image. When ``width`` and ``height`` are omitted, it 
+            forcifully fits to the bounding box and the side bearings get 
+            cropped. If you pass ``0`` to both ``width`` and ``height`` and set 
+            ``contain`` to ``True``, it expands to the bounding box while 
+            maintaining the origin of the contours, meaning that LSB will be 
+            maintained but RSB won’t. The difference between the two becomes 
+            more obvious when rotate or skew transformation is applied. 
+ 
+        :Example: 
+            .. code-block:: 
+ 
+                &gt;&gt; pen = FreeTypePen(None) 
+                &gt;&gt; glyph.draw(pen) 
+                &gt;&gt; pen.show(width=500, height=1000) 
+        &quot;&quot;&quot;</span>
+        <span class="s4">from </span><span class="s1">matplotlib </span><span class="s4">import </span><span class="s1">pyplot </span><span class="s4">as </span><span class="s1">plt</span>
+
+        <span class="s1">a = self.array(</span>
+            <span class="s1">width=width</span><span class="s4">,</span>
+            <span class="s1">height=height</span><span class="s4">,</span>
+            <span class="s1">transform=transform</span><span class="s4">,</span>
+            <span class="s1">contain=contain</span><span class="s4">,</span>
+            <span class="s1">evenOdd=evenOdd</span><span class="s4">,</span>
+        <span class="s1">)</span>
+        <span class="s1">plt.imshow(a</span><span class="s4">, </span><span class="s1">cmap=</span><span class="s3">&quot;gray_r&quot;</span><span class="s4">, </span><span class="s1">vmin=</span><span class="s5">0</span><span class="s4">, </span><span class="s1">vmax=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">plt.show()</span>
+
+    <span class="s4">def </span><span class="s1">image(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">width=</span><span class="s4">None, </span><span class="s1">height=</span><span class="s4">None, </span><span class="s1">transform=</span><span class="s4">None, </span><span class="s1">contain=</span><span class="s4">False, </span><span class="s1">evenOdd=</span><span class="s4">False</span>
+    <span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Returns the rendered contours as a PIL image. Requires `Pillow`. 
+        Can be used to display a glyph image in Jupyter Notebook. 
+ 
+        Args: 
+            width: Image width of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            height: Image height of the bitmap in pixels. If omitted, it 
+                automatically fits to the bounding box of the contours. 
+            transform: An optional 6-tuple containing an affine transformation, 
+                or a ``Transform`` object from the ``fontTools.misc.transform`` 
+                module. The bitmap size is not affected by this matrix. 
+            contain: If ``True``, the image size will be automatically expanded 
+                so that it fits to the bounding box of the paths. Useful for 
+                rendering glyphs with negative sidebearings without clipping. 
+            evenOdd: Pass ``True`` for even-odd fill instead of non-zero. 
+ 
+        Returns: 
+            A ``PIL.image`` object. The image is filled in black with alpha 
+            channel obtained from the rendered bitmap. 
+ 
+        :Notes: 
+            The image size should always be given explicitly if you need to get 
+            a proper glyph image. When ``width`` and ``height`` are omitted, it 
+            forcifully fits to the bounding box and the side bearings get 
+            cropped. If you pass ``0`` to both ``width`` and ``height`` and set 
+            ``contain`` to ``True``, it expands to the bounding box while 
+            maintaining the origin of the contours, meaning that LSB will be 
+            maintained but RSB won’t. The difference between the two becomes 
+            more obvious when rotate or skew transformation is applied. 
+ 
+        :Example: 
+            .. code-block:: 
+ 
+                &gt;&gt; pen = FreeTypePen(None) 
+                &gt;&gt; glyph.draw(pen) 
+                &gt;&gt; img = pen.image(width=500, height=1000) 
+                &gt;&gt; type(img), img.size 
+                (&lt;class 'PIL.Image.Image'&gt;, (500, 1000)) 
+        &quot;&quot;&quot;</span>
+        <span class="s4">from </span><span class="s1">PIL </span><span class="s4">import </span><span class="s1">Image</span>
+
+        <span class="s1">buf</span><span class="s4">, </span><span class="s1">size = self.buffer(</span>
+            <span class="s1">width=width</span><span class="s4">,</span>
+            <span class="s1">height=height</span><span class="s4">,</span>
+            <span class="s1">transform=transform</span><span class="s4">,</span>
+            <span class="s1">contain=contain</span><span class="s4">,</span>
+            <span class="s1">evenOdd=evenOdd</span><span class="s4">,</span>
+        <span class="s1">)</span>
+        <span class="s1">img = Image.new(</span><span class="s3">&quot;L&quot;</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">img.putalpha(Image.frombuffer(</span><span class="s3">&quot;L&quot;</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">buf))</span>
+        <span class="s4">return </span><span class="s1">img</span>
+
+    <span class="s1">@property</span>
+    <span class="s4">def </span><span class="s1">bbox(self):</span>
+        <span class="s2">&quot;&quot;&quot;Computes the exact bounding box of an outline. 
+ 
+        Returns: 
+            A tuple of ``(xMin, yMin, xMax, yMax)``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">bbox = FT_BBox()</span>
+        <span class="s1">outline = self.outline()</span>
+        <span class="s1">FT_Outline_Get_BBox(ctypes.byref(outline)</span><span class="s4">, </span><span class="s1">ctypes.byref(bbox))</span>
+        <span class="s4">return </span><span class="s1">(bbox.xMin / </span><span class="s5">64.0</span><span class="s4">, </span><span class="s1">bbox.yMin / </span><span class="s5">64.0</span><span class="s4">, </span><span class="s1">bbox.xMax / </span><span class="s5">64.0</span><span class="s4">, </span><span class="s1">bbox.yMax / </span><span class="s5">64.0</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s4">def </span><span class="s1">cbox(self):</span>
+        <span class="s2">&quot;&quot;&quot;Returns an outline's ‘control box’. 
+ 
+        Returns: 
+            A tuple of ``(xMin, yMin, xMax, yMax)``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cbox = FT_BBox()</span>
+        <span class="s1">outline = self.outline()</span>
+        <span class="s1">FT_Outline_Get_CBox(ctypes.byref(outline)</span><span class="s4">, </span><span class="s1">ctypes.byref(cbox))</span>
+        <span class="s4">return </span><span class="s1">(cbox.xMin / </span><span class="s5">64.0</span><span class="s4">, </span><span class="s1">cbox.yMin / </span><span class="s5">64.0</span><span class="s4">, </span><span class="s1">cbox.xMax / </span><span class="s5">64.0</span><span class="s4">, </span><span class="s1">cbox.yMax / </span><span class="s5">64.0</span><span class="s1">)</span>
+
+    <span class="s4">def </span><span class="s1">_moveTo(self</span><span class="s4">, </span><span class="s1">pt):</span>
+        <span class="s1">contour = Contour([]</span><span class="s4">, </span><span class="s1">[])</span>
+        <span class="s1">self.contours.append(contour)</span>
+        <span class="s1">contour.points.append(pt)</span>
+        <span class="s1">contour.tags.append(FT_CURVE_TAG_ON)</span>
+
+    <span class="s4">def </span><span class="s1">_lineTo(self</span><span class="s4">, </span><span class="s1">pt):</span>
+        <span class="s4">if not </span><span class="s1">(self.contours </span><span class="s4">and </span><span class="s1">len(self.contours[-</span><span class="s5">1</span><span class="s1">].points) &gt; </span><span class="s5">0</span><span class="s1">):</span>
+            <span class="s4">raise </span><span class="s1">PenError(</span><span class="s3">&quot;Contour missing required initial moveTo&quot;</span><span class="s1">)</span>
+        <span class="s1">contour = self.contours[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">contour.points.append(pt)</span>
+        <span class="s1">contour.tags.append(FT_CURVE_TAG_ON)</span>
+
+    <span class="s4">def </span><span class="s1">_curveToOne(self</span><span class="s4">, </span><span class="s1">p1</span><span class="s4">, </span><span class="s1">p2</span><span class="s4">, </span><span class="s1">p3):</span>
+        <span class="s4">if not </span><span class="s1">(self.contours </span><span class="s4">and </span><span class="s1">len(self.contours[-</span><span class="s5">1</span><span class="s1">].points) &gt; </span><span class="s5">0</span><span class="s1">):</span>
+            <span class="s4">raise </span><span class="s1">PenError(</span><span class="s3">&quot;Contour missing required initial moveTo&quot;</span><span class="s1">)</span>
+        <span class="s1">t1</span><span class="s4">, </span><span class="s1">t2</span><span class="s4">, </span><span class="s1">t3 = FT_CURVE_TAG_CUBIC</span><span class="s4">, </span><span class="s1">FT_CURVE_TAG_CUBIC</span><span class="s4">, </span><span class="s1">FT_CURVE_TAG_ON</span>
+        <span class="s1">contour = self.contours[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s4">for </span><span class="s1">p</span><span class="s4">, </span><span class="s1">t </span><span class="s4">in </span><span class="s1">((p1</span><span class="s4">, </span><span class="s1">t1)</span><span class="s4">, </span><span class="s1">(p2</span><span class="s4">, </span><span class="s1">t2)</span><span class="s4">, </span><span class="s1">(p3</span><span class="s4">, </span><span class="s1">t3)):</span>
+            <span class="s1">contour.points.append(p)</span>
+            <span class="s1">contour.tags.append(t)</span>
+
+    <span class="s4">def </span><span class="s1">_qCurveToOne(self</span><span class="s4">, </span><span class="s1">p1</span><span class="s4">, </span><span class="s1">p2):</span>
+        <span class="s4">if not </span><span class="s1">(self.contours </span><span class="s4">and </span><span class="s1">len(self.contours[-</span><span class="s5">1</span><span class="s1">].points) &gt; </span><span class="s5">0</span><span class="s1">):</span>
+            <span class="s4">raise </span><span class="s1">PenError(</span><span class="s3">&quot;Contour missing required initial moveTo&quot;</span><span class="s1">)</span>
+        <span class="s1">t1</span><span class="s4">, </span><span class="s1">t2 = FT_CURVE_TAG_CONIC</span><span class="s4">, </span><span class="s1">FT_CURVE_TAG_ON</span>
+        <span class="s1">contour = self.contours[-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s4">for </span><span class="s1">p</span><span class="s4">, </span><span class="s1">t </span><span class="s4">in </span><span class="s1">((p1</span><span class="s4">, </span><span class="s1">t1)</span><span class="s4">, </span><span class="s1">(p2</span><span class="s4">, </span><span class="s1">t2)):</span>
+            <span class="s1">contour.points.append(p)</span>
+            <span class="s1">contour.tags.append(t)</span>
+</pre>
+</body>
+</html>

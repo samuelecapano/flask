@@ -1,0 +1,1391 @@
+<html>
+<head>
+<title>otBase.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-style: italic;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+otBase.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.config </span><span class="s0">import </span><span class="s1">OPTIONS</span>
+<span class="s0">from </span><span class="s1">fontTools.misc.textTools </span><span class="s0">import </span><span class="s1">Tag</span><span class="s0">, </span><span class="s1">bytesjoin</span>
+<span class="s0">from </span><span class="s1">.DefaultTable </span><span class="s0">import </span><span class="s1">DefaultTable</span>
+<span class="s0">from </span><span class="s1">enum </span><span class="s0">import </span><span class="s1">IntEnum</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">array</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">lru_cache</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Iterator</span><span class="s0">, </span><span class="s1">NamedTuple</span><span class="s0">, </span><span class="s1">Optional</span><span class="s0">, </span><span class="s1">Tuple</span>
+
+<span class="s1">log = logging.getLogger(__name__)</span>
+
+<span class="s1">have_uharfbuzz = </span><span class="s0">False</span>
+<span class="s0">try</span><span class="s1">:</span>
+	<span class="s0">import </span><span class="s1">uharfbuzz </span><span class="s0">as </span><span class="s1">hb</span>
+	<span class="s2"># repack method added in uharfbuzz &gt;= 0.23; if uharfbuzz *can* be</span>
+	<span class="s2"># imported but repack method is missing, behave as if uharfbuzz</span>
+	<span class="s2"># is not available (fallback to the slower Python implementation)</span>
+	<span class="s1">have_uharfbuzz = callable(getattr(hb</span><span class="s0">, </span><span class="s3">&quot;repack&quot;</span><span class="s0">, None</span><span class="s1">))</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+	<span class="s0">pass</span>
+
+<span class="s1">USE_HARFBUZZ_REPACKER = OPTIONS[</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">__name__</span><span class="s0">}</span><span class="s3">:USE_HARFBUZZ_REPACKER&quot;</span><span class="s1">]</span>
+
+<span class="s0">class </span><span class="s1">OverflowErrorRecord(object):</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">overflowTuple):</span>
+		<span class="s1">self.tableType = overflowTuple[</span><span class="s4">0</span><span class="s1">]</span>
+		<span class="s1">self.LookupListIndex = overflowTuple[</span><span class="s4">1</span><span class="s1">]</span>
+		<span class="s1">self.SubTableIndex = overflowTuple[</span><span class="s4">2</span><span class="s1">]</span>
+		<span class="s1">self.itemName = overflowTuple[</span><span class="s4">3</span><span class="s1">]</span>
+		<span class="s1">self.itemIndex = overflowTuple[</span><span class="s4">4</span><span class="s1">]</span>
+
+	<span class="s0">def </span><span class="s1">__repr__(self):</span>
+		<span class="s0">return </span><span class="s1">str((self.tableType</span><span class="s0">, </span><span class="s3">&quot;LookupIndex:&quot;</span><span class="s0">, </span><span class="s1">self.LookupListIndex</span><span class="s0">, </span><span class="s3">&quot;SubTableIndex:&quot;</span><span class="s0">, </span><span class="s1">self.SubTableIndex</span><span class="s0">, </span><span class="s3">&quot;ItemName:&quot;</span><span class="s0">, </span><span class="s1">self.itemName</span><span class="s0">, </span><span class="s3">&quot;ItemIndex:&quot;</span><span class="s0">, </span><span class="s1">self.itemIndex))</span>
+
+<span class="s0">class </span><span class="s1">OTLOffsetOverflowError(Exception):</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">overflowErrorRecord):</span>
+		<span class="s1">self.value = overflowErrorRecord</span>
+
+	<span class="s0">def </span><span class="s1">__str__(self):</span>
+		<span class="s0">return </span><span class="s1">repr(self.value)</span>
+
+<span class="s0">class </span><span class="s1">RepackerState(IntEnum):</span>
+	<span class="s2"># Repacking control flow is implemnted using a state machine. The state machine table:</span>
+	<span class="s2">#</span>
+	<span class="s2"># State       | Packing Success | Packing Failed | Exception Raised |</span>
+	<span class="s2"># ------------+-----------------+----------------+------------------+</span>
+	<span class="s2"># PURE_FT     | Return result   | PURE_FT        | Return failure   |</span>
+	<span class="s2"># HB_FT       | Return result   | HB_FT          | FT_FALLBACK      |</span>
+	<span class="s2"># FT_FALLBACK | HB_FT           | FT_FALLBACK    | Return failure   |</span>
+
+	<span class="s2"># Pack only with fontTools, don't allow sharing between extensions.</span>
+	<span class="s1">PURE_FT = </span><span class="s4">1</span>
+
+	<span class="s2"># Attempt to pack with harfbuzz (allowing sharing between extensions)</span>
+	<span class="s2"># use fontTools to attempt overflow resolution.</span>
+	<span class="s1">HB_FT = </span><span class="s4">2</span>
+
+	<span class="s2"># Fallback if HB/FT packing gets stuck. Pack only with fontTools, don't allow sharing between</span>
+	<span class="s2"># extensions.</span>
+	<span class="s1">FT_FALLBACK = </span><span class="s4">3</span>
+
+<span class="s0">class </span><span class="s1">BaseTTXConverter(DefaultTable):</span>
+
+	<span class="s5">&quot;&quot;&quot;Generic base class for TTX table converters. It functions as an 
+    adapter between the TTX (ttLib actually) table model and the model 
+    we use for OpenType tables, which is necessarily subtly different. 
+    &quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s5">&quot;&quot;&quot;Create an object from the binary data. Called automatically on access.&quot;&quot;&quot;</span>
+		<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">otTables</span>
+		<span class="s1">reader = OTTableReader(data</span><span class="s0">, </span><span class="s1">tableTag=self.tableTag)</span>
+		<span class="s1">tableClass = getattr(otTables</span><span class="s0">, </span><span class="s1">self.tableTag)</span>
+		<span class="s1">self.table = tableClass()</span>
+		<span class="s1">self.table.decompile(reader</span><span class="s0">, </span><span class="s1">font)</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s5">&quot;&quot;&quot;Compiles the table into binary. Called automatically on save.&quot;&quot;&quot;</span>
+
+		<span class="s2"># General outline:</span>
+		<span class="s2"># Create a top-level OTTableWriter for the GPOS/GSUB table.</span>
+		<span class="s2">#   Call the compile method for the the table</span>
+		<span class="s2">#       for each 'converter' record in the table converter list</span>
+		<span class="s2">#           call converter's write method for each item in the value.</span>
+		<span class="s2">#               - For simple items, the write method adds a string to the</span>
+		<span class="s2">#               writer's self.items list.</span>
+		<span class="s2">#               - For Struct/Table/Subtable items, it add first adds new writer to the</span>
+		<span class="s2">#               to the writer's self.items, then calls the item's compile method.</span>
+		<span class="s2">#               This creates a tree of writers, rooted at the GUSB/GPOS writer, with</span>
+		<span class="s2">#               each writer representing a table, and the writer.items list containing</span>
+		<span class="s2">#               the child data strings and writers.</span>
+		<span class="s2">#   call the getAllData method</span>
+		<span class="s2">#       call _doneWriting, which removes duplicates</span>
+		<span class="s2">#       call _gatherTables. This traverses the tables, adding unique occurences to a flat list of tables</span>
+		<span class="s2">#       Traverse the flat list of tables, calling getDataLength on each to update their position</span>
+		<span class="s2">#       Traverse the flat list of tables again, calling getData each get the data in the table, now that</span>
+		<span class="s2">#       pos's and offset are known.</span>
+
+		<span class="s2">#       If a lookup subtable overflows an offset, we have to start all over.</span>
+		<span class="s1">overflowRecord = </span><span class="s0">None</span>
+		<span class="s2"># this is 3-state option: default (None) means automatically use hb.repack or</span>
+		<span class="s2"># silently fall back if it fails; True, use it and raise error if not possible</span>
+		<span class="s2"># or it errors out; False, don't use it, even if you can.</span>
+		<span class="s1">use_hb_repack = font.cfg[USE_HARFBUZZ_REPACKER]</span>
+		<span class="s0">if </span><span class="s1">self.tableTag </span><span class="s0">in </span><span class="s1">(</span><span class="s3">&quot;GSUB&quot;</span><span class="s0">, </span><span class="s3">&quot;GPOS&quot;</span><span class="s1">):</span>
+			<span class="s0">if </span><span class="s1">use_hb_repack </span><span class="s0">is False</span><span class="s1">:</span>
+				<span class="s1">log.debug(</span>
+					<span class="s3">&quot;hb.repack disabled, compiling '%s' with pure-python serializer&quot;</span><span class="s0">,</span>
+					<span class="s1">self.tableTag</span><span class="s0">,</span>
+				<span class="s1">)</span>
+			<span class="s0">elif not </span><span class="s1">have_uharfbuzz:</span>
+				<span class="s0">if </span><span class="s1">use_hb_repack </span><span class="s0">is True</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">ImportError(</span><span class="s3">&quot;No module named 'uharfbuzz'&quot;</span><span class="s1">)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">assert </span><span class="s1">use_hb_repack </span><span class="s0">is None</span>
+					<span class="s1">log.debug(</span>
+						<span class="s3">&quot;uharfbuzz not found, compiling '%s' with pure-python serializer&quot;</span><span class="s0">,</span>
+						<span class="s1">self.tableTag</span><span class="s0">,</span>
+					<span class="s1">)</span>
+
+		<span class="s0">if </span><span class="s1">(use_hb_repack </span><span class="s0">in </span><span class="s1">(</span><span class="s0">None, True</span><span class="s1">)</span>
+				<span class="s0">and </span><span class="s1">have_uharfbuzz</span>
+				<span class="s0">and </span><span class="s1">self.tableTag </span><span class="s0">in </span><span class="s1">(</span><span class="s3">&quot;GSUB&quot;</span><span class="s0">, </span><span class="s3">&quot;GPOS&quot;</span><span class="s1">)):</span>
+			<span class="s1">state = RepackerState.HB_FT</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">state = RepackerState.PURE_FT</span>
+
+		<span class="s1">hb_first_error_logged = </span><span class="s0">False</span>
+		<span class="s1">lastOverflowRecord = </span><span class="s0">None</span>
+		<span class="s0">while True</span><span class="s1">:</span>
+			<span class="s0">try</span><span class="s1">:</span>
+				<span class="s1">writer = OTTableWriter(tableTag=self.tableTag)</span>
+				<span class="s1">self.table.compile(writer</span><span class="s0">, </span><span class="s1">font)</span>
+				<span class="s0">if </span><span class="s1">state == RepackerState.HB_FT:</span>
+					<span class="s0">return </span><span class="s1">self.tryPackingHarfbuzz(writer</span><span class="s0">, </span><span class="s1">hb_first_error_logged)</span>
+				<span class="s0">elif </span><span class="s1">state == RepackerState.PURE_FT:</span>
+					<span class="s0">return </span><span class="s1">self.tryPackingFontTools(writer)</span>
+				<span class="s0">elif </span><span class="s1">state == RepackerState.FT_FALLBACK:</span>
+					<span class="s2"># Run packing with FontTools only, but don't return the result as it will</span>
+					<span class="s2"># not be optimally packed. Once a successful packing has been found, state is</span>
+					<span class="s2"># changed back to harfbuzz packing to produce the final, optimal, packing.</span>
+					<span class="s1">self.tryPackingFontTools(writer)</span>
+					<span class="s1">log.debug(</span><span class="s3">&quot;Re-enabling sharing between extensions and switching back to &quot;</span>
+										<span class="s3">&quot;harfbuzz+fontTools packing.&quot;</span><span class="s1">)</span>
+					<span class="s1">state = RepackerState.HB_FT</span>
+
+			<span class="s0">except </span><span class="s1">OTLOffsetOverflowError </span><span class="s0">as </span><span class="s1">e:</span>
+				<span class="s1">hb_first_error_logged = </span><span class="s0">True</span>
+				<span class="s1">ok = self.tryResolveOverflow(font</span><span class="s0">, </span><span class="s1">e</span><span class="s0">, </span><span class="s1">lastOverflowRecord)</span>
+				<span class="s1">lastOverflowRecord = e.value</span>
+
+				<span class="s0">if </span><span class="s1">ok:</span>
+					<span class="s0">continue</span>
+
+				<span class="s0">if </span><span class="s1">state </span><span class="s0">is </span><span class="s1">RepackerState.HB_FT:</span>
+					<span class="s1">log.debug(</span><span class="s3">&quot;Harfbuzz packing out of resolutions, disabling sharing between extensions and &quot;</span>
+									 <span class="s3">&quot;switching to fontTools only packing.&quot;</span><span class="s1">)</span>
+					<span class="s1">state = RepackerState.FT_FALLBACK</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">raise</span>
+
+	<span class="s0">def </span><span class="s1">tryPackingHarfbuzz(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">hb_first_error_logged):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">log.debug(</span><span class="s3">&quot;serializing '%s' with hb.repack&quot;</span><span class="s0">, </span><span class="s1">self.tableTag)</span>
+			<span class="s0">return </span><span class="s1">writer.getAllDataUsingHarfbuzz(self.tableTag)</span>
+		<span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">MemoryError</span><span class="s0">, </span><span class="s1">hb.RepackerError) </span><span class="s0">as </span><span class="s1">e:</span>
+			<span class="s2"># Only log hb repacker errors the first time they occur in</span>
+			<span class="s2"># the offset-overflow resolution loop, they are just noisy.</span>
+			<span class="s2"># Maybe we can revisit this if/when uharfbuzz actually gives</span>
+			<span class="s2"># us more info as to why hb.repack failed...</span>
+			<span class="s0">if not </span><span class="s1">hb_first_error_logged:</span>
+				<span class="s1">error_msg = </span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">type(e).__name__</span><span class="s0">}</span><span class="s3">&quot;</span>
+				<span class="s0">if </span><span class="s1">str(e) != </span><span class="s3">&quot;&quot;</span><span class="s1">:</span>
+					<span class="s1">error_msg += </span><span class="s3">f&quot;: </span><span class="s0">{</span><span class="s1">e</span><span class="s0">}</span><span class="s3">&quot;</span>
+				<span class="s1">log.warning(</span>
+						<span class="s3">&quot;hb.repack failed to serialize '%s', attempting fonttools resolutions &quot;</span>
+						<span class="s3">&quot;; the error message was: %s&quot;</span><span class="s0">,</span>
+						<span class="s1">self.tableTag</span><span class="s0">,</span>
+						<span class="s1">error_msg</span><span class="s0">,</span>
+				<span class="s1">)</span>
+				<span class="s1">hb_first_error_logged = </span><span class="s0">True</span>
+			<span class="s0">return </span><span class="s1">writer.getAllData(remove_duplicate=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+	<span class="s0">def </span><span class="s1">tryPackingFontTools(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s0">return </span><span class="s1">writer.getAllData()</span>
+
+
+	<span class="s0">def </span><span class="s1">tryResolveOverflow(self</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">e</span><span class="s0">, </span><span class="s1">lastOverflowRecord):</span>
+		<span class="s1">ok = </span><span class="s4">0</span>
+		<span class="s0">if </span><span class="s1">lastOverflowRecord == e.value:</span>
+			<span class="s2"># Oh well...</span>
+			<span class="s0">return </span><span class="s1">ok</span>
+
+		<span class="s1">overflowRecord = e.value</span>
+		<span class="s1">log.info(</span><span class="s3">&quot;Attempting to fix OTLOffsetOverflowError %s&quot;</span><span class="s0">, </span><span class="s1">e)</span>
+
+		<span class="s0">if </span><span class="s1">overflowRecord.itemName </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">from </span><span class="s1">.otTables </span><span class="s0">import </span><span class="s1">fixLookupOverFlows</span>
+			<span class="s1">ok = fixLookupOverFlows(font</span><span class="s0">, </span><span class="s1">overflowRecord)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">from </span><span class="s1">.otTables </span><span class="s0">import </span><span class="s1">fixSubTableOverFlows</span>
+			<span class="s1">ok = fixSubTableOverFlows(font</span><span class="s0">, </span><span class="s1">overflowRecord)</span>
+
+		<span class="s0">if </span><span class="s1">ok:</span>
+			<span class="s0">return </span><span class="s1">ok</span>
+
+		<span class="s2"># Try upgrading lookup to Extension and hope</span>
+		<span class="s2"># that cross-lookup sharing not happening would</span>
+		<span class="s2"># fix overflow...</span>
+		<span class="s0">from </span><span class="s1">.otTables </span><span class="s0">import </span><span class="s1">fixLookupOverFlows</span>
+		<span class="s0">return </span><span class="s1">fixLookupOverFlows(font</span><span class="s0">, </span><span class="s1">overflowRecord)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">self.table.toXML2(writer</span><span class="s0">, </span><span class="s1">font)</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">otTables</span>
+		<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;table&quot;</span><span class="s1">):</span>
+			<span class="s1">tableClass = getattr(otTables</span><span class="s0">, </span><span class="s1">self.tableTag)</span>
+			<span class="s1">self.table = tableClass()</span>
+		<span class="s1">self.table.fromXML(name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">self.table.populateDefaults()</span>
+
+	<span class="s0">def </span><span class="s1">ensureDecompiled(self</span><span class="s0">, </span><span class="s1">recurse=</span><span class="s0">True</span><span class="s1">):</span>
+		<span class="s1">self.table.ensureDecompiled(recurse=recurse)</span>
+
+
+<span class="s2"># https://github.com/fonttools/fonttools/pull/2285#issuecomment-834652928</span>
+<span class="s0">assert </span><span class="s1">len(struct.pack(</span><span class="s3">'i'</span><span class="s0">, </span><span class="s4">0</span><span class="s1">)) == </span><span class="s4">4</span>
+<span class="s0">assert </span><span class="s1">array.array(</span><span class="s3">'i'</span><span class="s1">).itemsize == </span><span class="s4">4</span><span class="s0">, </span><span class="s3">&quot;Oops, file a bug against fonttools.&quot;</span>
+
+<span class="s0">class </span><span class="s1">OTTableReader(object):</span>
+
+	<span class="s5">&quot;&quot;&quot;Helper class to retrieve data from an OpenType table.&quot;&quot;&quot;</span>
+
+	<span class="s1">__slots__ = (</span><span class="s3">'data'</span><span class="s0">, </span><span class="s3">'offset'</span><span class="s0">, </span><span class="s3">'pos'</span><span class="s0">, </span><span class="s3">'localState'</span><span class="s0">, </span><span class="s3">'tableTag'</span><span class="s1">)</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">localState=</span><span class="s0">None, </span><span class="s1">offset=</span><span class="s4">0</span><span class="s0">, </span><span class="s1">tableTag=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.data = data</span>
+		<span class="s1">self.offset = offset</span>
+		<span class="s1">self.pos = offset</span>
+		<span class="s1">self.localState = localState</span>
+		<span class="s1">self.tableTag = tableTag</span>
+
+	<span class="s0">def </span><span class="s1">advance(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s1">self.pos += count</span>
+
+	<span class="s0">def </span><span class="s1">seek(self</span><span class="s0">, </span><span class="s1">pos):</span>
+		<span class="s1">self.pos = pos</span>
+
+	<span class="s0">def </span><span class="s1">copy(self):</span>
+		<span class="s1">other = self.__class__(self.data</span><span class="s0">, </span><span class="s1">self.localState</span><span class="s0">, </span><span class="s1">self.offset</span><span class="s0">, </span><span class="s1">self.tableTag)</span>
+		<span class="s1">other.pos = self.pos</span>
+		<span class="s0">return </span><span class="s1">other</span>
+
+	<span class="s0">def </span><span class="s1">getSubReader(self</span><span class="s0">, </span><span class="s1">offset):</span>
+		<span class="s1">offset = self.offset + offset</span>
+		<span class="s0">return </span><span class="s1">self.__class__(self.data</span><span class="s0">, </span><span class="s1">self.localState</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">self.tableTag)</span>
+
+	<span class="s0">def </span><span class="s1">readValue(self</span><span class="s0">, </span><span class="s1">typecode</span><span class="s0">, </span><span class="s1">staticSize):</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">newpos = pos + staticSize</span>
+		<span class="s1">value</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">f&quot;&gt;</span><span class="s0">{</span><span class="s1">typecode</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s0">, </span><span class="s1">self.data[pos:newpos])</span>
+		<span class="s1">self.pos = newpos</span>
+		<span class="s0">return </span><span class="s1">value</span>
+	<span class="s0">def </span><span class="s1">readArray(self</span><span class="s0">, </span><span class="s1">typecode</span><span class="s0">, </span><span class="s1">staticSize</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">newpos = pos + count * staticSize</span>
+		<span class="s1">value = array.array(typecode</span><span class="s0">, </span><span class="s1">self.data[pos:newpos])</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s3">&quot;big&quot;</span><span class="s1">: value.byteswap()</span>
+		<span class="s1">self.pos = newpos</span>
+		<span class="s0">return </span><span class="s1">value.tolist()</span>
+
+	<span class="s0">def </span><span class="s1">readInt8(self):</span>
+		<span class="s0">return </span><span class="s1">self.readValue(</span><span class="s3">&quot;b&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">1</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">readInt8Array(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">self.readArray(</span><span class="s3">&quot;b&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">count=count)</span>
+
+	<span class="s0">def </span><span class="s1">readShort(self):</span>
+		<span class="s0">return </span><span class="s1">self.readValue(</span><span class="s3">&quot;h&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">2</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">readShortArray(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">self.readArray(</span><span class="s3">&quot;h&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">2</span><span class="s0">, </span><span class="s1">count=count)</span>
+
+	<span class="s0">def </span><span class="s1">readLong(self):</span>
+		<span class="s0">return </span><span class="s1">self.readValue(</span><span class="s3">&quot;i&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">4</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">readLongArray(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">self.readArray(</span><span class="s3">&quot;i&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">4</span><span class="s0">, </span><span class="s1">count=count)</span>
+
+	<span class="s0">def </span><span class="s1">readUInt8(self):</span>
+		<span class="s0">return </span><span class="s1">self.readValue(</span><span class="s3">&quot;B&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">1</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">readUInt8Array(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">self.readArray(</span><span class="s3">&quot;B&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">1</span><span class="s0">, </span><span class="s1">count=count)</span>
+
+	<span class="s0">def </span><span class="s1">readUShort(self):</span>
+		<span class="s0">return </span><span class="s1">self.readValue(</span><span class="s3">&quot;H&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">2</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">readUShortArray(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">self.readArray(</span><span class="s3">&quot;H&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">2</span><span class="s0">, </span><span class="s1">count=count)</span>
+
+	<span class="s0">def </span><span class="s1">readULong(self):</span>
+		<span class="s0">return </span><span class="s1">self.readValue(</span><span class="s3">&quot;I&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">4</span><span class="s1">)</span>
+	<span class="s0">def </span><span class="s1">readULongArray(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">self.readArray(</span><span class="s3">&quot;I&quot;</span><span class="s0">, </span><span class="s1">staticSize=</span><span class="s4">4</span><span class="s0">, </span><span class="s1">count=count)</span>
+
+	<span class="s0">def </span><span class="s1">readUInt24(self):</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">newpos = pos + </span><span class="s4">3</span>
+		<span class="s1">value</span><span class="s0">, </span><span class="s1">= struct.unpack(</span><span class="s3">&quot;&gt;l&quot;</span><span class="s0">, </span><span class="s6">b'</span><span class="s0">\0</span><span class="s6">'</span><span class="s1">+self.data[pos:newpos])</span>
+		<span class="s1">self.pos = newpos</span>
+		<span class="s0">return </span><span class="s1">value</span>
+	<span class="s0">def </span><span class="s1">readUInt24Array(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s0">return </span><span class="s1">[self.readUInt24() </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(count)]</span>
+
+	<span class="s0">def </span><span class="s1">readTag(self):</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">newpos = pos + </span><span class="s4">4</span>
+		<span class="s1">value = Tag(self.data[pos:newpos])</span>
+		<span class="s0">assert </span><span class="s1">len(value) == </span><span class="s4">4</span><span class="s0">, </span><span class="s1">value</span>
+		<span class="s1">self.pos = newpos</span>
+		<span class="s0">return </span><span class="s1">value</span>
+
+	<span class="s0">def </span><span class="s1">readData(self</span><span class="s0">, </span><span class="s1">count):</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">newpos = pos + count</span>
+		<span class="s1">value = self.data[pos:newpos]</span>
+		<span class="s1">self.pos = newpos</span>
+		<span class="s0">return </span><span class="s1">value</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">state = self.localState.copy() </span><span class="s0">if </span><span class="s1">self.localState </span><span class="s0">else </span><span class="s1">dict()</span>
+		<span class="s1">state[name] = value</span>
+		<span class="s1">self.localState = state</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s0">return </span><span class="s1">self.localState </span><span class="s0">and </span><span class="s1">self.localState[name]</span>
+
+	<span class="s0">def </span><span class="s1">__contains__(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s0">return </span><span class="s1">self.localState </span><span class="s0">and </span><span class="s1">name </span><span class="s0">in </span><span class="s1">self.localState</span>
+
+
+<span class="s0">class </span><span class="s1">OTTableWriter(object):</span>
+
+	<span class="s5">&quot;&quot;&quot;Helper class to gather and assemble data for OpenType tables.&quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">localState=</span><span class="s0">None, </span><span class="s1">tableTag=</span><span class="s0">None, </span><span class="s1">offsetSize=</span><span class="s4">2</span><span class="s1">):</span>
+		<span class="s1">self.items = []</span>
+		<span class="s1">self.pos = </span><span class="s0">None</span>
+		<span class="s1">self.localState = localState</span>
+		<span class="s1">self.tableTag = tableTag</span>
+		<span class="s1">self.offsetSize = offsetSize</span>
+		<span class="s1">self.parent = </span><span class="s0">None</span>
+
+	<span class="s2"># DEPRECATED: 'longOffset' is kept as a property for backward compat with old code.</span>
+	<span class="s2"># You should use 'offsetSize' instead (2, 3 or 4 bytes).</span>
+	<span class="s1">@property</span>
+	<span class="s0">def </span><span class="s1">longOffset(self):</span>
+		<span class="s0">return </span><span class="s1">self.offsetSize == </span><span class="s4">4</span>
+
+	<span class="s1">@longOffset.setter</span>
+	<span class="s0">def </span><span class="s1">longOffset(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">self.offsetSize = </span><span class="s4">4 </span><span class="s0">if </span><span class="s1">value </span><span class="s0">else </span><span class="s4">2</span>
+
+	<span class="s0">def </span><span class="s1">__setitem__(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">state = self.localState.copy() </span><span class="s0">if </span><span class="s1">self.localState </span><span class="s0">else </span><span class="s1">dict()</span>
+		<span class="s1">state[name] = value</span>
+		<span class="s1">self.localState = state</span>
+
+	<span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s0">return </span><span class="s1">self.localState[name]</span>
+
+	<span class="s0">def </span><span class="s1">__delitem__(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s0">del </span><span class="s1">self.localState[name]</span>
+
+	<span class="s2"># assembler interface</span>
+
+	<span class="s0">def </span><span class="s1">getDataLength(self):</span>
+		<span class="s5">&quot;&quot;&quot;Return the length of this table in bytes, without subtables.&quot;&quot;&quot;</span>
+		<span class="s1">l = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">item </span><span class="s0">in </span><span class="s1">self.items:</span>
+			<span class="s0">if </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getCountData&quot;</span><span class="s1">):</span>
+				<span class="s1">l += item.size</span>
+			<span class="s0">elif </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getData&quot;</span><span class="s1">):</span>
+				<span class="s1">l += item.offsetSize</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">l = l + len(item)</span>
+		<span class="s0">return </span><span class="s1">l</span>
+
+	<span class="s0">def </span><span class="s1">getData(self):</span>
+		<span class="s5">&quot;&quot;&quot;Assemble the data for this writer/table, without subtables.&quot;&quot;&quot;</span>
+		<span class="s1">items = list(self.items)  </span><span class="s2"># make a shallow copy</span>
+		<span class="s1">pos = self.pos</span>
+		<span class="s1">numItems = len(items)</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numItems):</span>
+			<span class="s1">item = items[i]</span>
+
+			<span class="s0">if </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getData&quot;</span><span class="s1">):</span>
+				<span class="s0">if </span><span class="s1">item.offsetSize == </span><span class="s4">4</span><span class="s1">:</span>
+					<span class="s1">items[i] = packULong(item.pos - pos)</span>
+				<span class="s0">elif </span><span class="s1">item.offsetSize == </span><span class="s4">2</span><span class="s1">:</span>
+					<span class="s0">try</span><span class="s1">:</span>
+						<span class="s1">items[i] = packUShort(item.pos - pos)</span>
+					<span class="s0">except </span><span class="s1">struct.error:</span>
+						<span class="s2"># provide data to fix overflow problem.</span>
+						<span class="s1">overflowErrorRecord = self.getOverflowErrorRecord(item)</span>
+
+						<span class="s0">raise </span><span class="s1">OTLOffsetOverflowError(overflowErrorRecord)</span>
+				<span class="s0">elif </span><span class="s1">item.offsetSize == </span><span class="s4">3</span><span class="s1">:</span>
+					<span class="s1">items[i] = packUInt24(item.pos - pos)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">ValueError(item.offsetSize)</span>
+
+		<span class="s0">return </span><span class="s1">bytesjoin(items)</span>
+
+	<span class="s0">def </span><span class="s1">getDataForHarfbuzz(self):</span>
+		<span class="s5">&quot;&quot;&quot;Assemble the data for this writer/table with all offset field set to 0&quot;&quot;&quot;</span>
+		<span class="s1">items = list(self.items)</span>
+		<span class="s1">packFuncs = {</span><span class="s4">2</span><span class="s1">: packUShort</span><span class="s0">, </span><span class="s4">3</span><span class="s1">: packUInt24</span><span class="s0">, </span><span class="s4">4</span><span class="s1">: packULong}</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">item </span><span class="s0">in </span><span class="s1">enumerate(items):</span>
+			<span class="s0">if </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getData&quot;</span><span class="s1">):</span>
+				<span class="s2"># Offset value is not needed in harfbuzz repacker, so setting offset to 0 to avoid overflow here</span>
+				<span class="s0">if </span><span class="s1">item.offsetSize </span><span class="s0">in </span><span class="s1">packFuncs:</span>
+					<span class="s1">items[i] = packFuncs[item.offsetSize](</span><span class="s4">0</span><span class="s1">)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">raise </span><span class="s1">ValueError(item.offsetSize)</span>
+
+		<span class="s0">return </span><span class="s1">bytesjoin(items)</span>
+
+	<span class="s0">def </span><span class="s1">__hash__(self):</span>
+		<span class="s2"># only works after self._doneWriting() has been called</span>
+		<span class="s0">return </span><span class="s1">hash(self.items)</span>
+
+	<span class="s0">def </span><span class="s1">__ne__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s0">return </span><span class="s1">result </span><span class="s0">if </span><span class="s1">result </span><span class="s0">is </span><span class="s1">NotImplemented </span><span class="s0">else not </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+		<span class="s0">return </span><span class="s1">self.offsetSize == other.offsetSize </span><span class="s0">and </span><span class="s1">self.items == other.items</span>
+
+	<span class="s0">def </span><span class="s1">_doneWriting(self</span><span class="s0">, </span><span class="s1">internedTables</span><span class="s0">, </span><span class="s1">shareExtension=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s2"># Convert CountData references to data string items</span>
+		<span class="s2"># collapse duplicate table references to a unique entry</span>
+		<span class="s2"># &quot;tables&quot; are OTTableWriter objects.</span>
+
+		<span class="s2"># For Extension Lookup types, we can</span>
+		<span class="s2"># eliminate duplicates only within the tree under the Extension Lookup,</span>
+		<span class="s2"># as offsets may exceed 64K even between Extension LookupTable subtables.</span>
+		<span class="s1">isExtension = hasattr(self</span><span class="s0">, </span><span class="s3">&quot;Extension&quot;</span><span class="s1">)</span>
+
+		<span class="s2"># Certain versions of Uniscribe reject the font if the GSUB/GPOS top-level</span>
+		<span class="s2"># arrays (ScriptList, FeatureList, LookupList) point to the same, possibly</span>
+		<span class="s2"># empty, array.  So, we don't share those.</span>
+		<span class="s2"># See: https://github.com/fonttools/fonttools/issues/518</span>
+		<span class="s1">dontShare = hasattr(self</span><span class="s0">, </span><span class="s3">'DontShare'</span><span class="s1">)</span>
+
+		<span class="s0">if </span><span class="s1">isExtension </span><span class="s0">and not </span><span class="s1">shareExtension:</span>
+			<span class="s1">internedTables = {}</span>
+
+		<span class="s1">items = self.items</span>
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(items)):</span>
+			<span class="s1">item = items[i]</span>
+			<span class="s0">if </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getCountData&quot;</span><span class="s1">):</span>
+				<span class="s1">items[i] = item.getCountData()</span>
+			<span class="s0">elif </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getData&quot;</span><span class="s1">):</span>
+				<span class="s1">item._doneWriting(internedTables</span><span class="s0">, </span><span class="s1">shareExtension=shareExtension)</span>
+				<span class="s2"># At this point, all subwriters are hashable based on their items.</span>
+				<span class="s2"># (See hash and comparison magic methods above.) So the ``setdefault``</span>
+				<span class="s2"># call here will return the first writer object we've seen with</span>
+				<span class="s2"># equal content, or store it in the dictionary if it's not been</span>
+				<span class="s2"># seen yet. We therefore replace the subwriter object with an equivalent</span>
+				<span class="s2"># object, which deduplicates the tree.</span>
+				<span class="s0">if not </span><span class="s1">dontShare:</span>
+					<span class="s1">items[i] = item = internedTables.setdefault(item</span><span class="s0">, </span><span class="s1">item)</span>
+		<span class="s1">self.items = tuple(items)</span>
+
+	<span class="s0">def </span><span class="s1">_gatherTables(self</span><span class="s0">, </span><span class="s1">tables</span><span class="s0">, </span><span class="s1">extTables</span><span class="s0">, </span><span class="s1">done):</span>
+		<span class="s2"># Convert table references in self.items tree to a flat</span>
+		<span class="s2"># list of tables in depth-first traversal order.</span>
+		<span class="s2"># &quot;tables&quot; are OTTableWriter objects.</span>
+		<span class="s2"># We do the traversal in reverse order at each level, in order to</span>
+		<span class="s2"># resolve duplicate references to be the last reference in the list of tables.</span>
+		<span class="s2"># For extension lookups, duplicate references can be merged only within the</span>
+		<span class="s2"># writer tree under the  extension lookup.</span>
+
+		<span class="s1">done[id(self)] = </span><span class="s0">True</span>
+
+		<span class="s1">numItems = len(self.items)</span>
+		<span class="s1">iRange = list(range(numItems))</span>
+		<span class="s1">iRange.reverse()</span>
+
+		<span class="s1">isExtension = hasattr(self</span><span class="s0">, </span><span class="s3">&quot;Extension&quot;</span><span class="s1">)</span>
+
+		<span class="s1">selfTables = tables</span>
+
+		<span class="s0">if </span><span class="s1">isExtension:</span>
+			<span class="s0">assert </span><span class="s1">extTables </span><span class="s0">is not None, </span><span class="s3">&quot;Program or XML editing error. Extension subtables cannot contain extensions subtables&quot;</span>
+			<span class="s1">tables</span><span class="s0">, </span><span class="s1">extTables</span><span class="s0">, </span><span class="s1">done = extTables</span><span class="s0">, None, </span><span class="s1">{}</span>
+
+		<span class="s2"># add Coverage table if it is sorted last.</span>
+		<span class="s1">sortCoverageLast = </span><span class="s0">False</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;sortCoverageLast&quot;</span><span class="s1">):</span>
+			<span class="s2"># Find coverage table</span>
+			<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numItems):</span>
+				<span class="s1">item = self.items[i]</span>
+				<span class="s0">if </span><span class="s1">getattr(item</span><span class="s0">, </span><span class="s3">'name'</span><span class="s0">, None</span><span class="s1">) == </span><span class="s3">&quot;Coverage&quot;</span><span class="s1">:</span>
+					<span class="s1">sortCoverageLast = </span><span class="s0">True</span>
+					<span class="s0">break</span>
+			<span class="s0">if </span><span class="s1">id(item) </span><span class="s0">not in </span><span class="s1">done:</span>
+				<span class="s1">item._gatherTables(tables</span><span class="s0">, </span><span class="s1">extTables</span><span class="s0">, </span><span class="s1">done)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s2"># We're a new parent of item</span>
+				<span class="s0">pass</span>
+
+		<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">iRange:</span>
+			<span class="s1">item = self.items[i]</span>
+			<span class="s0">if not </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getData&quot;</span><span class="s1">):</span>
+				<span class="s0">continue</span>
+
+			<span class="s0">if </span><span class="s1">sortCoverageLast </span><span class="s0">and </span><span class="s1">(i==</span><span class="s4">1</span><span class="s1">) </span><span class="s0">and </span><span class="s1">getattr(item</span><span class="s0">, </span><span class="s3">'name'</span><span class="s0">, None</span><span class="s1">) == </span><span class="s3">'Coverage'</span><span class="s1">:</span>
+				<span class="s2"># we've already 'gathered' it above</span>
+				<span class="s0">continue</span>
+
+			<span class="s0">if </span><span class="s1">id(item) </span><span class="s0">not in </span><span class="s1">done:</span>
+				<span class="s1">item._gatherTables(tables</span><span class="s0">, </span><span class="s1">extTables</span><span class="s0">, </span><span class="s1">done)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s2"># Item is already written out by other parent</span>
+				<span class="s0">pass</span>
+
+		<span class="s1">selfTables.append(self)</span>
+
+	<span class="s0">def </span><span class="s1">_gatherGraphForHarfbuzz(self</span><span class="s0">, </span><span class="s1">tables</span><span class="s0">, </span><span class="s1">obj_list</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">objidx</span><span class="s0">, </span><span class="s1">virtual_edges):</span>
+		<span class="s1">real_links = []</span>
+		<span class="s1">virtual_links = []</span>
+		<span class="s1">item_idx = objidx</span>
+
+		<span class="s2"># Merge virtual_links from parent</span>
+		<span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">virtual_edges:</span>
+			<span class="s1">virtual_links.append((</span><span class="s4">0</span><span class="s0">, </span><span class="s4">0</span><span class="s0">, </span><span class="s1">idx))</span>
+
+		<span class="s1">sortCoverageLast = </span><span class="s0">False</span>
+		<span class="s1">coverage_idx = </span><span class="s4">0</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;sortCoverageLast&quot;</span><span class="s1">):</span>
+			<span class="s2"># Find coverage table</span>
+			<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">item </span><span class="s0">in </span><span class="s1">enumerate(self.items):</span>
+				<span class="s0">if </span><span class="s1">getattr(item</span><span class="s0">, </span><span class="s3">'name'</span><span class="s0">, None</span><span class="s1">) == </span><span class="s3">&quot;Coverage&quot;</span><span class="s1">:</span>
+					<span class="s1">sortCoverageLast = </span><span class="s0">True</span>
+					<span class="s0">if </span><span class="s1">id(item) </span><span class="s0">not in </span><span class="s1">done:</span>
+						<span class="s1">coverage_idx = item_idx = item._gatherGraphForHarfbuzz(tables</span><span class="s0">, </span><span class="s1">obj_list</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">item_idx</span><span class="s0">, </span><span class="s1">virtual_edges)</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s1">coverage_idx = done[id(item)]</span>
+					<span class="s1">virtual_edges.append(coverage_idx)</span>
+					<span class="s0">break</span>
+
+		<span class="s1">child_idx = </span><span class="s4">0</span>
+		<span class="s1">offset_pos = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">item </span><span class="s0">in </span><span class="s1">enumerate(self.items):</span>
+			<span class="s0">if </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getData&quot;</span><span class="s1">):</span>
+				<span class="s1">pos = offset_pos</span>
+			<span class="s0">elif </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">&quot;getCountData&quot;</span><span class="s1">):</span>
+				<span class="s1">offset_pos += item.size</span>
+				<span class="s0">continue</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">offset_pos = offset_pos + len(item)</span>
+				<span class="s0">continue</span>
+
+			<span class="s0">if </span><span class="s1">id(item) </span><span class="s0">not in </span><span class="s1">done:</span>
+				<span class="s1">child_idx = item_idx = item._gatherGraphForHarfbuzz(tables</span><span class="s0">, </span><span class="s1">obj_list</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">item_idx</span><span class="s0">, </span><span class="s1">virtual_edges)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">child_idx = done[id(item)]</span>
+
+			<span class="s1">real_edge = (pos</span><span class="s0">, </span><span class="s1">item.offsetSize</span><span class="s0">, </span><span class="s1">child_idx)</span>
+			<span class="s1">real_links.append(real_edge)</span>
+			<span class="s1">offset_pos += item.offsetSize</span>
+
+		<span class="s1">tables.append(self)</span>
+		<span class="s1">obj_list.append((real_links</span><span class="s0">,</span><span class="s1">virtual_links))</span>
+		<span class="s1">item_idx += </span><span class="s4">1</span>
+		<span class="s1">done[id(self)] = item_idx</span>
+		<span class="s0">if </span><span class="s1">sortCoverageLast:</span>
+			<span class="s1">virtual_edges.pop()</span>
+
+		<span class="s0">return </span><span class="s1">item_idx</span>
+
+	<span class="s0">def </span><span class="s1">getAllDataUsingHarfbuzz(self</span><span class="s0">, </span><span class="s1">tableTag):</span>
+		<span class="s5">&quot;&quot;&quot;The Whole table is represented as a Graph. 
+                Assemble graph data and call Harfbuzz repacker to pack the table. 
+                Harfbuzz repacker is faster and retain as much sub-table sharing as possible, see also: 
+                https://github.com/harfbuzz/harfbuzz/blob/main/docs/repacker.md 
+                The input format for hb.repack() method is explained here: 
+                https://github.com/harfbuzz/uharfbuzz/blob/main/src/uharfbuzz/_harfbuzz.pyx#L1149 
+                &quot;&quot;&quot;</span>
+		<span class="s1">internedTables = {}</span>
+		<span class="s1">self._doneWriting(internedTables</span><span class="s0">, </span><span class="s1">shareExtension=</span><span class="s0">True</span><span class="s1">)</span>
+		<span class="s1">tables = []</span>
+		<span class="s1">obj_list = []</span>
+		<span class="s1">done = {}</span>
+		<span class="s1">objidx = </span><span class="s4">0</span>
+		<span class="s1">virtual_edges = []</span>
+		<span class="s1">self._gatherGraphForHarfbuzz(tables</span><span class="s0">, </span><span class="s1">obj_list</span><span class="s0">, </span><span class="s1">done</span><span class="s0">, </span><span class="s1">objidx</span><span class="s0">, </span><span class="s1">virtual_edges)</span>
+		<span class="s2"># Gather all data in two passes: the absolute positions of all</span>
+		<span class="s2"># subtable are needed before the actual data can be assembled.</span>
+		<span class="s1">pos = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">table </span><span class="s0">in </span><span class="s1">tables:</span>
+			<span class="s1">table.pos = pos</span>
+			<span class="s1">pos = pos + table.getDataLength()</span>
+
+		<span class="s1">data = []</span>
+		<span class="s0">for </span><span class="s1">table </span><span class="s0">in </span><span class="s1">tables:</span>
+			<span class="s1">tableData = table.getDataForHarfbuzz()</span>
+			<span class="s1">data.append(tableData)</span>
+
+		<span class="s0">if </span><span class="s1">hasattr(hb</span><span class="s0">, </span><span class="s3">&quot;repack_with_tag&quot;</span><span class="s1">):</span>
+			<span class="s0">return </span><span class="s1">hb.repack_with_tag(str(tableTag)</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">obj_list)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">return </span><span class="s1">hb.repack(data</span><span class="s0">, </span><span class="s1">obj_list)</span>
+
+	<span class="s0">def </span><span class="s1">getAllData(self</span><span class="s0">, </span><span class="s1">remove_duplicate=</span><span class="s0">True</span><span class="s1">):</span>
+		<span class="s5">&quot;&quot;&quot;Assemble all data, including all subtables.&quot;&quot;&quot;</span>
+		<span class="s0">if </span><span class="s1">remove_duplicate:</span>
+			<span class="s1">internedTables = {}</span>
+			<span class="s1">self._doneWriting(internedTables)</span>
+		<span class="s1">tables = []</span>
+		<span class="s1">extTables = []</span>
+		<span class="s1">done = {}</span>
+		<span class="s1">self._gatherTables(tables</span><span class="s0">, </span><span class="s1">extTables</span><span class="s0">, </span><span class="s1">done)</span>
+		<span class="s1">tables.reverse()</span>
+		<span class="s1">extTables.reverse()</span>
+		<span class="s2"># Gather all data in two passes: the absolute positions of all</span>
+		<span class="s2"># subtable are needed before the actual data can be assembled.</span>
+		<span class="s1">pos = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">table </span><span class="s0">in </span><span class="s1">tables:</span>
+			<span class="s1">table.pos = pos</span>
+			<span class="s1">pos = pos + table.getDataLength()</span>
+
+		<span class="s0">for </span><span class="s1">table </span><span class="s0">in </span><span class="s1">extTables:</span>
+			<span class="s1">table.pos = pos</span>
+			<span class="s1">pos = pos + table.getDataLength()</span>
+
+		<span class="s1">data = []</span>
+		<span class="s0">for </span><span class="s1">table </span><span class="s0">in </span><span class="s1">tables:</span>
+			<span class="s1">tableData = table.getData()</span>
+			<span class="s1">data.append(tableData)</span>
+
+		<span class="s0">for </span><span class="s1">table </span><span class="s0">in </span><span class="s1">extTables:</span>
+			<span class="s1">tableData = table.getData()</span>
+			<span class="s1">data.append(tableData)</span>
+
+		<span class="s0">return </span><span class="s1">bytesjoin(data)</span>
+
+	<span class="s2"># interface for gathering data, as used by table.compile()</span>
+
+	<span class="s0">def </span><span class="s1">getSubWriter(self</span><span class="s0">, </span><span class="s1">offsetSize=</span><span class="s4">2</span><span class="s1">):</span>
+		<span class="s1">subwriter = self.__class__(self.localState</span><span class="s0">, </span><span class="s1">self.tableTag</span><span class="s0">, </span><span class="s1">offsetSize=offsetSize)</span>
+		<span class="s1">subwriter.parent = self </span><span class="s2"># because some subtables have idential values, we discard</span>
+					<span class="s2"># the duplicates under the getAllData method. Hence some</span>
+					<span class="s2"># subtable writers can have more than one parent writer.</span>
+					<span class="s2"># But we just care about first one right now.</span>
+		<span class="s0">return </span><span class="s1">subwriter</span>
+
+	<span class="s0">def </span><span class="s1">writeValue(self</span><span class="s0">, </span><span class="s1">typecode</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">f&quot;&gt;</span><span class="s0">{</span><span class="s1">typecode</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeArray(self</span><span class="s0">, </span><span class="s1">typecode</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">a = array.array(typecode</span><span class="s0">, </span><span class="s1">values)</span>
+		<span class="s0">if </span><span class="s1">sys.byteorder != </span><span class="s3">&quot;big&quot;</span><span class="s1">: a.byteswap()</span>
+		<span class="s1">self.items.append(a.tobytes())</span>
+
+	<span class="s0">def </span><span class="s1">writeInt8(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">assert </span><span class="s1">-</span><span class="s4">128 </span><span class="s1">&lt;= value &lt; </span><span class="s4">128</span><span class="s0">, </span><span class="s1">value</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">&quot;&gt;b&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeInt8Array(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">self.writeArray(</span><span class="s3">'b'</span><span class="s0">, </span><span class="s1">values)</span>
+
+	<span class="s0">def </span><span class="s1">writeShort(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">assert </span><span class="s1">-</span><span class="s4">32768 </span><span class="s1">&lt;= value &lt; </span><span class="s4">32768</span><span class="s0">, </span><span class="s1">value</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">&quot;&gt;h&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeShortArray(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">self.writeArray(</span><span class="s3">'h'</span><span class="s0">, </span><span class="s1">values)</span>
+
+	<span class="s0">def </span><span class="s1">writeLong(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">&quot;&gt;i&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeLongArray(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">self.writeArray(</span><span class="s3">'i'</span><span class="s0">, </span><span class="s1">values)</span>
+
+	<span class="s0">def </span><span class="s1">writeUInt8(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= value &lt; </span><span class="s4">256</span><span class="s0">, </span><span class="s1">value</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">&quot;&gt;B&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeUInt8Array(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">self.writeArray(</span><span class="s3">'B'</span><span class="s0">, </span><span class="s1">values)</span>
+
+	<span class="s0">def </span><span class="s1">writeUShort(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= value &lt; </span><span class="s4">0x10000</span><span class="s0">, </span><span class="s1">value</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeUShortArray(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">self.writeArray(</span><span class="s3">'H'</span><span class="s0">, </span><span class="s1">values)</span>
+
+	<span class="s0">def </span><span class="s1">writeULong(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">self.items.append(struct.pack(</span><span class="s3">&quot;&gt;I&quot;</span><span class="s0">, </span><span class="s1">value))</span>
+	<span class="s0">def </span><span class="s1">writeULongArray(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">self.writeArray(</span><span class="s3">'I'</span><span class="s0">, </span><span class="s1">values)</span>
+
+	<span class="s0">def </span><span class="s1">writeUInt24(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= value &lt; </span><span class="s4">0x1000000</span><span class="s0">, </span><span class="s1">value</span>
+		<span class="s1">b = struct.pack(</span><span class="s3">&quot;&gt;L&quot;</span><span class="s0">, </span><span class="s1">value)</span>
+		<span class="s1">self.items.append(b[</span><span class="s4">1</span><span class="s1">:])</span>
+	<span class="s0">def </span><span class="s1">writeUInt24Array(self</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s0">for </span><span class="s1">value </span><span class="s0">in </span><span class="s1">values:</span>
+			<span class="s1">self.writeUInt24(value)</span>
+
+	<span class="s0">def </span><span class="s1">writeTag(self</span><span class="s0">, </span><span class="s1">tag):</span>
+		<span class="s1">tag = Tag(tag).tobytes()</span>
+		<span class="s0">assert </span><span class="s1">len(tag) == </span><span class="s4">4</span><span class="s0">, </span><span class="s1">tag</span>
+		<span class="s1">self.items.append(tag)</span>
+
+	<span class="s0">def </span><span class="s1">writeSubTable(self</span><span class="s0">, </span><span class="s1">subWriter):</span>
+		<span class="s1">self.items.append(subWriter)</span>
+
+	<span class="s0">def </span><span class="s1">writeCountReference(self</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">size=</span><span class="s4">2</span><span class="s0">, </span><span class="s1">value=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">ref = CountReference(table</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">size=size</span><span class="s0">, </span><span class="s1">value=value)</span>
+		<span class="s1">self.items.append(ref)</span>
+		<span class="s0">return </span><span class="s1">ref</span>
+
+	<span class="s0">def </span><span class="s1">writeStruct(self</span><span class="s0">, </span><span class="s1">format</span><span class="s0">, </span><span class="s1">values):</span>
+		<span class="s1">data = struct.pack(*(format</span><span class="s0">,</span><span class="s1">) + values)</span>
+		<span class="s1">self.items.append(data)</span>
+
+	<span class="s0">def </span><span class="s1">writeData(self</span><span class="s0">, </span><span class="s1">data):</span>
+		<span class="s1">self.items.append(data)</span>
+
+	<span class="s0">def </span><span class="s1">getOverflowErrorRecord(self</span><span class="s0">, </span><span class="s1">item):</span>
+		<span class="s1">LookupListIndex = SubTableIndex = itemName = itemIndex = </span><span class="s0">None</span>
+		<span class="s0">if </span><span class="s1">self.name == </span><span class="s3">'LookupList'</span><span class="s1">:</span>
+			<span class="s1">LookupListIndex = item.repeatIndex</span>
+		<span class="s0">elif </span><span class="s1">self.name == </span><span class="s3">'Lookup'</span><span class="s1">:</span>
+			<span class="s1">LookupListIndex = self.repeatIndex</span>
+			<span class="s1">SubTableIndex = item.repeatIndex</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">itemName = getattr(item</span><span class="s0">, </span><span class="s3">'name'</span><span class="s0">, </span><span class="s3">'&lt;none&gt;'</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">hasattr(item</span><span class="s0">, </span><span class="s3">'repeatIndex'</span><span class="s1">):</span>
+				<span class="s1">itemIndex = item.repeatIndex</span>
+			<span class="s0">if </span><span class="s1">self.name == </span><span class="s3">'SubTable'</span><span class="s1">:</span>
+				<span class="s1">LookupListIndex = self.parent.repeatIndex</span>
+				<span class="s1">SubTableIndex = self.repeatIndex</span>
+			<span class="s0">elif </span><span class="s1">self.name == </span><span class="s3">'ExtSubTable'</span><span class="s1">:</span>
+				<span class="s1">LookupListIndex = self.parent.parent.repeatIndex</span>
+				<span class="s1">SubTableIndex = self.parent.repeatIndex</span>
+			<span class="s0">else</span><span class="s1">: </span><span class="s2"># who knows how far below the SubTable level we are! Climb back up to the nearest subtable.</span>
+				<span class="s1">itemName = </span><span class="s3">&quot;.&quot;</span><span class="s1">.join([self.name</span><span class="s0">, </span><span class="s1">itemName])</span>
+				<span class="s1">p1 = self.parent</span>
+				<span class="s0">while </span><span class="s1">p1 </span><span class="s0">and </span><span class="s1">p1.name </span><span class="s0">not in </span><span class="s1">[</span><span class="s3">'ExtSubTable'</span><span class="s0">, </span><span class="s3">'SubTable'</span><span class="s1">]:</span>
+					<span class="s1">itemName = </span><span class="s3">&quot;.&quot;</span><span class="s1">.join([p1.name</span><span class="s0">, </span><span class="s1">itemName])</span>
+					<span class="s1">p1 = p1.parent</span>
+				<span class="s0">if </span><span class="s1">p1:</span>
+					<span class="s0">if </span><span class="s1">p1.name == </span><span class="s3">'ExtSubTable'</span><span class="s1">:</span>
+						<span class="s1">LookupListIndex = p1.parent.parent.repeatIndex</span>
+						<span class="s1">SubTableIndex = p1.parent.repeatIndex</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s1">LookupListIndex = p1.parent.repeatIndex</span>
+						<span class="s1">SubTableIndex = p1.repeatIndex</span>
+
+		<span class="s0">return </span><span class="s1">OverflowErrorRecord( (self.tableTag</span><span class="s0">, </span><span class="s1">LookupListIndex</span><span class="s0">, </span><span class="s1">SubTableIndex</span><span class="s0">, </span><span class="s1">itemName</span><span class="s0">, </span><span class="s1">itemIndex) )</span>
+
+
+<span class="s0">class </span><span class="s1">CountReference(object):</span>
+	<span class="s5">&quot;&quot;&quot;A reference to a Count value, not a count of references.&quot;&quot;&quot;</span>
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">size=</span><span class="s0">None, </span><span class="s1">value=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">self.table = table</span>
+		<span class="s1">self.name = name</span>
+		<span class="s1">self.size = size</span>
+		<span class="s0">if </span><span class="s1">value </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">self.setValue(value)</span>
+	<span class="s0">def </span><span class="s1">setValue(self</span><span class="s0">, </span><span class="s1">value):</span>
+		<span class="s1">table = self.table</span>
+		<span class="s1">name = self.name</span>
+		<span class="s0">if </span><span class="s1">table[name] </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">table[name] = value</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s0">assert </span><span class="s1">table[name] == value</span><span class="s0">, </span><span class="s1">(name</span><span class="s0">, </span><span class="s1">table[name]</span><span class="s0">, </span><span class="s1">value)</span>
+	<span class="s0">def </span><span class="s1">getValue(self):</span>
+		<span class="s0">return </span><span class="s1">self.table[self.name]</span>
+	<span class="s0">def </span><span class="s1">getCountData(self):</span>
+		<span class="s1">v = self.table[self.name]</span>
+		<span class="s0">if </span><span class="s1">v </span><span class="s0">is None</span><span class="s1">: v = </span><span class="s4">0</span>
+		<span class="s0">return </span><span class="s1">{</span><span class="s4">1</span><span class="s1">:packUInt8</span><span class="s0">, </span><span class="s4">2</span><span class="s1">:packUShort</span><span class="s0">, </span><span class="s4">4</span><span class="s1">:packULong}[self.size](v)</span>
+
+
+<span class="s0">def </span><span class="s1">packUInt8 (value):</span>
+	<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s3">&quot;&gt;B&quot;</span><span class="s0">, </span><span class="s1">value)</span>
+
+<span class="s0">def </span><span class="s1">packUShort(value):</span>
+	<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s3">&quot;&gt;H&quot;</span><span class="s0">, </span><span class="s1">value)</span>
+
+<span class="s0">def </span><span class="s1">packULong(value):</span>
+	<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= value &lt; </span><span class="s4">0x100000000</span><span class="s0">, </span><span class="s1">value</span>
+	<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s3">&quot;&gt;I&quot;</span><span class="s0">, </span><span class="s1">value)</span>
+
+<span class="s0">def </span><span class="s1">packUInt24(value):</span>
+	<span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= value &lt; </span><span class="s4">0x1000000</span><span class="s0">, </span><span class="s1">value</span>
+	<span class="s0">return </span><span class="s1">struct.pack(</span><span class="s3">&quot;&gt;I&quot;</span><span class="s0">, </span><span class="s1">value)[</span><span class="s4">1</span><span class="s1">:]</span>
+
+
+<span class="s0">class </span><span class="s1">BaseTable(object):</span>
+
+	<span class="s5">&quot;&quot;&quot;Generic base class for all OpenType (sub)tables.&quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__getattr__(self</span><span class="s0">, </span><span class="s1">attr):</span>
+		<span class="s1">reader = self.__dict__.get(</span><span class="s3">&quot;reader&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">reader:</span>
+			<span class="s0">del </span><span class="s1">self.reader</span>
+			<span class="s1">font = self.font</span>
+			<span class="s0">del </span><span class="s1">self.font</span>
+			<span class="s1">self.decompile(reader</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s0">return </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">attr)</span>
+
+		<span class="s0">raise </span><span class="s1">AttributeError(attr)</span>
+
+	<span class="s0">def </span><span class="s1">ensureDecompiled(self</span><span class="s0">, </span><span class="s1">recurse=</span><span class="s0">False</span><span class="s1">):</span>
+		<span class="s1">reader = self.__dict__.get(</span><span class="s3">&quot;reader&quot;</span><span class="s1">)</span>
+		<span class="s0">if </span><span class="s1">reader:</span>
+			<span class="s0">del </span><span class="s1">self.reader</span>
+			<span class="s1">font = self.font</span>
+			<span class="s0">del </span><span class="s1">self.font</span>
+			<span class="s1">self.decompile(reader</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">if </span><span class="s1">recurse:</span>
+			<span class="s0">for </span><span class="s1">subtable </span><span class="s0">in </span><span class="s1">self.iterSubTables():</span>
+				<span class="s1">subtable.value.ensureDecompiled(recurse)</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">getRecordSize(cls</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s1">totalSize = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">cls.converters:</span>
+			<span class="s1">size = conv.getRecordSize(reader)</span>
+			<span class="s0">if </span><span class="s1">size </span><span class="s0">is </span><span class="s1">NotImplemented: </span><span class="s0">return </span><span class="s1">NotImplemented</span>
+			<span class="s1">countValue = </span><span class="s4">1</span>
+			<span class="s0">if </span><span class="s1">conv.repeat:</span>
+				<span class="s0">if </span><span class="s1">conv.repeat </span><span class="s0">in </span><span class="s1">reader:</span>
+					<span class="s1">countValue = reader[conv.repeat] + conv.aux</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">return </span><span class="s1">NotImplemented</span>
+			<span class="s1">totalSize += size * countValue</span>
+		<span class="s0">return </span><span class="s1">totalSize</span>
+
+	<span class="s0">def </span><span class="s1">getConverters(self):</span>
+		<span class="s0">return </span><span class="s1">self.converters</span>
+
+	<span class="s0">def </span><span class="s1">getConverterByName(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s0">return </span><span class="s1">self.convertersByName[name]</span>
+
+	<span class="s0">def </span><span class="s1">populateDefaults(self</span><span class="s0">, </span><span class="s1">propagator=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s0">if </span><span class="s1">conv.repeat:</span>
+				<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s1">conv.name):</span>
+					<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">[])</span>
+				<span class="s1">countValue = len(getattr(self</span><span class="s0">, </span><span class="s1">conv.name)) - conv.aux</span>
+				<span class="s0">try</span><span class="s1">:</span>
+					<span class="s1">count_conv = self.getConverterByName(conv.repeat)</span>
+					<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">conv.repeat</span><span class="s0">, </span><span class="s1">countValue)</span>
+				<span class="s0">except </span><span class="s1">KeyError:</span>
+					<span class="s2"># conv.repeat is a propagated count</span>
+					<span class="s0">if </span><span class="s1">propagator </span><span class="s0">and </span><span class="s1">conv.repeat </span><span class="s0">in </span><span class="s1">propagator:</span>
+						<span class="s1">propagator[conv.repeat].setValue(countValue)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">conv.aux </span><span class="s0">and not </span><span class="s1">eval(conv.aux</span><span class="s0">, None, </span><span class="s1">self.__dict__):</span>
+					<span class="s0">continue</span>
+				<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s1">conv.name):</span>
+					<span class="s0">continue </span><span class="s2"># Warn if it should NOT be present?!</span>
+				<span class="s0">if </span><span class="s1">hasattr(conv</span><span class="s0">, </span><span class="s3">'writeNullOffset'</span><span class="s1">):</span>
+					<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, None</span><span class="s1">) </span><span class="s2"># Warn?</span>
+				<span class="s2">#elif not conv.isCount:</span>
+				<span class="s2">#   # Warn?</span>
+				<span class="s2">#   pass</span>
+				<span class="s0">if </span><span class="s1">hasattr(conv</span><span class="s0">, </span><span class="s3">&quot;DEFAULT&quot;</span><span class="s1">):</span>
+					<span class="s2"># OptionalValue converters (e.g. VarIndex)</span>
+					<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">conv.DEFAULT)</span>
+
+	<span class="s0">def </span><span class="s1">decompile(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">self.readFormat(reader)</span>
+		<span class="s1">table = {}</span>
+		<span class="s1">self.__rawTable = table  </span><span class="s2"># for debugging</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s0">if </span><span class="s1">conv.name == </span><span class="s3">&quot;SubTable&quot;</span><span class="s1">:</span>
+				<span class="s1">conv = conv.getConverter(reader.tableTag</span><span class="s0">,</span>
+						<span class="s1">table[</span><span class="s3">&quot;LookupType&quot;</span><span class="s1">])</span>
+			<span class="s0">if </span><span class="s1">conv.name == </span><span class="s3">&quot;ExtSubTable&quot;</span><span class="s1">:</span>
+				<span class="s1">conv = conv.getConverter(reader.tableTag</span><span class="s0">,</span>
+						<span class="s1">table[</span><span class="s3">&quot;ExtensionLookupType&quot;</span><span class="s1">])</span>
+			<span class="s0">if </span><span class="s1">conv.name == </span><span class="s3">&quot;FeatureParams&quot;</span><span class="s1">:</span>
+				<span class="s1">conv = conv.getConverter(reader[</span><span class="s3">&quot;FeatureTag&quot;</span><span class="s1">])</span>
+			<span class="s0">if </span><span class="s1">conv.name == </span><span class="s3">&quot;SubStruct&quot;</span><span class="s1">:</span>
+				<span class="s1">conv = conv.getConverter(reader.tableTag</span><span class="s0">,</span>
+				                         <span class="s1">table[</span><span class="s3">&quot;MorphType&quot;</span><span class="s1">])</span>
+			<span class="s0">try</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">conv.repeat:</span>
+					<span class="s0">if </span><span class="s1">isinstance(conv.repeat</span><span class="s0">, </span><span class="s1">int):</span>
+						<span class="s1">countValue = conv.repeat</span>
+					<span class="s0">elif </span><span class="s1">conv.repeat </span><span class="s0">in </span><span class="s1">table:</span>
+						<span class="s1">countValue = table[conv.repeat]</span>
+					<span class="s0">else</span><span class="s1">:</span>
+						<span class="s2"># conv.repeat is a propagated count</span>
+						<span class="s1">countValue = reader[conv.repeat]</span>
+					<span class="s1">countValue += conv.aux</span>
+					<span class="s1">table[conv.name] = conv.readArray(reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">countValue)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s0">if </span><span class="s1">conv.aux </span><span class="s0">and not </span><span class="s1">eval(conv.aux</span><span class="s0">, None, </span><span class="s1">table):</span>
+						<span class="s0">continue</span>
+					<span class="s1">table[conv.name] = conv.read(reader</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">table)</span>
+					<span class="s0">if </span><span class="s1">conv.isPropagated:</span>
+						<span class="s1">reader[conv.name] = table[conv.name]</span>
+			<span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+				<span class="s1">name = conv.name</span>
+				<span class="s1">e.args = e.args + (name</span><span class="s0">,</span><span class="s1">)</span>
+				<span class="s0">raise</span>
+
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'postRead'</span><span class="s1">):</span>
+			<span class="s1">self.postRead(table</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">self.__dict__.update(table)</span>
+
+		<span class="s0">del </span><span class="s1">self.__rawTable  </span><span class="s2"># succeeded, get rid of debugging info</span>
+
+	<span class="s0">def </span><span class="s1">compile(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">self.ensureDecompiled()</span>
+		<span class="s2"># TODO Following hack to be removed by rewriting how FormatSwitching tables</span>
+		<span class="s2"># are handled.</span>
+		<span class="s2"># https://github.com/fonttools/fonttools/pull/2238#issuecomment-805192631</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'preWrite'</span><span class="s1">):</span>
+			<span class="s1">deleteFormat = </span><span class="s0">not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'Format'</span><span class="s1">)</span>
+			<span class="s1">table = self.preWrite(font)</span>
+			<span class="s1">deleteFormat = deleteFormat </span><span class="s0">and </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'Format'</span><span class="s1">)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">deleteFormat = </span><span class="s0">False</span>
+			<span class="s1">table = self.__dict__.copy()</span>
+
+		<span class="s2"># some count references may have been initialized in a custom preWrite; we set</span>
+		<span class="s2"># these in the writer's state beforehand (instead of sequentially) so they will</span>
+		<span class="s2"># be propagated to all nested subtables even if the count appears in the current</span>
+		<span class="s2"># table only *after* the offset to the subtable that it is counting.</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s0">if </span><span class="s1">conv.isCount </span><span class="s0">and </span><span class="s1">conv.isPropagated:</span>
+				<span class="s1">value = table.get(conv.name)</span>
+				<span class="s0">if </span><span class="s1">isinstance(value</span><span class="s0">, </span><span class="s1">CountReference):</span>
+					<span class="s1">writer[conv.name] = value</span>
+
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'sortCoverageLast'</span><span class="s1">):</span>
+			<span class="s1">writer.sortCoverageLast = </span><span class="s4">1</span>
+
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'DontShare'</span><span class="s1">):</span>
+			<span class="s1">writer.DontShare = </span><span class="s0">True</span>
+
+		<span class="s0">if </span><span class="s1">hasattr(self.__class__</span><span class="s0">, </span><span class="s3">'LookupType'</span><span class="s1">):</span>
+			<span class="s1">writer[</span><span class="s3">'LookupType'</span><span class="s1">].setValue(self.__class__.LookupType)</span>
+
+		<span class="s1">self.writeFormat(writer)</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s1">value = table.get(conv.name) </span><span class="s2"># TODO Handle defaults instead of defaulting to None!</span>
+			<span class="s0">if </span><span class="s1">conv.repeat:</span>
+				<span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+					<span class="s1">value = []</span>
+				<span class="s1">countValue = len(value) - conv.aux</span>
+				<span class="s0">if </span><span class="s1">isinstance(conv.repeat</span><span class="s0">, </span><span class="s1">int):</span>
+					<span class="s0">assert </span><span class="s1">len(value) == conv.repeat</span><span class="s0">, </span><span class="s3">'expected %d values, got %d' </span><span class="s1">% (conv.repeat</span><span class="s0">, </span><span class="s1">len(value))</span>
+				<span class="s0">elif </span><span class="s1">conv.repeat </span><span class="s0">in </span><span class="s1">table:</span>
+					<span class="s1">CountReference(table</span><span class="s0">, </span><span class="s1">conv.repeat</span><span class="s0">, </span><span class="s1">value=countValue)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s2"># conv.repeat is a propagated count</span>
+					<span class="s1">writer[conv.repeat].setValue(countValue)</span>
+				<span class="s0">try</span><span class="s1">:</span>
+					<span class="s1">conv.writeArray(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">value)</span>
+				<span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+					<span class="s1">e.args = e.args + (conv.name+</span><span class="s3">'[]'</span><span class="s0">,</span><span class="s1">)</span>
+					<span class="s0">raise</span>
+			<span class="s0">elif </span><span class="s1">conv.isCount:</span>
+				<span class="s2"># Special-case Count values.</span>
+				<span class="s2"># Assumption: a Count field will *always* precede</span>
+				<span class="s2"># the actual array(s).</span>
+				<span class="s2"># We need a default value, as it may be set later by a nested</span>
+				<span class="s2"># table. We will later store it here.</span>
+				<span class="s2"># We add a reference: by the time the data is assembled</span>
+				<span class="s2"># the Count value will be filled in.</span>
+				<span class="s2"># We ignore the current count value since it will be recomputed,</span>
+				<span class="s2"># unless it's a CountReference that was already initialized in a custom preWrite.</span>
+				<span class="s0">if </span><span class="s1">isinstance(value</span><span class="s0">, </span><span class="s1">CountReference):</span>
+					<span class="s1">ref = value</span>
+					<span class="s1">ref.size = conv.staticSize</span>
+					<span class="s1">writer.writeData(ref)</span>
+					<span class="s1">table[conv.name] = ref.getValue()</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">ref = writer.writeCountReference(table</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">conv.staticSize)</span>
+					<span class="s1">table[conv.name] = </span><span class="s0">None</span>
+				<span class="s0">if </span><span class="s1">conv.isPropagated:</span>
+					<span class="s1">writer[conv.name] = ref</span>
+			<span class="s0">elif </span><span class="s1">conv.isLookupType:</span>
+				<span class="s2"># We make sure that subtables have the same lookup type,</span>
+				<span class="s2"># and that the type is the same as the one set on the</span>
+				<span class="s2"># Lookup object, if any is set.</span>
+				<span class="s0">if </span><span class="s1">conv.name </span><span class="s0">not in </span><span class="s1">table:</span>
+					<span class="s1">table[conv.name] = </span><span class="s0">None</span>
+				<span class="s1">ref = writer.writeCountReference(table</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">conv.staticSize</span><span class="s0">, </span><span class="s1">table[conv.name])</span>
+				<span class="s1">writer[</span><span class="s3">'LookupType'</span><span class="s1">] = ref</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">conv.aux </span><span class="s0">and not </span><span class="s1">eval(conv.aux</span><span class="s0">, None, </span><span class="s1">table):</span>
+					<span class="s0">continue</span>
+				<span class="s0">try</span><span class="s1">:</span>
+					<span class="s1">conv.write(writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">table</span><span class="s0">, </span><span class="s1">value)</span>
+				<span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+					<span class="s1">name = value.__class__.__name__ </span><span class="s0">if </span><span class="s1">value </span><span class="s0">is not None else </span><span class="s1">conv.name</span>
+					<span class="s1">e.args = e.args + (name</span><span class="s0">,</span><span class="s1">)</span>
+					<span class="s0">raise</span>
+				<span class="s0">if </span><span class="s1">conv.isPropagated:</span>
+					<span class="s1">writer[conv.name] = value</span>
+
+		<span class="s0">if </span><span class="s1">deleteFormat:</span>
+			<span class="s0">del </span><span class="s1">self.Format</span>
+
+	<span class="s0">def </span><span class="s1">readFormat(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">pass</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s0">pass</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">attrs=</span><span class="s0">None, </span><span class="s1">name=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">tableName = name </span><span class="s0">if </span><span class="s1">name </span><span class="s0">else </span><span class="s1">self.__class__.__name__</span>
+		<span class="s0">if </span><span class="s1">attrs </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">attrs = []</span>
+		<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;Format&quot;</span><span class="s1">):</span>
+			<span class="s1">attrs = attrs + [(</span><span class="s3">&quot;Format&quot;</span><span class="s0">, </span><span class="s1">self.Format)]</span>
+		<span class="s1">xmlWriter.begintag(tableName</span><span class="s0">, </span><span class="s1">attrs)</span>
+		<span class="s1">xmlWriter.newline()</span>
+		<span class="s1">self.toXML2(xmlWriter</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s1">xmlWriter.endtag(tableName)</span>
+		<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">toXML2(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s2"># Simpler variant of toXML, *only* for the top level tables (like GPOS, GSUB).</span>
+		<span class="s2"># This is because in TTX our parent writes our main tag, and in otBase.py we</span>
+		<span class="s2"># do it ourselves. I think I'm getting schizophrenic...</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s0">if </span><span class="s1">conv.repeat:</span>
+				<span class="s1">value = getattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">[])</span>
+				<span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(value)):</span>
+					<span class="s1">item = value[i]</span>
+					<span class="s1">conv.xmlWrite(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">item</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">,</span>
+							<span class="s1">[(</span><span class="s3">&quot;index&quot;</span><span class="s0">, </span><span class="s1">i)])</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s0">if </span><span class="s1">conv.aux </span><span class="s0">and not </span><span class="s1">eval(conv.aux</span><span class="s0">, None, </span><span class="s1">vars(self)):</span>
+					<span class="s0">continue</span>
+				<span class="s1">value = getattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, None</span><span class="s1">) </span><span class="s2"># TODO Handle defaults instead of defaulting to None!</span>
+				<span class="s1">conv.xmlWrite(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">[])</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">conv = self.getConverterByName(name)</span>
+		<span class="s0">except </span><span class="s1">KeyError:</span>
+			<span class="s0">raise    </span><span class="s2"># XXX on KeyError, raise nice error</span>
+		<span class="s1">value = conv.xmlRead(attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font)</span>
+		<span class="s0">if </span><span class="s1">conv.repeat:</span>
+			<span class="s1">seq = getattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, None</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">seq </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s1">seq = []</span>
+				<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">seq)</span>
+			<span class="s1">seq.append(value)</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">conv.name</span><span class="s0">, </span><span class="s1">value)</span>
+
+	<span class="s0">def </span><span class="s1">__ne__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s0">return </span><span class="s1">result </span><span class="s0">if </span><span class="s1">result </span><span class="s0">is </span><span class="s1">NotImplemented </span><span class="s0">else not </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+
+		<span class="s1">self.ensureDecompiled()</span>
+		<span class="s1">other.ensureDecompiled()</span>
+
+		<span class="s0">return </span><span class="s1">self.__dict__ == other.__dict__</span>
+
+	<span class="s0">class </span><span class="s1">SubTableEntry(NamedTuple):</span>
+		<span class="s5">&quot;&quot;&quot;See BaseTable.iterSubTables()&quot;&quot;&quot;</span>
+		<span class="s1">name: str</span>
+		<span class="s1">value: </span><span class="s3">&quot;BaseTable&quot;</span>
+		<span class="s1">index: Optional[int] = </span><span class="s0">None  </span><span class="s2"># index into given array, None for single values</span>
+
+	<span class="s0">def </span><span class="s1">iterSubTables(self) -&gt; Iterator[SubTableEntry]:</span>
+		<span class="s5">&quot;&quot;&quot;Yield (name, value, index) namedtuples for all subtables of current table. 
+ 
+        A sub-table is an instance of BaseTable (or subclass thereof) that is a child 
+        of self, the current parent table. 
+        The tuples also contain the attribute name (str) of the of parent table to get 
+        a subtable, and optionally, for lists of subtables (i.e. attributes associated 
+        with a converter that has a 'repeat'), an index into the list containing the 
+        given subtable value. 
+        This method can be useful to traverse trees of otTables. 
+        &quot;&quot;&quot;</span>
+		<span class="s0">for </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">self.getConverters():</span>
+			<span class="s1">name = conv.name</span>
+			<span class="s1">value = getattr(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, None</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s1">:</span>
+				<span class="s0">continue</span>
+			<span class="s0">if </span><span class="s1">isinstance(value</span><span class="s0">, </span><span class="s1">BaseTable):</span>
+				<span class="s0">yield </span><span class="s1">self.SubTableEntry(name</span><span class="s0">, </span><span class="s1">value)</span>
+			<span class="s0">elif </span><span class="s1">isinstance(value</span><span class="s0">, </span><span class="s1">list):</span>
+				<span class="s0">yield from </span><span class="s1">(</span>
+					<span class="s1">self.SubTableEntry(name</span><span class="s0">, </span><span class="s1">v</span><span class="s0">, </span><span class="s1">index=i)</span>
+					<span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">enumerate(value)</span>
+					<span class="s0">if </span><span class="s1">isinstance(v</span><span class="s0">, </span><span class="s1">BaseTable)</span>
+				<span class="s1">)</span>
+
+	<span class="s2"># instance (not @class)method for consistency with FormatSwitchingBaseTable</span>
+	<span class="s0">def </span><span class="s1">getVariableAttrs(self):</span>
+		<span class="s0">return </span><span class="s1">getVariableAttrs(self.__class__)</span>
+
+
+<span class="s0">class </span><span class="s1">FormatSwitchingBaseTable(BaseTable):</span>
+
+	<span class="s5">&quot;&quot;&quot;Minor specialization of BaseTable, for tables that have multiple 
+    formats, eg. CoverageFormat1 vs. CoverageFormat2.&quot;&quot;&quot;</span>
+
+	<span class="s1">@classmethod</span>
+	<span class="s0">def </span><span class="s1">getRecordSize(cls</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s0">return </span><span class="s1">NotImplemented</span>
+
+	<span class="s0">def </span><span class="s1">getConverters(self):</span>
+		<span class="s0">try</span><span class="s1">:</span>
+			<span class="s1">fmt = self.Format</span>
+		<span class="s0">except </span><span class="s1">AttributeError:</span>
+			<span class="s2"># some FormatSwitchingBaseTables (e.g. Coverage) no longer have 'Format'</span>
+			<span class="s2"># attribute after fully decompiled, only gain one in preWrite before being</span>
+			<span class="s2"># recompiled. In the decompiled state, these hand-coded classes defined in</span>
+			<span class="s2"># otTables.py lose their format-specific nature and gain more high-level</span>
+			<span class="s2"># attributes that are not tied to converters.</span>
+			<span class="s0">return </span><span class="s1">[]</span>
+		<span class="s0">return </span><span class="s1">self.converters.get(self.Format</span><span class="s0">, </span><span class="s1">[])</span>
+
+	<span class="s0">def </span><span class="s1">getConverterByName(self</span><span class="s0">, </span><span class="s1">name):</span>
+		<span class="s0">return </span><span class="s1">self.convertersByName[self.Format][name]</span>
+
+	<span class="s0">def </span><span class="s1">readFormat(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s1">self.Format = reader.readUShort()</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s1">writer.writeUShort(self.Format)</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">attrs=</span><span class="s0">None, </span><span class="s1">name=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s1">BaseTable.toXML(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">name)</span>
+
+	<span class="s0">def </span><span class="s1">getVariableAttrs(self):</span>
+		<span class="s0">return </span><span class="s1">getVariableAttrs(self.__class__</span><span class="s0">, </span><span class="s1">self.Format)</span>
+
+
+<span class="s0">class </span><span class="s1">UInt8FormatSwitchingBaseTable(FormatSwitchingBaseTable):</span>
+	<span class="s0">def </span><span class="s1">readFormat(self</span><span class="s0">, </span><span class="s1">reader):</span>
+		<span class="s1">self.Format = reader.readUInt8()</span>
+
+	<span class="s0">def </span><span class="s1">writeFormat(self</span><span class="s0">, </span><span class="s1">writer):</span>
+		<span class="s1">writer.writeUInt8(self.Format)</span>
+
+
+<span class="s1">formatSwitchingBaseTables = {</span>
+	<span class="s3">&quot;uint16&quot;</span><span class="s1">: FormatSwitchingBaseTable</span><span class="s0">,</span>
+	<span class="s3">&quot;uint8&quot;</span><span class="s1">: UInt8FormatSwitchingBaseTable</span><span class="s0">,</span>
+<span class="s1">}</span>
+
+<span class="s0">def </span><span class="s1">getFormatSwitchingBaseTableClass(formatType):</span>
+	<span class="s0">try</span><span class="s1">:</span>
+		<span class="s0">return </span><span class="s1">formatSwitchingBaseTables[formatType]</span>
+	<span class="s0">except </span><span class="s1">KeyError:</span>
+		<span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">f&quot;Unsupported format type: </span><span class="s0">{</span><span class="s1">formatType</span><span class="s0">!r}</span><span class="s3">&quot;</span><span class="s1">)</span>
+
+
+<span class="s2"># memoize since these are parsed from otData.py, thus stay constant</span>
+<span class="s1">@lru_cache()</span>
+<span class="s0">def </span><span class="s1">getVariableAttrs(cls: BaseTable</span><span class="s0">, </span><span class="s1">fmt: Optional[int] = </span><span class="s0">None</span><span class="s1">) -&gt; Tuple[str]:</span>
+	<span class="s5">&quot;&quot;&quot;Return sequence of variable table field names (can be empty). 
+ 
+    Attributes are deemed &quot;variable&quot; when their otData.py's description contain 
+    'VarIndexBase + {offset}', e.g. COLRv1 PaintVar* tables. 
+    &quot;&quot;&quot;</span>
+	<span class="s0">if not </span><span class="s1">issubclass(cls</span><span class="s0">, </span><span class="s1">BaseTable):</span>
+		<span class="s0">raise </span><span class="s1">TypeError(cls)</span>
+	<span class="s0">if </span><span class="s1">issubclass(cls</span><span class="s0">, </span><span class="s1">FormatSwitchingBaseTable):</span>
+		<span class="s0">if </span><span class="s1">fmt </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">f&quot;'fmt' is required for format-switching </span><span class="s0">{</span><span class="s1">cls.__name__</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+		<span class="s1">converters = cls.convertersByName[fmt]</span>
+	<span class="s0">else</span><span class="s1">:</span>
+		<span class="s1">converters = cls.convertersByName</span>
+	<span class="s2"># assume if no 'VarIndexBase' field is present, table has no variable fields</span>
+	<span class="s0">if </span><span class="s3">&quot;VarIndexBase&quot; </span><span class="s0">not in </span><span class="s1">converters:</span>
+		<span class="s0">return </span><span class="s1">()</span>
+	<span class="s1">varAttrs = {}</span>
+	<span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">conv </span><span class="s0">in </span><span class="s1">converters.items():</span>
+		<span class="s1">offset = conv.getVarIndexOffset()</span>
+		<span class="s0">if </span><span class="s1">offset </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">varAttrs[name] = offset</span>
+	<span class="s0">return </span><span class="s1">tuple(sorted(varAttrs</span><span class="s0">, </span><span class="s1">key=varAttrs.__getitem__))</span>
+
+
+<span class="s2">#</span>
+<span class="s2"># Support for ValueRecords</span>
+<span class="s2">#</span>
+<span class="s2"># This data type is so different from all other OpenType data types that</span>
+<span class="s2"># it requires quite a bit of code for itself. It even has special support</span>
+<span class="s2"># in OTTableReader and OTTableWriter...</span>
+<span class="s2">#</span>
+
+<span class="s1">valueRecordFormat = [</span>
+<span class="s2">#   Mask     Name       isDevice signed</span>
+	<span class="s1">(</span><span class="s4">0x0001</span><span class="s0">, </span><span class="s3">&quot;XPlacement&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">1</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0002</span><span class="s0">, </span><span class="s3">&quot;YPlacement&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">1</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0004</span><span class="s0">, </span><span class="s3">&quot;XAdvance&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">1</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0008</span><span class="s0">, </span><span class="s3">&quot;YAdvance&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">1</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0010</span><span class="s0">, </span><span class="s3">&quot;XPlaDevice&quot;</span><span class="s0">,	</span><span class="s4">1</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0020</span><span class="s0">, </span><span class="s3">&quot;YPlaDevice&quot;</span><span class="s0">,	</span><span class="s4">1</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0040</span><span class="s0">, </span><span class="s3">&quot;XAdvDevice&quot;</span><span class="s0">,	</span><span class="s4">1</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0080</span><span class="s0">, </span><span class="s3">&quot;YAdvDevice&quot;</span><span class="s0">,	</span><span class="s4">1</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+<span class="s2">#   reserved:</span>
+	<span class="s1">(</span><span class="s4">0x0100</span><span class="s0">, </span><span class="s3">&quot;Reserved1&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0200</span><span class="s0">, </span><span class="s3">&quot;Reserved2&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0400</span><span class="s0">, </span><span class="s3">&quot;Reserved3&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x0800</span><span class="s0">, </span><span class="s3">&quot;Reserved4&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x1000</span><span class="s0">, </span><span class="s3">&quot;Reserved5&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x2000</span><span class="s0">, </span><span class="s3">&quot;Reserved6&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x4000</span><span class="s0">, </span><span class="s3">&quot;Reserved7&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+	<span class="s1">(</span><span class="s4">0x8000</span><span class="s0">, </span><span class="s3">&quot;Reserved8&quot;</span><span class="s0">,	</span><span class="s4">0</span><span class="s0">,	</span><span class="s4">0</span><span class="s1">)</span><span class="s0">,</span>
+<span class="s1">]</span>
+
+<span class="s0">def </span><span class="s1">_buildDict():</span>
+	<span class="s1">d = {}</span>
+	<span class="s0">for </span><span class="s1">mask</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed </span><span class="s0">in </span><span class="s1">valueRecordFormat:</span>
+		<span class="s1">d[name] = mask</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed</span>
+	<span class="s0">return </span><span class="s1">d</span>
+
+<span class="s1">valueRecordFormatDict = _buildDict()</span>
+
+
+<span class="s0">class </span><span class="s1">ValueRecordFactory(object):</span>
+
+	<span class="s5">&quot;&quot;&quot;Given a format code, this object convert ValueRecords.&quot;&quot;&quot;</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">valueFormat):</span>
+		<span class="s1">format = []</span>
+		<span class="s0">for </span><span class="s1">mask</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed </span><span class="s0">in </span><span class="s1">valueRecordFormat:</span>
+			<span class="s0">if </span><span class="s1">valueFormat &amp; mask:</span>
+				<span class="s1">format.append((name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed))</span>
+		<span class="s1">self.format = format</span>
+
+	<span class="s0">def </span><span class="s1">__len__(self):</span>
+		<span class="s0">return </span><span class="s1">len(self.format)</span>
+
+	<span class="s0">def </span><span class="s1">readValueRecord(self</span><span class="s0">, </span><span class="s1">reader</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s1">format = self.format</span>
+		<span class="s0">if not </span><span class="s1">format:</span>
+			<span class="s0">return None</span>
+		<span class="s1">valueRecord = ValueRecord()</span>
+		<span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed </span><span class="s0">in </span><span class="s1">format:</span>
+			<span class="s0">if </span><span class="s1">signed:</span>
+				<span class="s1">value = reader.readShort()</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">value = reader.readUShort()</span>
+			<span class="s0">if </span><span class="s1">isDevice:</span>
+				<span class="s0">if </span><span class="s1">value:</span>
+					<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">otTables</span>
+					<span class="s1">subReader = reader.getSubReader(value)</span>
+					<span class="s1">value = getattr(otTables</span><span class="s0">, </span><span class="s1">name)()</span>
+					<span class="s1">value.decompile(subReader</span><span class="s0">, </span><span class="s1">font)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">value = </span><span class="s0">None</span>
+			<span class="s1">setattr(valueRecord</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">value)</span>
+		<span class="s0">return </span><span class="s1">valueRecord</span>
+
+	<span class="s0">def </span><span class="s1">writeValueRecord(self</span><span class="s0">, </span><span class="s1">writer</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">valueRecord):</span>
+		<span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed </span><span class="s0">in </span><span class="s1">self.format:</span>
+			<span class="s1">value = getattr(valueRecord</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s4">0</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">isDevice:</span>
+				<span class="s0">if </span><span class="s1">value:</span>
+					<span class="s1">subWriter = writer.getSubWriter()</span>
+					<span class="s1">writer.writeSubTable(subWriter)</span>
+					<span class="s1">value.compile(subWriter</span><span class="s0">, </span><span class="s1">font)</span>
+				<span class="s0">else</span><span class="s1">:</span>
+					<span class="s1">writer.writeUShort(</span><span class="s4">0</span><span class="s1">)</span>
+			<span class="s0">elif </span><span class="s1">signed:</span>
+				<span class="s1">writer.writeShort(value)</span>
+			<span class="s0">else</span><span class="s1">:</span>
+				<span class="s1">writer.writeUShort(value)</span>
+
+
+<span class="s0">class </span><span class="s1">ValueRecord(object):</span>
+
+	<span class="s2"># see ValueRecordFactory</span>
+
+	<span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">valueFormat=</span><span class="s0">None, </span><span class="s1">src=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">valueFormat </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s0">for </span><span class="s1">mask</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">signed </span><span class="s0">in </span><span class="s1">valueRecordFormat:</span>
+				<span class="s0">if </span><span class="s1">valueFormat &amp; mask:</span>
+					<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, None if </span><span class="s1">isDevice </span><span class="s0">else </span><span class="s4">0</span><span class="s1">)</span>
+			<span class="s0">if </span><span class="s1">src </span><span class="s0">is not None</span><span class="s1">:</span>
+				<span class="s0">for </span><span class="s1">key</span><span class="s0">,</span><span class="s1">val </span><span class="s0">in </span><span class="s1">src.__dict__.items():</span>
+					<span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s1">key):</span>
+						<span class="s0">continue</span>
+					<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">val)</span>
+		<span class="s0">elif </span><span class="s1">src </span><span class="s0">is not None</span><span class="s1">:</span>
+			<span class="s1">self.__dict__ = src.__dict__.copy()</span>
+
+	<span class="s0">def </span><span class="s1">getFormat(self):</span>
+		<span class="s1">format = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">self.__dict__.keys():</span>
+			<span class="s1">format = format | valueRecordFormatDict[name][</span><span class="s4">0</span><span class="s1">]</span>
+		<span class="s0">return </span><span class="s1">format</span>
+
+	<span class="s0">def </span><span class="s1">getEffectiveFormat(self):</span>
+		<span class="s1">format = </span><span class="s4">0</span>
+		<span class="s0">for </span><span class="s1">name</span><span class="s0">,</span><span class="s1">value </span><span class="s0">in </span><span class="s1">self.__dict__.items():</span>
+			<span class="s0">if </span><span class="s1">value:</span>
+				<span class="s1">format = format | valueRecordFormatDict[name][</span><span class="s4">0</span><span class="s1">]</span>
+		<span class="s0">return </span><span class="s1">format</span>
+
+	<span class="s0">def </span><span class="s1">toXML(self</span><span class="s0">, </span><span class="s1">xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">valueName</span><span class="s0">, </span><span class="s1">attrs=</span><span class="s0">None</span><span class="s1">):</span>
+		<span class="s0">if </span><span class="s1">attrs </span><span class="s0">is None</span><span class="s1">:</span>
+			<span class="s1">simpleItems = []</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">simpleItems = list(attrs)</span>
+		<span class="s0">for </span><span class="s1">mask</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">format </span><span class="s0">in </span><span class="s1">valueRecordFormat[:</span><span class="s4">4</span><span class="s1">]:  </span><span class="s2"># &quot;simple&quot; values</span>
+			<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s1">name):</span>
+				<span class="s1">simpleItems.append((name</span><span class="s0">, </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">name)))</span>
+		<span class="s1">deviceItems = []</span>
+		<span class="s0">for </span><span class="s1">mask</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">isDevice</span><span class="s0">, </span><span class="s1">format </span><span class="s0">in </span><span class="s1">valueRecordFormat[</span><span class="s4">4</span><span class="s1">:</span><span class="s4">8</span><span class="s1">]:  </span><span class="s2"># device records</span>
+			<span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s1">name):</span>
+				<span class="s1">device = getattr(self</span><span class="s0">, </span><span class="s1">name)</span>
+				<span class="s0">if </span><span class="s1">device </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">deviceItems.append((name</span><span class="s0">, </span><span class="s1">device))</span>
+		<span class="s0">if </span><span class="s1">deviceItems:</span>
+			<span class="s1">xmlWriter.begintag(valueName</span><span class="s0">, </span><span class="s1">simpleItems)</span>
+			<span class="s1">xmlWriter.newline()</span>
+			<span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">deviceRecord </span><span class="s0">in </span><span class="s1">deviceItems:</span>
+				<span class="s0">if </span><span class="s1">deviceRecord </span><span class="s0">is not None</span><span class="s1">:</span>
+					<span class="s1">deviceRecord.toXML(xmlWriter</span><span class="s0">, </span><span class="s1">font</span><span class="s0">, </span><span class="s1">name=name)</span>
+			<span class="s1">xmlWriter.endtag(valueName)</span>
+			<span class="s1">xmlWriter.newline()</span>
+		<span class="s0">else</span><span class="s1">:</span>
+			<span class="s1">xmlWriter.simpletag(valueName</span><span class="s0">, </span><span class="s1">simpleItems)</span>
+			<span class="s1">xmlWriter.newline()</span>
+
+	<span class="s0">def </span><span class="s1">fromXML(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content</span><span class="s0">, </span><span class="s1">font):</span>
+		<span class="s0">from </span><span class="s1">. </span><span class="s0">import </span><span class="s1">otTables</span>
+		<span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">attrs.items():</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, </span><span class="s1">int(v))</span>
+		<span class="s0">for </span><span class="s1">element </span><span class="s0">in </span><span class="s1">content:</span>
+			<span class="s0">if not </span><span class="s1">isinstance(element</span><span class="s0">, </span><span class="s1">tuple):</span>
+				<span class="s0">continue</span>
+			<span class="s1">name</span><span class="s0">, </span><span class="s1">attrs</span><span class="s0">, </span><span class="s1">content = element</span>
+			<span class="s1">value = getattr(otTables</span><span class="s0">, </span><span class="s1">name)()</span>
+			<span class="s0">for </span><span class="s1">elem2 </span><span class="s0">in </span><span class="s1">content:</span>
+				<span class="s0">if not </span><span class="s1">isinstance(elem2</span><span class="s0">, </span><span class="s1">tuple):</span>
+					<span class="s0">continue</span>
+				<span class="s1">name2</span><span class="s0">, </span><span class="s1">attrs2</span><span class="s0">, </span><span class="s1">content2 = elem2</span>
+				<span class="s1">value.fromXML(name2</span><span class="s0">, </span><span class="s1">attrs2</span><span class="s0">, </span><span class="s1">content2</span><span class="s0">, </span><span class="s1">font)</span>
+			<span class="s1">setattr(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">value)</span>
+
+	<span class="s0">def </span><span class="s1">__ne__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s1">result = self.__eq__(other)</span>
+		<span class="s0">return </span><span class="s1">result </span><span class="s0">if </span><span class="s1">result </span><span class="s0">is </span><span class="s1">NotImplemented </span><span class="s0">else not </span><span class="s1">result</span>
+
+	<span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+		<span class="s0">if </span><span class="s1">type(self) != type(other):</span>
+			<span class="s0">return </span><span class="s1">NotImplemented</span>
+		<span class="s0">return </span><span class="s1">self.__dict__ == other.__dict__</span>
+</pre>
+</body>
+</html>

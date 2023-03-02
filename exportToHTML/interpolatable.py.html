@@ -1,0 +1,522 @@
+<html>
+<head>
+<title>interpolatable.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+interpolatable.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tool to find wrong contour order between different masters, and 
+other interpolatability (or lack thereof) issues. 
+ 
+Call as: 
+$ fonttools varLib.interpolatable font1 font2 ... 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">fontTools.pens.basePen </span><span class="s2">import </span><span class="s1">AbstractPen</span><span class="s2">, </span><span class="s1">BasePen</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.pointPen </span><span class="s2">import </span><span class="s1">SegmentToPointPen</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.recordingPen </span><span class="s2">import </span><span class="s1">RecordingPen</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.statisticsPen </span><span class="s2">import </span><span class="s1">StatisticsPen</span>
+<span class="s2">from </span><span class="s1">fontTools.pens.momentsPen </span><span class="s2">import </span><span class="s1">OpenContourError</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">OrderedDict</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s2">def </span><span class="s1">_rot_list(l</span><span class="s2">, </span><span class="s1">k):</span>
+    <span class="s0">&quot;&quot;&quot;Rotate list by k items forward.  Ie. item at position 0 will be 
+    at position k in returned list.  Negative k is allowed.&quot;&quot;&quot;</span>
+    <span class="s1">n = len(l)</span>
+    <span class="s1">k %= n</span>
+    <span class="s2">if not </span><span class="s1">k: </span><span class="s2">return </span><span class="s1">l</span>
+    <span class="s2">return </span><span class="s1">l[n-k:] + l[:n-k]</span>
+
+
+<span class="s2">class </span><span class="s1">PerContourPen(BasePen):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">Pen</span><span class="s2">, </span><span class="s1">glyphset=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">BasePen.__init__(self</span><span class="s2">, </span><span class="s1">glyphset)</span>
+        <span class="s1">self._glyphset = glyphset</span>
+        <span class="s1">self._Pen = Pen</span>
+        <span class="s1">self._pen = </span><span class="s2">None</span>
+        <span class="s1">self.value = []</span>
+
+    <span class="s2">def </span><span class="s1">_moveTo(self</span><span class="s2">, </span><span class="s1">p0):</span>
+        <span class="s1">self._newItem()</span>
+        <span class="s1">self._pen.moveTo(p0)</span>
+
+    <span class="s2">def </span><span class="s1">_lineTo(self</span><span class="s2">, </span><span class="s1">p1):</span>
+        <span class="s1">self._pen.lineTo(p1)</span>
+
+    <span class="s2">def </span><span class="s1">_qCurveToOne(self</span><span class="s2">, </span><span class="s1">p1</span><span class="s2">, </span><span class="s1">p2):</span>
+        <span class="s1">self._pen.qCurveTo(p1</span><span class="s2">, </span><span class="s1">p2)</span>
+
+    <span class="s2">def </span><span class="s1">_curveToOne(self</span><span class="s2">, </span><span class="s1">p1</span><span class="s2">, </span><span class="s1">p2</span><span class="s2">, </span><span class="s1">p3):</span>
+        <span class="s1">self._pen.curveTo(p1</span><span class="s2">, </span><span class="s1">p2</span><span class="s2">, </span><span class="s1">p3)</span>
+
+    <span class="s2">def </span><span class="s1">_closePath(self):</span>
+        <span class="s1">self._pen.closePath()</span>
+        <span class="s1">self._pen = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_endPath(self):</span>
+        <span class="s1">self._pen.endPath()</span>
+        <span class="s1">self._pen = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_newItem(self):</span>
+        <span class="s1">self._pen = pen = self._Pen()</span>
+        <span class="s1">self.value.append(pen)</span>
+
+
+<span class="s2">class </span><span class="s1">PerContourOrComponentPen(PerContourPen):</span>
+    <span class="s2">def </span><span class="s1">addComponent(self</span><span class="s2">, </span><span class="s1">glyphName</span><span class="s2">, </span><span class="s1">transformation):</span>
+        <span class="s1">self._newItem()</span>
+        <span class="s1">self.value[-</span><span class="s3">1</span><span class="s1">].addComponent(glyphName</span><span class="s2">, </span><span class="s1">transformation)</span>
+
+
+<span class="s2">class </span><span class="s1">RecordingPointPen(BasePen):</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self.value = []</span>
+
+    <span class="s2">def </span><span class="s1">beginPath(self</span><span class="s2">, </span><span class="s1">identifier = </span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">endPath(self) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">addPoint(self</span><span class="s2">, </span><span class="s1">pt</span><span class="s2">, </span><span class="s1">segmentType=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.value.append((pt</span><span class="s2">, False if </span><span class="s1">segmentType </span><span class="s2">is None else True</span><span class="s1">))</span>
+
+
+<span class="s2">def </span><span class="s1">_vdiff(v0</span><span class="s2">, </span><span class="s1">v1):</span>
+    <span class="s2">return </span><span class="s1">tuple(b - a </span><span class="s2">for </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b </span><span class="s2">in </span><span class="s1">zip(v0</span><span class="s2">, </span><span class="s1">v1))</span>
+
+
+<span class="s2">def </span><span class="s1">_vlen(vec):</span>
+    <span class="s1">v = </span><span class="s3">0</span>
+    <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">vec:</span>
+        <span class="s1">v += x * x</span>
+    <span class="s2">return </span><span class="s1">v</span>
+
+<span class="s2">def </span><span class="s1">_complex_vlen(vec):</span>
+    <span class="s1">v = </span><span class="s3">0</span>
+    <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">vec:</span>
+        <span class="s1">v += abs(x) * abs(x)</span>
+    <span class="s2">return </span><span class="s1">v</span>
+
+
+<span class="s2">def </span><span class="s1">_matching_cost(G</span><span class="s2">, </span><span class="s1">matching):</span>
+    <span class="s2">return </span><span class="s1">sum(G[i][j] </span><span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j </span><span class="s2">in </span><span class="s1">enumerate(matching))</span>
+
+
+<span class="s2">def </span><span class="s1">min_cost_perfect_bipartite_matching(G):</span>
+    <span class="s1">n = len(G)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">scipy.optimize </span><span class="s2">import </span><span class="s1">linear_sum_assignment</span>
+
+        <span class="s1">rows</span><span class="s2">, </span><span class="s1">cols = linear_sum_assignment(G)</span>
+        <span class="s2">assert </span><span class="s1">(rows == list(range(n))).all()</span>
+        <span class="s2">return </span><span class="s1">list(cols)</span><span class="s2">, </span><span class="s1">_matching_cost(G</span><span class="s2">, </span><span class="s1">cols)</span>
+    <span class="s2">except </span><span class="s1">ImportError:</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">munkres </span><span class="s2">import </span><span class="s1">Munkres</span>
+
+        <span class="s1">cols = [</span><span class="s2">None</span><span class="s1">] * n</span>
+        <span class="s2">for </span><span class="s1">row</span><span class="s2">, </span><span class="s1">col </span><span class="s2">in </span><span class="s1">Munkres().compute(G):</span>
+            <span class="s1">cols[row] = col</span>
+        <span class="s2">return </span><span class="s1">cols</span><span class="s2">, </span><span class="s1">_matching_cost(G</span><span class="s2">, </span><span class="s1">cols)</span>
+    <span class="s2">except </span><span class="s1">ImportError:</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">if </span><span class="s1">n &gt; </span><span class="s3">6</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">Exception(</span><span class="s4">&quot;Install Python module 'munkres' or 'scipy &gt;= 0.17.0'&quot;</span><span class="s1">)</span>
+
+    <span class="s5"># Otherwise just brute-force</span>
+    <span class="s1">permutations = itertools.permutations(range(n))</span>
+    <span class="s1">best = list(next(permutations))</span>
+    <span class="s1">best_cost = _matching_cost(G</span><span class="s2">, </span><span class="s1">best)</span>
+    <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">permutations:</span>
+        <span class="s1">cost = _matching_cost(G</span><span class="s2">, </span><span class="s1">p)</span>
+        <span class="s2">if </span><span class="s1">cost &lt; best_cost:</span>
+            <span class="s1">best</span><span class="s2">, </span><span class="s1">best_cost = list(p)</span><span class="s2">, </span><span class="s1">cost</span>
+    <span class="s2">return </span><span class="s1">best</span><span class="s2">, </span><span class="s1">best_cost</span>
+
+
+<span class="s2">def </span><span class="s1">test(glyphsets</span><span class="s2">, </span><span class="s1">glyphs=</span><span class="s2">None, </span><span class="s1">names=</span><span class="s2">None</span><span class="s1">):</span>
+
+    <span class="s2">if </span><span class="s1">names </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">names = glyphsets</span>
+    <span class="s2">if </span><span class="s1">glyphs </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">glyphs = glyphsets[</span><span class="s3">0</span><span class="s1">].keys()</span>
+
+    <span class="s1">hist = []</span>
+    <span class="s1">problems = OrderedDict()</span>
+
+    <span class="s2">def </span><span class="s1">add_problem(glyphname</span><span class="s2">, </span><span class="s1">problem):</span>
+        <span class="s1">problems.setdefault(glyphname</span><span class="s2">, </span><span class="s1">[]).append(problem)</span>
+
+    <span class="s2">for </span><span class="s1">glyph_name </span><span class="s2">in </span><span class="s1">glyphs:</span>
+        <span class="s5"># print()</span>
+        <span class="s5"># print(glyph_name)</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">allVectors = []</span>
+            <span class="s1">allNodeTypes = []</span>
+            <span class="s1">allContourIsomorphisms = []</span>
+            <span class="s2">for </span><span class="s1">glyphset</span><span class="s2">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">zip(glyphsets</span><span class="s2">, </span><span class="s1">names):</span>
+                <span class="s5"># print('.', end='')</span>
+                <span class="s2">if </span><span class="s1">glyph_name </span><span class="s2">not in </span><span class="s1">glyphset:</span>
+                    <span class="s1">add_problem(glyph_name</span><span class="s2">, </span><span class="s1">{</span><span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;missing&quot;</span><span class="s2">, </span><span class="s4">&quot;master&quot;</span><span class="s1">: name})</span>
+                    <span class="s2">continue</span>
+                <span class="s1">glyph = glyphset[glyph_name]</span>
+
+                <span class="s1">perContourPen = PerContourOrComponentPen(</span>
+                    <span class="s1">RecordingPen</span><span class="s2">, </span><span class="s1">glyphset=glyphset</span>
+                <span class="s1">)</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    <span class="s1">glyph.draw(perContourPen</span><span class="s2">, </span><span class="s1">outputImpliedClosingLine=</span><span class="s2">True</span><span class="s1">)</span>
+                <span class="s2">except </span><span class="s1">TypeError:</span>
+                    <span class="s1">glyph.draw(perContourPen)</span>
+                <span class="s1">contourPens = perContourPen.value</span>
+                <span class="s2">del </span><span class="s1">perContourPen</span>
+
+                <span class="s1">contourVectors = []</span>
+                <span class="s1">contourIsomorphisms = []</span>
+                <span class="s1">nodeTypes = []</span>
+                <span class="s1">allNodeTypes.append(nodeTypes)</span>
+                <span class="s1">allVectors.append(contourVectors)</span>
+                <span class="s1">allContourIsomorphisms.append(contourIsomorphisms)</span>
+                <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">contour </span><span class="s2">in </span><span class="s1">enumerate(contourPens):</span>
+
+                    <span class="s1">nodeVecs = tuple(instruction[</span><span class="s3">0</span><span class="s1">] </span><span class="s2">for </span><span class="s1">instruction </span><span class="s2">in </span><span class="s1">contour.value)</span>
+                    <span class="s1">nodeTypes.append(nodeVecs)</span>
+
+                    <span class="s1">stats = StatisticsPen(glyphset=glyphset)</span>
+                    <span class="s2">try</span><span class="s1">:</span>
+                        <span class="s1">contour.replay(stats)</span>
+                    <span class="s2">except </span><span class="s1">OpenContourError </span><span class="s2">as </span><span class="s1">e:</span>
+                        <span class="s1">add_problem(</span>
+                            <span class="s1">glyph_name</span><span class="s2">,</span>
+                            <span class="s1">{</span><span class="s4">&quot;master&quot;</span><span class="s1">: name</span><span class="s2">, </span><span class="s4">&quot;contour&quot;</span><span class="s1">: ix</span><span class="s2">, </span><span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;open_path&quot;</span><span class="s1">}</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+                        <span class="s2">continue</span>
+                    <span class="s1">size = abs(stats.area) ** </span><span class="s3">0.5 </span><span class="s1">* </span><span class="s3">0.5</span>
+                    <span class="s1">vector = (</span>
+                        <span class="s1">int(size)</span><span class="s2">,</span>
+                        <span class="s1">int(stats.meanX)</span><span class="s2">,</span>
+                        <span class="s1">int(stats.meanY)</span><span class="s2">,</span>
+                        <span class="s1">int(stats.stddevX * </span><span class="s3">2</span><span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">int(stats.stddevY * </span><span class="s3">2</span><span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">int(stats.correlation * size)</span><span class="s2">,</span>
+                    <span class="s1">)</span>
+                    <span class="s1">contourVectors.append(vector)</span>
+                    <span class="s5"># print(vector)</span>
+
+                    <span class="s5"># Check starting point</span>
+                    <span class="s2">if </span><span class="s1">nodeVecs[</span><span class="s3">0</span><span class="s1">] == </span><span class="s4">'addComponent'</span><span class="s1">:</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">assert </span><span class="s1">nodeVecs[</span><span class="s3">0</span><span class="s1">] == </span><span class="s4">'moveTo'</span>
+                    <span class="s2">assert </span><span class="s1">nodeVecs[-</span><span class="s3">1</span><span class="s1">] </span><span class="s2">in </span><span class="s1">(</span><span class="s4">'closePath'</span><span class="s2">, </span><span class="s4">'endPath'</span><span class="s1">)</span>
+                    <span class="s1">points = RecordingPointPen()</span>
+                    <span class="s1">converter = SegmentToPointPen(points</span><span class="s2">, False</span><span class="s1">)</span>
+                    <span class="s1">contour.replay(converter)</span>
+                    <span class="s5"># points.value is a list of pt,bool where bool is true if on-curve and false if off-curve;</span>
+                    <span class="s5"># now check all rotations and mirror-rotations of the contour and build list of isomorphic</span>
+                    <span class="s5"># possible starting points.</span>
+                    <span class="s1">bits = </span><span class="s3">0</span>
+                    <span class="s2">for </span><span class="s1">pt</span><span class="s2">,</span><span class="s1">b </span><span class="s2">in </span><span class="s1">points.value:</span>
+                        <span class="s1">bits = (bits &lt;&lt; </span><span class="s3">1</span><span class="s1">) | b</span>
+                    <span class="s1">n = len(points.value)</span>
+                    <span class="s1">mask = (</span><span class="s3">1 </span><span class="s1">&lt;&lt; n ) - </span><span class="s3">1</span>
+                    <span class="s1">isomorphisms = []</span>
+                    <span class="s1">contourIsomorphisms.append(isomorphisms)</span>
+                    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n):</span>
+                        <span class="s1">b = ((bits &lt;&lt; i) &amp; mask) | ((bits &gt;&gt; (n - i)))</span>
+                        <span class="s2">if </span><span class="s1">b == bits:</span>
+                            <span class="s1">isomorphisms.append(_rot_list ([complex(*pt) </span><span class="s2">for </span><span class="s1">pt</span><span class="s2">,</span><span class="s1">bl </span><span class="s2">in </span><span class="s1">points.value]</span><span class="s2">, </span><span class="s1">i))</span>
+                    <span class="s5"># Add mirrored rotations</span>
+                    <span class="s1">mirrored = list(reversed(points.value))</span>
+                    <span class="s1">reversed_bits = </span><span class="s3">0</span>
+                    <span class="s2">for </span><span class="s1">pt</span><span class="s2">,</span><span class="s1">b </span><span class="s2">in </span><span class="s1">mirrored:</span>
+                        <span class="s1">reversed_bits = (reversed_bits &lt;&lt; </span><span class="s3">1</span><span class="s1">) | b</span>
+                    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n):</span>
+                        <span class="s1">b = ((reversed_bits &lt;&lt; i) &amp; mask) | ((reversed_bits &gt;&gt; (n - i)))</span>
+                        <span class="s2">if </span><span class="s1">b == bits:</span>
+                            <span class="s1">isomorphisms.append(_rot_list ([complex(*pt) </span><span class="s2">for </span><span class="s1">pt</span><span class="s2">,</span><span class="s1">bl </span><span class="s2">in </span><span class="s1">mirrored]</span><span class="s2">, </span><span class="s1">i))</span>
+
+            <span class="s5"># Check each master against the first on in the list.</span>
+            <span class="s1">m0 = allNodeTypes[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">m1 </span><span class="s2">in </span><span class="s1">enumerate(allNodeTypes[</span><span class="s3">1</span><span class="s1">:]):</span>
+                <span class="s2">if </span><span class="s1">len(m0) != len(m1):</span>
+                    <span class="s1">add_problem(</span>
+                        <span class="s1">glyph_name</span><span class="s2">,</span>
+                        <span class="s1">{</span>
+                            <span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;path_count&quot;</span><span class="s2">,</span>
+                            <span class="s4">&quot;master_1&quot;</span><span class="s1">: names[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s4">&quot;master_2&quot;</span><span class="s1">: names[i + </span><span class="s3">1</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s4">&quot;value_1&quot;</span><span class="s1">: len(m0)</span><span class="s2">,</span>
+                            <span class="s4">&quot;value_2&quot;</span><span class="s1">: len(m1)</span><span class="s2">,</span>
+                        <span class="s1">}</span><span class="s2">,</span>
+                    <span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">m0 == m1:</span>
+                    <span class="s2">continue</span>
+                <span class="s2">for </span><span class="s1">pathIx</span><span class="s2">, </span><span class="s1">(nodes1</span><span class="s2">, </span><span class="s1">nodes2) </span><span class="s2">in </span><span class="s1">enumerate(zip(m0</span><span class="s2">, </span><span class="s1">m1)):</span>
+                    <span class="s2">if </span><span class="s1">nodes1 == nodes2:</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">if </span><span class="s1">len(nodes1) != len(nodes2):</span>
+                        <span class="s1">add_problem(</span>
+                            <span class="s1">glyph_name</span><span class="s2">,</span>
+                            <span class="s1">{</span>
+                                <span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;node_count&quot;</span><span class="s2">,</span>
+                                <span class="s4">&quot;path&quot;</span><span class="s1">: pathIx</span><span class="s2">,</span>
+                                <span class="s4">&quot;master_1&quot;</span><span class="s1">: names[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                                <span class="s4">&quot;master_2&quot;</span><span class="s1">: names[i + </span><span class="s3">1</span><span class="s1">]</span><span class="s2">,</span>
+                                <span class="s4">&quot;value_1&quot;</span><span class="s1">: len(nodes1)</span><span class="s2">,</span>
+                                <span class="s4">&quot;value_2&quot;</span><span class="s1">: len(nodes2)</span><span class="s2">,</span>
+                            <span class="s1">}</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">for </span><span class="s1">nodeIx</span><span class="s2">, </span><span class="s1">(n1</span><span class="s2">, </span><span class="s1">n2) </span><span class="s2">in </span><span class="s1">enumerate(zip(nodes1</span><span class="s2">, </span><span class="s1">nodes2)):</span>
+                        <span class="s2">if </span><span class="s1">n1 != n2:</span>
+                            <span class="s1">add_problem(</span>
+                                <span class="s1">glyph_name</span><span class="s2">,</span>
+                                <span class="s1">{</span>
+                                    <span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;node_incompatibility&quot;</span><span class="s2">,</span>
+                                    <span class="s4">&quot;path&quot;</span><span class="s1">: pathIx</span><span class="s2">,</span>
+                                    <span class="s4">&quot;node&quot;</span><span class="s1">: nodeIx</span><span class="s2">,</span>
+                                    <span class="s4">&quot;master_1&quot;</span><span class="s1">: names[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                                    <span class="s4">&quot;master_2&quot;</span><span class="s1">: names[i + </span><span class="s3">1</span><span class="s1">]</span><span class="s2">,</span>
+                                    <span class="s4">&quot;value_1&quot;</span><span class="s1">: n1</span><span class="s2">,</span>
+                                    <span class="s4">&quot;value_2&quot;</span><span class="s1">: n2</span><span class="s2">,</span>
+                                <span class="s1">}</span><span class="s2">,</span>
+                            <span class="s1">)</span>
+                            <span class="s2">continue</span>
+
+            <span class="s1">m0 = allVectors[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">m1 </span><span class="s2">in </span><span class="s1">enumerate(allVectors[</span><span class="s3">1</span><span class="s1">:]):</span>
+                <span class="s2">if </span><span class="s1">len(m0) != len(m1):</span>
+                    <span class="s5"># We already reported this</span>
+                    <span class="s2">continue</span>
+                <span class="s2">if not </span><span class="s1">m0:</span>
+                    <span class="s2">continue</span>
+                <span class="s1">costs = [[_vlen(_vdiff(v0</span><span class="s2">, </span><span class="s1">v1)) </span><span class="s2">for </span><span class="s1">v1 </span><span class="s2">in </span><span class="s1">m1] </span><span class="s2">for </span><span class="s1">v0 </span><span class="s2">in </span><span class="s1">m0]</span>
+                <span class="s1">matching</span><span class="s2">, </span><span class="s1">matching_cost = min_cost_perfect_bipartite_matching(costs)</span>
+                <span class="s1">identity_matching = list(range(len(m0)))</span>
+                <span class="s1">identity_cost = sum(costs[i][i] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(m0)))</span>
+                <span class="s2">if </span><span class="s1">matching != identity_matching </span><span class="s2">and </span><span class="s1">matching_cost &lt; identity_cost * </span><span class="s3">.95</span><span class="s1">:</span>
+                    <span class="s1">add_problem(</span>
+                        <span class="s1">glyph_name</span><span class="s2">,</span>
+                        <span class="s1">{</span>
+                            <span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;contour_order&quot;</span><span class="s2">,</span>
+                            <span class="s4">&quot;master_1&quot;</span><span class="s1">: names[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s4">&quot;master_2&quot;</span><span class="s1">: names[i + </span><span class="s3">1</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s4">&quot;value_1&quot;</span><span class="s1">: list(range(len(m0)))</span><span class="s2">,</span>
+                            <span class="s4">&quot;value_2&quot;</span><span class="s1">: matching</span><span class="s2">,</span>
+                        <span class="s1">}</span><span class="s2">,</span>
+                    <span class="s1">)</span>
+                    <span class="s2">break</span>
+
+            <span class="s1">m0 = allContourIsomorphisms[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">m1 </span><span class="s2">in </span><span class="s1">enumerate(allContourIsomorphisms[</span><span class="s3">1</span><span class="s1">:]):</span>
+                <span class="s2">if </span><span class="s1">len(m0) != len(m1):</span>
+                    <span class="s5"># We already reported this</span>
+                    <span class="s2">continue</span>
+                <span class="s2">if not </span><span class="s1">m0:</span>
+                    <span class="s2">continue</span>
+                <span class="s2">for </span><span class="s1">ix</span><span class="s2">,</span><span class="s1">(contour0</span><span class="s2">,</span><span class="s1">contour1) </span><span class="s2">in </span><span class="s1">enumerate(zip(m0</span><span class="s2">,</span><span class="s1">m1)):</span>
+                    <span class="s1">c0 = contour0[</span><span class="s3">0</span><span class="s1">]</span>
+                    <span class="s1">costs = [v </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">(_complex_vlen(_vdiff(c0</span><span class="s2">, </span><span class="s1">c1)) </span><span class="s2">for </span><span class="s1">c1 </span><span class="s2">in </span><span class="s1">contour1)]</span>
+                    <span class="s1">min_cost = min(costs)</span>
+                    <span class="s1">first_cost = costs[</span><span class="s3">0</span><span class="s1">]</span>
+                    <span class="s2">if </span><span class="s1">min_cost &lt; first_cost * </span><span class="s3">.95</span><span class="s1">:</span>
+                        <span class="s1">add_problem(</span>
+                            <span class="s1">glyph_name</span><span class="s2">,</span>
+                            <span class="s1">{</span>
+                                <span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;wrong_start_point&quot;</span><span class="s2">,</span>
+                                <span class="s4">&quot;contour&quot;</span><span class="s1">: ix</span><span class="s2">,</span>
+                                <span class="s4">&quot;master_1&quot;</span><span class="s1">: names[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span>
+                                <span class="s4">&quot;master_2&quot;</span><span class="s1">: names[i + </span><span class="s3">1</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">}</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+
+        <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e:</span>
+            <span class="s1">add_problem(</span>
+                <span class="s1">glyph_name</span><span class="s2">,</span>
+                <span class="s1">{</span><span class="s4">&quot;type&quot;</span><span class="s1">: </span><span class="s4">&quot;math_error&quot;</span><span class="s2">, </span><span class="s4">&quot;master&quot;</span><span class="s1">: name</span><span class="s2">, </span><span class="s4">&quot;error&quot;</span><span class="s1">: e}</span><span class="s2">,</span>
+            <span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">problems</span>
+
+
+<span class="s2">def </span><span class="s1">main(args=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Test for interpolatability issues between fonts&quot;&quot;&quot;</span>
+    <span class="s2">import </span><span class="s1">argparse</span>
+
+    <span class="s1">parser = argparse.ArgumentParser(</span>
+        <span class="s4">&quot;fonttools varLib.interpolatable&quot;</span><span class="s2">,</span>
+        <span class="s1">description=main.__doc__</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s4">&quot;--json&quot;</span><span class="s2">,</span>
+        <span class="s1">action=</span><span class="s4">&quot;store_true&quot;</span><span class="s2">,</span>
+        <span class="s1">help=</span><span class="s4">&quot;Output report in JSON format&quot;</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s4">&quot;inputs&quot;</span><span class="s2">, </span><span class="s1">metavar=</span><span class="s4">&quot;FILE&quot;</span><span class="s2">, </span><span class="s1">type=str</span><span class="s2">, </span><span class="s1">nargs=</span><span class="s4">&quot;+&quot;</span><span class="s2">, </span><span class="s1">help=</span><span class="s4">&quot;Input TTF/UFO files&quot;</span>
+    <span class="s1">)</span>
+
+    <span class="s1">args = parser.parse_args(args)</span>
+    <span class="s1">glyphs = </span><span class="s2">None</span>
+    <span class="s5"># glyphs = ['uni08DB', 'uniFD76']</span>
+    <span class="s5"># glyphs = ['uni08DE', 'uni0034']</span>
+    <span class="s5"># glyphs = ['uni08DE', 'uni0034', 'uni0751', 'uni0753', 'uni0754', 'uni08A4', 'uni08A4.fina', 'uni08A5.fina']</span>
+
+    <span class="s2">from </span><span class="s1">os.path </span><span class="s2">import </span><span class="s1">basename</span>
+
+    <span class="s1">fonts = []</span>
+    <span class="s1">names = []</span>
+
+    <span class="s2">if </span><span class="s1">len(args.inputs) == </span><span class="s3">1</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">args.inputs[</span><span class="s3">0</span><span class="s1">].endswith(</span><span class="s4">'.designspace'</span><span class="s1">):</span>
+            <span class="s2">from </span><span class="s1">fontTools.designspaceLib </span><span class="s2">import </span><span class="s1">DesignSpaceDocument</span>
+            <span class="s1">designspace = DesignSpaceDocument.fromfile(args.inputs[</span><span class="s3">0</span><span class="s1">])</span>
+            <span class="s1">args.inputs = [master.path </span><span class="s2">for </span><span class="s1">master </span><span class="s2">in </span><span class="s1">designspace.sources]</span>
+
+        <span class="s2">elif </span><span class="s1">args.inputs[</span><span class="s3">0</span><span class="s1">].endswith(</span><span class="s4">'.glyphs'</span><span class="s1">):</span>
+            <span class="s2">from </span><span class="s1">glyphsLib </span><span class="s2">import </span><span class="s1">GSFont</span><span class="s2">, </span><span class="s1">to_ufos</span>
+            <span class="s1">gsfont = GSFont(args.inputs[</span><span class="s3">0</span><span class="s1">])</span>
+            <span class="s1">fonts.extend(to_ufos(gsfont))</span>
+            <span class="s1">names = [</span><span class="s4">'%s-%s' </span><span class="s1">% (f.info.familyName</span><span class="s2">, </span><span class="s1">f.info.styleName) </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">fonts]</span>
+            <span class="s1">args.inputs = []</span>
+
+        <span class="s2">elif </span><span class="s1">args.inputs[</span><span class="s3">0</span><span class="s1">].endswith(</span><span class="s4">'.ttf'</span><span class="s1">):</span>
+            <span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">TTFont</span>
+            <span class="s1">font = TTFont(args.inputs[</span><span class="s3">0</span><span class="s1">])</span>
+            <span class="s2">if </span><span class="s4">'gvar' </span><span class="s2">in </span><span class="s1">font:</span>
+                <span class="s5"># Is variable font</span>
+                <span class="s1">gvar = font[</span><span class="s4">'gvar'</span><span class="s1">]</span>
+                <span class="s5"># Gather all &quot;master&quot; locations</span>
+                <span class="s1">locs = set()</span>
+                <span class="s2">for </span><span class="s1">variations </span><span class="s2">in </span><span class="s1">gvar.variations.values():</span>
+                    <span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">variations:</span>
+                        <span class="s1">loc = []</span>
+                        <span class="s2">for </span><span class="s1">tag</span><span class="s2">,</span><span class="s1">val </span><span class="s2">in </span><span class="s1">sorted(var.axes.items()):</span>
+                            <span class="s1">loc.append((tag</span><span class="s2">,</span><span class="s1">val[</span><span class="s3">1</span><span class="s1">]))</span>
+                        <span class="s1">locs.add(tuple(loc))</span>
+                <span class="s5"># Rebuild locs as dictionaries</span>
+                <span class="s1">new_locs = [{}]</span>
+                <span class="s1">names.append(</span><span class="s4">&quot;()&quot;</span><span class="s1">)</span>
+                <span class="s2">for </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">sorted(locs</span><span class="s2">, </span><span class="s1">key=</span><span class="s2">lambda </span><span class="s1">v: (len(v)</span><span class="s2">, </span><span class="s1">v)):</span>
+                    <span class="s1">names.append(str(loc))</span>
+                    <span class="s1">l = {}</span>
+                    <span class="s2">for </span><span class="s1">tag</span><span class="s2">,</span><span class="s1">val </span><span class="s2">in </span><span class="s1">loc:</span>
+                        <span class="s1">l[tag] = val</span>
+                    <span class="s1">new_locs.append(l)</span>
+                <span class="s1">locs = new_locs</span>
+                <span class="s2">del </span><span class="s1">new_locs</span>
+                <span class="s5"># locs is all master locations now</span>
+
+                <span class="s2">for </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">locs:</span>
+                    <span class="s1">fonts.append(font.getGlyphSet(location=loc</span><span class="s2">, </span><span class="s1">normalized=</span><span class="s2">True</span><span class="s1">))</span>
+
+                <span class="s1">args.inputs = []</span>
+
+
+    <span class="s2">for </span><span class="s1">filename </span><span class="s2">in </span><span class="s1">args.inputs:</span>
+        <span class="s2">if </span><span class="s1">filename.endswith(</span><span class="s4">&quot;.ufo&quot;</span><span class="s1">):</span>
+            <span class="s2">from </span><span class="s1">fontTools.ufoLib </span><span class="s2">import </span><span class="s1">UFOReader</span>
+            <span class="s1">fonts.append(UFOReader(filename))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">from </span><span class="s1">fontTools.ttLib </span><span class="s2">import </span><span class="s1">TTFont</span>
+            <span class="s1">fonts.append(TTFont(filename))</span>
+
+        <span class="s1">names.append(basename(filename).rsplit(</span><span class="s4">&quot;.&quot;</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)[</span><span class="s3">0</span><span class="s1">])</span>
+
+    <span class="s2">if </span><span class="s1">hasattr(fonts[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s4">'getGlyphSet'</span><span class="s1">):</span>
+        <span class="s1">glyphsets = [font.getGlyphSet() </span><span class="s2">for </span><span class="s1">font </span><span class="s2">in </span><span class="s1">fonts]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">glyphsets = fonts</span>
+
+    <span class="s1">problems = test(glyphsets</span><span class="s2">, </span><span class="s1">glyphs=glyphs</span><span class="s2">, </span><span class="s1">names=names)</span>
+    <span class="s2">if </span><span class="s1">args.json:</span>
+        <span class="s2">import </span><span class="s1">json</span>
+
+        <span class="s1">print(json.dumps(problems))</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">for </span><span class="s1">glyph</span><span class="s2">, </span><span class="s1">glyph_problems </span><span class="s2">in </span><span class="s1">problems.items():</span>
+            <span class="s1">print(</span><span class="s4">f&quot;Glyph </span><span class="s2">{</span><span class="s1">glyph</span><span class="s2">} </span><span class="s4">was not compatible: &quot;</span><span class="s1">)</span>
+            <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">glyph_problems:</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;missing&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span><span class="s4">&quot;    Glyph was missing in master %s&quot; </span><span class="s1">% p[</span><span class="s4">&quot;master&quot;</span><span class="s1">])</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;open_path&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span><span class="s4">&quot;    Glyph has an open path in master %s&quot; </span><span class="s1">% p[</span><span class="s4">&quot;master&quot;</span><span class="s1">])</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;path_count&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span>
+                        <span class="s4">&quot;    Path count differs: %i in %s, %i in %s&quot;</span>
+                        <span class="s1">% (p[</span><span class="s4">&quot;value_1&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">p[</span><span class="s4">&quot;master_1&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">p[</span><span class="s4">&quot;value_2&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">p[</span><span class="s4">&quot;master_2&quot;</span><span class="s1">])</span>
+                    <span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;node_count&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span>
+                        <span class="s4">&quot;    Node count differs in path %i: %i in %s, %i in %s&quot;</span>
+                        <span class="s1">% (</span>
+                            <span class="s1">p[</span><span class="s4">&quot;path&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;value_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;value_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;node_incompatibility&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span>
+                        <span class="s4">&quot;    Node %o incompatible in path %i: %s in %s, %s in %s&quot;</span>
+                        <span class="s1">% (</span>
+                            <span class="s1">p[</span><span class="s4">&quot;node&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;path&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;value_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;value_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;contour_order&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span>
+                        <span class="s4">&quot;    Contour order differs: %s in %s, %s in %s&quot;</span>
+                        <span class="s1">% (</span>
+                            <span class="s1">p[</span><span class="s4">&quot;value_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;value_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">p[</span><span class="s4">&quot;type&quot;</span><span class="s1">] == </span><span class="s4">&quot;wrong_start_point&quot;</span><span class="s1">:</span>
+                    <span class="s1">print(</span>
+                        <span class="s4">&quot;    Contour %d start point differs: %s, %s&quot;</span>
+                        <span class="s1">% (</span>
+                            <span class="s1">p[</span><span class="s4">&quot;contour&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_1&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                            <span class="s1">p[</span><span class="s4">&quot;master_2&quot;</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">problems:</span>
+        <span class="s2">return </span><span class="s1">problems</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s4">&quot;__main__&quot;</span><span class="s1">:</span>
+    <span class="s2">import </span><span class="s1">sys</span>
+
+    <span class="s1">problems = main()</span>
+    <span class="s1">sys.exit(int(bool(problems)))</span>
+</pre>
+</body>
+</html>

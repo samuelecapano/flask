@@ -1,0 +1,1573 @@
+<html>
+<head>
+<title>font_manager.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+font_manager.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A module for finding, managing, and using fonts across platforms. 
+ 
+This module provides a single `FontManager` instance, ``fontManager``, that can 
+be shared across backends and platforms.  The `findfont` 
+function returns the best TrueType (TTF) font file in the local or 
+system font path that matches the specified `FontProperties` 
+instance.  The `FontManager` also handles Adobe Font Metrics 
+(AFM) font files for use by the PostScript backend. 
+ 
+The design is based on the `W3C Cascading Style Sheet, Level 1 (CSS1) 
+font specification &lt;http://www.w3.org/TR/1998/REC-CSS2-19980512/&gt;`_. 
+Future versions may implement the Level 2 or 2.1 specifications. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># KNOWN ISSUES</span>
+<span class="s2">#</span>
+<span class="s2">#   - documentation</span>
+<span class="s2">#   - font variant is untested</span>
+<span class="s2">#   - font stretch is incomplete</span>
+<span class="s2">#   - font size is incomplete</span>
+<span class="s2">#   - default font algorithm needs improvement and testing</span>
+<span class="s2">#   - setWeights function needs improvement</span>
+<span class="s2">#   - 'light' is an invalid weight value, remove it.</span>
+
+<span class="s3">from </span><span class="s1">base64 </span><span class="s3">import </span><span class="s1">b64encode</span>
+<span class="s3">import </span><span class="s1">copy</span>
+<span class="s3">import </span><span class="s1">dataclasses</span>
+<span class="s3">from </span><span class="s1">functools </span><span class="s3">import </span><span class="s1">lru_cache</span>
+<span class="s3">from </span><span class="s1">io </span><span class="s3">import </span><span class="s1">BytesIO</span>
+<span class="s3">import </span><span class="s1">json</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Number</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">from </span><span class="s1">pathlib </span><span class="s3">import </span><span class="s1">Path</span>
+<span class="s3">import </span><span class="s1">re</span>
+<span class="s3">import </span><span class="s1">subprocess</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">threading</span>
+
+<span class="s3">import </span><span class="s1">matplotlib </span><span class="s3">as </span><span class="s1">mpl</span>
+<span class="s3">from </span><span class="s1">matplotlib </span><span class="s3">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">_afm</span><span class="s3">, </span><span class="s1">cbook</span><span class="s3">, </span><span class="s1">ft2font</span>
+<span class="s3">from </span><span class="s1">matplotlib._fontconfig_pattern </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">parse_fontconfig_pattern</span><span class="s3">, </span><span class="s1">generate_fontconfig_pattern)</span>
+<span class="s3">from </span><span class="s1">matplotlib.rcsetup </span><span class="s3">import </span><span class="s1">_validators</span>
+
+<span class="s1">_log = logging.getLogger(__name__)</span>
+
+<span class="s1">font_scalings = {</span>
+    <span class="s4">'xx-small'</span><span class="s1">: </span><span class="s5">0.579</span><span class="s3">,</span>
+    <span class="s4">'x-small'</span><span class="s1">:  </span><span class="s5">0.694</span><span class="s3">,</span>
+    <span class="s4">'small'</span><span class="s1">:    </span><span class="s5">0.833</span><span class="s3">,</span>
+    <span class="s4">'medium'</span><span class="s1">:   </span><span class="s5">1.0</span><span class="s3">,</span>
+    <span class="s4">'large'</span><span class="s1">:    </span><span class="s5">1.200</span><span class="s3">,</span>
+    <span class="s4">'x-large'</span><span class="s1">:  </span><span class="s5">1.440</span><span class="s3">,</span>
+    <span class="s4">'xx-large'</span><span class="s1">: </span><span class="s5">1.728</span><span class="s3">,</span>
+    <span class="s4">'larger'</span><span class="s1">:   </span><span class="s5">1.2</span><span class="s3">,</span>
+    <span class="s4">'smaller'</span><span class="s1">:  </span><span class="s5">0.833</span><span class="s3">,</span>
+    <span class="s3">None</span><span class="s1">:       </span><span class="s5">1.0</span><span class="s3">,</span>
+<span class="s1">}</span>
+<span class="s1">stretch_dict = {</span>
+    <span class="s4">'ultra-condensed'</span><span class="s1">: </span><span class="s5">100</span><span class="s3">,</span>
+    <span class="s4">'extra-condensed'</span><span class="s1">: </span><span class="s5">200</span><span class="s3">,</span>
+    <span class="s4">'condensed'</span><span class="s1">:       </span><span class="s5">300</span><span class="s3">,</span>
+    <span class="s4">'semi-condensed'</span><span class="s1">:  </span><span class="s5">400</span><span class="s3">,</span>
+    <span class="s4">'normal'</span><span class="s1">:          </span><span class="s5">500</span><span class="s3">,</span>
+    <span class="s4">'semi-expanded'</span><span class="s1">:   </span><span class="s5">600</span><span class="s3">,</span>
+    <span class="s4">'semi-extended'</span><span class="s1">:   </span><span class="s5">600</span><span class="s3">,</span>
+    <span class="s4">'expanded'</span><span class="s1">:        </span><span class="s5">700</span><span class="s3">,</span>
+    <span class="s4">'extended'</span><span class="s1">:        </span><span class="s5">700</span><span class="s3">,</span>
+    <span class="s4">'extra-expanded'</span><span class="s1">:  </span><span class="s5">800</span><span class="s3">,</span>
+    <span class="s4">'extra-extended'</span><span class="s1">:  </span><span class="s5">800</span><span class="s3">,</span>
+    <span class="s4">'ultra-expanded'</span><span class="s1">:  </span><span class="s5">900</span><span class="s3">,</span>
+    <span class="s4">'ultra-extended'</span><span class="s1">:  </span><span class="s5">900</span><span class="s3">,</span>
+<span class="s1">}</span>
+<span class="s1">weight_dict = {</span>
+    <span class="s4">'ultralight'</span><span class="s1">: </span><span class="s5">100</span><span class="s3">,</span>
+    <span class="s4">'light'</span><span class="s1">:      </span><span class="s5">200</span><span class="s3">,</span>
+    <span class="s4">'normal'</span><span class="s1">:     </span><span class="s5">400</span><span class="s3">,</span>
+    <span class="s4">'regular'</span><span class="s1">:    </span><span class="s5">400</span><span class="s3">,</span>
+    <span class="s4">'book'</span><span class="s1">:       </span><span class="s5">400</span><span class="s3">,</span>
+    <span class="s4">'medium'</span><span class="s1">:     </span><span class="s5">500</span><span class="s3">,</span>
+    <span class="s4">'roman'</span><span class="s1">:      </span><span class="s5">500</span><span class="s3">,</span>
+    <span class="s4">'semibold'</span><span class="s1">:   </span><span class="s5">600</span><span class="s3">,</span>
+    <span class="s4">'demibold'</span><span class="s1">:   </span><span class="s5">600</span><span class="s3">,</span>
+    <span class="s4">'demi'</span><span class="s1">:       </span><span class="s5">600</span><span class="s3">,</span>
+    <span class="s4">'bold'</span><span class="s1">:       </span><span class="s5">700</span><span class="s3">,</span>
+    <span class="s4">'heavy'</span><span class="s1">:      </span><span class="s5">800</span><span class="s3">,</span>
+    <span class="s4">'extra bold'</span><span class="s1">: </span><span class="s5">800</span><span class="s3">,</span>
+    <span class="s4">'black'</span><span class="s1">:      </span><span class="s5">900</span><span class="s3">,</span>
+<span class="s1">}</span>
+<span class="s1">_weight_regexes = [</span>
+    <span class="s2"># From fontconfig's FcFreeTypeQueryFaceInternal; not the same as</span>
+    <span class="s2"># weight_dict!</span>
+    <span class="s1">(</span><span class="s4">&quot;thin&quot;</span><span class="s3">, </span><span class="s5">100</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;extralight&quot;</span><span class="s3">, </span><span class="s5">200</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;ultralight&quot;</span><span class="s3">, </span><span class="s5">200</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;demilight&quot;</span><span class="s3">, </span><span class="s5">350</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;semilight&quot;</span><span class="s3">, </span><span class="s5">350</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;light&quot;</span><span class="s3">, </span><span class="s5">300</span><span class="s1">)</span><span class="s3">,  </span><span class="s2"># Needs to come *after* demi/semilight!</span>
+    <span class="s1">(</span><span class="s4">&quot;book&quot;</span><span class="s3">, </span><span class="s5">380</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;regular&quot;</span><span class="s3">, </span><span class="s5">400</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;normal&quot;</span><span class="s3">, </span><span class="s5">400</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;medium&quot;</span><span class="s3">, </span><span class="s5">500</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;demibold&quot;</span><span class="s3">, </span><span class="s5">600</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;demi&quot;</span><span class="s3">, </span><span class="s5">600</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;semibold&quot;</span><span class="s3">, </span><span class="s5">600</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;extrabold&quot;</span><span class="s3">, </span><span class="s5">800</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;superbold&quot;</span><span class="s3">, </span><span class="s5">800</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;ultrabold&quot;</span><span class="s3">, </span><span class="s5">800</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;bold&quot;</span><span class="s3">, </span><span class="s5">700</span><span class="s1">)</span><span class="s3">,  </span><span class="s2"># Needs to come *after* extra/super/ultrabold!</span>
+    <span class="s1">(</span><span class="s4">&quot;ultrablack&quot;</span><span class="s3">, </span><span class="s5">1000</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;superblack&quot;</span><span class="s3">, </span><span class="s5">1000</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;extrablack&quot;</span><span class="s3">, </span><span class="s5">1000</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">r&quot;\bultra&quot;</span><span class="s3">, </span><span class="s5">1000</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">(</span><span class="s4">&quot;black&quot;</span><span class="s3">, </span><span class="s5">900</span><span class="s1">)</span><span class="s3">,  </span><span class="s2"># Needs to come *after* ultra/super/extrablack!</span>
+    <span class="s1">(</span><span class="s4">&quot;heavy&quot;</span><span class="s3">, </span><span class="s5">900</span><span class="s1">)</span><span class="s3">,</span>
+<span class="s1">]</span>
+<span class="s1">font_family_aliases = {</span>
+    <span class="s4">'serif'</span><span class="s3">,</span>
+    <span class="s4">'sans-serif'</span><span class="s3">,</span>
+    <span class="s4">'sans serif'</span><span class="s3">,</span>
+    <span class="s4">'cursive'</span><span class="s3">,</span>
+    <span class="s4">'fantasy'</span><span class="s3">,</span>
+    <span class="s4">'monospace'</span><span class="s3">,</span>
+    <span class="s4">'sans'</span><span class="s3">,</span>
+<span class="s1">}</span>
+
+
+<span class="s2"># OS Font paths</span>
+<span class="s3">try</span><span class="s1">:</span>
+    <span class="s1">_HOME = Path.home()</span>
+<span class="s3">except </span><span class="s1">Exception:  </span><span class="s2"># Exceptions thrown by home() are not specified...</span>
+    <span class="s1">_HOME = Path(os.devnull)  </span><span class="s2"># Just an arbitrary path with no children.</span>
+<span class="s1">MSFolders = \</span>
+    <span class="s4">r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'</span>
+<span class="s1">MSFontDirectories = [</span>
+    <span class="s4">r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'</span><span class="s3">,</span>
+    <span class="s4">r'SOFTWARE\Microsoft\Windows\CurrentVersion\Fonts'</span><span class="s1">]</span>
+<span class="s1">MSUserFontDirectories = [</span>
+    <span class="s1">str(_HOME / </span><span class="s4">'AppData/Local/Microsoft/Windows/Fonts'</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">str(_HOME / </span><span class="s4">'AppData/Roaming/Microsoft/Windows/Fonts'</span><span class="s1">)</span><span class="s3">,</span>
+<span class="s1">]</span>
+<span class="s1">X11FontDirectories = [</span>
+    <span class="s2"># an old standard installation point</span>
+    <span class="s4">&quot;/usr/X11R6/lib/X11/fonts/TTF/&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;/usr/X11/lib/X11/fonts&quot;</span><span class="s3">,</span>
+    <span class="s2"># here is the new standard location for fonts</span>
+    <span class="s4">&quot;/usr/share/fonts/&quot;</span><span class="s3">,</span>
+    <span class="s2"># documented as a good place to install new fonts</span>
+    <span class="s4">&quot;/usr/local/share/fonts/&quot;</span><span class="s3">,</span>
+    <span class="s2"># common application, not really useful</span>
+    <span class="s4">&quot;/usr/lib/openoffice/share/fonts/truetype/&quot;</span><span class="s3">,</span>
+    <span class="s2"># user fonts</span>
+    <span class="s1">str((Path(os.environ.get(</span><span class="s4">'XDG_DATA_HOME'</span><span class="s1">) </span><span class="s3">or </span><span class="s1">_HOME / </span><span class="s4">&quot;.local/share&quot;</span><span class="s1">))</span>
+        <span class="s1">/ </span><span class="s4">&quot;fonts&quot;</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">str(_HOME / </span><span class="s4">&quot;.fonts&quot;</span><span class="s1">)</span><span class="s3">,</span>
+<span class="s1">]</span>
+<span class="s1">OSXFontDirectories = [</span>
+    <span class="s4">&quot;/Library/Fonts/&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;/Network/Library/Fonts/&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;/System/Library/Fonts/&quot;</span><span class="s3">,</span>
+    <span class="s2"># fonts installed via MacPorts</span>
+    <span class="s4">&quot;/opt/local/share/fonts&quot;</span><span class="s3">,</span>
+    <span class="s2"># user fonts</span>
+    <span class="s1">str(_HOME / </span><span class="s4">&quot;Library/Fonts&quot;</span><span class="s1">)</span><span class="s3">,</span>
+<span class="s1">]</span>
+
+
+<span class="s3">def </span><span class="s1">get_fontext_synonyms(fontext):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return a list of file extensions that are synonyms for 
+    the given file extension *fileext*. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s4">'afm'</span><span class="s1">: [</span><span class="s4">'afm'</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s4">'otf'</span><span class="s1">: [</span><span class="s4">'otf'</span><span class="s3">, </span><span class="s4">'ttc'</span><span class="s3">, </span><span class="s4">'ttf'</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s4">'ttc'</span><span class="s1">: [</span><span class="s4">'otf'</span><span class="s3">, </span><span class="s4">'ttc'</span><span class="s3">, </span><span class="s4">'ttf'</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s4">'ttf'</span><span class="s1">: [</span><span class="s4">'otf'</span><span class="s3">, </span><span class="s4">'ttc'</span><span class="s3">, </span><span class="s4">'ttf'</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}[fontext]</span>
+
+
+<span class="s3">def </span><span class="s1">list_fonts(directory</span><span class="s3">, </span><span class="s1">extensions):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return a list of all fonts matching any of the extensions, found 
+    recursively under the directory. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">extensions = [</span><span class="s4">&quot;.&quot; </span><span class="s1">+ ext </span><span class="s3">for </span><span class="s1">ext </span><span class="s3">in </span><span class="s1">extensions]</span>
+    <span class="s3">return </span><span class="s1">[os.path.join(dirpath</span><span class="s3">, </span><span class="s1">filename)</span>
+            <span class="s2"># os.walk ignores access errors, unlike Path.glob.</span>
+            <span class="s3">for </span><span class="s1">dirpath</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">filenames </span><span class="s3">in </span><span class="s1">os.walk(directory)</span>
+            <span class="s3">for </span><span class="s1">filename </span><span class="s3">in </span><span class="s1">filenames</span>
+            <span class="s3">if </span><span class="s1">Path(filename).suffix.lower() </span><span class="s3">in </span><span class="s1">extensions]</span>
+
+
+<span class="s3">def </span><span class="s1">win32FontDirectory():</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Return the user-specified font directory for Win32.  This is 
+    looked up from the registry key :: 
+ 
+      \\HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders\Fonts 
+ 
+    If the key is not found, ``%WINDIR%\Fonts`` will be returned. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">import </span><span class="s1">winreg</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">with </span><span class="s1">winreg.OpenKey(winreg.HKEY_CURRENT_USER</span><span class="s3">, </span><span class="s1">MSFolders) </span><span class="s3">as </span><span class="s1">user:</span>
+            <span class="s3">return </span><span class="s1">winreg.QueryValueEx(user</span><span class="s3">, </span><span class="s4">'Fonts'</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s3">except </span><span class="s1">OSError:</span>
+        <span class="s3">return </span><span class="s1">os.path.join(os.environ[</span><span class="s4">'WINDIR'</span><span class="s1">]</span><span class="s3">, </span><span class="s4">'Fonts'</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">_get_win32_installed_fonts():</span>
+    <span class="s0">&quot;&quot;&quot;List the font paths known to the Windows registry.&quot;&quot;&quot;</span>
+    <span class="s3">import </span><span class="s1">winreg</span>
+    <span class="s1">items = set()</span>
+    <span class="s2"># Search and resolve fonts listed in the registry.</span>
+    <span class="s3">for </span><span class="s1">domain</span><span class="s3">, </span><span class="s1">base_dirs </span><span class="s3">in </span><span class="s1">[</span>
+            <span class="s1">(winreg.HKEY_LOCAL_MACHINE</span><span class="s3">, </span><span class="s1">[win32FontDirectory()])</span><span class="s3">,  </span><span class="s2"># System.</span>
+            <span class="s1">(winreg.HKEY_CURRENT_USER</span><span class="s3">, </span><span class="s1">MSUserFontDirectories)</span><span class="s3">,  </span><span class="s2"># User.</span>
+    <span class="s1">]:</span>
+        <span class="s3">for </span><span class="s1">base_dir </span><span class="s3">in </span><span class="s1">base_dirs:</span>
+            <span class="s3">for </span><span class="s1">reg_path </span><span class="s3">in </span><span class="s1">MSFontDirectories:</span>
+                <span class="s3">try</span><span class="s1">:</span>
+                    <span class="s3">with </span><span class="s1">winreg.OpenKey(domain</span><span class="s3">, </span><span class="s1">reg_path) </span><span class="s3">as </span><span class="s1">local:</span>
+                        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(winreg.QueryInfoKey(local)[</span><span class="s5">1</span><span class="s1">]):</span>
+                            <span class="s2"># value may contain the filename of the font or its</span>
+                            <span class="s2"># absolute path.</span>
+                            <span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">tp = winreg.EnumValue(local</span><span class="s3">, </span><span class="s1">j)</span>
+                            <span class="s3">if not </span><span class="s1">isinstance(value</span><span class="s3">, </span><span class="s1">str):</span>
+                                <span class="s3">continue</span>
+                            <span class="s3">try</span><span class="s1">:</span>
+                                <span class="s2"># If value contains already an absolute path,</span>
+                                <span class="s2"># then it is not changed further.</span>
+                                <span class="s1">path = Path(base_dir</span><span class="s3">, </span><span class="s1">value).resolve()</span>
+                            <span class="s3">except </span><span class="s1">RuntimeError:</span>
+                                <span class="s2"># Don't fail with invalid entries.</span>
+                                <span class="s3">continue</span>
+                            <span class="s1">items.add(path)</span>
+                <span class="s3">except </span><span class="s1">(OSError</span><span class="s3">, </span><span class="s1">MemoryError):</span>
+                    <span class="s3">continue</span>
+    <span class="s3">return </span><span class="s1">items</span>
+
+
+<span class="s1">@lru_cache()</span>
+<span class="s3">def </span><span class="s1">_get_fontconfig_fonts():</span>
+    <span class="s0">&quot;&quot;&quot;Cache and list the font paths known to ``fc-list``.&quot;&quot;&quot;</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s6">b'--format' </span><span class="s3">not in </span><span class="s1">subprocess.check_output([</span><span class="s4">'fc-list'</span><span class="s3">, </span><span class="s4">'--help'</span><span class="s1">]):</span>
+            <span class="s1">_log.warning(  </span><span class="s2"># fontconfig 2.7 implemented --format.</span>
+                <span class="s4">'Matplotlib needs fontconfig&gt;=2.7 to query system fonts.'</span><span class="s1">)</span>
+            <span class="s3">return </span><span class="s1">[]</span>
+        <span class="s1">out = subprocess.check_output([</span><span class="s4">'fc-list'</span><span class="s3">, </span><span class="s4">'--format=%{file}</span><span class="s3">\\</span><span class="s4">n'</span><span class="s1">])</span>
+    <span class="s3">except </span><span class="s1">(OSError</span><span class="s3">, </span><span class="s1">subprocess.CalledProcessError):</span>
+        <span class="s3">return </span><span class="s1">[]</span>
+    <span class="s3">return </span><span class="s1">[Path(os.fsdecode(fname)) </span><span class="s3">for </span><span class="s1">fname </span><span class="s3">in </span><span class="s1">out.split(</span><span class="s6">b'</span><span class="s3">\n</span><span class="s6">'</span><span class="s1">)]</span>
+
+
+<span class="s3">def </span><span class="s1">findSystemFonts(fontpaths=</span><span class="s3">None, </span><span class="s1">fontext=</span><span class="s4">'ttf'</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Search for fonts in the specified font paths.  If no paths are 
+    given, will use a standard set of system paths, as well as the 
+    list of fonts tracked by fontconfig if fontconfig is installed and 
+    available.  A list of TrueType fonts are returned by default with 
+    AFM fonts as an option. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fontfiles = set()</span>
+    <span class="s1">fontexts = get_fontext_synonyms(fontext)</span>
+
+    <span class="s3">if </span><span class="s1">fontpaths </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">sys.platform == </span><span class="s4">'win32'</span><span class="s1">:</span>
+            <span class="s1">installed_fonts = _get_win32_installed_fonts()</span>
+            <span class="s1">fontpaths = []</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">installed_fonts = _get_fontconfig_fonts()</span>
+            <span class="s3">if </span><span class="s1">sys.platform == </span><span class="s4">'darwin'</span><span class="s1">:</span>
+                <span class="s1">fontpaths = [*X11FontDirectories</span><span class="s3">, </span><span class="s1">*OSXFontDirectories]</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">fontpaths = X11FontDirectories</span>
+        <span class="s1">fontfiles.update(str(path) </span><span class="s3">for </span><span class="s1">path </span><span class="s3">in </span><span class="s1">installed_fonts</span>
+                         <span class="s3">if </span><span class="s1">path.suffix.lower()[</span><span class="s5">1</span><span class="s1">:] </span><span class="s3">in </span><span class="s1">fontexts)</span>
+
+    <span class="s3">elif </span><span class="s1">isinstance(fontpaths</span><span class="s3">, </span><span class="s1">str):</span>
+        <span class="s1">fontpaths = [fontpaths]</span>
+
+    <span class="s3">for </span><span class="s1">path </span><span class="s3">in </span><span class="s1">fontpaths:</span>
+        <span class="s1">fontfiles.update(map(os.path.abspath</span><span class="s3">, </span><span class="s1">list_fonts(path</span><span class="s3">, </span><span class="s1">fontexts)))</span>
+
+    <span class="s3">return </span><span class="s1">[fname </span><span class="s3">for </span><span class="s1">fname </span><span class="s3">in </span><span class="s1">fontfiles </span><span class="s3">if </span><span class="s1">os.path.exists(fname)]</span>
+
+
+<span class="s3">def </span><span class="s1">_fontentry_helper_repr_png(fontent):</span>
+    <span class="s3">from </span><span class="s1">matplotlib.figure </span><span class="s3">import </span><span class="s1">Figure  </span><span class="s2"># Circular import.</span>
+    <span class="s1">fig = Figure()</span>
+    <span class="s1">font_path = Path(fontent.fname) </span><span class="s3">if </span><span class="s1">fontent.fname != </span><span class="s4">'' </span><span class="s3">else None</span>
+    <span class="s1">fig.text(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s1">fontent.name</span><span class="s3">, </span><span class="s1">font=font_path)</span>
+    <span class="s3">with </span><span class="s1">BytesIO() </span><span class="s3">as </span><span class="s1">buf:</span>
+        <span class="s1">fig.savefig(buf</span><span class="s3">, </span><span class="s1">bbox_inches=</span><span class="s4">'tight'</span><span class="s3">, </span><span class="s1">transparent=</span><span class="s3">True</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">buf.getvalue()</span>
+
+
+<span class="s3">def </span><span class="s1">_fontentry_helper_repr_html(fontent):</span>
+    <span class="s1">png_stream = _fontentry_helper_repr_png(fontent)</span>
+    <span class="s1">png_b64 = b64encode(png_stream).decode()</span>
+    <span class="s3">return </span><span class="s4">f&quot;&lt;img src=</span><span class="s3">\&quot;</span><span class="s4">data:image/png;base64, </span><span class="s3">{</span><span class="s1">png_b64</span><span class="s3">}\&quot; </span><span class="s4">/&gt;&quot;</span>
+
+
+<span class="s1">FontEntry = dataclasses.make_dataclass(</span>
+    <span class="s4">'FontEntry'</span><span class="s3">, </span><span class="s1">[</span>
+        <span class="s1">(</span><span class="s4">'fname'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">''</span><span class="s1">))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s4">'name'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">''</span><span class="s1">))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s4">'style'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">'normal'</span><span class="s1">))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s4">'variant'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">'normal'</span><span class="s1">))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s4">'weight'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">'normal'</span><span class="s1">))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s4">'stretch'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">'normal'</span><span class="s1">))</span><span class="s3">,</span>
+        <span class="s1">(</span><span class="s4">'size'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s1">dataclasses.field(default=</span><span class="s4">'medium'</span><span class="s1">))</span><span class="s3">,</span>
+    <span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">namespace={</span>
+        <span class="s4">'__doc__'</span><span class="s1">: </span><span class="s4">&quot;&quot;&quot; 
+    A class for storing Font properties. 
+ 
+    It is used when populating the font lookup dictionary. 
+    &quot;&quot;&quot;</span><span class="s3">,</span>
+        <span class="s4">'_repr_html_'</span><span class="s1">: </span><span class="s3">lambda </span><span class="s1">self: _fontentry_helper_repr_html(self)</span><span class="s3">,</span>
+        <span class="s4">'_repr_png_'</span><span class="s1">: </span><span class="s3">lambda </span><span class="s1">self: _fontentry_helper_repr_png(self)</span><span class="s3">,</span>
+    <span class="s1">}</span>
+<span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">ttfFontProperty(font):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Extract information from a TrueType font file. 
+ 
+    Parameters 
+    ---------- 
+    font : `.FT2Font` 
+        The TrueType font file from which information will be extracted. 
+ 
+    Returns 
+    ------- 
+    `FontEntry` 
+        The extracted font properties. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">name = font.family_name</span>
+
+    <span class="s2">#  Styles are: italic, oblique, and normal (default)</span>
+
+    <span class="s1">sfnt = font.get_sfnt()</span>
+    <span class="s1">mac_key = (</span><span class="s5">1</span><span class="s3">,  </span><span class="s2"># platform: macintosh</span>
+               <span class="s5">0</span><span class="s3">,  </span><span class="s2"># id: roman</span>
+               <span class="s5">0</span><span class="s1">)  </span><span class="s2"># langid: english</span>
+    <span class="s1">ms_key = (</span><span class="s5">3</span><span class="s3">,  </span><span class="s2"># platform: microsoft</span>
+              <span class="s5">1</span><span class="s3">,  </span><span class="s2"># id: unicode_cs</span>
+              <span class="s5">0x0409</span><span class="s1">)  </span><span class="s2"># langid: english_united_states</span>
+
+    <span class="s2"># These tables are actually mac_roman-encoded, but mac_roman support may be</span>
+    <span class="s2"># missing in some alternative Python implementations and we are only going</span>
+    <span class="s2"># to look for ASCII substrings, where any ASCII-compatible encoding works</span>
+    <span class="s2"># - or big-endian UTF-16, since important Microsoft fonts use that.</span>
+    <span class="s1">sfnt2 = (sfnt.get((*mac_key</span><span class="s3">, </span><span class="s5">2</span><span class="s1">)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'latin-1'</span><span class="s1">).lower() </span><span class="s3">or</span>
+             <span class="s1">sfnt.get((*ms_key</span><span class="s3">, </span><span class="s5">2</span><span class="s1">)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'utf_16_be'</span><span class="s1">).lower())</span>
+    <span class="s1">sfnt4 = (sfnt.get((*mac_key</span><span class="s3">, </span><span class="s5">4</span><span class="s1">)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'latin-1'</span><span class="s1">).lower() </span><span class="s3">or</span>
+             <span class="s1">sfnt.get((*ms_key</span><span class="s3">, </span><span class="s5">4</span><span class="s1">)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'utf_16_be'</span><span class="s1">).lower())</span>
+
+    <span class="s3">if </span><span class="s1">sfnt4.find(</span><span class="s4">'oblique'</span><span class="s1">) &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">style = </span><span class="s4">'oblique'</span>
+    <span class="s3">elif </span><span class="s1">sfnt4.find(</span><span class="s4">'italic'</span><span class="s1">) &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">style = </span><span class="s4">'italic'</span>
+    <span class="s3">elif </span><span class="s1">sfnt2.find(</span><span class="s4">'regular'</span><span class="s1">) &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">style = </span><span class="s4">'normal'</span>
+    <span class="s3">elif </span><span class="s1">font.style_flags &amp; ft2font.ITALIC:</span>
+        <span class="s1">style = </span><span class="s4">'italic'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">style = </span><span class="s4">'normal'</span>
+
+    <span class="s2">#  Variants are: small-caps and normal (default)</span>
+
+    <span class="s2">#  !!!!  Untested</span>
+    <span class="s3">if </span><span class="s1">name.lower() </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'capitals'</span><span class="s3">, </span><span class="s4">'small-caps'</span><span class="s1">]:</span>
+        <span class="s1">variant = </span><span class="s4">'small-caps'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">variant = </span><span class="s4">'normal'</span>
+
+    <span class="s2"># The weight-guessing algorithm is directly translated from fontconfig</span>
+    <span class="s2"># 2.13.1's FcFreeTypeQueryFaceInternal (fcfreetype.c).</span>
+    <span class="s1">wws_subfamily = </span><span class="s5">22</span>
+    <span class="s1">typographic_subfamily = </span><span class="s5">16</span>
+    <span class="s1">font_subfamily = </span><span class="s5">2</span>
+    <span class="s1">styles = [</span>
+        <span class="s1">sfnt.get((*mac_key</span><span class="s3">, </span><span class="s1">wws_subfamily)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'latin-1'</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">sfnt.get((*mac_key</span><span class="s3">, </span><span class="s1">typographic_subfamily)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'latin-1'</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">sfnt.get((*mac_key</span><span class="s3">, </span><span class="s1">font_subfamily)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'latin-1'</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">sfnt.get((*ms_key</span><span class="s3">, </span><span class="s1">wws_subfamily)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'utf-16-be'</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">sfnt.get((*ms_key</span><span class="s3">, </span><span class="s1">typographic_subfamily)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'utf-16-be'</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">sfnt.get((*ms_key</span><span class="s3">, </span><span class="s1">font_subfamily)</span><span class="s3">, </span><span class="s6">b''</span><span class="s1">).decode(</span><span class="s4">'utf-16-be'</span><span class="s1">)</span><span class="s3">,</span>
+    <span class="s1">]</span>
+    <span class="s1">styles = [*filter(</span><span class="s3">None, </span><span class="s1">styles)] </span><span class="s3">or </span><span class="s1">[font.style_name]</span>
+
+    <span class="s3">def </span><span class="s1">get_weight():  </span><span class="s2"># From fontconfig's FcFreeTypeQueryFaceInternal.</span>
+        <span class="s2"># OS/2 table weight.</span>
+        <span class="s1">os2 = font.get_sfnt_table(</span><span class="s4">&quot;OS/2&quot;</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">os2 </span><span class="s3">and </span><span class="s1">os2[</span><span class="s4">&quot;version&quot;</span><span class="s1">] != </span><span class="s5">0xffff</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">os2[</span><span class="s4">&quot;usWeightClass&quot;</span><span class="s1">]</span>
+        <span class="s2"># PostScript font info weight.</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">ps_font_info_weight = (</span>
+                <span class="s1">font.get_ps_font_info()[</span><span class="s4">&quot;weight&quot;</span><span class="s1">].replace(</span><span class="s4">&quot; &quot;</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s1">) </span><span class="s3">or </span><span class="s4">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s3">pass</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">for </span><span class="s1">regex</span><span class="s3">, </span><span class="s1">weight </span><span class="s3">in </span><span class="s1">_weight_regexes:</span>
+                <span class="s3">if </span><span class="s1">re.fullmatch(regex</span><span class="s3">, </span><span class="s1">ps_font_info_weight</span><span class="s3">, </span><span class="s1">re.I):</span>
+                    <span class="s3">return </span><span class="s1">weight</span>
+        <span class="s2"># Style name weight.</span>
+        <span class="s3">for </span><span class="s1">style </span><span class="s3">in </span><span class="s1">styles:</span>
+            <span class="s1">style = style.replace(</span><span class="s4">&quot; &quot;</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s3">for </span><span class="s1">regex</span><span class="s3">, </span><span class="s1">weight </span><span class="s3">in </span><span class="s1">_weight_regexes:</span>
+                <span class="s3">if </span><span class="s1">re.search(regex</span><span class="s3">, </span><span class="s1">style</span><span class="s3">, </span><span class="s1">re.I):</span>
+                    <span class="s3">return </span><span class="s1">weight</span>
+        <span class="s3">if </span><span class="s1">font.style_flags &amp; ft2font.BOLD:</span>
+            <span class="s3">return </span><span class="s5">700  </span><span class="s2"># &quot;bold&quot;</span>
+        <span class="s3">return </span><span class="s5">500  </span><span class="s2"># &quot;medium&quot;, not &quot;regular&quot;!</span>
+
+    <span class="s1">weight = int(get_weight())</span>
+
+    <span class="s2">#  Stretch can be absolute and relative</span>
+    <span class="s2">#  Absolute stretches are: ultra-condensed, extra-condensed, condensed,</span>
+    <span class="s2">#    semi-condensed, normal, semi-expanded, expanded, extra-expanded,</span>
+    <span class="s2">#    and ultra-expanded.</span>
+    <span class="s2">#  Relative stretches are: wider, narrower</span>
+    <span class="s2">#  Child value is: inherit</span>
+
+    <span class="s3">if </span><span class="s1">any(word </span><span class="s3">in </span><span class="s1">sfnt4 </span><span class="s3">for </span><span class="s1">word </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'narrow'</span><span class="s3">, </span><span class="s4">'condensed'</span><span class="s3">, </span><span class="s4">'cond'</span><span class="s1">]):</span>
+        <span class="s1">stretch = </span><span class="s4">'condensed'</span>
+    <span class="s3">elif </span><span class="s4">'demi cond' </span><span class="s3">in </span><span class="s1">sfnt4:</span>
+        <span class="s1">stretch = </span><span class="s4">'semi-condensed'</span>
+    <span class="s3">elif </span><span class="s1">any(word </span><span class="s3">in </span><span class="s1">sfnt4 </span><span class="s3">for </span><span class="s1">word </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'wide'</span><span class="s3">, </span><span class="s4">'expanded'</span><span class="s3">, </span><span class="s4">'extended'</span><span class="s1">]):</span>
+        <span class="s1">stretch = </span><span class="s4">'expanded'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">stretch = </span><span class="s4">'normal'</span>
+
+    <span class="s2">#  Sizes can be absolute and relative.</span>
+    <span class="s2">#  Absolute sizes are: xx-small, x-small, small, medium, large, x-large,</span>
+    <span class="s2">#    and xx-large.</span>
+    <span class="s2">#  Relative sizes are: larger, smaller</span>
+    <span class="s2">#  Length value is an absolute font size, e.g., 12pt</span>
+    <span class="s2">#  Percentage values are in 'em's.  Most robust specification.</span>
+
+    <span class="s3">if not </span><span class="s1">font.scalable:</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError(</span><span class="s4">&quot;Non-scalable fonts are not supported&quot;</span><span class="s1">)</span>
+    <span class="s1">size = </span><span class="s4">'scalable'</span>
+
+    <span class="s3">return </span><span class="s1">FontEntry(font.fname</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">style</span><span class="s3">, </span><span class="s1">variant</span><span class="s3">, </span><span class="s1">weight</span><span class="s3">, </span><span class="s1">stretch</span><span class="s3">, </span><span class="s1">size)</span>
+
+
+<span class="s3">def </span><span class="s1">afmFontProperty(fontpath</span><span class="s3">, </span><span class="s1">font):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Extract information from an AFM font file. 
+ 
+    Parameters 
+    ---------- 
+    font : AFM 
+        The AFM font file from which information will be extracted. 
+ 
+    Returns 
+    ------- 
+    `FontEntry` 
+        The extracted font properties. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name = font.get_familyname()</span>
+    <span class="s1">fontname = font.get_fontname().lower()</span>
+
+    <span class="s2">#  Styles are: italic, oblique, and normal (default)</span>
+
+    <span class="s3">if </span><span class="s1">font.get_angle() != </span><span class="s5">0 </span><span class="s3">or </span><span class="s4">'italic' </span><span class="s3">in </span><span class="s1">name.lower():</span>
+        <span class="s1">style = </span><span class="s4">'italic'</span>
+    <span class="s3">elif </span><span class="s4">'oblique' </span><span class="s3">in </span><span class="s1">name.lower():</span>
+        <span class="s1">style = </span><span class="s4">'oblique'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">style = </span><span class="s4">'normal'</span>
+
+    <span class="s2">#  Variants are: small-caps and normal (default)</span>
+
+    <span class="s2"># !!!!  Untested</span>
+    <span class="s3">if </span><span class="s1">name.lower() </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'capitals'</span><span class="s3">, </span><span class="s4">'small-caps'</span><span class="s1">]:</span>
+        <span class="s1">variant = </span><span class="s4">'small-caps'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">variant = </span><span class="s4">'normal'</span>
+
+    <span class="s1">weight = font.get_weight().lower()</span>
+    <span class="s3">if </span><span class="s1">weight </span><span class="s3">not in </span><span class="s1">weight_dict:</span>
+        <span class="s1">weight = </span><span class="s4">'normal'</span>
+
+    <span class="s2">#  Stretch can be absolute and relative</span>
+    <span class="s2">#  Absolute stretches are: ultra-condensed, extra-condensed, condensed,</span>
+    <span class="s2">#    semi-condensed, normal, semi-expanded, expanded, extra-expanded,</span>
+    <span class="s2">#    and ultra-expanded.</span>
+    <span class="s2">#  Relative stretches are: wider, narrower</span>
+    <span class="s2">#  Child value is: inherit</span>
+    <span class="s3">if </span><span class="s4">'demi cond' </span><span class="s3">in </span><span class="s1">fontname:</span>
+        <span class="s1">stretch = </span><span class="s4">'semi-condensed'</span>
+    <span class="s3">elif </span><span class="s1">any(word </span><span class="s3">in </span><span class="s1">fontname </span><span class="s3">for </span><span class="s1">word </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'narrow'</span><span class="s3">, </span><span class="s4">'cond'</span><span class="s1">]):</span>
+        <span class="s1">stretch = </span><span class="s4">'condensed'</span>
+    <span class="s3">elif </span><span class="s1">any(word </span><span class="s3">in </span><span class="s1">fontname </span><span class="s3">for </span><span class="s1">word </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'wide'</span><span class="s3">, </span><span class="s4">'expanded'</span><span class="s3">, </span><span class="s4">'extended'</span><span class="s1">]):</span>
+        <span class="s1">stretch = </span><span class="s4">'expanded'</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">stretch = </span><span class="s4">'normal'</span>
+
+    <span class="s2">#  Sizes can be absolute and relative.</span>
+    <span class="s2">#  Absolute sizes are: xx-small, x-small, small, medium, large, x-large,</span>
+    <span class="s2">#    and xx-large.</span>
+    <span class="s2">#  Relative sizes are: larger, smaller</span>
+    <span class="s2">#  Length value is an absolute font size, e.g., 12pt</span>
+    <span class="s2">#  Percentage values are in 'em's.  Most robust specification.</span>
+
+    <span class="s2">#  All AFM fonts are apparently scalable.</span>
+
+    <span class="s1">size = </span><span class="s4">'scalable'</span>
+
+    <span class="s3">return </span><span class="s1">FontEntry(fontpath</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">style</span><span class="s3">, </span><span class="s1">variant</span><span class="s3">, </span><span class="s1">weight</span><span class="s3">, </span><span class="s1">stretch</span><span class="s3">, </span><span class="s1">size)</span>
+
+
+<span class="s3">class </span><span class="s1">FontProperties:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A class for storing and manipulating font properties. 
+ 
+    The font properties are the six properties described in the 
+    `W3C Cascading Style Sheet, Level 1 
+    &lt;http://www.w3.org/TR/1998/REC-CSS2-19980512/&gt;`_ font 
+    specification and *math_fontfamily* for math fonts: 
+ 
+    - family: A list of font names in decreasing order of priority. 
+      The items may include a generic font family name, either 'sans-serif', 
+      'serif', 'cursive', 'fantasy', or 'monospace'.  In that case, the actual 
+      font to be used will be looked up from the associated rcParam during the 
+      search process in `.findfont`. Default: :rc:`font.family` 
+ 
+    - style: Either 'normal', 'italic' or 'oblique'. 
+      Default: :rc:`font.style` 
+ 
+    - variant: Either 'normal' or 'small-caps'. 
+      Default: :rc:`font.variant` 
+ 
+    - stretch: A numeric value in the range 0-1000 or one of 
+      'ultra-condensed', 'extra-condensed', 'condensed', 
+      'semi-condensed', 'normal', 'semi-expanded', 'expanded', 
+      'extra-expanded' or 'ultra-expanded'. Default: :rc:`font.stretch` 
+ 
+    - weight: A numeric value in the range 0-1000 or one of 
+      'ultralight', 'light', 'normal', 'regular', 'book', 'medium', 
+      'roman', 'semibold', 'demibold', 'demi', 'bold', 'heavy', 
+      'extra bold', 'black'. Default: :rc:`font.weight` 
+ 
+    - size: Either a relative value of 'xx-small', 'x-small', 
+      'small', 'medium', 'large', 'x-large', 'xx-large' or an 
+      absolute font size, e.g., 10. Default: :rc:`font.size` 
+ 
+    - math_fontfamily: The family of fonts used to render math text. 
+      Supported values are: 'dejavusans', 'dejavuserif', 'cm', 
+      'stix', 'stixsans' and 'custom'. Default: :rc:`mathtext.fontset` 
+ 
+    Alternatively, a font may be specified using the absolute path to a font 
+    file, by using the *fname* kwarg.  However, in this case, it is typically 
+    simpler to just pass the path (as a `pathlib.Path`, not a `str`) to the 
+    *font* kwarg of the `.Text` object. 
+ 
+    The preferred usage of font sizes is to use the relative values, 
+    e.g.,  'large', instead of absolute font sizes, e.g., 12.  This 
+    approach allows all text sizes to be made larger or smaller based 
+    on the font manager's default font size. 
+ 
+    This class will also accept a fontconfig_ pattern_, if it is the only 
+    argument provided.  This support does not depend on fontconfig; we are 
+    merely borrowing its pattern syntax for use here. 
+ 
+    .. _fontconfig: https://www.freedesktop.org/wiki/Software/fontconfig/ 
+    .. _pattern: 
+       https://www.freedesktop.org/software/fontconfig/fontconfig-user.html 
+ 
+    Note that Matplotlib's internal font manager and fontconfig use a 
+    different algorithm to lookup fonts, so the results of the same pattern 
+    may be different in Matplotlib than in other applications that use 
+    fontconfig. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">family=</span><span class="s3">None, </span><span class="s1">style=</span><span class="s3">None, </span><span class="s1">variant=</span><span class="s3">None, </span><span class="s1">weight=</span><span class="s3">None,</span>
+                 <span class="s1">stretch=</span><span class="s3">None, </span><span class="s1">size=</span><span class="s3">None,</span>
+                 <span class="s1">fname=</span><span class="s3">None,  </span><span class="s2"># if set, it's a hardcoded filename to use</span>
+                 <span class="s1">math_fontfamily=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">self.set_family(family)</span>
+        <span class="s1">self.set_style(style)</span>
+        <span class="s1">self.set_variant(variant)</span>
+        <span class="s1">self.set_weight(weight)</span>
+        <span class="s1">self.set_stretch(stretch)</span>
+        <span class="s1">self.set_file(fname)</span>
+        <span class="s1">self.set_size(size)</span>
+        <span class="s1">self.set_math_fontfamily(math_fontfamily)</span>
+        <span class="s2"># Treat family as a fontconfig pattern if it is the only parameter</span>
+        <span class="s2"># provided.  Even in that case, call the other setters first to set</span>
+        <span class="s2"># attributes not specified by the pattern to the rcParams defaults.</span>
+        <span class="s3">if </span><span class="s1">(isinstance(family</span><span class="s3">, </span><span class="s1">str)</span>
+                <span class="s3">and </span><span class="s1">style </span><span class="s3">is None and </span><span class="s1">variant </span><span class="s3">is None and </span><span class="s1">weight </span><span class="s3">is None</span>
+                <span class="s3">and </span><span class="s1">stretch </span><span class="s3">is None and </span><span class="s1">size </span><span class="s3">is None and </span><span class="s1">fname </span><span class="s3">is None</span><span class="s1">):</span>
+            <span class="s1">self.set_fontconfig_pattern(family)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">_from_any(cls</span><span class="s3">, </span><span class="s1">arg):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generic constructor which can build a `.FontProperties` from any of the 
+        following: 
+ 
+        - a `.FontProperties`: it is passed through as is; 
+        - `None`: a `.FontProperties` using rc values is used; 
+        - an `os.PathLike`: it is used as path to the font file; 
+        - a `str`: it is parsed as a fontconfig pattern; 
+        - a `dict`: it is passed as ``**kwargs`` to `.FontProperties`. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">isinstance(arg</span><span class="s3">, </span><span class="s1">cls):</span>
+            <span class="s3">return </span><span class="s1">arg</span>
+        <span class="s3">elif </span><span class="s1">arg </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">cls()</span>
+        <span class="s3">elif </span><span class="s1">isinstance(arg</span><span class="s3">, </span><span class="s1">os.PathLike):</span>
+            <span class="s3">return </span><span class="s1">cls(fname=arg)</span>
+        <span class="s3">elif </span><span class="s1">isinstance(arg</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s3">return </span><span class="s1">cls(arg)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">cls(**arg)</span>
+
+    <span class="s3">def </span><span class="s1">__hash__(self):</span>
+        <span class="s1">l = (tuple(self.get_family())</span><span class="s3">,</span>
+             <span class="s1">self.get_slant()</span><span class="s3">,</span>
+             <span class="s1">self.get_variant()</span><span class="s3">,</span>
+             <span class="s1">self.get_weight()</span><span class="s3">,</span>
+             <span class="s1">self.get_stretch()</span><span class="s3">,</span>
+             <span class="s1">self.get_size()</span><span class="s3">,</span>
+             <span class="s1">self.get_file()</span><span class="s3">,</span>
+             <span class="s1">self.get_math_fontfamily())</span>
+        <span class="s3">return </span><span class="s1">hash(l)</span>
+
+    <span class="s3">def </span><span class="s1">__eq__(self</span><span class="s3">, </span><span class="s1">other):</span>
+        <span class="s3">return </span><span class="s1">hash(self) == hash(other)</span>
+
+    <span class="s3">def </span><span class="s1">__str__(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_fontconfig_pattern()</span>
+
+    <span class="s3">def </span><span class="s1">get_family(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a list of individual font family names or generic family names. 
+ 
+        The font families or generic font families (which will be resolved 
+        from their respective rcParams when searching for a matching font) in 
+        the order of preference. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._family</span>
+
+    <span class="s3">def </span><span class="s1">get_name(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the name of the font that best matches the font properties. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">get_font(findfont(self)).family_name</span>
+
+    <span class="s3">def </span><span class="s1">get_style(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the font style.  Values are: 'normal', 'italic' or 'oblique'. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._slant</span>
+
+    <span class="s3">def </span><span class="s1">get_variant(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the font variant.  Values are: 'normal' or 'small-caps'. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._variant</span>
+
+    <span class="s3">def </span><span class="s1">get_weight(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font weight.  Options are: A numeric value in the 
+        range 0-1000 or one of 'light', 'normal', 'regular', 'book', 
+        'medium', 'roman', 'semibold', 'demibold', 'demi', 'bold', 
+        'heavy', 'extra bold', 'black' 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._weight</span>
+
+    <span class="s3">def </span><span class="s1">get_stretch(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the font stretch or width.  Options are: 'ultra-condensed', 
+        'extra-condensed', 'condensed', 'semi-condensed', 'normal', 
+        'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded'. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._stretch</span>
+
+    <span class="s3">def </span><span class="s1">get_size(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the font size. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._size</span>
+
+    <span class="s3">def </span><span class="s1">get_file(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the filename of the associated font. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._file</span>
+
+    <span class="s3">def </span><span class="s1">get_fontconfig_pattern(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get a fontconfig_ pattern_ suitable for looking up the font as 
+        specified with fontconfig's ``fc-match`` utility. 
+ 
+        This support does not depend on fontconfig; we are merely borrowing its 
+        pattern syntax for use here. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">generate_fontconfig_pattern(self)</span>
+
+    <span class="s3">def </span><span class="s1">set_family(self</span><span class="s3">, </span><span class="s1">family):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Change the font family.  Can be either an alias (generic name 
+        is CSS parlance), such as: 'serif', 'sans-serif', 'cursive', 
+        'fantasy', or 'monospace', a real font name or a list of real 
+        font names.  Real font names are not supported when 
+        :rc:`text.usetex` is `True`. Default: :rc:`font.family` 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">family </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">family = mpl.rcParams[</span><span class="s4">'font.family'</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">isinstance(family</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s1">family = [family]</span>
+        <span class="s1">self._family = family</span>
+
+    <span class="s3">def </span><span class="s1">set_style(self</span><span class="s3">, </span><span class="s1">style):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font style. 
+ 
+        Parameters 
+        ---------- 
+        style : {'normal', 'italic', 'oblique'}, default: :rc:`font.style` 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">style </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">style = mpl.rcParams[</span><span class="s4">'font.style'</span><span class="s1">]</span>
+        <span class="s1">_api.check_in_list([</span><span class="s4">'normal'</span><span class="s3">, </span><span class="s4">'italic'</span><span class="s3">, </span><span class="s4">'oblique'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">style=style)</span>
+        <span class="s1">self._slant = style</span>
+
+    <span class="s3">def </span><span class="s1">set_variant(self</span><span class="s3">, </span><span class="s1">variant):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font variant. 
+ 
+        Parameters 
+        ---------- 
+        variant : {'normal', 'small-caps'}, default: :rc:`font.variant` 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">variant </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">variant = mpl.rcParams[</span><span class="s4">'font.variant'</span><span class="s1">]</span>
+        <span class="s1">_api.check_in_list([</span><span class="s4">'normal'</span><span class="s3">, </span><span class="s4">'small-caps'</span><span class="s1">]</span><span class="s3">, </span><span class="s1">variant=variant)</span>
+        <span class="s1">self._variant = variant</span>
+
+    <span class="s3">def </span><span class="s1">set_weight(self</span><span class="s3">, </span><span class="s1">weight):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font weight. 
+ 
+        Parameters 
+        ---------- 
+        weight : int or {'ultralight', 'light', 'normal', 'regular', 'book', \ 
+'medium', 'roman', 'semibold', 'demibold', 'demi', 'bold', 'heavy', \ 
+'extra bold', 'black'}, default: :rc:`font.weight` 
+            If int, must be in the range  0-1000. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">weight </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">weight = mpl.rcParams[</span><span class="s4">'font.weight'</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">weight </span><span class="s3">in </span><span class="s1">weight_dict:</span>
+            <span class="s1">self._weight = weight</span>
+            <span class="s3">return</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">weight = int(weight)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s3">pass</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s5">0 </span><span class="s1">&lt;= weight &lt;= </span><span class="s5">1000</span><span class="s1">:</span>
+                <span class="s1">self._weight = weight</span>
+                <span class="s3">return</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">weight=</span><span class="s3">} </span><span class="s4">is invalid&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_stretch(self</span><span class="s3">, </span><span class="s1">stretch):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font stretch or width. 
+ 
+        Parameters 
+        ---------- 
+        stretch : int or {'ultra-condensed', 'extra-condensed', 'condensed', \ 
+'semi-condensed', 'normal', 'semi-expanded', 'expanded', 'extra-expanded', \ 
+'ultra-expanded'}, default: :rc:`font.stretch` 
+            If int, must be in the range  0-1000. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">stretch </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">stretch = mpl.rcParams[</span><span class="s4">'font.stretch'</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">stretch </span><span class="s3">in </span><span class="s1">stretch_dict:</span>
+            <span class="s1">self._stretch = stretch</span>
+            <span class="s3">return</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">stretch = int(stretch)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s3">pass</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s5">0 </span><span class="s1">&lt;= stretch &lt;= </span><span class="s5">1000</span><span class="s1">:</span>
+                <span class="s1">self._stretch = stretch</span>
+                <span class="s3">return</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;</span><span class="s3">{</span><span class="s1">stretch=</span><span class="s3">} </span><span class="s4">is invalid&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">set_size(self</span><span class="s3">, </span><span class="s1">size):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font size. 
+ 
+        Parameters 
+        ---------- 
+        size : float or {'xx-small', 'x-small', 'small', 'medium', \ 
+'large', 'x-large', 'xx-large'}, default: :rc:`font.size` 
+            If a float, the font size in points. The string values denote 
+            sizes relative to the default font size. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">size </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">size = mpl.rcParams[</span><span class="s4">'font.size'</span><span class="s1">]</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">size = float(size)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s1">scale = font_scalings[size]</span>
+            <span class="s3">except </span><span class="s1">KeyError </span><span class="s3">as </span><span class="s1">err:</span>
+                <span class="s3">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;Size is invalid. Valid font size are &quot;</span>
+                    <span class="s1">+ </span><span class="s4">&quot;, &quot;</span><span class="s1">.join(map(str</span><span class="s3">, </span><span class="s1">font_scalings))) </span><span class="s3">from </span><span class="s1">err</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">size = scale * FontManager.get_default_size()</span>
+        <span class="s3">if </span><span class="s1">size &lt; </span><span class="s5">1.0</span><span class="s1">:</span>
+            <span class="s1">_log.info(</span><span class="s4">'Fontsize %1.2f &lt; 1.0 pt not allowed by FreeType. '</span>
+                      <span class="s4">'Setting fontsize = 1 pt'</span><span class="s3">, </span><span class="s1">size)</span>
+            <span class="s1">size = </span><span class="s5">1.0</span>
+        <span class="s1">self._size = size</span>
+
+    <span class="s3">def </span><span class="s1">set_file(self</span><span class="s3">, </span><span class="s1">file):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the filename of the fontfile to use.  In this case, all 
+        other properties will be ignored. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._file = os.fspath(file) </span><span class="s3">if </span><span class="s1">file </span><span class="s3">is not None else None</span>
+
+    <span class="s3">def </span><span class="s1">set_fontconfig_pattern(self</span><span class="s3">, </span><span class="s1">pattern):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the properties by parsing a fontconfig_ *pattern*. 
+ 
+        This support does not depend on fontconfig; we are merely borrowing its 
+        pattern syntax for use here. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">for </span><span class="s1">key</span><span class="s3">, </span><span class="s1">val </span><span class="s3">in </span><span class="s1">parse_fontconfig_pattern(pattern).items():</span>
+            <span class="s3">if </span><span class="s1">type(val) == list:</span>
+                <span class="s1">getattr(self</span><span class="s3">, </span><span class="s4">&quot;set_&quot; </span><span class="s1">+ key)(val[</span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">getattr(self</span><span class="s3">, </span><span class="s4">&quot;set_&quot; </span><span class="s1">+ key)(val)</span>
+
+    <span class="s3">def </span><span class="s1">get_math_fontfamily(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the name of the font family used for math text. 
+ 
+        The default font is :rc:`mathtext.fontset`. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self._math_fontfamily</span>
+
+    <span class="s3">def </span><span class="s1">set_math_fontfamily(self</span><span class="s3">, </span><span class="s1">fontfamily):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the font family for text in math mode. 
+ 
+        If not set explicitly, :rc:`mathtext.fontset` will be used. 
+ 
+        Parameters 
+        ---------- 
+        fontfamily : str 
+            The name of the font family. 
+ 
+            Available font families are defined in the 
+            matplotlibrc.template file 
+            :ref:`here &lt;customizing-with-matplotlibrc-files&gt;` 
+ 
+        See Also 
+        -------- 
+        .text.Text.get_math_fontfamily 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">fontfamily </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">fontfamily = mpl.rcParams[</span><span class="s4">'mathtext.fontset'</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">valid_fonts = _validators[</span><span class="s4">'mathtext.fontset'</span><span class="s1">].valid.values()</span>
+            <span class="s2"># _check_in_list() Validates the parameter math_fontfamily as</span>
+            <span class="s2"># if it were passed to rcParams['mathtext.fontset']</span>
+            <span class="s1">_api.check_in_list(valid_fonts</span><span class="s3">, </span><span class="s1">math_fontfamily=fontfamily)</span>
+        <span class="s1">self._math_fontfamily = fontfamily</span>
+
+    <span class="s3">def </span><span class="s1">copy(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return a copy of self.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">copy.copy(self)</span>
+
+    <span class="s2"># Aliases</span>
+    <span class="s1">set_name = set_family</span>
+    <span class="s1">get_slant = get_style</span>
+    <span class="s1">set_slant = set_style</span>
+    <span class="s1">get_size_in_points = get_size</span>
+
+
+<span class="s3">class </span><span class="s1">_JSONEncoder(json.JSONEncoder):</span>
+    <span class="s3">def </span><span class="s1">default(self</span><span class="s3">, </span><span class="s1">o):</span>
+        <span class="s3">if </span><span class="s1">isinstance(o</span><span class="s3">, </span><span class="s1">FontManager):</span>
+            <span class="s3">return </span><span class="s1">dict(o.__dict__</span><span class="s3">, </span><span class="s1">__class__=</span><span class="s4">'FontManager'</span><span class="s1">)</span>
+        <span class="s3">elif </span><span class="s1">isinstance(o</span><span class="s3">, </span><span class="s1">FontEntry):</span>
+            <span class="s1">d = dict(o.__dict__</span><span class="s3">, </span><span class="s1">__class__=</span><span class="s4">'FontEntry'</span><span class="s1">)</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s2"># Cache paths of fonts shipped with Matplotlib relative to the</span>
+                <span class="s2"># Matplotlib data path, which helps in the presence of venvs.</span>
+                <span class="s1">d[</span><span class="s4">&quot;fname&quot;</span><span class="s1">] = str(</span>
+                    <span class="s1">Path(d[</span><span class="s4">&quot;fname&quot;</span><span class="s1">]).relative_to(mpl.get_data_path()))</span>
+            <span class="s3">except </span><span class="s1">ValueError:</span>
+                <span class="s3">pass</span>
+            <span class="s3">return </span><span class="s1">d</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">super().default(o)</span>
+
+
+<span class="s3">def </span><span class="s1">_json_decode(o):</span>
+    <span class="s1">cls = o.pop(</span><span class="s4">'__class__'</span><span class="s3">, None</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">cls </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">o</span>
+    <span class="s3">elif </span><span class="s1">cls == </span><span class="s4">'FontManager'</span><span class="s1">:</span>
+        <span class="s1">r = FontManager.__new__(FontManager)</span>
+        <span class="s1">r.__dict__.update(o)</span>
+        <span class="s3">return </span><span class="s1">r</span>
+    <span class="s3">elif </span><span class="s1">cls == </span><span class="s4">'FontEntry'</span><span class="s1">:</span>
+        <span class="s1">r = FontEntry.__new__(FontEntry)</span>
+        <span class="s1">r.__dict__.update(o)</span>
+        <span class="s3">if not </span><span class="s1">os.path.isabs(r.fname):</span>
+            <span class="s1">r.fname = os.path.join(mpl.get_data_path()</span><span class="s3">, </span><span class="s1">r.fname)</span>
+        <span class="s3">return </span><span class="s1">r</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Don't know how to deserialize __class__=%s&quot; </span><span class="s1">% cls)</span>
+
+
+<span class="s3">def </span><span class="s1">json_dump(data</span><span class="s3">, </span><span class="s1">filename):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Dump `FontManager` *data* as JSON to the file named *filename*. 
+ 
+    See Also 
+    -------- 
+    json_load 
+ 
+    Notes 
+    ----- 
+    File paths that are children of the Matplotlib data path (typically, fonts 
+    shipped with Matplotlib) are stored relative to that data path (to remain 
+    valid across virtualenvs). 
+ 
+    This function temporarily locks the output file to prevent multiple 
+    processes from overwriting one another's output. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">cbook._lock_path(filename)</span><span class="s3">, </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s4">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">fh:</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">json.dump(data</span><span class="s3">, </span><span class="s1">fh</span><span class="s3">, </span><span class="s1">cls=_JSONEncoder</span><span class="s3">, </span><span class="s1">indent=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s3">except </span><span class="s1">OSError </span><span class="s3">as </span><span class="s1">e:</span>
+            <span class="s1">_log.warning(</span><span class="s4">'Could not save font_manager cache {}'</span><span class="s1">.format(e))</span>
+
+
+<span class="s3">def </span><span class="s1">json_load(filename):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Load a `FontManager` from the JSON file named *filename*. 
+ 
+    See Also 
+    -------- 
+    json_dump 
+    &quot;&quot;&quot;</span>
+    <span class="s3">with </span><span class="s1">open(filename) </span><span class="s3">as </span><span class="s1">fh:</span>
+        <span class="s3">return </span><span class="s1">json.load(fh</span><span class="s3">, </span><span class="s1">object_hook=_json_decode)</span>
+
+
+<span class="s3">class </span><span class="s1">FontManager:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    On import, the `FontManager` singleton instance creates a list of ttf and 
+    afm fonts and caches their `FontProperties`.  The `FontManager.findfont` 
+    method does a nearest neighbor search to find the font that most closely 
+    matches the specification.  If no good enough match is found, the default 
+    font is returned. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># Increment this version number whenever the font cache data</span>
+    <span class="s2"># format or behavior has changed and requires an existing font</span>
+    <span class="s2"># cache files to be rebuilt.</span>
+    <span class="s1">__version__ = </span><span class="s5">330</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">size=</span><span class="s3">None, </span><span class="s1">weight=</span><span class="s4">'normal'</span><span class="s1">):</span>
+        <span class="s1">self._version = self.__version__</span>
+
+        <span class="s1">self.__default_weight = weight</span>
+        <span class="s1">self.default_size = size</span>
+
+        <span class="s2"># Create list of font paths.</span>
+        <span class="s1">paths = [cbook._get_data_path(</span><span class="s4">'fonts'</span><span class="s3">, </span><span class="s1">subdir)</span>
+                 <span class="s3">for </span><span class="s1">subdir </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'ttf'</span><span class="s3">, </span><span class="s4">'afm'</span><span class="s3">, </span><span class="s4">'pdfcorefonts'</span><span class="s1">]]</span>
+        <span class="s1">_log.debug(</span><span class="s4">'font search path %s'</span><span class="s3">, </span><span class="s1">paths)</span>
+
+        <span class="s1">self.defaultFamily = {</span>
+            <span class="s4">'ttf'</span><span class="s1">: </span><span class="s4">'DejaVu Sans'</span><span class="s3">,</span>
+            <span class="s4">'afm'</span><span class="s1">: </span><span class="s4">'Helvetica'</span><span class="s1">}</span>
+
+        <span class="s1">self.afmlist = []</span>
+        <span class="s1">self.ttflist = []</span>
+
+        <span class="s2"># Delay the warning by 5s.</span>
+        <span class="s1">timer = threading.Timer(</span><span class="s5">5</span><span class="s3">, lambda</span><span class="s1">: _log.warning(</span>
+            <span class="s4">'Matplotlib is building the font cache; this may take a moment.'</span><span class="s1">))</span>
+        <span class="s1">timer.start()</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s3">for </span><span class="s1">fontext </span><span class="s3">in </span><span class="s1">[</span><span class="s4">&quot;afm&quot;</span><span class="s3">, </span><span class="s4">&quot;ttf&quot;</span><span class="s1">]:</span>
+                <span class="s3">for </span><span class="s1">path </span><span class="s3">in </span><span class="s1">[*findSystemFonts(paths</span><span class="s3">, </span><span class="s1">fontext=fontext)</span><span class="s3">,</span>
+                             <span class="s1">*findSystemFonts(fontext=fontext)]:</span>
+                    <span class="s3">try</span><span class="s1">:</span>
+                        <span class="s1">self.addfont(path)</span>
+                    <span class="s3">except </span><span class="s1">OSError </span><span class="s3">as </span><span class="s1">exc:</span>
+                        <span class="s1">_log.info(</span><span class="s4">&quot;Failed to open font file %s: %s&quot;</span><span class="s3">, </span><span class="s1">path</span><span class="s3">, </span><span class="s1">exc)</span>
+                    <span class="s3">except </span><span class="s1">Exception </span><span class="s3">as </span><span class="s1">exc:</span>
+                        <span class="s1">_log.info(</span><span class="s4">&quot;Failed to extract font properties from %s: &quot;</span>
+                                  <span class="s4">&quot;%s&quot;</span><span class="s3">, </span><span class="s1">path</span><span class="s3">, </span><span class="s1">exc)</span>
+        <span class="s3">finally</span><span class="s1">:</span>
+            <span class="s1">timer.cancel()</span>
+
+    <span class="s3">def </span><span class="s1">addfont(self</span><span class="s3">, </span><span class="s1">path):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Cache the properties of the font at *path* to make it available to the 
+        `FontManager`.  The type of font is inferred from the path suffix. 
+ 
+        Parameters 
+        ---------- 
+        path : str or path-like 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Convert to string in case of a path as</span>
+        <span class="s2"># afmFontProperty and FT2Font expect this</span>
+        <span class="s1">path = os.fsdecode(path)</span>
+        <span class="s3">if </span><span class="s1">Path(path).suffix.lower() == </span><span class="s4">&quot;.afm&quot;</span><span class="s1">:</span>
+            <span class="s3">with </span><span class="s1">open(path</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s1">) </span><span class="s3">as </span><span class="s1">fh:</span>
+                <span class="s1">font = _afm.AFM(fh)</span>
+            <span class="s1">prop = afmFontProperty(path</span><span class="s3">, </span><span class="s1">font)</span>
+            <span class="s1">self.afmlist.append(prop)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">font = ft2font.FT2Font(path)</span>
+            <span class="s1">prop = ttfFontProperty(font)</span>
+            <span class="s1">self.ttflist.append(prop)</span>
+        <span class="s1">self._findfont_cached.cache_clear()</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">defaultFont(self):</span>
+        <span class="s2"># Lazily evaluated (findfont then caches the result) to avoid including</span>
+        <span class="s2"># the venv path in the json serialization.</span>
+        <span class="s3">return </span><span class="s1">{ext: self.findfont(family</span><span class="s3">, </span><span class="s1">fontext=ext)</span>
+                <span class="s3">for </span><span class="s1">ext</span><span class="s3">, </span><span class="s1">family </span><span class="s3">in </span><span class="s1">self.defaultFamily.items()}</span>
+
+    <span class="s3">def </span><span class="s1">get_default_weight(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the default font weight. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.__default_weight</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s3">def </span><span class="s1">get_default_size():</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the default font size. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">mpl.rcParams[</span><span class="s4">'font.size'</span><span class="s1">]</span>
+
+    <span class="s3">def </span><span class="s1">set_default_weight(self</span><span class="s3">, </span><span class="s1">weight):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the default font weight.  The initial value is 'normal'. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.__default_weight = weight</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s3">def </span><span class="s1">_expand_aliases(family):</span>
+        <span class="s3">if </span><span class="s1">family </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'sans'</span><span class="s3">, </span><span class="s4">'sans serif'</span><span class="s1">):</span>
+            <span class="s1">family = </span><span class="s4">'sans-serif'</span>
+        <span class="s3">return </span><span class="s1">mpl.rcParams[</span><span class="s4">'font.' </span><span class="s1">+ family]</span>
+
+    <span class="s2"># Each of the scoring functions below should return a value between</span>
+    <span class="s2"># 0.0 (perfect match) and 1.0 (terrible match)</span>
+    <span class="s3">def </span><span class="s1">score_family(self</span><span class="s3">, </span><span class="s1">families</span><span class="s3">, </span><span class="s1">family2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a match score between the list of font families in 
+        *families* and the font family name *family2*. 
+ 
+        An exact match at the head of the list returns 0.0. 
+ 
+        A match further down the list will return between 0 and 1. 
+ 
+        No match will return 1.0. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if not </span><span class="s1">isinstance(families</span><span class="s3">, </span><span class="s1">(list</span><span class="s3">, </span><span class="s1">tuple)):</span>
+            <span class="s1">families = [families]</span>
+        <span class="s3">elif </span><span class="s1">len(families) == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s5">1.0</span>
+        <span class="s1">family2 = family2.lower()</span>
+        <span class="s1">step = </span><span class="s5">1 </span><span class="s1">/ len(families)</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">family1 </span><span class="s3">in </span><span class="s1">enumerate(families):</span>
+            <span class="s1">family1 = family1.lower()</span>
+            <span class="s3">if </span><span class="s1">family1 </span><span class="s3">in </span><span class="s1">font_family_aliases:</span>
+                <span class="s1">options = [*map(str.lower</span><span class="s3">, </span><span class="s1">self._expand_aliases(family1))]</span>
+                <span class="s3">if </span><span class="s1">family2 </span><span class="s3">in </span><span class="s1">options:</span>
+                    <span class="s1">idx = options.index(family2)</span>
+                    <span class="s3">return </span><span class="s1">(i + (idx / len(options))) * step</span>
+            <span class="s3">elif </span><span class="s1">family1 == family2:</span>
+                <span class="s2"># The score should be weighted by where in the</span>
+                <span class="s2"># list the font was found.</span>
+                <span class="s3">return </span><span class="s1">i * step</span>
+        <span class="s3">return </span><span class="s5">1.0</span>
+
+    <span class="s3">def </span><span class="s1">score_style(self</span><span class="s3">, </span><span class="s1">style1</span><span class="s3">, </span><span class="s1">style2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a match score between *style1* and *style2*. 
+ 
+        An exact match returns 0.0. 
+ 
+        A match between 'italic' and 'oblique' returns 0.1. 
+ 
+        No match returns 1.0. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">style1 == style2:</span>
+            <span class="s3">return </span><span class="s5">0.0</span>
+        <span class="s3">elif </span><span class="s1">(style1 </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'italic'</span><span class="s3">, </span><span class="s4">'oblique'</span><span class="s1">)</span>
+              <span class="s3">and </span><span class="s1">style2 </span><span class="s3">in </span><span class="s1">(</span><span class="s4">'italic'</span><span class="s3">, </span><span class="s4">'oblique'</span><span class="s1">)):</span>
+            <span class="s3">return </span><span class="s5">0.1</span>
+        <span class="s3">return </span><span class="s5">1.0</span>
+
+    <span class="s3">def </span><span class="s1">score_variant(self</span><span class="s3">, </span><span class="s1">variant1</span><span class="s3">, </span><span class="s1">variant2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a match score between *variant1* and *variant2*. 
+ 
+        An exact match returns 0.0, otherwise 1.0. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">variant1 == variant2:</span>
+            <span class="s3">return </span><span class="s5">0.0</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s5">1.0</span>
+
+    <span class="s3">def </span><span class="s1">score_stretch(self</span><span class="s3">, </span><span class="s1">stretch1</span><span class="s3">, </span><span class="s1">stretch2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a match score between *stretch1* and *stretch2*. 
+ 
+        The result is the absolute value of the difference between the 
+        CSS numeric values of *stretch1* and *stretch2*, normalized 
+        between 0.0 and 1.0. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">stretchval1 = int(stretch1)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s1">stretchval1 = stretch_dict.get(stretch1</span><span class="s3">, </span><span class="s5">500</span><span class="s1">)</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">stretchval2 = int(stretch2)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s1">stretchval2 = stretch_dict.get(stretch2</span><span class="s3">, </span><span class="s5">500</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">abs(stretchval1 - stretchval2) / </span><span class="s5">1000.0</span>
+
+    <span class="s3">def </span><span class="s1">score_weight(self</span><span class="s3">, </span><span class="s1">weight1</span><span class="s3">, </span><span class="s1">weight2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a match score between *weight1* and *weight2*. 
+ 
+        The result is 0.0 if both weight1 and weight 2 are given as strings 
+        and have the same value. 
+ 
+        Otherwise, the result is the absolute value of the difference between 
+        the CSS numeric values of *weight1* and *weight2*, normalized between 
+        0.05 and 1.0. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># exact match of the weight names, e.g. weight1 == weight2 == &quot;regular&quot;</span>
+        <span class="s3">if </span><span class="s1">cbook._str_equal(weight1</span><span class="s3">, </span><span class="s1">weight2):</span>
+            <span class="s3">return </span><span class="s5">0.0</span>
+        <span class="s1">w1 = weight1 </span><span class="s3">if </span><span class="s1">isinstance(weight1</span><span class="s3">, </span><span class="s1">Number) </span><span class="s3">else </span><span class="s1">weight_dict[weight1]</span>
+        <span class="s1">w2 = weight2 </span><span class="s3">if </span><span class="s1">isinstance(weight2</span><span class="s3">, </span><span class="s1">Number) </span><span class="s3">else </span><span class="s1">weight_dict[weight2]</span>
+        <span class="s3">return </span><span class="s5">0.95 </span><span class="s1">* (abs(w1 - w2) / </span><span class="s5">1000</span><span class="s1">) + </span><span class="s5">0.05</span>
+
+    <span class="s3">def </span><span class="s1">score_size(self</span><span class="s3">, </span><span class="s1">size1</span><span class="s3">, </span><span class="s1">size2):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a match score between *size1* and *size2*. 
+ 
+        If *size2* (the size specified in the font file) is 'scalable', this 
+        function always returns 0.0, since any font size can be generated. 
+ 
+        Otherwise, the result is the absolute distance between *size1* and 
+        *size2*, normalized so that the usual range of font sizes (6pt - 
+        72pt) will lie between 0.0 and 1.0. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">size2 == </span><span class="s4">'scalable'</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s5">0.0</span>
+        <span class="s2"># Size value should have already been</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">sizeval1 = float(size1)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s1">sizeval1 = self.default_size * font_scalings[size1]</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">sizeval2 = float(size2)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s3">return </span><span class="s5">1.0</span>
+        <span class="s3">return </span><span class="s1">abs(sizeval1 - sizeval2) / </span><span class="s5">72</span>
+
+    <span class="s3">def </span><span class="s1">findfont(self</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">fontext=</span><span class="s4">'ttf'</span><span class="s3">, </span><span class="s1">directory=</span><span class="s3">None,</span>
+                 <span class="s1">fallback_to_default=</span><span class="s3">True, </span><span class="s1">rebuild_if_missing=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find a font that most closely matches the given font properties. 
+ 
+        Parameters 
+        ---------- 
+        prop : str or `~matplotlib.font_manager.FontProperties` 
+            The font properties to search for. This can be either a 
+            `.FontProperties` object or a string defining a 
+            `fontconfig patterns`_. 
+ 
+        fontext : {'ttf', 'afm'}, default: 'ttf' 
+            The extension of the font file: 
+ 
+            - 'ttf': TrueType and OpenType fonts (.ttf, .ttc, .otf) 
+            - 'afm': Adobe Font Metrics (.afm) 
+ 
+        directory : str, optional 
+            If given, only search this directory and its subdirectories. 
+ 
+        fallback_to_default : bool 
+            If True, will fall back to the default font family (usually 
+            &quot;DejaVu Sans&quot; or &quot;Helvetica&quot;) if the first lookup hard-fails. 
+ 
+        rebuild_if_missing : bool 
+            Whether to rebuild the font cache and search again if the first 
+            match appears to point to a nonexisting font (i.e., the font cache 
+            contains outdated entries). 
+ 
+        Returns 
+        ------- 
+        str 
+            The filename of the best matching font. 
+ 
+        Notes 
+        ----- 
+        This performs a nearest neighbor search.  Each font is given a 
+        similarity score to the target font properties.  The first font with 
+        the highest score is returned.  If no matches below a certain 
+        threshold are found, the default font (usually DejaVu Sans) is 
+        returned. 
+ 
+        The result is cached, so subsequent lookups don't have to 
+        perform the O(n) nearest neighbor search. 
+ 
+        See the `W3C Cascading Style Sheet, Level 1 
+        &lt;http://www.w3.org/TR/1998/REC-CSS2-19980512/&gt;`_ documentation 
+        for a description of the font finding algorithm. 
+ 
+        .. _fontconfig patterns: 
+           https://www.freedesktop.org/software/fontconfig/fontconfig-user.html 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Pass the relevant rcParams (and the font manager, as `self`) to</span>
+        <span class="s2"># _findfont_cached so to prevent using a stale cache entry after an</span>
+        <span class="s2"># rcParam was changed.</span>
+        <span class="s1">rc_params = tuple(tuple(mpl.rcParams[key]) </span><span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s1">[</span>
+            <span class="s4">&quot;font.serif&quot;</span><span class="s3">, </span><span class="s4">&quot;font.sans-serif&quot;</span><span class="s3">, </span><span class="s4">&quot;font.cursive&quot;</span><span class="s3">, </span><span class="s4">&quot;font.fantasy&quot;</span><span class="s3">,</span>
+            <span class="s4">&quot;font.monospace&quot;</span><span class="s1">])</span>
+        <span class="s1">ret = self._findfont_cached(</span>
+            <span class="s1">prop</span><span class="s3">, </span><span class="s1">fontext</span><span class="s3">, </span><span class="s1">directory</span><span class="s3">, </span><span class="s1">fallback_to_default</span><span class="s3">, </span><span class="s1">rebuild_if_missing</span><span class="s3">,</span>
+            <span class="s1">rc_params)</span>
+        <span class="s3">if </span><span class="s1">isinstance(ret</span><span class="s3">, </span><span class="s1">Exception):</span>
+            <span class="s3">raise </span><span class="s1">ret</span>
+        <span class="s3">return </span><span class="s1">ret</span>
+
+    <span class="s3">def </span><span class="s1">get_font_names(self):</span>
+        <span class="s0">&quot;&quot;&quot;Return the list of available fonts.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">list(set([font.name </span><span class="s3">for </span><span class="s1">font </span><span class="s3">in </span><span class="s1">self.ttflist]))</span>
+
+    <span class="s3">def </span><span class="s1">_find_fonts_by_props(self</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">fontext=</span><span class="s4">'ttf'</span><span class="s3">, </span><span class="s1">directory=</span><span class="s3">None,</span>
+                             <span class="s1">fallback_to_default=</span><span class="s3">True, </span><span class="s1">rebuild_if_missing=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find font families that most closely match the given properties. 
+ 
+        Parameters 
+        ---------- 
+        prop : str or `~matplotlib.font_manager.FontProperties` 
+            The font properties to search for. This can be either a 
+            `.FontProperties` object or a string defining a 
+            `fontconfig patterns`_. 
+ 
+        fontext : {'ttf', 'afm'}, default: 'ttf' 
+            The extension of the font file: 
+ 
+            - 'ttf': TrueType and OpenType fonts (.ttf, .ttc, .otf) 
+            - 'afm': Adobe Font Metrics (.afm) 
+ 
+        directory : str, optional 
+            If given, only search this directory and its subdirectories. 
+ 
+        fallback_to_default : bool 
+            If True, will fall back to the default font family (usually 
+            &quot;DejaVu Sans&quot; or &quot;Helvetica&quot;) if none of the families were found. 
+ 
+        rebuild_if_missing : bool 
+            Whether to rebuild the font cache and search again if the first 
+            match appears to point to a nonexisting font (i.e., the font cache 
+            contains outdated entries). 
+ 
+        Returns 
+        ------- 
+        list[str] 
+            The paths of the fonts found 
+ 
+        Notes 
+        ----- 
+        This is an extension/wrapper of the original findfont API, which only 
+        returns a single font for given font properties. Instead, this API 
+        returns a dict containing multiple fonts and their filepaths 
+        which closely match the given font properties.  Since this internally 
+        uses the original API, there's no change to the logic of performing the 
+        nearest neighbor search.  See `findfont` for more details. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">prop = FontProperties._from_any(prop)</span>
+
+        <span class="s1">fpaths = []</span>
+        <span class="s3">for </span><span class="s1">family </span><span class="s3">in </span><span class="s1">prop.get_family():</span>
+            <span class="s1">cprop = prop.copy()</span>
+            <span class="s1">cprop.set_family(family)  </span><span class="s2"># set current prop's family</span>
+
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s1">fpaths.append(</span>
+                    <span class="s1">self.findfont(</span>
+                        <span class="s1">cprop</span><span class="s3">, </span><span class="s1">fontext</span><span class="s3">, </span><span class="s1">directory</span><span class="s3">,</span>
+                        <span class="s1">fallback_to_default=</span><span class="s3">False,  </span><span class="s2"># don't fallback to default</span>
+                        <span class="s1">rebuild_if_missing=rebuild_if_missing</span><span class="s3">,</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+            <span class="s3">except </span><span class="s1">ValueError:</span>
+                <span class="s3">if </span><span class="s1">family </span><span class="s3">in </span><span class="s1">font_family_aliases:</span>
+                    <span class="s1">_log.warning(</span>
+                        <span class="s4">&quot;findfont: Generic family %r not found because &quot;</span>
+                        <span class="s4">&quot;none of the following families were found: %s&quot;</span><span class="s3">,</span>
+                        <span class="s1">family</span><span class="s3">, </span><span class="s4">&quot;, &quot;</span><span class="s1">.join(self._expand_aliases(family))</span>
+                    <span class="s1">)</span>
+                <span class="s3">else</span><span class="s1">:</span>
+                    <span class="s1">_log.warning(</span><span class="s4">&quot;findfont: Font family %r not found.&quot;</span><span class="s3">, </span><span class="s1">family)</span>
+
+        <span class="s2"># only add default family if no other font was found and</span>
+        <span class="s2"># fallback_to_default is enabled</span>
+        <span class="s3">if not </span><span class="s1">fpaths:</span>
+            <span class="s3">if </span><span class="s1">fallback_to_default:</span>
+                <span class="s1">dfamily = self.defaultFamily[fontext]</span>
+                <span class="s1">cprop = prop.copy()</span>
+                <span class="s1">cprop.set_family(dfamily)</span>
+                <span class="s1">fpaths.append(</span>
+                    <span class="s1">self.findfont(</span>
+                        <span class="s1">cprop</span><span class="s3">, </span><span class="s1">fontext</span><span class="s3">, </span><span class="s1">directory</span><span class="s3">,</span>
+                        <span class="s1">fallback_to_default=</span><span class="s3">True,</span>
+                        <span class="s1">rebuild_if_missing=rebuild_if_missing</span><span class="s3">,</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Failed to find any font, and fallback &quot;</span>
+                                 <span class="s4">&quot;to the default font was disabled&quot;</span><span class="s1">)</span>
+
+        <span class="s3">return </span><span class="s1">fpaths</span>
+
+    <span class="s1">@lru_cache(</span><span class="s5">1024</span><span class="s1">)</span>
+    <span class="s3">def </span><span class="s1">_findfont_cached(self</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">fontext</span><span class="s3">, </span><span class="s1">directory</span><span class="s3">, </span><span class="s1">fallback_to_default</span><span class="s3">,</span>
+                         <span class="s1">rebuild_if_missing</span><span class="s3">, </span><span class="s1">rc_params):</span>
+
+        <span class="s1">prop = FontProperties._from_any(prop)</span>
+
+        <span class="s1">fname = prop.get_file()</span>
+        <span class="s3">if </span><span class="s1">fname </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">fname</span>
+
+        <span class="s3">if </span><span class="s1">fontext == </span><span class="s4">'afm'</span><span class="s1">:</span>
+            <span class="s1">fontlist = self.afmlist</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">fontlist = self.ttflist</span>
+
+        <span class="s1">best_score = </span><span class="s5">1e64</span>
+        <span class="s1">best_font = </span><span class="s3">None</span>
+
+        <span class="s1">_log.debug(</span><span class="s4">'findfont: Matching %s.'</span><span class="s3">, </span><span class="s1">prop)</span>
+        <span class="s3">for </span><span class="s1">font </span><span class="s3">in </span><span class="s1">fontlist:</span>
+            <span class="s3">if </span><span class="s1">(directory </span><span class="s3">is not None and</span>
+                    <span class="s1">Path(directory) </span><span class="s3">not in </span><span class="s1">Path(font.fname).parents):</span>
+                <span class="s3">continue</span>
+            <span class="s2"># Matching family should have top priority, so multiply it by 10.</span>
+            <span class="s1">score = (self.score_family(prop.get_family()</span><span class="s3">, </span><span class="s1">font.name) * </span><span class="s5">10</span>
+                     <span class="s1">+ self.score_style(prop.get_style()</span><span class="s3">, </span><span class="s1">font.style)</span>
+                     <span class="s1">+ self.score_variant(prop.get_variant()</span><span class="s3">, </span><span class="s1">font.variant)</span>
+                     <span class="s1">+ self.score_weight(prop.get_weight()</span><span class="s3">, </span><span class="s1">font.weight)</span>
+                     <span class="s1">+ self.score_stretch(prop.get_stretch()</span><span class="s3">, </span><span class="s1">font.stretch)</span>
+                     <span class="s1">+ self.score_size(prop.get_size()</span><span class="s3">, </span><span class="s1">font.size))</span>
+            <span class="s1">_log.debug(</span><span class="s4">'findfont: score(%s) = %s'</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">score)</span>
+            <span class="s3">if </span><span class="s1">score &lt; best_score:</span>
+                <span class="s1">best_score = score</span>
+                <span class="s1">best_font = font</span>
+            <span class="s3">if </span><span class="s1">score == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s3">break</span>
+
+        <span class="s3">if </span><span class="s1">best_font </span><span class="s3">is None or </span><span class="s1">best_score &gt;= </span><span class="s5">10.0</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">fallback_to_default:</span>
+                <span class="s1">_log.warning(</span>
+                    <span class="s4">'findfont: Font family %s not found. Falling back to %s.'</span><span class="s3">,</span>
+                    <span class="s1">prop.get_family()</span><span class="s3">, </span><span class="s1">self.defaultFamily[fontext])</span>
+                <span class="s3">for </span><span class="s1">family </span><span class="s3">in </span><span class="s1">map(str.lower</span><span class="s3">, </span><span class="s1">prop.get_family()):</span>
+                    <span class="s3">if </span><span class="s1">family </span><span class="s3">in </span><span class="s1">font_family_aliases:</span>
+                        <span class="s1">_log.warning(</span>
+                            <span class="s4">&quot;findfont: Generic family %r not found because &quot;</span>
+                            <span class="s4">&quot;none of the following families were found: %s&quot;</span><span class="s3">,</span>
+                            <span class="s1">family</span><span class="s3">, </span><span class="s4">&quot;, &quot;</span><span class="s1">.join(self._expand_aliases(family)))</span>
+                <span class="s1">default_prop = prop.copy()</span>
+                <span class="s1">default_prop.set_family(self.defaultFamily[fontext])</span>
+                <span class="s3">return </span><span class="s1">self.findfont(default_prop</span><span class="s3">, </span><span class="s1">fontext</span><span class="s3">, </span><span class="s1">directory</span><span class="s3">,</span>
+                                     <span class="s1">fallback_to_default=</span><span class="s3">False</span><span class="s1">)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s2"># This return instead of raise is intentional, as we wish to</span>
+                <span class="s2"># cache the resulting exception, which will not occur if it was</span>
+                <span class="s2"># actually raised.</span>
+                <span class="s3">return </span><span class="s1">ValueError(</span><span class="s4">f&quot;Failed to find font </span><span class="s3">{</span><span class="s1">prop</span><span class="s3">}</span><span class="s4">, and fallback &quot;</span>
+                                  <span class="s4">f&quot;to the default font was disabled&quot;</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">_log.debug(</span><span class="s4">'findfont: Matching %s to %s (%r) with score of %f.'</span><span class="s3">,</span>
+                       <span class="s1">prop</span><span class="s3">, </span><span class="s1">best_font.name</span><span class="s3">, </span><span class="s1">best_font.fname</span><span class="s3">, </span><span class="s1">best_score)</span>
+            <span class="s1">result = best_font.fname</span>
+
+        <span class="s3">if not </span><span class="s1">os.path.isfile(result):</span>
+            <span class="s3">if </span><span class="s1">rebuild_if_missing:</span>
+                <span class="s1">_log.info(</span>
+                    <span class="s4">'findfont: Found a missing font file.  Rebuilding cache.'</span><span class="s1">)</span>
+                <span class="s1">new_fm = _load_fontmanager(try_read_cache=</span><span class="s3">False</span><span class="s1">)</span>
+                <span class="s2"># Replace self by the new fontmanager, because users may have</span>
+                <span class="s2"># a reference to this specific instance.</span>
+                <span class="s2"># TODO: _load_fontmanager should really be (used by) a method</span>
+                <span class="s2"># modifying the instance in place.</span>
+                <span class="s1">vars(self).update(vars(new_fm))</span>
+                <span class="s3">return </span><span class="s1">self.findfont(</span>
+                    <span class="s1">prop</span><span class="s3">, </span><span class="s1">fontext</span><span class="s3">, </span><span class="s1">directory</span><span class="s3">, </span><span class="s1">rebuild_if_missing=</span><span class="s3">False</span><span class="s1">)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s2"># This return instead of raise is intentional, as we wish to</span>
+                <span class="s2"># cache the resulting exception, which will not occur if it was</span>
+                <span class="s2"># actually raised.</span>
+                <span class="s3">return </span><span class="s1">ValueError(</span><span class="s4">&quot;No valid font could be found&quot;</span><span class="s1">)</span>
+
+        <span class="s3">return </span><span class="s1">_cached_realpath(result)</span>
+
+
+<span class="s1">@lru_cache()</span>
+<span class="s3">def </span><span class="s1">is_opentype_cff_font(filename):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return whether the given font is a Postscript Compact Font Format Font 
+    embedded in an OpenType wrapper.  Used by the PostScript and PDF backends 
+    that can not subset these fonts. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">os.path.splitext(filename)[</span><span class="s5">1</span><span class="s1">].lower() == </span><span class="s4">'.otf'</span><span class="s1">:</span>
+        <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">fd:</span>
+            <span class="s3">return </span><span class="s1">fd.read(</span><span class="s5">4</span><span class="s1">) == </span><span class="s6">b&quot;OTTO&quot;</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return False</span>
+
+
+<span class="s1">@lru_cache(</span><span class="s5">64</span><span class="s1">)</span>
+<span class="s3">def </span><span class="s1">_get_font(font_filepaths</span><span class="s3">, </span><span class="s1">hinting_factor</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">_kerning_factor</span><span class="s3">, </span><span class="s1">thread_id):</span>
+    <span class="s1">first_fontpath</span><span class="s3">, </span><span class="s1">*rest = font_filepaths</span>
+    <span class="s3">return </span><span class="s1">ft2font.FT2Font(</span>
+        <span class="s1">first_fontpath</span><span class="s3">, </span><span class="s1">hinting_factor</span><span class="s3">,</span>
+        <span class="s1">_fallback_list=[</span>
+            <span class="s1">ft2font.FT2Font(</span>
+                <span class="s1">fpath</span><span class="s3">, </span><span class="s1">hinting_factor</span><span class="s3">,</span>
+                <span class="s1">_kerning_factor=_kerning_factor</span>
+            <span class="s1">)</span>
+            <span class="s3">for </span><span class="s1">fpath </span><span class="s3">in </span><span class="s1">rest</span>
+        <span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">_kerning_factor=_kerning_factor</span>
+    <span class="s1">)</span>
+
+
+<span class="s2"># FT2Font objects cannot be used across fork()s because they reference the same</span>
+<span class="s2"># FT_Library object.  While invalidating *all* existing FT2Fonts after a fork</span>
+<span class="s2"># would be too complicated to be worth it, the main way FT2Fonts get reused is</span>
+<span class="s2"># via the cache of _get_font, which we can empty upon forking (not on Windows,</span>
+<span class="s2"># which has no fork() or register_at_fork()).</span>
+<span class="s3">if </span><span class="s1">hasattr(os</span><span class="s3">, </span><span class="s4">&quot;register_at_fork&quot;</span><span class="s1">):</span>
+    <span class="s1">os.register_at_fork(after_in_child=_get_font.cache_clear)</span>
+
+
+<span class="s1">@lru_cache(</span><span class="s5">64</span><span class="s1">)</span>
+<span class="s3">def </span><span class="s1">_cached_realpath(path):</span>
+    <span class="s2"># Resolving the path avoids embedding the font twice in pdf/ps output if a</span>
+    <span class="s2"># single font is selected using two different relative paths.</span>
+    <span class="s3">return </span><span class="s1">os.path.realpath(path)</span>
+
+
+<span class="s1">@_api.rename_parameter(</span><span class="s4">'3.6'</span><span class="s3">, </span><span class="s4">&quot;filepath&quot;</span><span class="s3">, </span><span class="s4">&quot;font_filepaths&quot;</span><span class="s1">)</span>
+<span class="s3">def </span><span class="s1">get_font(font_filepaths</span><span class="s3">, </span><span class="s1">hinting_factor=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Get an `.ft2font.FT2Font` object given a list of file paths. 
+ 
+    Parameters 
+    ---------- 
+    font_filepaths : Iterable[str, Path, bytes], str, Path, bytes 
+        Relative or absolute paths to the font files to be used. 
+ 
+        If a single string, bytes, or `pathlib.Path`, then it will be treated 
+        as a list with that entry only. 
+ 
+        If more than one filepath is passed, then the returned FT2Font object 
+        will fall back through the fonts, in the order given, to find a needed 
+        glyph. 
+ 
+    Returns 
+    ------- 
+    `.ft2font.FT2Font` 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">isinstance(font_filepaths</span><span class="s3">, </span><span class="s1">(str</span><span class="s3">, </span><span class="s1">Path</span><span class="s3">, </span><span class="s1">bytes)):</span>
+        <span class="s1">paths = (_cached_realpath(font_filepaths)</span><span class="s3">,</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">paths = tuple(_cached_realpath(fname) </span><span class="s3">for </span><span class="s1">fname </span><span class="s3">in </span><span class="s1">font_filepaths)</span>
+
+    <span class="s3">if </span><span class="s1">hinting_factor </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">hinting_factor = mpl.rcParams[</span><span class="s4">'text.hinting_factor'</span><span class="s1">]</span>
+
+    <span class="s3">return </span><span class="s1">_get_font(</span>
+        <span class="s2"># must be a tuple to be cached</span>
+        <span class="s1">paths</span><span class="s3">,</span>
+        <span class="s1">hinting_factor</span><span class="s3">,</span>
+        <span class="s1">_kerning_factor=mpl.rcParams[</span><span class="s4">'text.kerning_factor'</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s2"># also key on the thread ID to prevent segfaults with multi-threading</span>
+        <span class="s1">thread_id=threading.get_ident()</span>
+    <span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">_load_fontmanager(*</span><span class="s3">, </span><span class="s1">try_read_cache=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s1">fm_path = Path(</span>
+        <span class="s1">mpl.get_cachedir()</span><span class="s3">, </span><span class="s4">f&quot;fontlist-v</span><span class="s3">{</span><span class="s1">FontManager.__version__</span><span class="s3">}</span><span class="s4">.json&quot;</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">try_read_cache:</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">fm = json_load(fm_path)</span>
+        <span class="s3">except </span><span class="s1">Exception:</span>
+            <span class="s3">pass</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">getattr(fm</span><span class="s3">, </span><span class="s4">&quot;_version&quot;</span><span class="s3">, </span><span class="s1">object()) == FontManager.__version__:</span>
+                <span class="s1">_log.debug(</span><span class="s4">&quot;Using fontManager instance from %s&quot;</span><span class="s3">, </span><span class="s1">fm_path)</span>
+                <span class="s3">return </span><span class="s1">fm</span>
+    <span class="s1">fm = FontManager()</span>
+    <span class="s1">json_dump(fm</span><span class="s3">, </span><span class="s1">fm_path)</span>
+    <span class="s1">_log.info(</span><span class="s4">&quot;generated new fontManager&quot;</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">fm</span>
+
+
+<span class="s1">fontManager = _load_fontmanager()</span>
+<span class="s1">findfont = fontManager.findfont</span>
+<span class="s1">get_font_names = fontManager.get_font_names</span>
+</pre>
+</body>
+</html>
