@@ -1,4 +1,4 @@
-###### old
+###### aggiungo path flask nelle varie url 
 
 from flask import Flask, render_template, redirect, request, send_from_directory, url_for
 #importato per immagini
@@ -26,14 +26,14 @@ app = Flask(__name__)
 #db_path = "//home/capanos/mysite/database.db" db su pythonever
 #aggiunto per caricamento
 app.config['SECRET_KEY'] = 'jkhljhkjjhkjhhkdzzc'
-app.config['UPLOADED_PHOTOS_DEST'] ='uploads'
+app.config['UPLOADED_PHOTOS_DEST'] ='flask/uploads'
 
 photos =UploadSet('photos', IMAGES)
 configure_uploads(app, photos)
 #app = Flask(__name__, static_url_path='/static') ###eliminami anche cartella static
 
 ################################################
-risultatoappoggio = "/upload/human-pose-estimation-cover.jpg"   ###provo ad associargli un valore all'interno del def
+risultatoappoggio = "flask/upload/human-pose-estimation-cover.jpg"   ###provo ad associargli un valore all'interno del def
 
 
 
@@ -63,22 +63,13 @@ def index():
 # non toccare va! guarda la parte html
 
 
-@app.route('/<int:idx>/delete', methods=("POST",))
-def delete(idx):
-    connection = sqlite3.connect('database.db')
-    connection.row_factory = sqlite3.Row
-    connection.execute('DELETE FROM posts WHERE id=?', (idx,))
-    connection.commit()
-    connection.close()
-    return redirect('/')
-
 
 @app.route('/crea.html', methods=("GET", "POST"))
 def crea():
     if request.method == 'POST':
         titolo = request.form['titolo']
         info = request.form['info']
-        connection = sqlite3.connect('database.db')
+        connection = sqlite3.connect('flask/database.db')
         connection.row_factory = sqlite3.Row
         connection.execute(
             'INSERT INTO posts (titolo, info) VALUES (?, ?)', (titolo, info)
@@ -154,7 +145,7 @@ def upload_image():
         filename = photos.save(form.photo.data)
         file_url = url_for('get_file', filename=filename)
         #print(file_url) #è lindirizzo dell'immagine caricata senza apici qui è da vedere se rimetterlo
-        stringa = "uploads/"+ filename
+        stringa = "flask/uploads/"+ filename
         #print (stringa)
         image_path = str(stringa)
         output = cv2.imread(image_path)
@@ -165,7 +156,7 @@ def upload_image():
 
     else:
         file_url = None
-        output = "uploads/human-pose-estimation-cover.jpg"
+        output = "flask/uploads/human-pose-estimation-cover.jpg"
 
     return render_template('movenze.html', form=form, file_url=file_url, risultatoappoggio = risultatoappoggio)
 
