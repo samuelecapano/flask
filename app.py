@@ -26,14 +26,14 @@ app = Flask(__name__)
 #db_path = "//home/capanos/mysite/database.db" db su pythonever
 #aggiunto per caricamento
 app.config['SECRET_KEY'] = 'jkhljhkjjhkjhhkdzzc'
-app.config['UPLOADED_PHOTOS_DEST'] ='flask/uploads'
+app.config['UPLOADED_PHOTOS_DEST'] ='uploads'
 
 photos =UploadSet('photos', IMAGES)
 configure_uploads(app, photos)
 #app = Flask(__name__, static_url_path='/static') ###eliminami anche cartella static
 
 ################################################
-risultatoappoggio = "flask/upload/human-pose-estimation-cover.jpg"   ###provo ad associargli un valore all'interno del def
+risultatoappoggio = "upload/human-pose-estimation-cover.jpg"   ###provo ad associargli un valore all'interno del def
 
 
 
@@ -69,7 +69,7 @@ def crea():
     if request.method == 'POST':
         titolo = request.form['titolo']
         info = request.form['info']
-        connection = sqlite3.connect('flask/database.db')
+        connection = sqlite3.connect('database.db')
         connection.row_factory = sqlite3.Row
         connection.execute(
             'INSERT INTO posts (titolo, info) VALUES (?, ?)', (titolo, info)
@@ -145,7 +145,7 @@ def upload_image():
         filename = photos.save(form.photo.data)
         file_url = url_for('get_file', filename=filename)
         #print(file_url) #è lindirizzo dell'immagine caricata senza apici qui è da vedere se rimetterlo
-        stringa = "flask/uploads/"+ filename
+        stringa = "uploads/"+ filename
         #print (stringa)
         image_path = str(stringa)
         output = cv2.imread(image_path)
@@ -156,7 +156,7 @@ def upload_image():
 
     else:
         file_url = None
-        output = "flask/uploads/human-pose-estimation-cover.jpg"
+        output = "uploads/human-pose-estimation-cover.jpg"
 
     return render_template('movenze.html', form=form, file_url=file_url, risultatoappoggio = risultatoappoggio)
 
